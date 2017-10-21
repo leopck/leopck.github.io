@@ -13,4 +13,7 @@ Of course, the downside would be that all your source codes for the website is a
 
 There are a few more things that I need to iron out the details like the Google Analytics, Disqus, adding designs, logos, and so on. (Hopefully I can get three more features into this blog: Google AMPS, AngularJS, Database via JSON + YAML)
 
++ Adding development page (Linux Container?, Docker?, LinuxJS?)
++ Adding IoT platform page (to talk to my sensors and stuff)
+
 I'll be migrating all my old posts from Blogspot into here shortly stay tuned.
