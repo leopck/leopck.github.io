@@ -18,10 +18,14 @@ All of these should be implemented git-like. Allowing anyone with materials to i
 This is design with curating materials and being open source at the same time.
 
 
-```
+`
 #include <stdio.h>
+
+void func(){
+  test();
+}
 
 void main(){
   printf("Test %s", "junk");
 }
-```
+`
