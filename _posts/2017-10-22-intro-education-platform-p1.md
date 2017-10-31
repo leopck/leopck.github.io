@@ -16,3 +16,12 @@ With those in mind, I'm planning to create an open source platform for Education
 All of these should be implemented git-like. Allowing anyone with materials to implement their materials in several methods rather than restricting them to learning via one method only.
 
 This is design with curating materials and being open source at the same time.
+
+
+```
+#include <stdio.h>
+
+void main(){
+  printf("Test %s", "junk");
+}
+```
