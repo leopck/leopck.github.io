@@ -1,6 +1,6 @@
 ---
 layout: post
-title: All about ESP8266
+title: Project Listing
 ---
 
 Here's a compiled list of useful links and tutorials on my projects (It's still in drafting)
