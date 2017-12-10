@@ -3,8 +3,6 @@ layout: post
 title: Project MangaMeeya
 ---
 
-# Project MangaMeeya
-
 **What is MangaMeeya?**
 
 It is a fast and small image viewer that is commonly used in the Manga reading community.
