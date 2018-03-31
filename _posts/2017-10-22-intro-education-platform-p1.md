@@ -17,8 +17,7 @@ All of these should be implemented git-like. Allowing anyone with materials to i
 
 This is design with curating materials and being open source at the same time.
 
-
-`
+{% highlight c %}
 #include <stdio.h>
 
 void func(){
@@ -28,4 +27,5 @@ void func(){
 void main(){
   printf("Test %s", "junk");
 }
-`
+
+{% endhighlight %}
