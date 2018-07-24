@@ -76,4 +76,31 @@ Please ensure that the variable `fileToUpload=@` is the same as the variable ins
 ```
  curl -i -X POST -H "Content-Type: multipart/form-data"  -F ""fileToUpload"=@/path/to/file;userid=1234" http://<url to php file>/upload.php
 ```
+## Python codes for testing
 
+{% highlight html %}
+def publishToServer(filetopush):
+    files = {
+        'fileToUpload': open(filetopush, 'rb')
+    }
+    try:
+        response = requests.post('http://localhost/upload.php', files=files)
+        return response
+    except Exception as err:
+        print('Exception occured: {}'.format(err))
+        print('Failed in publishing to server')
+        return 1
+
+def generateTextFile(var):
+    textContent = """\
+    Something\t%s
+    """ % (
+        var
+        )
+    workingdir = os.getcwd()
+    file = open(workingdir + "/bkc", "w") 
+    file.write(textContent)
+    file.close() 
+    publishToServer(workingdir + "/bkc")
+    return textContent 
+{% endhighlight %}
