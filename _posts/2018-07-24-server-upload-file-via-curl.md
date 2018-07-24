@@ -78,7 +78,8 @@ Please ensure that the variable `fileToUpload=@` is the same as the variable ins
 ```
 ## Python codes for testing
 
-{% highlight html %}
+{% highlight python %}
+
 def publishToServer(filetopush):
     files = {
         'fileToUpload': open(filetopush, 'rb')
@@ -103,4 +104,5 @@ def generateTextFile(var):
     file.close() 
     publishToServer(workingdir + "/bkc")
     return textContent 
+    
 {% endhighlight %}
