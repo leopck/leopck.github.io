@@ -15,7 +15,7 @@ I followed this tutorial below to setup my Apache and PHP
 ```
 https://www.digitalocean.com/community/tutorials/how-to-install-linux-apache-mysql-php-lamp-stack-ubuntu-18-04#step-3-%E2%80%94-installing-php
 ```
-Once that is done, I had to configure php.ini inside ` /etc/php/7.0/apache2/php.ini` to allow file_uploads. My sample php.ini is here:
+Once that is done, I had to configure php.ini inside `/etc/php/7.0/apache2/php.ini` to allow file_uploads. My sample php.ini is here:
 `https://gist.github.com/leopck/11a680ca615590116f5d67e3f3ddedd0`
 
 ## Setup directory structure
