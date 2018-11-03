@@ -46,3 +46,4 @@ Untested/Unsure keycommands:
   Hold Esc + Backspace + Ctrl + right arrow for three seconds to reset the keyboard to factory settings.
   
 If you know more keys please comment in Github
+https://github.com/leopck/leopck.github.io/blob/master/_posts/2018-11-03-keycool-programming.md
