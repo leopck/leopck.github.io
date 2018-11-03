@@ -47,3 +47,4 @@ Untested/Unsure keycommands:
   
 If you know more keys please comment in Github
 https://github.com/leopck/leopck.github.io/blob/master/_posts/2018-11-03-keycool-programming.md
+or post an issue in Github [Post an Issue for comments](https://github.com/leopck/leopck.github.io/issues)
