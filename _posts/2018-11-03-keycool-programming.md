@@ -11,7 +11,10 @@ Keycool keyboard keys for re-configuring, keyboard used here is keycool 84 with 
 # Mechanical keycool programming
 
 My keycool keyboard is the "keycool 84 with bluetooth"
+
+```
 [Get it here: Taobao shop](https://detail.tmall.com/item.htm?_ezgpid=51000384028977&_ezxp=XPlatformTaobao&id=572097098329)
+```
 
 Most of these are learnt through reverse engineering, so there might be a lot more that I'm missing out.
 
