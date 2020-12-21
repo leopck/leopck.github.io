@@ -1,6 +1,6 @@
 ---
 layout: post
-title: UGreeen Documentation
+title: UGreen Documentation
 categories:
 - blog
 ---
