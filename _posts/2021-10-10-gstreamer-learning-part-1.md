@@ -16,7 +16,11 @@ This learnings are to share about how to go about creating your own gstreamer pl
 ## Gstreamer Plugins Documentations
 
 1. https://qiita.com/maueki/items/419f9a4bd0a397ec474c : Easily one of the best and simplest tutorial thus far to get started though not complete and using his code demo is broken for me as it doesn't run. Outdated.
-2. 
+2. https://developer.ridgerun.com/wiki/index.php?title=Creating_a_New_GStreamer_Element_or_Application_Using_Templates : Shows all the list of empty Gstreamer elements that I can use and how to use project maker
+3. https://gstreamer.freedesktop.org/documentation/gstreamer/gstmemory.html?gi-language=c : Understanding on how gstreamer gstmemory works
+4. https://lazka.github.io/pgi-docs/Gst-1.0/classes/MapInfo.html : Understanding on gst.mapinfo
+5. https://gstreamer.freedesktop.org/documentation/gstreamer/gstbuffer.html?gi-language=c : Understanding on gstbuffer
+6. https://gstreamer.freedesktop.org/documentation/gstreamer/gstutils.html?gi-language=c : Understanding on gstutils
 
 ## Build system with gstreamer and building steps
 
@@ -103,3 +107,54 @@ $ GST_PLUGIN_PATH=. gst-launch-1.0 myprojectsrc ! myprojectsink
 3. Use GST_DEBUG=5 gst-inspect-1.0 ... this will show all the debug log or gst-launch-1.0
 4. Even if it compiles, it doesn't mean that the syntaxs pass, during runtime, it shows some syntaxs not found, resolve that.
 5. Meaning of blacklist: https://newbedev.com/what-s-the-meaning-of-blacklisted-on-gstreamer
+
+## Some important notes and understanding
+
+When creating an element you can refer to here for a list of base elements that you can use:
+
+```
+Create an empty GStreamer element
+The gst-element-maker tool creates a barebones GStreamer element which may inherit from a variety of base classes. As per 1.15, the base classes for elements available are:
+
+audiodecoder
+audioencoder
+audiofilter
+audiosink
+audiosrc
+baseparse
+basesink
+basesrc
+basetransform
+element
+videodecoder
+videoencoder
+videofilter
+videosink
+Additionally, you can create classes based on other GStreamer elements such as:
+
+sinkpad
+sinkpad-audio
+sinkpad-simple
+sinkpad-template
+sinkpad-template-video
+srcpad
+srcpad-audio
+srcpad-simple
+srcpad-template
+srcpad-template-video
+```
+
+- Gstmemory
+
+Helps to allocate a region of the memory and manage the data of a GstBuffer
+
+- GstBuffer
+
+Basic unit of data transfer in Gstreamer. Contains the timing and offset along with other arbitrary metadata that is associated with the GstMemory blocks that the buffer contains.
+
+- Great sample for learning is filesrc:
+
+Filesrc is pretty simple though they used goto which makes it look confusing and gchar with is from glib, but ignoring those, you'll comprehend the code pretty easily after organizing it using IDE.
+
+https://github.com/GStreamer/gstreamer/blob/4a2d1d9c78580f247a35c217f9dc3fe077cd5a38/plugins/elements/gstfilesrc.h
+https://github.com/GStreamer/gstreamer/blob/4a2d1d9c78580f247a35c217f9dc3fe077cd5a38/plugins/elements/gstfilesrc.c
