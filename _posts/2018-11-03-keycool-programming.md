@@ -58,8 +58,10 @@ Fn + F12 = Lock Win
 Untested/Unsure keycommands:
   Hold Esc + Backspace + Ctrl + right arrow for three seconds to reset the keyboard to factory settings.
   
- This is well-documented in here: https://gist.github.com/sheeeng/2a14f12ec02a97a27fa04df004985a87
+Reference documentation on this:
+ This is well-documented in here: [https://gist.github.com/sheeeng/2a14f12ec02a97a27fa04df004985a87](https://gist.github.com/sheeeng/2a14f12ec02a97a27fa04df004985a87)
+ Partial Cheatsheet: [https://cheatography.com/puzzlovaski/cheat-sheets/keycool-kc-84-fn-combination-key/](https://cheatography.com/puzzlovaski/cheat-sheets/keycool-kc-84-fn-combination-key/)
   
 If you know more keys please comment in Github
-https://github.com/leopck/leopck.github.io/blob/master/_posts/2018-11-03-keycool-programming.md
+[https://github.com/leopck/leopck.github.io/blob/master/_posts/2018-11-03-keycool-programming.md](https://github.com/leopck/leopck.github.io/blob/master/_posts/2018-11-03-keycool-programming.md)
 or post an issue in Github [Post an Issue for comments](https://github.com/leopck/leopck.github.io/issues)
