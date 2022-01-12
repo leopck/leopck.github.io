@@ -28,7 +28,7 @@ Fn + left arrow key = decrease led speed
 
 Fn + Pause = Toggle between the different LED modes
 
-Fn + PrtSc = Start Bluetooth mode
+PrtSc (3 secs) = Turn on/off Bluetooth mode
 
 Fn + 1 = Go to Bluetooth number 1
 Fn + 2 = Go to Bluetooth number 2
@@ -57,6 +57,8 @@ Fn + F12 = Lock Win
 
 Untested/Unsure keycommands:
   Hold Esc + Backspace + Ctrl + right arrow for three seconds to reset the keyboard to factory settings.
+  
+ This is well-documented in here: https://gist.github.com/sheeeng/2a14f12ec02a97a27fa04df004985a87
   
 If you know more keys please comment in Github
 https://github.com/leopck/leopck.github.io/blob/master/_posts/2018-11-03-keycool-programming.md
