@@ -1,6 +1,6 @@
 ---
 layout: default
-title: All about ESP32
+title: IoT Protocols
 ---
 
 Here's a compiled list of useful links and tutorials on any hardware (It's still in drafting)
