@@ -1,4 +1,4 @@
-#Scripting my own DDNS for Mikrotik
+# Scripting my own DDNS for Mikrotik
 
 Mikrotik as in every other proprietary routers, has their own scripting language. Previously, I was using dlink router and they were kind enough to provide a free ddns service. Namely, dlinkddns which doesn't require any form of monthly activation or subsciption. The only condition was that you are an owner of dlink router, you can get the ddns domain name.
 
