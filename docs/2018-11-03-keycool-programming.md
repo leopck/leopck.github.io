@@ -1,5 +1,5 @@
 ---
-layout: post
+layout: default
 title: Keycool Mechanical Keyboard configuration
 categories:
 - blog

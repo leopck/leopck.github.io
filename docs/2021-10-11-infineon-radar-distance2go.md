@@ -1,5 +1,5 @@
 ---
-layout: post
+layout: default
 title: Infineon Distance2Go Part 1
 categories:
 - blog

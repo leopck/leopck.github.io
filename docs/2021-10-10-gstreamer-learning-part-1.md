@@ -1,5 +1,5 @@
 ---
-layout: post
+layout: default
 title: Gstreamer Learning Part 1
 categories:
 - blog

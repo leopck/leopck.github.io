@@ -1,5 +1,5 @@
 ---
-layout: post
+layout: default
 title: Development of Education Platform (Part 1)
 ---
 

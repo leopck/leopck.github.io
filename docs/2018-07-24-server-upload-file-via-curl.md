@@ -1,5 +1,5 @@
 ---
-layout: post
+layout: default
 title: Server upload using PHP and cUrl
 categories:
 - blog

@@ -1,5 +1,5 @@
 ---
-layout: post
+layout: default
 title: RTSP CCTV Camera configurations
 categories:
 - blog
