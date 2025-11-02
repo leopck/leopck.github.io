@@ -1,49 +1,98 @@
-# Fridays with Faraday - Static Site
+# 🎯 Fridays with Faraday - Static Site Generator
 
-A static site generated from Markdown sources, automatically deployed to GitHub Pages.
+## 🚀 **Quick Start**
 
-## 🚀 Quick Start
+### **1. Setup**
+```bash
+# Extract zip and enter directory
+cd fridays-with-faraday-site
 
-### Local Development
+# Install dependencies
+npm install
 
-1. **Install dependencies:**
-   ```bash
-   npm install
-   ```
+# Build the site
+npm run build
 
-2. **Build the site:**
-   ```bash
-   npm run build
-   ```
+# Test locally
+npm run serve
+```
 
-3. **Serve locally (optional):**
-   ```bash
-   npm run serve
-   ```
-   Visit http://localhost:3000 to view the site
+### **2. GitHub Pages Deployment**
+```bash
+# Add all files
+git add .
 
-4. **Development mode:**
-   ```bash
-   npm run dev
-   ```
+# Commit and push
+git commit -m "Add static site generator"
+git push origin master
 
-### Project Structure
+# Enable GitHub Pages:
+# Repository Settings → Pages → Source: gh-pages branch
+```
+
+### **3. Done!**
+- Visit: `https://yourusername.github.io/repository-name`
+- Auto-deploys on every push to master
+
+---
+
+## 🏗️ **Project Structure**
 
 ```
-├── posts/                  # Markdown source files
-│   ├── esp32/
-│   ├── gaudi/
-│   ├── graphics/
-│   ├── llm/
-│   └── vllm/
-├── static-site-generator/  # Site generator
-│   ├── generator.js       # Main generator script
-│   ├── templates/         # HTML templates
-│   ├── assets/           # CSS/JS files
-│   └── dist/             # Generated site (auto-generated)
-├── .github/workflows/     # GitHub Actions
-└── docs/                  # Documentation
+fridays-with-faraday-site/
+├── 📝 generator-enhanced.js    # Enhanced static site generator
+├── 📦 package.json             # Dependencies & scripts
+├── 📄 posts/                   # Markdown source files
+│   ├── esp32/                 # ESP32 posts (5)
+│   ├── experiments/           # Technical experiments (18)
+│   ├── gaudi/                 # Gaudi graphics (4)
+│   ├── graphics/              # Graphics programming (3)
+│   ├── llm/                   # LLM content (5)
+│   └── vllm/                  # VLLM optimization (4)
+├── 🎨 static-site-generator/   # Templates & assets
+│   ├── templates/             # HTML templates
+│   └── assets/                # CSS & JS files
+├── 🔧 .github/workflows/       # CI/CD workflows
+│   ├── deploy.yml             # Build & deploy workflow
+│   └── ci.yml                 # CI testing workflow
+└── 📤 dist/                   # Built site (auto-generated)
+    ├── index.html             # Homepage
+    ├── search.html            # Search functionality
+    ├── rss.xml               # RSS feed
+    ├── css/                  # Stylesheets
+    ├── js/                   # JavaScript
+    └── [categories]/         # Post directories
 ```
+
+---
+
+## ⚡ **CI/CD Workflow**
+
+### **How It Works**
+```
+Your Code Push
+       ↓
+   GitHub Actions
+       ↓
+   Build Job (CI)
+       ↓
+   Upload Artifacts
+       ↓
+   Deploy Job (CD)
+       ↓
+   GitHub Pages (Live!)
+```
+
+### **Two Workflows**
+
+#### **1. `.github/workflows/deploy.yml`**
+- **Triggers**: Push to `master` branch
+- **Build Job**: Compiles Markdown → HTML
+- **Deploy Job**: Publishes to `gh-pages` branch
+
+#### **2. `.github/workflows/ci.yml`**
+- **Triggers**: Pull requests to `master`
+- **Tests**: Build validation, file checks, post count
 
 ## 📝 Adding Content
 

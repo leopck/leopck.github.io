@@ -3,8 +3,8 @@ const path = require('path');
 
 // Enhanced configuration with front matter support
 const CONFIG = {
-  postsDirectory: '/workspace/posts',
-  outputDirectory: '/workspace',
+  postsDirectory: 'posts',
+  outputDirectory: 'dist',
   basePath: ''
 };
 
@@ -818,6 +818,12 @@ async function copyEnhancedAssets() {
 
 async function main() {
   try {
+    // Ensure output directory exists
+    if (!fs.existsSync(CONFIG.outputDirectory)) {
+      fs.mkdirSync(CONFIG.outputDirectory, { recursive: true });
+      console.log(`✓ Created output directory: ${CONFIG.outputDirectory}`);
+    }
+    
     const posts = await loadPosts();
     await generateEnhancedPages(posts);
   } catch (error) {
