@@ -1,68 +1,224 @@
-# fridayswithfaraday.com
+# Fridays with Faraday - Static Site
 
-Personal site for embedded systems and microcontroller work.
+A static site generated from Markdown sources, automatically deployed to GitHub Pages.
 
-## Quick Start
+## 🚀 Quick Start
 
-1. **Clone this repo**
+### Local Development
+
+1. **Install dependencies:**
    ```bash
-   git clone https://github.com/yourusername/yourusername.github.io.git
-   cd yourusername.github.io
+   npm install
    ```
 
-2. **Test locally**
-   - Open `index.html` in your browser
-   - Or use a local server:
-     ```bash
-     python3 -m http.server 8000
-     # Visit http://localhost:8000
-     ```
-
-3. **Deploy to GitHub Pages**
+2. **Build the site:**
    ```bash
-   git add .
-   git commit -m "Initial commit"
+   npm run build
+   ```
+
+3. **Serve locally (optional):**
+   ```bash
+   npm run serve
+   ```
+   Visit http://localhost:3000 to view the site
+
+4. **Development mode:**
+   ```bash
+   npm run dev
+   ```
+
+### Project Structure
+
+```
+├── posts/                  # Markdown source files
+│   ├── esp32/
+│   ├── gaudi/
+│   ├── graphics/
+│   ├── llm/
+│   └── vllm/
+├── static-site-generator/  # Site generator
+│   ├── generator.js       # Main generator script
+│   ├── templates/         # HTML templates
+│   ├── assets/           # CSS/JS files
+│   └── dist/             # Generated site (auto-generated)
+├── .github/workflows/     # GitHub Actions
+└── docs/                  # Documentation
+```
+
+## 📝 Adding Content
+
+### Create a New Post
+
+1. **Add markdown file** to the appropriate category in `posts/`:
+   - `posts/esp32/` - ESP32 microcontroller content
+   - `posts/gaudi/` - Intel Gaudi AI accelerator content
+   - `posts/graphics/` - Graphics programming content
+   - `posts/llm/` - Large Language Model content
+   - `posts/vllm/` - vLLM content
+   - `posts/experiments/` - General experiments
+
+2. **Markdown format**:
+   ```markdown
+   # Your Post Title
+
+   Brief description of your post content...
+
+   ## Section 1
+
+   Your content here with **bold text**, `inline code`, and:
+   
+   - Lists
+   - Links: [Example](https://example.com)
+   - Code blocks:
+   
+   ```bash
+   # Terminal commands
+   ls -la
+   ```
+
+   Thank you for reading! [← Back to Experiments]({{basePath}}/experiments.html)
+   ```
+
+3. **Rebuild site**:
+   ```bash
+   npm run build
+   ```
+
+## 🔧 Available Commands
+
+| Command | Description |
+|---------|-------------|
+| `npm run build` | Generate site from Markdown sources |
+| `npm run dev` | Build in development mode |
+| `npm run clean` | Clean build output |
+| `npm run build:clean` | Clean and rebuild |
+| `npm run serve` | Serve built site locally |
+| `npm test` | Run tests |
+
+## 🚀 GitHub Pages Deployment
+
+### Automatic Deployment
+
+The site automatically builds and deploys when you push to `main` or `master` branch:
+
+1. **Push to main branch:**
+   ```bash
    git push origin main
    ```
 
-4. **Set up custom domain** (optional)
-   - In GitHub repo settings → Pages
-   - Add custom domain: `fridayswithfaraday.com`
-   - Update your DNS:
-     - Add A records pointing to:
-       - 185.199.108.153
-       - 185.199.109.153
-       - 185.199.110.153
-       - 185.199.111.153
-     - Or add CNAME record: `yourusername.github.io`
+2. **GitHub Actions** will:
+   - ✅ Checkout code
+   - ✅ Install Node.js and dependencies
+   - ✅ Build the site from Markdown
+   - ✅ Deploy to GitHub Pages
+   - ✅ Upload build artifacts
 
-## Adding New Experiments
+3. **Deployment URL:**
+   - `https://yourusername.github.io/repository-name/`
+   - Or custom domain if configured
 
-1. Create a new file: `experiments/your-project.html`
-2. Copy template from existing experiment
-3. Update content
-4. Add card to `experiments.html`
-5. Push to GitHub
+### Manual Deployment
 
-## File Structure
+```bash
+# Build locally
+npm run build
 
-```
-/
-├── index.html          # Homepage
-├── experiments.html    # All experiments listing
-├── CNAME              # Custom domain config
-├── css/
-│   └── style.css      # All styles
-├── js/
-│   └── main.js        # Interactions
-└── experiments/
-    ├── esp32-low-power.html
-    └── stm32-dma.html
+# Deploy to gh-pages branch (requires gh-pages package)
+npx gh-pages -d static-site-generator/dist
 ```
 
-## Technologies
+## ⚙️ Configuration
 
-- Pure HTML/CSS/JavaScript (no build process)
-- No dependencies
-- Mobile responsive
-- Dark theme optimized for technical content
+### GitHub Pages Setup
+
+1. **Enable GitHub Pages:**
+   - Go to repository Settings → Pages
+   - Source: Deploy from a branch
+   - Branch: `gh-pages` / `/(root)`
+
+2. **Custom Domain (optional):**
+   - Add `CNAME` file to repository root
+   - Configure DNS with your domain provider
+   - Add `CNAME` secret to repository settings
+
+### Build Configuration
+
+Edit `static-site-generator/generator.js` to customize:
+
+- **Categories:** Modify the `categories` array
+- **Templates:** Update files in `templates/` directory
+- **Styling:** Edit `assets/css/style.css`
+- **Navigation:** Modify `createNavigation()` function
+
+### Workflow Customization
+
+Edit `.github/workflows/build.yml` to:
+- Change trigger branches
+- Modify Node.js version
+- Add post-build steps
+- Configure notifications
+
+## 🐛 Troubleshooting
+
+### Build Fails
+
+1. **Check Node.js version:**
+   ```bash
+   node --version  # Should be >= 14.0.0
+   ```
+
+2. **Clear npm cache:**
+   ```bash
+   npm cache clean --force
+   rm -rf node_modules
+   npm install
+   ```
+
+3. **Check file paths:**
+   - Verify `posts/` directory exists
+   - Ensure markdown files are in correct categories
+
+### Deployment Issues
+
+1. **Verify GitHub Pages settings:**
+   - Repository Settings → Pages
+   - Source branch: `gh-pages`
+   - No HTTPS blocking
+
+2. **Check workflow logs:**
+   - Go to Actions tab in repository
+   - Click on failed workflow run
+   - Review error messages
+
+3. **Permissions issue:**
+   - Repository Settings → Actions → General
+   - Workflow permissions: Read and write
+
+## 📦 Dependencies
+
+- **Node.js 14+** - Runtime environment
+- **No external npm packages** - Uses built-in Node.js modules
+- **GitHub Actions** - Automated deployment
+
+## 🤝 Contributing
+
+1. Fork the repository
+2. Create feature branch: `git checkout -b feature-name`
+3. Make changes and test: `npm run build`
+4. Commit changes: `git commit -m 'Add feature'`
+5. Push to branch: `git push origin feature-name`
+6. Submit pull request
+
+## 📄 License
+
+MIT License - see LICENSE file for details
+
+## 🆘 Support
+
+- Check GitHub Actions logs for build issues
+- Review generator.js for customization options
+- Open issue for bugs or feature requests
+
+---
+
+**Built with ❤️ using static site generator and GitHub Pages**
