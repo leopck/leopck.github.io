@@ -1,273 +1,348 @@
-# 🎯 Fridays with Faraday - Static Site Generator
+# Fridays with Faraday - Jekyll Static Site
 
-## 🚀 **Quick Start**
+A modern, responsive Jekyll static site for the "Fridays with Faraday" technical blog, covering ESP32 microcontroller programming, AI accelerator optimization, and performance analysis.
 
-### **1. Setup**
+## 🚀 Features
+
+- **Modern Jekyll 4.x** implementation with essential plugins
+- **Responsive Design** optimized for all devices
+- **Technical Content Focus** with code highlighting, math rendering, and diagrams
+- **SEO Optimized** with structured data, Open Graph, and social sharing
+- **Fast Performance** with optimized assets and caching
+- **Docker Development** environment for consistent builds
+- **GitHub Pages Ready** deployment configuration
+- **Advanced Typography** with beautiful code blocks and reading experience
+
+## 📁 Project Structure
+
+```
+jekyll-site/
+├── _layouts/              # Jekyll layouts
+│   ├── default.html       # Base layout
+│   ├── post.html          # Blog post layout
+│   └── page.html          # Static page layout
+├── _includes/             # Reusable components
+│   ├── navigation.html    # Main navigation
+│   ├── footer.html        # Site footer
+│   ├── post-meta.html     # Post metadata
+│   └── toc.html           # Table of contents
+├── _posts/                # Blog posts in Jekyll format
+├── _sass/                 # SCSS stylesheets
+│   ├── _variables.scss    # Sass variables
+│   ├── _mixins.scss       # Sass mixins
+│   ├── _typography.scss   # Typography styles
+│   ├── _base.scss         # Base styles
+│   └── _layout.scss       # Layout components
+├── _assets/               # JavaScript and other assets
+│   └── js/
+│       └── main.js        # Main JavaScript functionality
+├── css/                   # Compiled CSS
+│   └── style.scss         # Main stylesheet entry point
+├── docker/                # Docker configuration
+│   └── nginx.conf         # Nginx configuration
+├── _scripts/              # Utility scripts
+│   ├── build.sh           # Build automation script
+│   ├── convert_posts.py   # Content conversion script
+│   └── convert_posts.rb   # Ruby version of converter
+├── _config.yml            # Jekyll configuration
+├── Gemfile                # Ruby dependencies
+├── docker-compose.yml     # Docker development setup
+├── Dockerfile             # Production container
+└── Dockerfile.dev         # Development container
+```
+
+## 🛠️ Development
+
+### Prerequisites
+
+- **Docker & Docker Compose** (recommended for development)
+- **Ruby 3.2+** and **Bundler** (alternative to Docker)
+- **Node.js 18+** (for optional JavaScript tooling)
+
+### Quick Start
+
+1. **Clone and setup:**
+   ```bash
+   git clone <repository>
+   cd jekyll-site
+   ```
+
+2. **Development with Docker:**
+   ```bash
+   # Start development server
+   docker-compose up jekyll
+   
+   # Or run full development environment
+   docker-compose up
+   ```
+
+3. **Access the site:**
+   ```
+   http://localhost:4000
+   ```
+
+### Alternative: Native Development
+
+1. **Install dependencies:**
+   ```bash
+   bundle install
+   ```
+
+2. **Start development server:**
+   ```bash
+   bundle exec jekyll serve --livereload --drafts
+   ```
+
+3. **Build for production:**
+   ```bash
+   bundle exec jekyll build
+   ```
+
+### Using Build Scripts
+
+The project includes automated build scripts:
+
 ```bash
-# Extract zip and enter directory
-cd fridays-with-faraday-site
-
-# Install dependencies
-npm install
+# Make scripts executable
+chmod +x _scripts/build.sh
 
 # Build the site
-npm run build
+./_scripts/build.sh build
 
-# Test locally
-npm run serve
+# Start development server
+./_scripts/build.sh dev
+
+# Clean build artifacts
+./_scripts/build.sh clean
+
+# Run tests
+./_scripts/build.sh test
+
+# Deploy to GitHub Pages
+./_scripts/build.sh deploy
 ```
 
-### **2. GitHub Pages Deployment**
+## 📝 Content Management
+
+### Post Organization
+
+All blog posts are stored in the `_posts/` directory with Jekyll naming convention:
+- Format: `YYYY-MM-DD-title.md`
+- Categories: esp32, experiments, gaudi, graphics, llm, vllm
+- Front matter includes: title, date, category, tags, description, difficulty
+
+### Content Conversion
+
+Existing posts have been automatically converted from Node.js format to Jekyll:
+
 ```bash
-# Add all files
-git add .
-
-# Commit and push
-git commit -m "Add static site generator"
-git push origin master
-
-# Enable GitHub Pages:
-# Repository Settings → Pages → Source: gh-pages branch
+# Convert additional posts if needed
+python _scripts/convert_posts.py /path/to/old/posts /path/to/jekyll/posts
 ```
 
-### **3. Done!**
-- Visit: `https://yourusername.github.io/repository-name`
-- Auto-deploys on every push to master
+### Front Matter Structure
 
+```yaml
 ---
-
-## 🏗️ **Project Structure**
-
-```
-fridays-with-faraday-site/
-├── 📝 generator-enhanced.js    # Enhanced static site generator
-├── 📦 package.json             # Dependencies & scripts
-├── 📄 posts/                   # Markdown source files
-│   ├── esp32/                 # ESP32 posts (5)
-│   ├── experiments/           # Technical experiments (18)
-│   ├── gaudi/                 # Gaudi graphics (4)
-│   ├── graphics/              # Graphics programming (3)
-│   ├── llm/                   # LLM content (5)
-│   └── vllm/                  # VLLM optimization (4)
-├── 🎨 static-site-generator/   # Templates & assets
-│   ├── templates/             # HTML templates
-│   └── assets/                # CSS & JS files
-├── 🔧 .github/workflows/       # CI/CD workflows
-│   ├── deploy.yml             # Build & deploy workflow
-│   └── ci.yml                 # CI testing workflow
-└── 📤 dist/                   # Built site (auto-generated)
-    ├── index.html             # Homepage
-    ├── search.html            # Search functionality
-    ├── rss.xml               # RSS feed
-    ├── css/                  # Stylesheets
-    ├── js/                   # JavaScript
-    └── [categories]/         # Post directories
-```
-
+title: "Post Title"
+author: "Fridays with Faraday"
+category: "esp32"
+tags: [microcontroller, dma, embedded, performance]
+description: "Technical analysis and implementation guide"
+difficulty: intermediate
+layout: post
+toc: true
+show_related_posts: true
+show_share_buttons: true
+reading_time: 5
 ---
-
-## ⚡ **CI/CD Workflow**
-
-### **How It Works**
-```
-Your Code Push
-       ↓
-   GitHub Actions
-       ↓
-   Build Job (CI)
-       ↓
-   Upload Artifacts
-       ↓
-   Deploy Job (CD)
-       ↓
-   GitHub Pages (Live!)
 ```
 
-### **Two Workflows**
+## 🎨 Styling & Design
 
-#### **1. `.github/workflows/deploy.yml`**
-- **Triggers**: Push to `master` branch
-- **Build Job**: Compiles Markdown → HTML
-- **Deploy Job**: Publishes to `gh-pages` branch
+### SCSS Architecture
 
-#### **2. `.github/workflows/ci.yml`**
-- **Triggers**: Pull requests to `master`
-- **Tests**: Build validation, file checks, post count
+The project uses a modular SCSS architecture:
 
-## 📝 Adding Content
+- **Variables** (`_variables.scss`): Colors, typography, spacing
+- **Mixins** (`_mixins.scss`): Reusable CSS patterns
+- **Typography** (`_typography.scss`): Text styling and code blocks
+- **Base** (`_base.scss`): Reset and foundation styles
+- **Layout** (`_layout.scss`): Component layouts
 
-### Create a New Post
+### Design System
 
-1. **Add markdown file** to the appropriate category in `posts/`:
-   - `posts/esp32/` - ESP32 microcontroller content
-   - `posts/gaudi/` - Intel Gaudi AI accelerator content
-   - `posts/graphics/` - Graphics programming content
-   - `posts/llm/` - Large Language Model content
-   - `posts/vllm/` - vLLM content
-   - `posts/experiments/` - General experiments
+- **Primary Color**: #007acc (Blue)
+- **Secondary Color**: #ff6b35 (Orange)
+- **Typography**: Inter + JetBrains Mono
+- **Categories**: Color-coded by technology (ESP32, LLM, etc.)
+- **Responsive**: Mobile-first approach with breakpoints
 
-2. **Markdown format**:
-   ```markdown
-   # Your Post Title
+### Category Colors
 
-   Brief description of your post content...
+- **ESP32**: #007acc (Blue)
+- **Experiments**: #ff6b35 (Orange)  
+- **Gaudi**: #8b5cf6 (Purple)
+- **Graphics**: #06d6a0 (Green)
+- **LLM**: #f72585 (Pink)
+- **vLLM**: #fb8c00 (Orange)
 
-   ## Section 1
+## 🔧 Configuration
 
-   Your content here with **bold text**, `inline code`, and:
-   
-   - Lists
-   - Links: [Example](https://example.com)
-   - Code blocks:
-   
-   ```bash
-   # Terminal commands
-   ls -la
-   ```
+### Jekyll Configuration
 
-   Thank you for reading! [← Back to Experiments]({{basePath}}/experiments.html)
-   ```
+The main configuration is in `_config.yml`:
 
-3. **Rebuild site**:
-   ```bash
-   npm run build
-   ```
+```yaml
+# Site settings
+title: "Fridays with Faraday"
+description: "Technical blog on embedded systems and optimization"
+url: "https://fridayswithfaraday.github.io"
 
-## 🔧 Available Commands
+# Collections for categories
+collections:
+  esp32:
+    output: true
+    permalink: /esp32/:title/
+  # ... other categories
 
-| Command | Description |
-|---------|-------------|
-| `npm run build` | Generate site from Markdown sources |
-| `npm run dev` | Build in development mode |
-| `npm run clean` | Clean build output |
-| `npm run build:clean` | Clean and rebuild |
-| `npm run serve` | Serve built site locally |
-| `npm test` | Run tests |
+# Plugins
+plugins:
+  - jekyll-feed
+  - jekyll-seo-tag
+  - jekyll-sitemap
+  - jekyll-archives
+  - jekyll-related-posts
+  - jekyll-katex
+  - jekyll-toc
+  - jekyll-paginate
+```
 
-## 🚀 GitHub Pages Deployment
+### Environment Variables
 
-### Automatic Deployment
+- `JEKYLL_ENV=production` - Enable production optimizations
+- `JEKYLL_ENV=development` - Enable development features (live reload, drafts)
 
-The site automatically builds and deploys when you push to `main` or `master` branch:
+## 🚀 Deployment
 
-1. **Push to main branch:**
-   ```bash
-   git push origin main
-   ```
+### GitHub Pages
 
-2. **GitHub Actions** will:
-   - ✅ Checkout code
-   - ✅ Install Node.js and dependencies
-   - ✅ Build the site from Markdown
-   - ✅ Deploy to GitHub Pages
-   - ✅ Upload build artifacts
+The site is configured for GitHub Pages deployment:
 
-3. **Deployment URL:**
-   - `https://yourusername.github.io/repository-name/`
-   - Or custom domain if configured
+1. **Enable GitHub Pages** in repository settings
+2. **Source**: Deploy from a branch
+3. **Branch**: `main` / `master`, folder: `/ (root)`
+4. **Custom domain** (optional): Configure in repository settings
+
+### Docker Production Deployment
+
+```bash
+# Build and run production container
+docker-compose up -d web
+```
 
 ### Manual Deployment
 
 ```bash
-# Build locally
-npm run build
+# Build site
+bundle exec jekyll build
 
-# Deploy to gh-pages branch (requires gh-pages package)
-npx gh-pages -d static-site-generator/dist
+# Deploy _site/ directory to your web server
 ```
 
-## ⚙️ Configuration
+## 📊 Features
 
-### GitHub Pages Setup
+### Built-in Functionality
 
-1. **Enable GitHub Pages:**
-   - Go to repository Settings → Pages
-   - Source: Deploy from a branch
-   - Branch: `gh-pages` / `/(root)`
+- ✅ **Responsive Navigation** with mobile menu
+- ✅ **Table of Contents** auto-generation
+- ✅ **Related Posts** algorithm based on tags/categories
+- ✅ **Social Sharing** buttons with OpenGraph
+- ✅ **Search Integration** (Lunr.js ready)
+- ✅ **RSS Feed** generation
+- ✅ **Sitemap** auto-generation
+- ✅ **SEO Optimization** with structured data
+- ✅ **Performance Optimized** with asset pipeline
+- ✅ **Code Highlighting** with syntax highlighting
+- ✅ **Math Rendering** with KaTeX support
 
-2. **Custom Domain (optional):**
-   - Add `CNAME` file to repository root
-   - Configure DNS with your domain provider
-   - Add `CNAME` secret to repository settings
+### Advanced Features
 
-### Build Configuration
+- ✅ **Reading Time** estimation
+- ✅ **Related Posts** with category/tag matching
+- ✅ **Breadcrumb Navigation**
+- ✅ **Author Profiles** and social links
+- ✅ **Tag Clouds** and category pages
+- ✅ **Archive Pages** by year and category
+- ✅ **404 Error Page**
+- ✅ **Favicon and OpenGraph** images
+- ✅ **Dark Mode** ready (theme toggle available)
 
-Edit `static-site-generator/generator.js` to customize:
+## 🧪 Testing
 
-- **Categories:** Modify the `categories` array
-- **Templates:** Update files in `templates/` directory
-- **Styling:** Edit `assets/css/style.css`
-- **Navigation:** Modify `createNavigation()` function
+The site includes automated testing:
 
-### Workflow Customization
+```bash
+# Run all tests
+./_scripts/build.sh test
 
-Edit `.github/workflows/build.yml` to:
-- Change trigger branches
-- Modify Node.js version
-- Add post-build steps
-- Configure notifications
+# HTML validation with htmlproofer
+htmlproofer _site/ --assume-extension --check-html
 
-## 🐛 Troubleshooting
+# Build verification
+bundle exec jekyll build --trace
+```
 
-### Build Fails
+## 📱 Browser Support
 
-1. **Check Node.js version:**
-   ```bash
-   node --version  # Should be >= 14.0.0
-   ```
-
-2. **Clear npm cache:**
-   ```bash
-   npm cache clean --force
-   rm -rf node_modules
-   npm install
-   ```
-
-3. **Check file paths:**
-   - Verify `posts/` directory exists
-   - Ensure markdown files are in correct categories
-
-### Deployment Issues
-
-1. **Verify GitHub Pages settings:**
-   - Repository Settings → Pages
-   - Source branch: `gh-pages`
-   - No HTTPS blocking
-
-2. **Check workflow logs:**
-   - Go to Actions tab in repository
-   - Click on failed workflow run
-   - Review error messages
-
-3. **Permissions issue:**
-   - Repository Settings → Actions → General
-   - Workflow permissions: Read and write
-
-## 📦 Dependencies
-
-- **Node.js 14+** - Runtime environment
-- **No external npm packages** - Uses built-in Node.js modules
-- **GitHub Actions** - Automated deployment
+- ✅ Chrome 90+
+- ✅ Firefox 88+
+- ✅ Safari 14+
+- ✅ Edge 90+
+- ✅ Mobile browsers (iOS Safari, Chrome Mobile)
 
 ## 🤝 Contributing
 
-1. Fork the repository
-2. Create feature branch: `git checkout -b feature-name`
-3. Make changes and test: `npm run build`
-4. Commit changes: `git commit -m 'Add feature'`
-5. Push to branch: `git push origin feature-name`
-6. Submit pull request
+1. **Fork** the repository
+2. **Create** a feature branch
+3. **Make** your changes
+4. **Test** thoroughly
+5. **Submit** a pull request
+
+### Content Guidelines
+
+- Use clear, descriptive titles
+- Include proper front matter
+- Add relevant tags and categories
+- Ensure technical accuracy
+- Follow existing writing style
+
+### Code Guidelines
+
+- Follow existing SCSS structure
+- Test responsive design
+- Optimize for performance
+- Document new features
 
 ## 📄 License
 
-MIT License - see LICENSE file for details
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## 🆘 Support
+## 🙏 Acknowledgments
 
-- Check GitHub Actions logs for build issues
-- Review generator.js for customization options
-- Open issue for bugs or feature requests
+- **Jekyll** community for the excellent static site generator
+- **GitHub Pages** for hosting and deployment
+- **Open source contributors** whose work inspired this project
+- **ESP32 community** for inspiration and examples
+
+## 📞 Support
+
+- **Issues**: Report bugs and request features via GitHub Issues
+- **Documentation**: Check the `_docs/` directory for additional guides
+- **Community**: Join our discussions for questions and help
 
 ---
 
-**Built with ❤️ using static site generator and GitHub Pages**
+**Built with ❤️ using Jekyll and modern web technologies**
+
+*Fridays with Faraday - Working with microcontrollers, embedded systems, and performance optimization*
