@@ -9,6 +9,28 @@ const CONFIG = {
   basePath: ''
 };
 
+// Helper function to create proper basePath prefix
+function getBasePath() {
+  return CONFIG.basePath ? CONFIG.basePath : '';
+}
+
+// Helper function to create asset path (for root files)
+function getAssetPath(asset) {
+  const prefix = getBasePath();
+  return prefix ? `${prefix}/${asset}` : asset;
+}
+
+// Helper function to create asset path for subdirectory files
+function getAssetPathForSubdir(asset) {
+  const prefix = getBasePath();
+  if (prefix) {
+    // Remove leading slash from prefix if present to avoid double slashes
+    const cleanPrefix = prefix.startsWith('/') ? prefix.slice(1) : prefix;
+    return `../${cleanPrefix}/${asset}`;
+  }
+  return `../${asset}`;
+}
+
 // Enhanced utility functions
 function parseFrontMatter(content) {
   const frontMatterRegex = /^---\s*\n([\s\S]*?)\n---\s*\n([\s\S]*)$/;
@@ -496,7 +518,7 @@ async function generateIndex(posts) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>f/f - Fridays with Faraday</title>
   <meta name="description" content="Working with microcontrollers, embedded systems, and performance optimization">
-  <link rel="stylesheet" href="css/style.css">
+  <link rel="stylesheet" href="${getAssetPath('css/style.css')}">
   <link rel="alternate" type="application/rss+xml" title="Fridays with Faraday" href="rss.xml">
 </head>
 <body>
@@ -509,7 +531,7 @@ async function generateIndex(posts) {
 
   ${createFooter()}
 
-  <script src="js/main.js"></script>
+  <script src="${getAssetPath('js/main.js')}"></script>
 </body>
 </html>`;
 
@@ -543,7 +565,7 @@ async function generateExperimentsPage(posts) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Experiments - Fridays with Faraday</title>
   <meta name="description" content="Embedded systems experiments and microcontroller projects">
-  <link rel="stylesheet" href="css/style.css">
+  <link rel="stylesheet" href="${getAssetPath('css/style.css')}">
   <link rel="alternate" type="application/rss+xml" title="Fridays with Faraday" href="rss.xml">
 </head>
 <body>
@@ -556,7 +578,7 @@ async function generateExperimentsPage(posts) {
 
   ${createFooter()}
 
-  <script src="js/main.js"></script>
+  <script src="${getAssetPath('js/main.js')}"></script>
 </body>
 </html>`;
 
@@ -640,7 +662,7 @@ async function generatePost(allPosts, post) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>${escapeHtml(post.title)} - Fridays with Faraday</title>
   <meta name="description" content="${escapeHtml(post.description)}">
-  <link rel="stylesheet" href="../css/style.css">
+  <link rel="stylesheet" href="${getAssetPathForSubdir('css/style.css')}">
   <link rel="alternate" type="application/rss+xml" title="Fridays with Faraday" href="../rss.xml">
 </head>
 <body>
@@ -659,7 +681,7 @@ async function generatePost(allPosts, post) {
 
   ${createFooter()}
 
-  <script src="../js/main.js"></script>
+  <script src="${getAssetPathForSubdir('js/main.js')}"></script>
 </body>
 </html>`;
 
@@ -749,7 +771,7 @@ document.addEventListener('DOMContentLoaded', function() {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Search - Fridays with Faraday</title>
   <meta name="description" content="Search all technical posts and experiments">
-  <link rel="stylesheet" href="css/style.css">
+  <link rel="stylesheet" href="${getAssetPath('css/style.css')}">
   <link rel="alternate" type="application/rss+xml" title="Fridays with Faraday" href="rss.xml">
 </head>
 <body>
@@ -780,7 +802,7 @@ document.addEventListener('DOMContentLoaded', function() {
 
   ${createFooter()}
 
-  <script src="js/main.js"></script>
+  <script src="${getAssetPath('js/main.js')}"></script>
   <script>
 ${searchJs}
   </script>
