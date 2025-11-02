@@ -5,6 +5,7 @@ const path = require('path');
 const CONFIG = {
   postsDirectory: 'posts',
   outputDirectory: 'dist',
+  assetsDirectory: 'static-site-generator/assets',
   basePath: ''
 };
 
@@ -798,22 +799,30 @@ async function generateRSSFeedFile(posts) {
 
 async function copyEnhancedAssets() {
   // Copy CSS
-  const cssSource = '/workspace/static-site-generator/assets/css/style.css';
+  const cssSource = path.join(CONFIG.assetsDirectory, 'css', 'style.css');
   const cssDest = path.join(CONFIG.outputDirectory, 'css');
   if (!fs.existsSync(cssDest)) {
     fs.mkdirSync(cssDest, { recursive: true });
   }
-  fs.copyFileSync(cssSource, path.join(cssDest, 'style.css'));
-  console.log('✓ Copied enhanced style.css');
+  if (fs.existsSync(cssSource)) {
+    fs.copyFileSync(cssSource, path.join(cssDest, 'style.css'));
+    console.log('✓ Copied enhanced style.css');
+  } else {
+    console.log('⚠ Warning: style.css not found at', cssSource);
+  }
 
   // Copy JS
-  const jsSource = '/workspace/static-site-generator/assets/js/main.js';
+  const jsSource = path.join(CONFIG.assetsDirectory, 'js', 'main.js');
   const jsDest = path.join(CONFIG.outputDirectory, 'js');
   if (!fs.existsSync(jsDest)) {
     fs.mkdirSync(jsDest, { recursive: true });
   }
-  fs.copyFileSync(jsSource, path.join(jsDest, 'main.js'));
-  console.log('✓ Copied main.js');
+  if (fs.existsSync(jsSource)) {
+    fs.copyFileSync(jsSource, path.join(jsDest, 'main.js'));
+    console.log('✓ Copied main.js');
+  } else {
+    console.log('⚠ Warning: main.js not found at', jsSource);
+  }
 }
 
 async function main() {

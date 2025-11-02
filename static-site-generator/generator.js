@@ -77,9 +77,9 @@ function parseYAMLValue(value) {
 
 // Configuration
 const CONFIG = {
-  postsDirectory: '/workspace/posts',
-  outputDirectory: '/workspace/static-site-generator/dist',
-  assetsDirectory: '/workspace/static-site-generator/assets',
+  postsDirectory: 'posts',
+  outputDirectory: 'static-site-generator/dist',
+  assetsDirectory: 'static-site-generator/assets',
   basePath: '',
   siteUrl: 'https://your-domain.com', // Update with your actual site URL
   siteTitle: 'Fridays with Faraday',
