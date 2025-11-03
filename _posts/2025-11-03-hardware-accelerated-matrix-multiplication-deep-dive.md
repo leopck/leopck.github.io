@@ -673,14 +673,14 @@ nvcc -ptx -O3 -arch=sm_80 sgemm_vectorized.cu -o sgemm_vectorized.ptx
 grep -A 20 "ld.global.v4" sgemm_vectorized.ptx
 
 # Key PTX sections for vectorized load
-ld.global.v4.f32 {%r1, %r2, %r3, %r4}, [%r5];
-ld.global.v4.f32 {%r6, %r7, %r8, %r9}, [%r10];
-ld.global.v4.f32 {%r11, %r12, %r13, %r14}, [%r15];
-ld.global.v4.f32 {%r16, %r17, %r18, %r19}, [%r20];
+ld.global.v4.f32 \{\%r1, \%r2, \%r3, \%r4\}, [\%r5];
+ld.global.v4.f32 \{\%r6, \%r7, \%r8, \%r9\}, [\%r10];
+ld.global.v4.f32 \{\%r11, \%r12, \%r13, \%r14\}, [\%r15];
+ld.global.v4.f32 \{\%r16, \%r17, \%r18, \%r19\}, [\%r20];
 
 # Shared memory loads (optimized)
-ld.shared.v4.f32 {%r21, %r22, %r23, %r24}, [%r25];
-ld.shared.v4.f32 {%r26, %r27, %r28, %r29}, [%r30];
+ld.shared.v4.f32 \{\%r21, \%r22, \%r23, \%r24\}, [\%r25];
+ld.shared.v4.f32 \{\%r26, \%r27, \%r28, \%r29\}, [\%r30];
 
 # Multiply-add operations (FMA)
 fma.rn.f32 %r31, %r1, %r6, %r31;
