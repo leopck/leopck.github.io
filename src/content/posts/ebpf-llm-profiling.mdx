@@ -1,0 +1,433 @@
+---
+title: "Production LLM Profiling with eBPF: Beyond nvidia-smi"
+description: "Using BPFtrace and custom eBPF programs to trace CUDA runtime behavior, understand GPU scheduling latencies, and diagnose inference performance issues that nvidia-smi can't reveal."
+publishDate: 2024-11-12
+category: profiling
+tags: [ebpf, bpftrace, cuda, profiling, performance, linux]
+difficulty: expert
+readingTime: 24
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+
+nvidia-smi tells you GPU utilization. It doesn't tell you *why* utilization dropped from 95% to 60%, or where those mysterious latency spikes come from. eBPF gives us the tools to trace the entire inference path from Python down to kernel driver calls.
+
+## The eBPF Advantage for GPU Profiling
+
+Traditional GPU profiling tools (Nsight, nvprof) instrument the GPU side. But inference latency often stems from:
+
+- **CUDA runtime overhead**: Driver calls, context switches
+- **CPU-GPU synchronization**: cudaStreamSynchronize blocking
+- **Memory allocation**: cudaMalloc during inference
+- **Python GIL contention**: Threading issues in the inference server
+- **System scheduling**: CPU scheduler decisions affecting GPU kernel launch
+
+eBPF traces all of these on the CPU side with minimal overhead (under 5%).
+
+## Tracing CUDA Runtime Calls
+
+The CUDA runtime library (`libcuda.so`, `libcudart.so`) exposes user-space functions we can trace:
+
+```c
+// bpftrace script: cuda_latency.bt
+#!/usr/bin/env bpftrace
+
+// Trace cudaLaunchKernel latency
+uprobe:/usr/local/cuda/lib64/libcudart.so:cudaLaunchKernel
+{
+    @launch_start[tid] = nsecs;
+}
+
+uretprobe:/usr/local/cuda/lib64/libcudart.so:cudaLaunchKernel
+/@launch_start[tid]/
+{
+    $latency = nsecs - @launch_start[tid];
+    @cuda_launch_latency_us = hist($latency / 1000);
+    delete(@launch_start[tid]);
+}
+
+// Trace cudaStreamSynchronize blocking time
+uprobe:/usr/local/cuda/lib64/libcudart.so:cudaStreamSynchronize
+{
+    @sync_start[tid] = nsecs;
+}
+
+uretprobe:/usr/local/cuda/lib64/libcudart.so:cudaStreamSynchronize
+/@sync_start[tid]/
+{
+    $latency = nsecs - @sync_start[tid];
+    @stream_sync_latency_us = hist($latency / 1000);
+    
+    // Alert on unexpectedly long syncs
+    if ($latency > 10000000) {  // > 10ms
+        printf("WARN: cudaStreamSynchronize blocked %d ms (tid=%d)\n", 
+               $latency / 1000000, tid);
+    }
+    delete(@sync_start[tid]);
+}
+
+// Trace cudaMalloc during inference (should be rare)
+uprobe:/usr/local/cuda/lib64/libcudart.so:cudaMalloc
+{
+    @malloc_count++;
+    @malloc_stack[ustack()] = count();
+}
+
+END
+{
+    printf("\n=== CUDA Launch Latency (µs) ===\n");
+    print(@cuda_launch_latency_us);
+    
+    printf("\n=== Stream Sync Latency (µs) ===\n");
+    print(@stream_sync_latency_us);
+    
+    printf("\n=== cudaMalloc calls: %d ===\n", @malloc_count);
+    printf("Allocation stacks:\n");
+    print(@malloc_stack);
+}
+```
+
+<Callout type="perf" title="Typical Results">
+  Healthy inference shows cudaLaunchKernel at 2-5µs and rare cudaStreamSynchronize calls. If you see cudaMalloc during inference, you have a memory pool misconfiguration.
+</Callout>
+
+## Tracing GPU Driver IOCTLs
+
+The NVIDIA kernel driver communicates via ioctls. Tracing these reveals driver-level behavior:
+
+```c
+// bpftrace script: nvidia_driver.bt
+#!/usr/bin/env bpftrace
+
+#include <linux/fs.h>
+
+// Trace all ioctls to nvidia device files
+tracepoint:syscalls:sys_enter_ioctl
+/comm == "python" || comm == "python3"/
+{
+    @ioctl_start[tid] = nsecs;
+    @ioctl_cmd[tid] = args->cmd;
+}
+
+tracepoint:syscalls:sys_exit_ioctl
+/@ioctl_start[tid]/
+{
+    $latency = nsecs - @ioctl_start[tid];
+    $cmd = @ioctl_cmd[tid];
+    
+    // Categorize by ioctl command
+    @ioctl_latency[$cmd] = hist($latency / 1000);
+    
+    // Track high-latency ioctls
+    if ($latency > 1000000) {  // > 1ms
+        printf("Slow IOCTL: cmd=0x%x latency=%d µs\n", 
+               $cmd, $latency / 1000);
+    }
+    
+    delete(@ioctl_start[tid]);
+    delete(@ioctl_cmd[tid]);
+}
+```
+
+## Diagnosing GPU Memory Pressure
+
+When GPU memory is fragmented, cudaMalloc can take milliseconds:
+
+```c
+// bpftrace script: cuda_memory_pressure.bt
+#!/usr/bin/env bpftrace
+
+uprobe:/usr/local/cuda/lib64/libcudart.so:cudaMalloc
+{
+    @alloc_start[tid] = nsecs;
+    @alloc_size[tid] = arg1;  // Size parameter
+}
+
+uretprobe:/usr/local/cuda/lib64/libcudart.so:cudaMalloc
+/@alloc_start[tid]/
+{
+    $latency = nsecs - @alloc_start[tid];
+    $size = @alloc_size[tid];
+    
+    @malloc_latency_by_size[$size / 1048576] = hist($latency / 1000);
+    
+    // Flag slow allocations
+    if ($latency > 100000) {  // > 100µs
+        printf("SLOW cudaMalloc: %d MB took %d µs\n",
+               $size / 1048576, $latency / 1000);
+        print(ustack());
+    }
+    
+    delete(@alloc_start[tid]);
+    delete(@alloc_size[tid]);
+}
+
+uprobe:/usr/local/cuda/lib64/libcudart.so:cudaFree
+{
+    @free_count++;
+}
+
+interval:s:10
+{
+    printf("cudaFree calls in last 10s: %d\n", @free_count);
+    @free_count = 0;
+}
+```
+
+<Benchmark
+  title="cudaMalloc Latency by Allocation Size"
+  columns={["Size", "P50 Latency", "P99 Latency", "Note"]}
+  rows={[
+    { values: ["< 1 MB", "3 µs", "15 µs", "Pooled"], highlight: false },
+    { values: ["1-10 MB", "8 µs", "45 µs", "Pooled"], highlight: false },
+    { values: ["10-100 MB", "25 µs", "180 µs", "May fragment"], highlight: false },
+    { values: ["100-500 MB", "120 µs", "2.5 ms", "Likely compaction"], highlight: true },
+    { values: ["> 500 MB", "450 µs", "15 ms", "Compaction + defrag"], highlight: true },
+  ]}
+  notes="A100-80GB, measured during vLLM inference with dynamic batching"
+/>
+
+## Tracing Python-CUDA Interaction
+
+Python inference servers often have GIL contention issues. Trace the interaction:
+
+```c
+// bpftrace script: python_cuda_interaction.bt
+#!/usr/bin/env bpftrace
+
+// Track when Python threads acquire/release GIL
+uprobe:/usr/lib/libpython3.10.so:PyGILState_Ensure
+{
+    @gil_acquire_start[tid] = nsecs;
+}
+
+uretprobe:/usr/lib/libpython3.10.so:PyGILState_Ensure
+/@gil_acquire_start[tid]/
+{
+    $latency = nsecs - @gil_acquire_start[tid];
+    @gil_acquire_latency = hist($latency / 1000);
+    
+    if ($latency > 1000000) {
+        printf("GIL contention: tid=%d waited %d µs\n", 
+               tid, $latency / 1000);
+    }
+    delete(@gil_acquire_start[tid]);
+}
+
+// Correlate GIL holding time with CUDA calls
+uprobe:/usr/lib/libpython3.10.so:PyGILState_Ensure
+{
+    @gil_holder = tid;
+    @gil_acquired = nsecs;
+}
+
+uprobe:/usr/local/cuda/lib64/libcudart.so:cudaLaunchKernel
+/@gil_holder == tid/
+{
+    // CUDA call while holding GIL - measure
+    @cuda_with_gil++;
+}
+
+uprobe:/usr/local/cuda/lib64/libcudart.so:cudaStreamSynchronize
+/@gil_holder == tid/
+{
+    // Blocking CUDA call while holding GIL - BAD
+    @sync_with_gil++;
+    printf("WARNING: cudaStreamSynchronize with GIL held (tid=%d)\n", tid);
+}
+
+END
+{
+    printf("CUDA calls with GIL: %d\n", @cuda_with_gil);
+    printf("Sync calls with GIL (BAD): %d\n", @sync_with_gil);
+}
+```
+
+<Callout type="danger" title="GIL + cudaStreamSynchronize">
+  Calling cudaStreamSynchronize while holding the Python GIL blocks all Python threads during GPU computation. This is a common source of inference latency spikes.
+</Callout>
+
+## Tracing CPU Scheduling Effects
+
+CPU scheduler decisions affect kernel launch latency:
+
+```c
+// bpftrace script: scheduler_impact.bt
+#!/usr/bin/env bpftrace
+
+#include <linux/sched.h>
+
+// Track when inference threads get scheduled off-CPU
+tracepoint:sched:sched_switch
+/comm == "python" || comm == "cuda-EvtHandlr"/
+{
+    @offcpu_start[tid] = nsecs;
+    @offcpu_reason[tid] = args->prev_state;
+}
+
+tracepoint:sched:sched_switch
+/@offcpu_start[args->next_pid]/
+{
+    $offcpu_time = nsecs - @offcpu_start[args->next_pid];
+    
+    @offcpu_latency = hist($offcpu_time / 1000);
+    
+    if ($offcpu_time > 1000000) {  // > 1ms
+        printf("Thread %d off-CPU for %d µs (reason=%d)\n",
+               args->next_pid, $offcpu_time / 1000,
+               @offcpu_reason[args->next_pid]);
+    }
+    
+    delete(@offcpu_start[args->next_pid]);
+    delete(@offcpu_reason[args->next_pid]);
+}
+
+// Track CPU migrations (bad for cache)
+tracepoint:sched:sched_migrate_task
+/comm == "python"/
+{
+    @migrations++;
+    printf("Migration: pid=%d from CPU%d to CPU%d\n",
+           args->pid, args->orig_cpu, args->dest_cpu);
+}
+```
+
+## Complete Inference Request Tracing
+
+Combining all traces to understand end-to-end latency:
+
+```c
+// bpftrace script: inference_request.bt
+#!/usr/bin/env bpftrace
+
+// Requires application instrumentation via USDT probes
+// Add to your Python code:
+// import ctypes
+// ctypes.CDLL(None).dtrace_probe_inference_start(request_id)
+
+usdt:inference_server:inference_start
+{
+    @req_start[arg0] = nsecs;  // arg0 = request_id
+    @req_tid[arg0] = tid;
+}
+
+// Track CUDA operations for this request
+uprobe:/usr/local/cuda/lib64/libcudart.so:cudaLaunchKernel
+/@req_tid[$request_id] == tid/
+{
+    @kernel_launches[@req_tid[$request_id]]++;
+}
+
+usdt:inference_server:inference_end
+/@req_start[arg0]/
+{
+    $total_latency = nsecs - @req_start[arg0];
+    $req_id = arg0;
+    
+    @inference_latency_ms = hist($total_latency / 1000000);
+    
+    printf("Request %d: %d ms, %d kernel launches\n",
+           $req_id, $total_latency / 1000000,
+           @kernel_launches[@req_tid[$req_id]]);
+    
+    delete(@req_start[$req_id]);
+    delete(@req_tid[$req_id]);
+    delete(@kernel_launches[@req_tid[$req_id]]);
+}
+```
+
+## Practical Debugging Session
+
+Here's a real debugging session for a latency spike issue:
+
+```bash
+# Step 1: Identify the spike pattern
+$ sudo bpftrace -e '
+  uprobe:/usr/local/cuda/lib64/libcudart.so:cudaStreamSynchronize {
+    @start[tid] = nsecs;
+  }
+  uretprobe:/usr/local/cuda/lib64/libcudart.so:cudaStreamSynchronize
+  /@start[tid]/ {
+    $lat = (nsecs - @start[tid]) / 1000000;
+    if ($lat > 50) {
+      printf("%s: %d ms sync\n", strftime("%H:%M:%S", nsecs), $lat);
+    }
+    delete(@start[tid]);
+  }
+' -p $(pgrep -f vllm)
+
+# Output shows periodic 200ms spikes every ~30 seconds
+# 14:32:15: 203 ms sync
+# 14:32:45: 198 ms sync
+
+# Step 2: Correlate with memory operations
+$ sudo bpftrace -e '
+  uprobe:/usr/local/cuda/lib64/libcudart.so:cudaMalloc {
+    @alloc_time = nsecs;
+  }
+  uretprobe:/usr/local/cuda/lib64/libcudart.so:cudaMalloc
+  /@alloc_time/ {
+    printf("cudaMalloc: %d µs\n", (nsecs - @alloc_time) / 1000);
+  }
+' -p $(pgrep -f vllm)
+
+# Shows cudaMalloc calls right before spikes
+# cudaMalloc: 156432 µs  <- 156ms allocation!
+
+# Step 3: Get allocation stack trace
+$ sudo bpftrace -e '
+  uprobe:/usr/local/cuda/lib64/libcudart.so:cudaMalloc {
+    @start = nsecs;
+  }
+  uretprobe:/usr/local/cuda/lib64/libcudart.so:cudaMalloc
+  /@start/ {
+    if ((nsecs - @start) > 100000000) {
+      print(ustack(perf));
+    }
+  }
+'
+# Stack trace reveals: KV cache expansion during batch size increase
+```
+
+<PerfChart
+  title="Latency Before/After Fix"
+  unit="ms"
+  data={[
+    { label: "P50 Before", value: 45, color: "gray" },
+    { label: "P99 Before", value: 203, color: "red" },
+    { label: "P50 After", value: 42, color: "gray" },
+    { label: "P99 After", value: 58, color: "green" },
+  ]}
+/>
+
+**Root cause**: Dynamic batch expansion was triggering KV cache reallocation.
+**Fix**: Pre-allocate KV cache for maximum batch size.
+
+## eBPF Overhead Measurement
+
+```bash
+# Measure tracing overhead
+$ sudo bpftrace -e 'BEGIN { @start = nsecs; }
+                    interval:s:10 { 
+                      printf("Overhead: %d probes/s\n", @count/10); 
+                      @count = 0; 
+                    }
+                    uprobe:/usr/local/cuda/lib64/libcudart.so:* { 
+                      @count++; 
+                    }'
+
+# Typical output: 50,000-200,000 probes/second
+# CPU overhead: 2-5% of one core
+```
+
+## Conclusion
+
+eBPF transforms GPU debugging from "GPU utilization is low" to "cudaStreamSynchronize blocked for 200ms because cudaMalloc was defragmenting after KV cache expansion." This precision is essential for optimizing production inference systems.
+
+Key traces to run regularly:
+1. **cudaMalloc during inference** - Should be zero
+2. **cudaStreamSynchronize latency** - Should be under 50ms P99
+3. **GIL contention** - Should be under 1ms P99
+4. **Off-CPU time for inference threads** - Should be under 100µs P99

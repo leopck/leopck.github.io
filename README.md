@@ -1,348 +1,222 @@
-# Fridays with Faraday - Jekyll Static Site
+# Fridays with Faraday
 
-A modern, responsive Jekyll static site for the "Fridays with Faraday" technical blog, covering ESP32 microcontroller programming, AI accelerator optimization, and performance analysis.
+A modern, performance-focused technical blog built with Astro and MDX. Designed for deep technical content on systems optimization, embedded programming, and LLM inference.
 
 ## 🚀 Features
 
-- **Modern Jekyll 4.x** implementation with essential plugins
-- **Responsive Design** optimized for all devices
-- **Technical Content Focus** with code highlighting, math rendering, and diagrams
-- **SEO Optimized** with structured data, Open Graph, and social sharing
-- **Fast Performance** with optimized assets and caching
-- **Docker Development** environment for consistent builds
-- **GitHub Pages Ready** deployment configuration
-- **Advanced Typography** with beautiful code blocks and reading experience
+- **Astro 4.15** with MDX support for rich technical content
+- **Custom MDX Components** for technical visualizations:
+  - `RegisterDiagram` - Hardware register bit-field visualization
+  - `MemoryLayout` - Memory map and region diagrams
+  - `PerfChart` - Performance comparison bar charts
+  - `Benchmark` - Benchmark result tables
+  - `Callout` - Info, warning, danger, tip boxes
+  - `CodeCompare` - Side-by-side code comparisons
+- **Syntax Highlighting** with Shiki (One Dark Pro theme)
+- **Math Support** via KaTeX
+- **Dark Theme** with terminal-inspired aesthetics
+- **Responsive Design** with mobile-first approach
+- **SEO Optimized** with Open Graph and Twitter cards
+- **RSS Feed** for subscribers
+- **GitHub Pages Ready** with deployment workflow
 
 ## 📁 Project Structure
 
 ```
-jekyll-site/
-├── _layouts/              # Jekyll layouts
-│   ├── default.html       # Base layout
-│   ├── post.html          # Blog post layout
-│   └── page.html          # Static page layout
-├── _includes/             # Reusable components
-│   ├── navigation.html    # Main navigation
-│   ├── footer.html        # Site footer
-│   ├── post-meta.html     # Post metadata
-│   └── toc.html           # Table of contents
-├── _posts/                # Blog posts in Jekyll format
-├── _sass/                 # SCSS stylesheets
-│   ├── _variables.scss    # Sass variables
-│   ├── _mixins.scss       # Sass mixins
-│   ├── _typography.scss   # Typography styles
-│   ├── _base.scss         # Base styles
-│   └── _layout.scss       # Layout components
-├── _assets/               # JavaScript and other assets
-│   └── js/
-│       └── main.js        # Main JavaScript functionality
-├── css/                   # Compiled CSS
-│   └── style.scss         # Main stylesheet entry point
-├── docker/                # Docker configuration
-│   └── nginx.conf         # Nginx configuration
-├── _scripts/              # Utility scripts
-│   ├── build.sh           # Build automation script
-│   ├── convert_posts.py   # Content conversion script
-│   └── convert_posts.rb   # Ruby version of converter
-├── _config.yml            # Jekyll configuration
-├── Gemfile                # Ruby dependencies
-├── docker-compose.yml     # Docker development setup
-├── Dockerfile             # Production container
-└── Dockerfile.dev         # Development container
+fridayswithfaraday/
+├── src/
+│   ├── components/        # Astro components
+│   │   ├── mdx/          # Custom MDX components
+│   │   ├── Header.astro
+│   │   ├── Footer.astro
+│   │   └── ...
+│   ├── content/
+│   │   └── posts/        # MDX blog posts
+│   ├── layouts/          # Page layouts
+│   ├── pages/            # Route pages
+│   └── styles/           # SCSS styles
+├── public/               # Static assets
+├── astro.config.mjs      # Astro configuration
+└── package.json
 ```
 
-## 🛠️ Development
+## 🛠️ Getting Started
 
 ### Prerequisites
 
-- **Docker & Docker Compose** (recommended for development)
-- **Ruby 3.2+** and **Bundler** (alternative to Docker)
-- **Node.js 18+** (for optional JavaScript tooling)
+- Node.js 20+
+- npm or yarn
 
-### Quick Start
-
-1. **Clone and setup:**
-   ```bash
-   git clone <repository>
-   cd jekyll-site
-   ```
-
-2. **Development with Docker:**
-   ```bash
-   # Start development server
-   docker-compose up jekyll
-   
-   # Or run full development environment
-   docker-compose up
-   ```
-
-3. **Access the site:**
-   ```
-   http://localhost:4000
-   ```
-
-### Alternative: Native Development
-
-1. **Install dependencies:**
-   ```bash
-   bundle install
-   ```
-
-2. **Start development server:**
-   ```bash
-   bundle exec jekyll serve --livereload --drafts
-   ```
-
-3. **Build for production:**
-   ```bash
-   bundle exec jekyll build
-   ```
-
-### Using Build Scripts
-
-The project includes automated build scripts:
+### Installation
 
 ```bash
-# Make scripts executable
-chmod +x _scripts/build.sh
+# Clone or download this project
+cd fridayswithfaraday
 
-# Build the site
-./_scripts/build.sh build
+# Install dependencies
+npm install
 
 # Start development server
-./_scripts/build.sh dev
+npm run dev
 
-# Clean build artifacts
-./_scripts/build.sh clean
+# Build for production
+npm run build
 
-# Run tests
-./_scripts/build.sh test
-
-# Deploy to GitHub Pages
-./_scripts/build.sh deploy
+# Preview production build
+npm run preview
 ```
 
-## 📝 Content Management
+### Development
 
-### Post Organization
+The dev server runs at `http://localhost:4321` with hot reloading.
 
-All blog posts are stored in the `_posts/` directory with Jekyll naming convention:
-- Format: `YYYY-MM-DD-title.md`
-- Categories: esp32, experiments, gaudi, graphics, llm, vllm
-- Front matter includes: title, date, category, tags, description, difficulty
+## 📝 Writing Posts
 
-### Content Conversion
+Create new posts in `src/content/posts/` as MDX files:
 
-Existing posts have been automatically converted from Node.js format to Jekyll:
-
-```bash
-# Convert additional posts if needed
-python _scripts/convert_posts.py /path/to/old/posts /path/to/jekyll/posts
-```
-
-### Front Matter Structure
-
-```yaml
+```mdx
 ---
-title: "Post Title"
-author: "Fridays with Faraday"
-category: "esp32"
-tags: [microcontroller, dma, embedded, performance]
-description: "Technical analysis and implementation guide"
-difficulty: intermediate
-layout: post
-toc: true
-show_related_posts: true
-show_share_buttons: true
-reading_time: 5
+title: "Your Post Title"
+description: "A brief description"
+publishDate: 2024-11-15
+category: vllm  # or: microcontrollers, llm-inference, profiling, etc.
+tags: [tag1, tag2, tag3]
+difficulty: intermediate  # beginner, intermediate, advanced, expert
+readingTime: 15
+featured: false
+draft: false
 ---
+
+import Callout from '@/components/mdx/Callout.astro';
+
+Your content here...
+
+<Callout type="warning" title="Important">
+  This is a warning callout.
+</Callout>
 ```
 
-## 🎨 Styling & Design
+### Available Categories
 
-### SCSS Architecture
+- `microcontrollers` - Embedded systems, ESP32, ARM
+- `vllm` - vLLM internals and optimization
+- `llm-inference` - LLM inference general
+- `transformers` - Attention, architectures
+- `hardware-optimization` - CPU/GPU optimization
+- `profiling` - Performance analysis
+- `kernel-development` - CUDA, custom kernels
+- `memory-systems` - Memory hierarchy
+- `distributed-systems` - Multi-GPU, serving
+- `gpu-programming` - CUDA, Gaudi
 
-The project uses a modular SCSS architecture:
+### Difficulty Levels
 
-- **Variables** (`_variables.scss`): Colors, typography, spacing
-- **Mixins** (`_mixins.scss`): Reusable CSS patterns
-- **Typography** (`_typography.scss`): Text styling and code blocks
-- **Base** (`_base.scss`): Reset and foundation styles
-- **Layout** (`_layout.scss`): Component layouts
+- `beginner` - Foundational concepts
+- `intermediate` - Practical implementation
+- `advanced` - Deep technical details
+- `expert` - Cutting-edge research level
 
-### Design System
+## 🧩 Custom Components
 
-- **Primary Color**: #007acc (Blue)
-- **Secondary Color**: #ff6b35 (Orange)
-- **Typography**: Inter + JetBrains Mono
-- **Categories**: Color-coded by technology (ESP32, LLM, etc.)
-- **Responsive**: Mobile-first approach with breakpoints
+### Callout
 
-### Category Colors
-
-- **ESP32**: #007acc (Blue)
-- **Experiments**: #ff6b35 (Orange)  
-- **Gaudi**: #8b5cf6 (Purple)
-- **Graphics**: #06d6a0 (Green)
-- **LLM**: #f72585 (Pink)
-- **vLLM**: #fb8c00 (Orange)
-
-## 🔧 Configuration
-
-### Jekyll Configuration
-
-The main configuration is in `_config.yml`:
-
-```yaml
-# Site settings
-title: "Fridays with Faraday"
-description: "Technical blog on embedded systems and optimization"
-url: "https://fridayswithfaraday.github.io"
-
-# Collections for categories
-collections:
-  esp32:
-    output: true
-    permalink: /esp32/:title/
-  # ... other categories
-
-# Plugins
-plugins:
-  - jekyll-feed
-  - jekyll-seo-tag
-  - jekyll-sitemap
-  - jekyll-archives
-  - jekyll-related-posts
-  - jekyll-katex
-  - jekyll-toc
-  - jekyll-paginate
+```mdx
+<Callout type="info" title="Note">
+  Informational content here.
+</Callout>
 ```
 
-### Environment Variables
+Types: `info`, `warning`, `danger`, `tip`, `perf`
 
-- `JEKYLL_ENV=production` - Enable production optimizations
-- `JEKYLL_ENV=development` - Enable development features (live reload, drafts)
+### RegisterDiagram
+
+```mdx
+<RegisterDiagram
+  name="GPIO_CTRL_REG"
+  address="0x40000000"
+  bits={[
+    { range: "31:16", name: "Reserved", desc: "Reserved bits", color: "gray" },
+    { range: "15:8", name: "MODE", desc: "Operating mode", color: "blue" },
+    { range: "7:0", name: "VALUE", desc: "Output value", color: "green" },
+  ]}
+/>
+```
+
+### MemoryLayout
+
+```mdx
+<MemoryLayout
+  title="Memory Map"
+  regions={[
+    { start: "0x00000000", end: "0x0FFFFFFF", name: "Flash", size: "256MB", color: "blue" },
+    { start: "0x20000000", end: "0x2FFFFFFF", name: "SRAM", size: "256MB", color: "green" },
+  ]}
+/>
+```
+
+### PerfChart
+
+```mdx
+<PerfChart
+  title="Performance Comparison"
+  unit="ops/sec"
+  data={[
+    { label: "Baseline", value: 1000, color: "gray" },
+    { label: "Optimized", value: 2500, color: "green" },
+  ]}
+/>
+```
+
+### Benchmark
+
+```mdx
+<Benchmark
+  title="Results"
+  columns={["Config", "Throughput", "Latency"]}
+  rows={[
+    { values: ["A", "100", "10ms"], highlight: false },
+    { values: ["B", "250", "8ms"], highlight: true },
+  ]}
+  notes="Measured on A100"
+/>
+```
 
 ## 🚀 Deployment
 
 ### GitHub Pages
 
-The site is configured for GitHub Pages deployment:
-
-1. **Enable GitHub Pages** in repository settings
-2. **Source**: Deploy from a branch
-3. **Branch**: `main` / `master`, folder: `/ (root)`
-4. **Custom domain** (optional): Configure in repository settings
-
-### Docker Production Deployment
-
-```bash
-# Build and run production container
-docker-compose up -d web
-```
+1. Push to GitHub
+2. Enable GitHub Pages in repository settings
+3. The workflow in `.github/workflows/deploy.yml` handles deployment automatically
 
 ### Manual Deployment
 
 ```bash
-# Build site
-bundle exec jekyll build
-
-# Deploy _site/ directory to your web server
+npm run build
+# Deploy the `dist/` directory to your hosting provider
 ```
 
-## 📊 Features
+## 🎨 Customization
 
-### Built-in Functionality
+### Colors and Typography
 
-- ✅ **Responsive Navigation** with mobile menu
-- ✅ **Table of Contents** auto-generation
-- ✅ **Related Posts** algorithm based on tags/categories
-- ✅ **Social Sharing** buttons with OpenGraph
-- ✅ **Search Integration** (Lunr.js ready)
-- ✅ **RSS Feed** generation
-- ✅ **Sitemap** auto-generation
-- ✅ **SEO Optimization** with structured data
-- ✅ **Performance Optimized** with asset pipeline
-- ✅ **Code Highlighting** with syntax highlighting
-- ✅ **Math Rendering** with KaTeX support
+Edit `src/styles/_variables.scss` to customize:
+- Color palette
+- Font families
+- Spacing scale
+- Breakpoints
 
-### Advanced Features
+### Layout
 
-- ✅ **Reading Time** estimation
-- ✅ **Related Posts** with category/tag matching
-- ✅ **Breadcrumb Navigation**
-- ✅ **Author Profiles** and social links
-- ✅ **Tag Clouds** and category pages
-- ✅ **Archive Pages** by year and category
-- ✅ **404 Error Page**
-- ✅ **Favicon and OpenGraph** images
-- ✅ **Dark Mode** ready (theme toggle available)
-
-## 🧪 Testing
-
-The site includes automated testing:
-
-```bash
-# Run all tests
-./_scripts/build.sh test
-
-# HTML validation with htmlproofer
-htmlproofer _site/ --assume-extension --check-html
-
-# Build verification
-bundle exec jekyll build --trace
-```
-
-## 📱 Browser Support
-
-- ✅ Chrome 90+
-- ✅ Firefox 88+
-- ✅ Safari 14+
-- ✅ Edge 90+
-- ✅ Mobile browsers (iOS Safari, Chrome Mobile)
-
-## 🤝 Contributing
-
-1. **Fork** the repository
-2. **Create** a feature branch
-3. **Make** your changes
-4. **Test** thoroughly
-5. **Submit** a pull request
-
-### Content Guidelines
-
-- Use clear, descriptive titles
-- Include proper front matter
-- Add relevant tags and categories
-- Ensure technical accuracy
-- Follow existing writing style
-
-### Code Guidelines
-
-- Follow existing SCSS structure
-- Test responsive design
-- Optimize for performance
-- Document new features
+Modify layouts in `src/layouts/` for different page structures.
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT License - feel free to use this as a starting point for your own technical blog.
 
-## 🙏 Acknowledgments
+## 🙏 Credits
 
-- **Jekyll** community for the excellent static site generator
-- **GitHub Pages** for hosting and deployment
-- **Open source contributors** whose work inspired this project
-- **ESP32 community** for inspiration and examples
-
-## 📞 Support
-
-- **Issues**: Report bugs and request features via GitHub Issues
-- **Documentation**: Check the `_docs/` directory for additional guides
-- **Community**: Join our discussions for questions and help
-
----
-
-**Built with ❤️ using Jekyll and modern web technologies**
-
-*Fridays with Faraday - Working with microcontrollers, embedded systems, and performance optimization*
+- [Astro](https://astro.build) - Static site generator
+- [MDX](https://mdxjs.com) - Markdown + JSX
+- [Shiki](https://shiki.matsu.io) - Syntax highlighting
+- [KaTeX](https://katex.org) - Math rendering

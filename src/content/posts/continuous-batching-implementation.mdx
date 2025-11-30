@@ -1,0 +1,373 @@
+---
+title: "Implementing Continuous Batching: From Scheduling Theory to vLLM Practice"
+description: "A detailed analysis of continuous batching algorithms, including iteration-level scheduling, preemption strategies, and the interaction between scheduler and memory manager in production inference systems."
+publishDate: 2024-11-10
+category: vllm
+tags: [vllm, continuous-batching, scheduling, inference, throughput]
+difficulty: expert
+readingTime: 23
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+
+Static batching wastes GPU cycles waiting for the longest sequence. Continuous batching fills those gaps by adding new requests as others complete. But implementing it correctly requires solving several non-trivial scheduling problems.
+
+## The Static Batching Problem
+
+In static batching, a batch executes together until completion:
+
+```
+Time →
+Request A: [████████████████████████████████████████]  1000 tokens
+Request B: [████████]                                    200 tokens  
+Request C: [████████████████]                            400 tokens
+
+GPU utilization during Request A's tail: 33% (only A running)
+Total batch time: 1000 iterations
+Wasted compute: 1400 token-iterations
+```
+
+With continuous batching:
+
+```
+Time →
+Request A: [████████████████████████████████████████]  1000 tokens
+Request B: [████████]                                    200 tokens
+Request D:          [████████████]                       300 tokens (added when B finished)
+Request C: [████████████████]                            400 tokens
+Request E:                   [████████████████████]      500 tokens (added when C finished)
+
+GPU utilization: ~95% throughout
+```
+
+## The Scheduler Architecture
+
+vLLM's scheduler operates at iteration granularity:
+
+```python
+class IterationLevelScheduler:
+    """
+    Schedules sequences for each decode iteration.
+    Must balance:
+    - Memory constraints (KV cache)
+    - Fairness (starvation prevention)
+    - Throughput (batch size)
+    - Latency SLOs
+    """
+    
+    def __init__(self, config: SchedulerConfig):
+        self.waiting_queue: List[SequenceGroup] = []     # New requests
+        self.running_queue: List[SequenceGroup] = []     # Active sequences  
+        self.swapped_queue: List[SequenceGroup] = []     # Preempted to CPU
+        self.block_manager = BlockManager(config)
+        
+    def schedule(self) -> SchedulerOutputs:
+        """
+        Called before each decode iteration.
+        Returns which sequences to run and memory operations to perform.
+        """
+        # Phase 1: Handle running sequences
+        running_scheduled = self._schedule_running()
+        
+        # Phase 2: Try to swap in preempted sequences
+        swapped_scheduled = self._schedule_swapped()
+        
+        # Phase 3: Admit new sequences if memory available
+        waiting_scheduled = self._schedule_waiting()
+        
+        return SchedulerOutputs(
+            scheduled_seqs=running_scheduled + swapped_scheduled + waiting_scheduled,
+            preemption_ops=self._preempt_if_needed(),
+            swap_in_ops=self._get_swap_ins(),
+            swap_out_ops=self._get_swap_outs(),
+        )
+```
+
+## Memory-Aware Scheduling
+
+The scheduler must coordinate with the block manager:
+
+```python
+def _can_admit_sequence(self, seq_group: SequenceGroup) -> bool:
+    """
+    Check if we can admit a new sequence without preemption.
+    """
+    # Calculate blocks needed for this sequence
+    prompt_tokens = len(seq_group.prompt_token_ids)
+    blocks_needed = (prompt_tokens + self.block_size - 1) // self.block_size
+    
+    # Reserve space for at least N decode iterations
+    min_decode_blocks = self.config.min_decode_blocks  # e.g., 16
+    total_blocks_needed = blocks_needed + min_decode_blocks
+    
+    # Check against available blocks
+    available_blocks = self.block_manager.get_available_blocks()
+    
+    if total_blocks_needed <= available_blocks:
+        return True
+    
+    # Check if preemption could free enough blocks
+    preemptable_blocks = self._calculate_preemptable_blocks()
+    return total_blocks_needed <= available_blocks + preemptable_blocks
+
+def _calculate_preemptable_blocks(self) -> int:
+    """
+    Calculate how many blocks we could free via preemption.
+    Lower priority sequences can be preempted.
+    """
+    preemptable = 0
+    for seq_group in reversed(self.running_queue):  # Lowest priority last
+        if seq_group.priority < self.config.preemption_threshold:
+            preemptable += self.block_manager.get_blocks_for_seq(seq_group)
+    return preemptable
+```
+
+<Callout type="warning" title="Preemption Overhead">
+  Preemption requires copying KV cache to CPU memory (swap out) and back (swap in). On A100, this costs ~2ms per GB swapped. Frequent preemption can dominate latency.
+</Callout>
+
+## Preemption Strategies
+
+Two main preemption approaches:
+
+### 1. Recomputation (No Swap)
+
+```python
+class RecomputationPreemption:
+    """
+    Discard KV cache and recompute on resume.
+    Best when: Prefill is cheap relative to swap overhead.
+    """
+    
+    def preempt(self, seq_group: SequenceGroup) -> PreemptionResult:
+        # Simply free the blocks - sequence will re-prefill on resume
+        freed_blocks = self.block_manager.free_blocks(seq_group)
+        
+        # Track how much work will be redone
+        recompute_tokens = seq_group.get_completed_tokens()
+        
+        return PreemptionResult(
+            method='recompute',
+            freed_blocks=freed_blocks,
+            recompute_cost_tokens=recompute_tokens,
+            swap_cost_bytes=0
+        )
+```
+
+### 2. Swapping (Preserve State)
+
+```python
+class SwapPreemption:
+    """
+    Copy KV cache to CPU memory.
+    Best when: Sequence has generated many tokens (expensive to recompute).
+    """
+    
+    def preempt(self, seq_group: SequenceGroup) -> PreemptionResult:
+        # Get physical blocks to swap
+        blocks = self.block_manager.get_blocks(seq_group)
+        
+        # Calculate swap cost
+        bytes_to_swap = len(blocks) * self.block_size_bytes
+        
+        # Initiate async copy to CPU
+        cpu_blocks = self.cpu_allocator.allocate(len(blocks))
+        self.swap_engine.swap_out_async(blocks, cpu_blocks)
+        
+        # Update block table to point to CPU
+        self.block_manager.swap_out(seq_group, cpu_blocks)
+        
+        return PreemptionResult(
+            method='swap',
+            freed_blocks=len(blocks),
+            recompute_cost_tokens=0,
+            swap_cost_bytes=bytes_to_swap
+        )
+```
+
+### Decision Logic
+
+```python
+def choose_preemption_method(self, seq_group: SequenceGroup) -> str:
+    """
+    Choose between recomputation and swapping.
+    """
+    generated_tokens = seq_group.get_num_generated_tokens()
+    blocks_used = self.block_manager.get_blocks_for_seq(seq_group)
+    
+    # Estimate costs
+    recompute_cost_ms = self._estimate_prefill_time(
+        seq_group.get_prompt_len() + generated_tokens
+    )
+    swap_cost_ms = self._estimate_swap_time(blocks_used * self.block_size_bytes)
+    
+    # Also consider: will this sequence likely be resumed soon?
+    resume_probability = self._estimate_resume_probability(seq_group)
+    
+    # If recompute is cheap or sequence won't resume soon, recompute
+    if recompute_cost_ms < swap_cost_ms or resume_probability < 0.5:
+        return 'recompute'
+    else:
+        return 'swap'
+```
+
+## Priority and Fairness
+
+Without fairness mechanisms, long sequences can starve:
+
+```python
+class FairnessScheduler(IterationLevelScheduler):
+    """
+    Implements weighted fair queueing for inference requests.
+    """
+    
+    def __init__(self, config: SchedulerConfig):
+        super().__init__(config)
+        self.virtual_time = 0.0
+        
+    def _calculate_priority(self, seq_group: SequenceGroup) -> float:
+        """
+        Priority based on virtual finish time.
+        Lower = higher priority (will finish earlier in fair schedule).
+        """
+        # Base priority from request
+        weight = seq_group.priority_weight  # e.g., 1.0 for normal
+        
+        # Calculate "fair" finish time
+        remaining_tokens = seq_group.max_tokens - seq_group.get_num_generated_tokens()
+        virtual_finish_time = self.virtual_time + remaining_tokens / weight
+        
+        # Adjust for waiting time (prevent starvation)
+        wait_time = time.time() - seq_group.arrival_time
+        starvation_boost = wait_time / self.config.max_wait_time  # 0 to 1
+        
+        return virtual_finish_time * (1 - 0.3 * starvation_boost)
+    
+    def _schedule_running(self) -> List[SequenceGroup]:
+        # Sort by priority
+        self.running_queue.sort(key=self._calculate_priority)
+        
+        # Take top N that fit in memory
+        scheduled = []
+        memory_used = 0
+        for seq_group in self.running_queue:
+            blocks_needed = self._estimate_next_iteration_blocks(seq_group)
+            if memory_used + blocks_needed <= self.config.max_batch_blocks:
+                scheduled.append(seq_group)
+                memory_used += blocks_needed
+        
+        # Update virtual time
+        if scheduled:
+            self.virtual_time += 1.0 / len(scheduled)
+        
+        return scheduled
+```
+
+## Performance Characteristics
+
+<Benchmark
+  title="Continuous vs Static Batching Performance"
+  columns={["Metric", "Static (batch=8)", "Continuous (max=64)", "Improvement"]}
+  rows={[
+    { values: ["Throughput", "1,247 tok/s", "3,891 tok/s", "+212%"], highlight: true },
+    { values: ["P50 Latency", "45ms/tok", "52ms/tok", "-15%"], highlight: false },
+    { values: ["P99 Latency", "89ms/tok", "142ms/tok", "-60%"], highlight: false },
+    { values: ["GPU Utilization", "62%", "94%", "+52%"], highlight: true },
+    { values: ["Memory Efficiency", "34%", "89%", "+162%"], highlight: true },
+  ]}
+  notes="Llama-70B on A100-80GB, mixed request lengths (256-2048 tokens)"
+/>
+
+<Callout type="info" title="Latency Trade-off">
+  Continuous batching improves throughput at the cost of tail latency. Each request shares GPU with more concurrent requests, increasing per-token latency.
+</Callout>
+
+## Chunked Prefill Integration
+
+Modern continuous batching also chunks prefill:
+
+```python
+def schedule_with_chunked_prefill(self) -> SchedulerOutputs:
+    """
+    Interleave prefill chunks with decode iterations.
+    Prevents prefill from blocking decode.
+    """
+    decode_seqs = []
+    prefill_seqs = []
+    prefill_budget = self.config.prefill_chunk_size  # e.g., 512 tokens
+    
+    # First, schedule decode (high priority)
+    for seq in self.running_queue:
+        if seq.is_decoding():
+            decode_seqs.append(seq)
+    
+    # Then, schedule prefill chunks with remaining budget
+    for seq in self.waiting_queue:
+        if seq.is_prefilling():
+            remaining_prefill = seq.get_remaining_prefill_tokens()
+            chunk_size = min(remaining_prefill, prefill_budget)
+            
+            if chunk_size > 0 and self._can_schedule_prefill_chunk(seq, chunk_size):
+                prefill_seqs.append((seq, chunk_size))
+                prefill_budget -= chunk_size
+                
+                if prefill_budget <= 0:
+                    break
+    
+    return SchedulerOutputs(
+        decode_seqs=decode_seqs,
+        prefill_seqs=prefill_seqs,
+    )
+```
+
+<PerfChart
+  title="Latency Impact of Prefill Chunking"
+  unit="ms"
+  data={[
+    { label: "No Chunking (prefill)", value: 450, color: "red", annotation: "Blocks decode" },
+    { label: "512-token Chunks", value: 85, color: "orange" },
+    { label: "256-token Chunks", value: 62, color: "green" },
+    { label: "128-token Chunks", value: 58, color: "green" },
+  ]}
+/>
+
+## Debugging Scheduler Issues
+
+Common scheduler problems and diagnosis:
+
+```python
+class SchedulerDiagnostics:
+    def diagnose_low_throughput(self):
+        metrics = self.get_metrics()
+        
+        if metrics.avg_batch_size < self.config.max_batch_size * 0.5:
+            if metrics.memory_utilization > 0.9:
+                print("Issue: Memory pressure limiting batch size")
+                print(f"  - Consider: Reduce max_model_len or increase GPU memory")
+            elif metrics.waiting_queue_avg > 0:
+                print("Issue: Scheduler not admitting waiting requests")
+                print(f"  - Check: Block allocation failures")
+        
+        if metrics.preemption_rate > 0.1:
+            print("Issue: High preemption rate ({:.1%})".format(metrics.preemption_rate))
+            print(f"  - Average swap size: {metrics.avg_swap_size_mb:.1f} MB")
+            print(f"  - Consider: Increase GPU memory or reduce max sequence length")
+        
+        if metrics.avg_waiting_time > self.config.slo_ms:
+            print("Issue: Queue time exceeding SLO")
+            print(f"  - Avg wait: {metrics.avg_waiting_time:.1f}ms")
+            print(f"  - Consider: Add more replicas or reduce batch size for latency")
+```
+
+## Conclusion
+
+Continuous batching transforms inference from a batch processing problem to a real-time scheduling problem. The key challenges are:
+
+1. **Memory coordination**: Scheduler and block manager must cooperate
+2. **Preemption strategy**: Balance recomputation vs. swap costs
+3. **Fairness**: Prevent long-sequence starvation
+4. **Prefill chunking**: Don't let prefill block decode
+
+Properly implemented, continuous batching delivers 2-4x throughput improvement with acceptable latency trade-offs.
