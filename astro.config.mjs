@@ -28,7 +28,7 @@ const prettyCodeOptions = {
 };
 
 export default defineConfig({
-  site: 'https://leopck.github.io',
+  site: 'https://fridayswithfaraday.com',
   integrations: [
     mdx({
       remarkPlugins: [remarkGfm, remarkMath],
