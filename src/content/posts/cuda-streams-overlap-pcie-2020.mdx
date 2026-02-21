@@ -1,0 +1,183 @@
+---
+title: "CUDA Streams: Overlapping PCIe Transfers with Compute (and When It Actually Helps)"
+author: "stanley-phoong"
+description: "A practical performance deep-dive into CUDA streams, pinned memory, and async copies. Learn when overlap works, how to measure it, and what bottlenecks (PCIe, H2D/D2H, kernel occupancy) prevent real gains."
+publishDate: 2020-04-07
+category: gpu-programming
+tags: [cuda, streams, pcie, async-memcpy, overlap, optimization, performance]
+difficulty: expert
+readingTime: 20
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+
+If you’re moving data over PCIe and launching kernels, you’ve probably heard “use streams to overlap copy and compute.” True — but only when **your pipeline is actually duplex**, your copies are **async-capable**, and your kernel leaves **enough headroom** for the copy engines.
+
+This post shows the mechanics, the measurement method, and the common “I used streams but nothing got faster” failure modes.
+
+## The mental model: 3 engines, 2 copies, 1 kernel
+
+On most NVIDIA GPUs you can overlap:
+- **H2D** (host-to-device copy) using a copy engine
+- **Kernel execution** using SMs
+- **D2H** (device-to-host copy) using a copy engine
+
+But overlap only helps if:
+- Copies are **asynchronous** (requires **pinned** host memory)
+- Work is **chunked** so there’s something to overlap
+- You’re not already saturating one resource (PCIe, DRAM BW, SMs)
+
+<Benchmark
+  title="Overlap feasibility checklist"
+  columns={["Requirement", "Why it matters", "How to verify"]}
+  rows={[
+    { values: ["Pinned host buffers", "Async H2D/D2H needs page-locked memory", "Use cudaHostAlloc / cudaHostRegister; profiler shows memcpyAsync"], highlight: true },
+    { values: ["Chunked pipeline", "Need independent stages to overlap", "Split into tiles; see alternating memcpy/kernels in timeline"], highlight: true },
+    { values: ["Duplex capability", "Need separate engines for H2D and D2H to overlap both", "Check deviceQuery: asyncEngineCount, concurrent copy/exec"], highlight: false },
+    { values: ["Kernel not fully copy-engine blocking", "Some kernels can serialize copies (e.g., heavy mem pressure)", "Measure with Nsight Systems timeline"], highlight: false },
+  ]}
+/>
+
+## Baseline: synchronous pipeline (no overlap)
+
+```cpp
+// Baseline: H2D -> kernel -> D2H (serialized)
+cudaMemcpy(d_in, h_in, bytes, cudaMemcpyHostToDevice);
+kernel<<<grid, block>>>(d_in, d_out);
+cudaMemcpy(h_out, d_out, bytes, cudaMemcpyDeviceToHost);
+```
+
+This costs approximately:
+\[
+T_{total} \approx T_{H2D} + T_{kernel} + T_{D2H}
+\]
+
+## Streamed pipeline: double-buffering the transfer/compute loop
+
+The classic pattern is **two streams** and **two device buffers**:
+
+```cpp
+cudaStream_t s0, s1;
+cudaStreamCreate(&s0);
+cudaStreamCreate(&s1);
+
+// Pinned host buffers (critical)
+cudaHostAlloc(&h0, bytes, cudaHostAllocDefault);
+cudaHostAlloc(&h1, bytes, cudaHostAllocDefault);
+
+float *d_in0, *d_in1, *d_out0, *d_out1;
+cudaMalloc(&d_in0, bytes); cudaMalloc(&d_in1, bytes);
+cudaMalloc(&d_out0, bytes); cudaMalloc(&d_out1, bytes);
+
+for (int tile = 0; tile < numTiles; tile++) {
+  auto stream = (tile & 1) ? s1 : s0;
+  auto h_in   = (tile & 1) ? h1 : h0;
+  auto d_in   = (tile & 1) ? d_in1 : d_in0;
+  auto d_out  = (tile & 1) ? d_out1 : d_out0;
+
+  // async H2D
+  cudaMemcpyAsync(d_in, h_in, bytes, cudaMemcpyHostToDevice, stream);
+
+  // kernel
+  kernel<<<grid, block, 0, stream>>>(d_in, d_out);
+
+  // async D2H
+  cudaMemcpyAsync(h_out + tile * elems, d_out, bytes, cudaMemcpyDeviceToHost, stream);
+}
+
+cudaDeviceSynchronize();
+```
+
+When it works, the steady-state looks like:
+\[
+T_{tile} \approx \max(T_{H2D}, T_{kernel}, T_{D2H})
+\]
+and the total is roughly \(T_{startup} + numTiles \cdot T_{tile}\).
+
+## Measuring overlap correctly (don’t trust a single timing)
+
+### Use CUDA events per stream
+
+```cpp
+cudaEvent_t start, stop;
+cudaEventCreate(&start);
+cudaEventCreate(&stop);
+
+cudaEventRecord(start, 0);
+// enqueue work across streams
+cudaEventRecord(stop, 0);
+cudaEventSynchronize(stop);
+
+float ms = 0;
+cudaEventElapsedTime(&ms, start, stop);
+```
+
+### Use a timeline tool for truth
+
+If overlap is real, a timeline (Nsight Systems) shows **memcpyAsync** bars concurrent with kernel bars.
+
+<Callout type="warning" title="Common measurement trap">
+  If you time from the CPU without synchronizing correctly, you often measure enqueue overhead, not device execution. Always validate overlap with a GPU timeline at least once.
+</Callout>
+
+## When overlap doesn’t help (the usual suspects)
+
+### 1) Host buffers aren’t pinned
+
+If you use pageable memory, `cudaMemcpyAsync` may internally stage through pinned buffers and serialize.
+
+### 2) PCIe is the bottleneck
+
+If \(T_{H2D}\) dominates and your kernel is short, overlap can’t hide the transfer:
+
+<Benchmark
+  title="Bottleneck regimes (per tile)"
+  columns={["Regime", "Dominant term", "Best-case overlap gain"]}
+  rows={[
+    { values: ["Copy-bound", "T_H2D or T_D2H", "~none unless kernel longer"], highlight: false },
+    { values: ["Compute-bound", "T_kernel", "Can hide copies if smaller"], highlight: true },
+    { values: ["Balanced", "Similar times", "Good overlap potential"], highlight: true },
+  ]}
+/>
+
+### 3) Kernel saturates DRAM, starving copy engines
+
+Even if copy engines are separate, both kernel and memcpy ultimately hit memory fabric. A bandwidth-saturated kernel can reduce effective copy BW.
+
+## Example numbers (illustrative)
+
+Assume per tile:
+- \(T_{H2D}=1.2\) ms
+- \(T_{kernel}=2.0\) ms
+- \(T_{D2H}=1.0\) ms
+
+Serialized: \(4.2\) ms/tile  
+Overlapped: \(\max(1.2, 2.0, 1.0)=2.0\) ms/tile → **2.1× speedup**
+
+<PerfChart
+  title="Serialized vs overlapped tile time"
+  type="bar"
+  data={{
+    labels: ["Serialized", "Overlapped"],
+    datasets: [{
+      label: "ms per tile",
+      data: [4.2, 2.0],
+      backgroundColor: ["#ef4444", "#10b981"],
+    }]
+  }}
+/>
+
+## Optimization checklist
+
+- **Pin host memory**: `cudaHostAlloc` / `cudaHostRegister`
+- **Choose a tile size** that makes kernels “long enough” to hide transfers
+- **Use 2–4 streams** with double/triple buffering
+- **Avoid tiny kernels**; fuse work if possible
+- **Profile**: confirm overlap in timeline; check achieved PCIe BW
+
+## Conclusion
+
+Streams are not magic; they’re a scheduling tool. Overlap works when you structure work into tiles, use pinned memory, and your pipeline has a balanced stage. Measure the bottleneck first — then overlap the parts that can actually run concurrently.
+

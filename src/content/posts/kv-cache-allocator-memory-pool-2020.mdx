@@ -1,0 +1,183 @@
+---
+title: "KV Cache Allocators: Memory Pools, Fragmentation, and Predictable LLM Serving"
+author: "stanley-phoong"
+description: "A systems-level look at KV cache allocation. We model fragmentation, design a page/block allocator, and show how pooling and prefix-sharing stabilize p99 latency under mixed request workloads."
+publishDate: 2020-06-18
+category: llm-inference
+tags: [llm, kv-cache, allocator, memory-pool, fragmentation, optimization, performance]
+difficulty: expert
+readingTime: 21
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+
+In LLM serving, KV cache is not just “some memory.” It’s a **high-churn, long-lived allocation stream** whose allocator behavior directly determines whether you get stable throughput or catastrophic p99 spikes.
+
+If you allocate KV cache like a normal tensor per request, you will eventually hit:
+- **fragmentation** (can’t fit new requests despite free memory)
+- **unpredictable evictions**
+- **p99 latency explosions** when you’re forced to shrink batches
+
+This post treats KV cache management as an allocator problem.
+
+## KV cache as an allocation workload
+
+Each request grows by 1 token per decode step:
+- append K/V for every layer
+- shape per token per layer: \(2 \cdot H \cdot d \cdot bytes\)
+
+Total bytes per token:
+
+```python
+def kv_bytes_per_token(layers, heads, head_dim, dtype_bytes=2):
+    return 2 * layers * heads * head_dim * dtype_bytes
+```
+
+Total bytes for a request of length \(L\):
+\[
+Bytes(L) = L \cdot BytesPerToken
+\]
+
+## Why naive contiguous allocation fragments
+
+If you allocate a contiguous block sized for “max length” or allocate and reallocate growing buffers, you create holes of many sizes.
+
+Classic symptom: “free memory is large, but no block is large enough.”
+
+<Benchmark
+  title="Allocator behavior under mixed request lengths"
+  columns={["Strategy", "Fragmentation", "p99 latency risk", "Implementation cost"]}
+  rows={[
+    { values: ["Contiguous per request", "High", "High", "Low"], highlight: false },
+    { values: ["Page/block allocator", "Low", "Low", "Medium"], highlight: true },
+    { values: ["Buddy allocator", "Medium", "Medium", "High"], highlight: false },
+  ]}
+/>
+
+## The fix: page/block allocation
+
+Instead of “one big buffer per request,” allocate fixed-size pages (e.g., 16 tokens per page).
+
+Then each request is a page list:
+
+```python
+class PagePool:
+    def __init__(self, total_pages, page_tokens=16):
+        self.page_tokens = page_tokens
+        self.free = list(range(total_pages))
+        self.in_use = set()
+
+    def alloc(self):
+        if not self.free:
+            return None
+        p = self.free.pop()
+        self.in_use.add(p)
+        return p
+
+    def free_page(self, p):
+        if p in self.in_use:
+            self.in_use.remove(p)
+            self.free.append(p)
+
+class RequestKV:
+    def __init__(self):
+        self.pages = []   # list[int]
+        self.length = 0
+
+    def ensure_capacity(self, pool, new_len):
+        while len(self.pages) * pool.page_tokens < new_len:
+            p = pool.alloc()
+            if p is None:
+                return False
+            self.pages.append(p)
+        return True
+```
+
+Fragmentation collapses because all free blocks are identical.
+
+## Page size is a real tuning knob
+
+Small pages:
+- better packing for short requests
+- more page table overhead
+
+Large pages:
+- lower overhead
+- worse internal fragmentation for short requests
+
+<PerfChart
+  title="Conceptual trade-off: page size"
+  type="line"
+  data={{
+    labels: ["8", "16", "32", "64"],
+    datasets: [
+      { label: "Overhead (relative)", data: [1.0, 0.6, 0.4, 0.3], borderColor: "#ef4444" },
+      { label: "Internal frag (relative)", data: [0.4, 0.6, 0.8, 1.0], borderColor: "#3b82f6" },
+    ]
+  }}
+/>
+
+## Prefix sharing: beams and speculative decoding need it
+
+Many requests share long prefixes (prompt + early tokens). Beam search shares prefixes until divergence.
+
+If you copy KV pages per branch, you explode memory. Prefer **copy-on-write** semantics:
+- pages are reference-counted
+- only fork pages when a write occurs
+
+```python
+class RefCountPool(PagePool):
+    def __init__(self, total_pages, page_tokens=16):
+        super().__init__(total_pages, page_tokens)
+        self.refcnt = {}
+
+    def incref(self, p):
+        self.refcnt[p] = self.refcnt.get(p, 0) + 1
+
+    def decref(self, p):
+        self.refcnt[p] -= 1
+        if self.refcnt[p] == 0:
+            del self.refcnt[p]
+            self.free_page(p)
+```
+
+## p99 stability: admission control based on pages
+
+Instead of “admit request if bytes fit,” admit if pages are available for its expected growth:
+
+```python
+def can_admit(pool_free_pages, est_tokens, page_tokens=16):
+    needed_pages = (est_tokens + page_tokens - 1) // page_tokens
+    return pool_free_pages >= needed_pages
+```
+
+This makes p99 predictable because you never overcommit the KV cache.
+
+<Callout type="tip" title="Serving is allocator math">
+  Stable p99 is not achieved by “faster kernels” alone. It’s achieved by never forcing batch collapse due to allocator failure.
+</Callout>
+
+## Illustrative results (mixed workload)
+
+<Benchmark
+  title="KV allocator impact (example workload)"
+  columns={["Allocator", "Utilization", "OOM/evictions", "p99 latency", "Throughput"]}
+  rows={[
+    { values: ["Contiguous", "65%", "Frequent", "480 ms", "1.0×"], highlight: false },
+    { values: ["Paged pool", "94%", "Rare", "180 ms", "1.8×"], highlight: true },
+    { values: ["Paged + prefix share", "96%", "Rare", "160 ms", "2.0×"], highlight: true },
+  ]}
+/>
+
+## Conclusion
+
+Treat KV cache as an allocator problem:
+- fixed-size pages kill fragmentation
+- pooling makes allocation constant-time
+- prefix sharing prevents beam/speculative blow-ups
+- admission control keeps p99 stable
+
+Once KV cache is predictable, all the other optimizations (batching, CUDA graphs, flash attention) finally pay off consistently.
+
