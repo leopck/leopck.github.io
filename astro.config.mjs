@@ -4,61 +4,39 @@ import sitemap from '@astrojs/sitemap';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
-import rehypePrettyCode from 'rehype-pretty-code';
-import { rehypeCustomComponents } from './src/plugins/rehype-custom-components.mjs';
 
-/** @type {import('rehype-pretty-code').Options} */
-const prettyCodeOptions = {
-  theme: {
-    dark: 'one-dark-pro',
-    light: 'github-light',
-  },
-  keepBackground: true,
-  onVisitLine(node) {
-    if (node.children.length === 0) {
-      node.children = [{ type: 'text', value: ' ' }];
-    }
-  },
-  onVisitHighlightedLine(node) {
-    node.properties.className = ['highlighted'];
-  },
-  onVisitHighlightedChars(node) {
-    node.properties.className = ['word'];
-  },
-};
+// NOTE: rehype-pretty-code has been REMOVED.
+// It conflicts with Astro's built-in Shiki integration.
+// Astro already handles code highlighting via shikiConfig below.
 
 export default defineConfig({
   site: 'https://fridayswithfaraday.com',
   integrations: [
     mdx({
       remarkPlugins: [remarkGfm, remarkMath],
-      rehypePlugins: [
-        rehypeKatex,
-        [rehypePrettyCode, prettyCodeOptions],
-        rehypeCustomComponents,
-      ],
-      shikiConfig: {
-        theme: 'one-dark-pro',
-        wrap: true,
-      },
+      rehypePlugins: [rehypeKatex],
+      // Shiki is configured globally below in markdown.shikiConfig
     }),
     sitemap(),
   ],
   markdown: {
     remarkPlugins: [remarkGfm, remarkMath],
-    rehypePlugins: [
-      rehypeKatex,
-      [rehypePrettyCode, prettyCodeOptions],
-    ],
+    rehypePlugins: [rehypeKatex],
     shikiConfig: {
       theme: 'one-dark-pro',
       wrap: true,
+      // Map 'cuda' to 'cpp' so code blocks with ```cuda get highlighted
+      langAlias: {
+        cuda: 'cpp',
+      },
     },
   },
   vite: {
     css: {
       preprocessorOptions: {
         scss: {
+          // Fix: Use modern Sass compiler API (eliminates legacy-js-api deprecation warnings)
+          api: 'modern-compiler',
           additionalData: `@use "src/styles/variables" as *;`,
         },
       },
