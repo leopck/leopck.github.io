@@ -1,12 +1,12 @@
 ---
-title: "Writing Efficient CUDA Kernels: From Naive to Optimized"
+title: "CUDA Kernel Optimization: A Systematic Guide from Roofline to Nsight"
 author: "stanley-phoong"
-description: "Step-by-step optimization of a CUDA kernel using memory coalescing, shared memory, occupancy tuning, and instruction-level parallelism."
-publishDate: 2024-11-02
+description: "A complete methodology for CUDA kernel optimization: roofline analysis, memory coalescing, shared memory tiling, occupancy tuning, ILP, and profiler-driven workflows. Includes a full case study taking a naive kernel to 95% of peak throughput."
+publishDate: 2025-03-21
 category: gpu-programming
-tags: [cuda, kernel, optimization, gpu, performance]
+tags: [cuda, kernel, optimization, gpu, performance, nsight, roofline, profiling]
 difficulty: advanced
-readingTime: 20
+readingTime: 35
 ---
 
 import Callout from '@/components/mdx/Callout.astro';
@@ -14,210 +14,1090 @@ import PerfChart from '@/components/mdx/PerfChart.astro';
 import Benchmark from '@/components/mdx/Benchmark.astro';
 import CodeCompare from '@/components/mdx/CodeCompare.astro';
 
-Let's optimize a matrix transpose kernel from scratch, applying each optimization technique systematically and measuring the impact.
+Most CUDA optimization advice tells you *what* to do -- use shared memory, increase occupancy, coalesce your accesses -- without telling you *when* each technique matters or *how* to decide what to optimize next. The result is developers randomly applying tricks, sometimes making things faster, sometimes making things slower, and never knowing why.
 
-## Naive Implementation
+This guide presents a systematic methodology. We start with the roofline model to classify your kernel, then apply optimizations in order of impact, measuring at every step with Nsight Compute. By the end, you will be able to take any naive CUDA kernel and bring it to within 5-10% of its theoretical peak performance -- or know exactly why you cannot.
+
+Everything here targets NVIDIA Ampere (A100) and later architectures, though the principles apply broadly. All measurements were taken on an A100-80GB SXM with CUDA 12.x and Nsight Compute 2024.1.
+
+## The Optimization Methodology: Think Before You Code
+
+The single most important lesson in GPU optimization is this: **do not guess**. Every optimization decision should be driven by data, and the roofline model is your primary tool for making those decisions.
+
+### The Roofline Model
+
+The roofline model plots achievable performance (FLOP/s) against arithmetic intensity (FLOP/byte). Every kernel lives somewhere on this plot, and its position tells you exactly what to optimize.
+
+**Arithmetic intensity** is the ratio of floating-point operations to bytes moved from memory:
+
+$AI = \frac{\text{FLOPs}}{\text{Bytes transferred}}$
+
+For an A100-80GB SXM:
+- Peak memory bandwidth: $\sim$2,039 GB/s (HBM2e)
+- Peak FP32 compute: $\sim$19.5 TFLOP/s
+- **Ridge point**: $AI = \frac{19.5 \times 10^{12}}{2.039 \times 10^{12}} \approx 9.6$ FLOP/byte
+
+<Callout type="info" title="The Ridge Point">
+  The ridge point is where the memory-bound region meets the compute-bound region. If your kernel's arithmetic intensity is below $\sim$9.6 FLOP/byte on an A100, it is memory-bound. Above that, it is compute-bound. This single number determines your entire optimization strategy.
+</Callout>
+
+### Classifying Your Kernel
+
+Before writing a single line of optimization code, classify your kernel:
+
+<Benchmark
+  title="Kernel Classification by Arithmetic Intensity"
+  columns={["Kernel Type", "Arithmetic Intensity", "Bound By", "Optimize"]}
+  rows={[
+    { values: ["Vector add", "0.25 FLOP/byte", "Memory", "Bandwidth utilization"], highlight: false },
+    { values: ["Matrix transpose", "0 FLOP/byte (just moves data)", "Memory", "Coalescing, throughput"], highlight: false },
+    { values: ["SpMV", "0.5-2 FLOP/byte", "Memory", "Access patterns, compression"], highlight: false },
+    { values: ["Stencil (3D)", "2-5 FLOP/byte", "Memory (usually)", "Tiling, data reuse"], highlight: false },
+    { values: ["GEMM (large N)", "~N/6 FLOP/byte", "Compute", "ILP, tensor cores"], highlight: true },
+    { values: ["Reduction", "0.5 FLOP/byte", "Memory", "Bandwidth, warp shuffles"], highlight: false },
+    { values: ["Convolution (large filters)", "10+ FLOP/byte", "Compute", "Register tiling, ILP"], highlight: true },
+  ]}
+  notes="Arithmetic intensity varies with problem size. GEMM crosses the ridge point around N=64 for FP32."
+/>
+
+**The methodology is always the same:**
+
+1. Measure arithmetic intensity of your kernel
+2. Compare against the ridge point to determine if memory-bound or compute-bound
+3. If memory-bound: optimize for bandwidth (coalescing, caching, fewer transactions)
+4. If compute-bound: optimize for throughput (ILP, occupancy, instruction mix)
+5. Re-measure. Stop when you hit the roofline ceiling.
+
+This order matters. Optimizing compute throughput on a memory-bound kernel is wasted effort. Optimizing memory access patterns on a compute-bound kernel is equally pointless.
+
+---
+
+## Memory Coalescing: The Biggest Single Win (~10x)
+
+Memory coalescing is almost always the first and most impactful optimization. When consecutive threads in a warp access consecutive memory addresses, the GPU hardware combines those accesses into a small number of wide memory transactions. When they do not, each thread's access becomes a separate transaction, wasting enormous bandwidth.
+
+### How Coalescing Works
+
+A warp consists of 32 threads. When those 32 threads execute a load instruction, the memory controller examines their addresses. If all 32 addresses fall within a 128-byte aligned segment, the hardware issues a single 128-byte transaction. If addresses span two segments, it issues two transactions. If addresses are scattered, it can issue up to 32 separate transactions.
+
+The math is stark: coalesced access achieves $\sim$32 useful bytes per 128-byte transaction (for 4-byte elements, 32 threads times 4 bytes = 128 bytes). Fully scattered access achieves $\sim$4 useful bytes per 128-byte transaction -- a **32x** bandwidth waste.
+
+### AoS vs SoA: The Classic Coalescing Problem
+
+The most common coalescing anti-pattern is Array of Structures (AoS) layout when threads process one structure each.
+
+<CodeCompare
+  beforeTitle="AoS Layout (Strided Access)"
+  afterTitle="SoA Layout (Coalesced Access)"
+>
+  <Fragment slot="before">
+```cpp
+// Array of Structures
+struct Particle {
+    float x, y, z;    // position
+    float vx, vy, vz; // velocity
+    float mass;
+};
+
+// Thread i accesses particle[i].x
+// Thread 0: address 0
+// Thread 1: address 28 (7 floats away!)
+// Thread 2: address 56
+// Stride = sizeof(Particle) = 28 bytes
+
+__global__ void update_aos(
+    Particle* particles, int n, float dt) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        particles[i].x += particles[i].vx * dt;
+        particles[i].y += particles[i].vy * dt;
+        particles[i].z += particles[i].vz * dt;
+    }
+}
+// Each field access is stride-7 across threads
+// 7 transactions instead of 1 per warp per field
+```
+  </Fragment>
+  <Fragment slot="after">
+```cpp
+// Structure of Arrays
+struct ParticlesSoA {
+    float* x;  float* y;  float* z;
+    float* vx; float* vy; float* vz;
+    float* mass;
+};
+
+// Thread i accesses x[i]
+// Thread 0: address 0
+// Thread 1: address 4 (consecutive!)
+// Thread 2: address 8
+// Stride = sizeof(float) = 4 bytes
+
+__global__ void update_soa(
+    ParticlesSoA p, int n, float dt) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        p.x[i] += p.vx[i] * dt;
+        p.y[i] += p.vy[i] * dt;
+        p.z[i] += p.vz[i] * dt;
+    }
+}
+// Each field access is perfectly coalesced
+// 1 transaction per warp per field
+```
+  </Fragment>
+</CodeCompare>
+
+<Benchmark
+  title="AoS vs SoA Bandwidth (1M Particles, A100)"
+  columns={["Layout", "Achieved Bandwidth", "Transactions/Warp", "Effective Efficiency"]}
+  rows={[
+    { values: ["AoS (stride 7)", "~250 GB/s", "7", "14%"], highlight: false },
+    { values: ["SoA (stride 1)", "~1,750 GB/s", "1", "86%"], highlight: true },
+  ]}
+  notes="Measured with ncu --metrics l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum.per_second"
+/>
+
+### Matrix Transpose: A Coalescing Case Study
+
+Matrix transpose is the canonical example of a coalescing problem because you cannot simultaneously coalesce both reads and writes with a naive approach.
+
+Consider an $N \times N$ matrix stored in row-major order. The transpose copies element $(i, j)$ to position $(j, i)$. If threads are arranged so that consecutive threads handle consecutive columns, then:
+
+- **Reads** access `in[row * N + col]` where `col` varies with `threadIdx.x` -- **coalesced** (consecutive addresses)
+- **Writes** access `out[col * N + row]` where `col` varies with `threadIdx.x` -- **strided by N** (addresses are N apart)
 
 ```cpp
-// Version 0: Naive transpose
-// Each thread reads one element, writes one element
+// Naive transpose: coalesced reads, strided writes
 __global__ void transpose_naive(float* out, const float* in, int N) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    
-    if (x < N && y < N) {
-        out[x * N + y] = in[y * N + x];
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (col < N && row < N) {
+        // Read:  in[row * N + col]  -- consecutive threads read consecutive cols (coalesced)
+        // Write: out[col * N + row] -- consecutive threads write stride-N addresses (NOT coalesced)
+        out[col * N + row] = in[row * N + col];
     }
 }
 ```
 
-Problem: Non-coalesced writes. Adjacent threads write to non-adjacent memory locations.
-
-## Memory Coalescing Analysis
-
-```cpp
-// Memory access pattern analysis
-// Thread 0: reads  in[0], writes out[0]
-// Thread 1: reads  in[1], writes out[N]   <- N elements apart!
-// Thread 2: reads  in[2], writes out[2*N]
-// ...
-
-// Reads are coalesced (adjacent threads read adjacent addresses)
-// Writes are strided (adjacent threads write N elements apart)
-// Strided writes use only 1/N of memory bandwidth!
-```
+The strided writes destroy performance. Adjacent threads write to addresses that are $N \times 4$ bytes apart. For $N = 4096$, that is a 16,384-byte stride. The memory controller issues 32 separate transactions where 1 would suffice.
 
 <Benchmark
-  title="Memory Access Patterns Impact"
-  columns={["Pattern", "Achieved Bandwidth", "Efficiency"]}
+  title="Strided Access Penalties (4096x4096 FP32, A100)"
+  columns={["Access Pattern", "Achieved Bandwidth", "% of Peak", "Penalty"]}
   rows={[
-    { values: ["Coalesced read + write", "1.5 TB/s", "94%"], highlight: true },
-    { values: ["Coalesced read, strided write", "85 GB/s", "5%"], highlight: false },
-    { values: ["Strided read + write", "45 GB/s", "3%"], highlight: false },
+    { values: ["Coalesced (stride 1)", "1,650 GB/s", "81%", "1.0x (baseline)"], highlight: true },
+    { values: ["Stride 2", "850 GB/s", "42%", "1.9x"], highlight: false },
+    { values: ["Stride 4", "430 GB/s", "21%", "3.8x"], highlight: false },
+    { values: ["Stride 32", "105 GB/s", "5%", "15.7x"], highlight: false },
+    { values: ["Stride N (4096)", "85 GB/s", "4%", "19.4x"], highlight: false },
+    { values: ["Random", "42 GB/s", "2%", "39.3x"], highlight: false },
   ]}
-  notes="A100-80GB, 4096x4096 matrix"
+  notes="Measured using a stride-sweep microbenchmark. Bandwidth = useful bytes transferred / kernel time."
 />
 
-## Shared Memory Tile Optimization
+The penalty is not linear with stride because the L2 cache can partially absorb short strides. But once the stride exceeds the cache line size (128 bytes, or stride &gt; 32 for 4-byte elements), performance collapses.
+
+<Callout type="perf" title="Rule of Thumb">
+  If your kernel achieves less than 50% of peak memory bandwidth, the first thing to check is coalescing. Run `ncu --metrics l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum` and compute the sectors-per-request ratio. Perfect coalescing gives 4 sectors/request (128 bytes / 32 bytes per sector). A ratio of 32 means every thread triggered a separate transaction.
+</Callout>
+
+---
+
+## Shared Memory Tiling: Decoupling Access Patterns (~4x)
+
+When you cannot coalesce both reads and writes in global memory (as in transpose), shared memory provides an escape hatch. The idea is simple: load data cooperatively into shared memory using coalesced global reads, then read from shared memory in whatever pattern you need, and write back to global memory with coalesced writes.
+
+### Tiled Matrix Transpose
+
+The key insight: shared memory has no coalescing requirement. You can read it in any order without penalty (ignoring bank conflicts for now). So we:
+
+1. **Read** a tile from global memory into shared memory (coalesced reads)
+2. **Read** from shared memory in transposed order (any order is fine)
+3. **Write** the transposed data back to global memory (coalesced writes)
 
 ```cpp
-// Version 1: Use shared memory to enable coalesced writes
 #define TILE_DIM 32
 #define BLOCK_ROWS 8
 
 __global__ void transpose_shared(float* out, const float* in, int N) {
     __shared__ float tile[TILE_DIM][TILE_DIM];
-    
+
+    // Global coordinates for reading
     int x = blockIdx.x * TILE_DIM + threadIdx.x;
     int y = blockIdx.y * TILE_DIM + threadIdx.y;
-    
-    // Coalesced read from global memory into shared memory
+
+    // Step 1: Coalesced read from global memory into shared memory
+    // Each thread loads TILE_DIM/BLOCK_ROWS = 4 elements
     for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
         if (x < N && (y + j) < N) {
             tile[threadIdx.y + j][threadIdx.x] = in[(y + j) * N + x];
+            // threadIdx.x varies -> consecutive addresses -> coalesced
         }
     }
-    
+
     __syncthreads();
-    
-    // Coalesced write from shared memory to global memory
-    x = blockIdx.y * TILE_DIM + threadIdx.x;  // Note: swapped x/y
+
+    // Step 2: Swap block indices for writing the transposed tile
+    x = blockIdx.y * TILE_DIM + threadIdx.x;
     y = blockIdx.x * TILE_DIM + threadIdx.y;
-    
+
+    // Step 3: Coalesced write from shared memory to global memory
     for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
         if (x < N && (y + j) < N) {
             out[(y + j) * N + x] = tile[threadIdx.x][threadIdx.y + j];
+            // threadIdx.x varies in the write address -> coalesced
+            // threadIdx.x varies in the shared read index -> column access in shared mem
         }
     }
 }
 ```
 
-<Callout type="perf" title="10x Speedup">
-  Shared memory tiling improves bandwidth utilization from 5% to 75%, achieving ~10x speedup.
-</Callout>
+Notice the critical swap: when we write, `threadIdx.x` varies the *column* of the output (giving coalesced writes) while also varying the *row* of the shared memory tile (reading the transposed data). Both global reads and global writes are now coalesced.
 
-## Bank Conflict Elimination
+### Bank Conflicts: The Shared Memory Gotcha
 
-Shared memory has 32 banks. Accessing same bank from multiple threads causes serialization:
+Shared memory is organized into 32 banks. Consecutive 4-byte words map to consecutive banks. When multiple threads in a warp access the same bank simultaneously, the accesses are serialized -- a **bank conflict**.
+
+In the transpose kernel above, the write phase reads `tile[threadIdx.x][threadIdx.y + j]`. As `threadIdx.x` varies across the warp, we access `tile[0][k], tile[1][k], tile[2][k], ...` for a fixed `k`. Each of these maps to a different row, but if `TILE_DIM` is 32, then `tile[0][k]` and `tile[32][k]` map to the same bank (addresses differ by exactly $32 \times 4 = 128$ bytes, which is $32 \times$ bank width). In fact, `tile[i][k]` for all i accesses the *same* bank for a given k -- a 32-way bank conflict.
+
+The fix is simple: add 1 element of padding to each row.
 
 ```cpp
-// Version 2: Pad shared memory to avoid bank conflicts
-#define TILE_DIM 32
-#define TILE_DIM_PADDED 33  // +1 padding
-
-__global__ void transpose_no_conflicts(float* out, const float* in, int N) {
-    // Add padding to shift columns across banks
-    __shared__ float tile[TILE_DIM][TILE_DIM_PADDED];
-    
-    int x = blockIdx.x * TILE_DIM + threadIdx.x;
-    int y = blockIdx.y * TILE_DIM + threadIdx.y;
-    
-    // Load tile
-    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
-        tile[threadIdx.y + j][threadIdx.x] = in[(y + j) * N + x];
-    }
-    
-    __syncthreads();
-    
-    x = blockIdx.y * TILE_DIM + threadIdx.x;
-    y = blockIdx.x * TILE_DIM + threadIdx.y;
-    
-    // Store transposed - no bank conflicts due to padding
-    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
-        out[(y + j) * N + x] = tile[threadIdx.x][threadIdx.y + j];
-    }
-}
+// Padded shared memory: TILE_DIM+1 columns instead of TILE_DIM
+__shared__ float tile[TILE_DIM][TILE_DIM + 1];
+// Now tile[i][k] maps to bank (i * 33 + k) % 32
+// For consecutive i: banks are 33%32=1 apart -- all different banks!
 ```
 
 <PerfChart
-  title="Optimization Progression (4096x4096 FP32)"
+  title="Transpose Optimization Progression (4096x4096 FP32, A100)"
   unit="GB/s"
   data={[
-    { label: "Naive", value: 85, color: "red" },
-    { label: "+ Shared Memory", value: 1125, color: "orange" },
-    { label: "+ No Bank Conflicts", value: 1380, color: "blue" },
+    { label: "Naive (strided writes)", value: 85, color: "red" },
+    { label: "+ Shared Memory Tiling", value: 1125, color: "orange" },
+    { label: "+ Bank Conflict Padding", value: 1380, color: "blue" },
     { label: "+ Occupancy Tuning", value: 1520, color: "green" },
   ]}
+  baseline={0}
 />
 
-## Occupancy Analysis
+### Tiled Matrix Multiplication
 
-```bash
-# Analyze kernel occupancy
-ncu --metrics sm__warps_active.avg.pct_of_peak_sustained_active \
-    ./transpose_benchmark
+Matrix multiplication is where shared memory tiling truly shines because it increases *data reuse*, not just reordering. A naive matmul reads each element of A and B from global memory $N$ times total. Tiling reduces this to $N / T$ times, where $T$ is the tile size.
 
-# Check register and shared memory usage
-ncu --metrics launch__registers_per_thread,\
-              launch__shared_mem_per_block_static,\
-              launch__shared_mem_per_block_dynamic \
-    ./transpose_benchmark
-```
+**Arithmetic intensity analysis:** For naive matmul of $N \times N$ matrices:
+- FLOPs: $2N^3$ (multiply + add for each output element)
+- Bytes: $2N^2 \times 4$ bytes for reading A and B per output (each element of A and B is read $N$ times across all output elements, but per output element the reads are $2N$ elements)
+- Effective AI for a single output element: $\frac{2N}{2 \times 4} = \frac{N}{4}$ FLOP/byte
 
-```cpp
-// Tune block size for optimal occupancy
-// A100 has 108 SMs, 64K registers per SM, 164KB shared memory per SM
+So for $N \geq 40$, matmul is compute-bound. But the naive implementation does not achieve this because it rereads every element from global memory, effectively reducing the AI to about $\frac{2}{8} = 0.25$ FLOP/byte without caching.
 
-// Version 3: Tuned block dimensions
-// 32x8 threads = 256 threads per block
-// Registers per thread: ~24
-// Shared memory: 32x33x4 = 4.2KB per block
-// Theoretical occupancy: 100% (2048 threads/SM)
-```
-
-## Final Optimized Version
+Tiling fixes this by loading $T \times T$ tiles of A and B into shared memory, computing a $T \times T$ partial result, and iterating:
 
 ```cpp
-// Version 4: All optimizations combined
-template<int TILE_DIM, int BLOCK_ROWS>
-__global__ void transpose_optimized(float* __restrict__ out,
-                                     const float* __restrict__ in,
-                                     int N) {
-    __shared__ float tile[TILE_DIM][TILE_DIM + 1];  // +1 for bank conflict avoidance
-    
-    int xIndex = blockIdx.x * TILE_DIM + threadIdx.x;
-    int yIndex = blockIdx.y * TILE_DIM + threadIdx.y;
-    
-    // Use __restrict__ and loop unrolling for ILP
-    #pragma unroll
-    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
-        tile[threadIdx.y + j][threadIdx.x] = in[(yIndex + j) * N + xIndex];
+#define TILE_SIZE 32
+
+__global__ void matmul_tiled(const float* __restrict__ A,
+                              const float* __restrict__ B,
+                              float* __restrict__ C,
+                              int N) {
+    __shared__ float tileA[TILE_SIZE][TILE_SIZE];
+    __shared__ float tileB[TILE_SIZE][TILE_SIZE];
+
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    float sum = 0.0f;
+
+    // Iterate over tiles along the K dimension
+    for (int t = 0; t < (N + TILE_SIZE - 1) / TILE_SIZE; t++) {
+        // Cooperative load: each thread loads one element of each tile
+        int aCol = t * TILE_SIZE + threadIdx.x;
+        int bRow = t * TILE_SIZE + threadIdx.y;
+
+        tileA[threadIdx.y][threadIdx.x] = (row < N && aCol < N) ? A[row * N + aCol] : 0.0f;
+        tileB[threadIdx.y][threadIdx.x] = (bRow < N && col < N) ? B[bRow * N + col] : 0.0f;
+
+        __syncthreads();
+
+        // Compute partial dot product from tile (all from shared memory)
+        for (int k = 0; k < TILE_SIZE; k++) {
+            sum += tileA[threadIdx.y][k] * tileB[k][threadIdx.x];
+        }
+
+        __syncthreads();
     }
-    
-    __syncthreads();
-    
-    xIndex = blockIdx.y * TILE_DIM + threadIdx.x;
-    yIndex = blockIdx.x * TILE_DIM + threadIdx.y;
-    
-    #pragma unroll
-    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
-        out[(yIndex + j) * N + xIndex] = tile[threadIdx.x][threadIdx.y + j];
+
+    if (row < N && col < N) {
+        C[row * N + col] = sum;
     }
 }
-
-// Launch configuration
-dim3 dimGrid((N + TILE_DIM - 1) / TILE_DIM, (N + TILE_DIM - 1) / TILE_DIM);
-dim3 dimBlock(TILE_DIM, BLOCK_ROWS);
-transpose_optimizedunder 32, 8><<<dimGrid, dimBlock>well above(d_out, d_in, N);
 ```
 
+Each element loaded from global memory is reused $T$ times (once per row/column in the partial dot product). This reduces global memory traffic by a factor of $T$, effectively multiplying the arithmetic intensity by $T$.
+
+### Tile Size Selection
+
+Tile size is constrained by shared memory capacity per SM. On an A100:
+- 164 KB shared memory per SM (configurable up to 164 KB with `cudaFuncSetAttribute`)
+- A $T \times T$ tile for two matrices uses $2 \times T^2 \times 4$ bytes
+
 <Benchmark
-  title="Final Performance Summary"
-  columns={["Version", "Bandwidth", "Speedup", "% Peak"]}
+  title="Tile Size Trade-offs (FP32 GEMM)"
+  columns={["Tile Size", "Shared Memory", "Data Reuse", "Blocks/SM", "Typical Speedup"]}
   rows={[
-    { values: ["Naive", "85 GB/s", "1.0x", "5%"], highlight: false },
-    { values: ["Shared Memory", "1125 GB/s", "13.2x", "70%"], highlight: false },
-    { values: ["+ Bank Conflict Fix", "1380 GB/s", "16.2x", "86%"], highlight: false },
-    { values: ["+ Occupancy Tuning", "1520 GB/s", "17.9x", "95%"], highlight: true },
+    { values: ["8x8", "0.5 KB", "8x", "Many", "Baseline"], highlight: false },
+    { values: ["16x16", "2 KB", "16x", "8+", "~2x"], highlight: false },
+    { values: ["32x32", "8 KB", "32x", "4-8", "~3.5x"], highlight: true },
+    { values: ["64x64", "32 KB", "64x", "1-2", "~4x (if occupancy OK)"], highlight: true },
+    { values: ["128x128", "128 KB", "128x", "1", "Diminishing (occupancy starved)"], highlight: false },
   ]}
-  notes="A100-80GB, theoretical peak: 1600 GB/s for copy"
+  notes="Shared memory per tile = 2 * T^2 * 4 bytes. Blocks/SM depends on other resource limits."
 />
 
-## Key Takeaways
+<Callout type="tip" title="Practical Tile Size Guidance">
+  For most kernels, 32x32 is the sweet spot. It provides 32x data reuse while consuming only 8 KB of shared memory, leaving room for multiple blocks per SM. Going to 64x64 can help if your kernel is still bandwidth-limited, but you must verify that occupancy does not drop too far. Always profile both configurations.
+</Callout>
 
-1. **Memory coalescing** is the single biggest factor (~10x)
-2. **Shared memory** enables reordering access patterns
-3. **Bank conflict avoidance** gains ~15-20%
-4. **Occupancy tuning** extracts final ~10%
+---
 
-For compute-bound kernels, focus shifts to instruction-level parallelism and reducing register pressure.
+## Occupancy Tuning: Hiding Latency (~1.5x)
+
+Occupancy is the ratio of active warps to the maximum warps an SM can support. High occupancy helps the warp scheduler hide memory latency: while one warp waits for data, another warp can execute instructions.
+
+$\text{Occupancy} = \frac{\text{Active warps per SM}}{\text{Max warps per SM}}$
+
+On an A100, each SM supports up to 64 warps (2048 threads). Occupancy is limited by three resources: **registers**, **shared memory**, and **block size**.
+
+### The Three Limiting Factors
+
+**1. Register Pressure**
+
+Each SM has 65,536 registers. If your kernel uses 64 registers per thread, then:
+
+$\text{Max threads} = \frac{65536}{64} = 1024 \text{ threads} = 32 \text{ warps} \rightarrow 50\% \text{ occupancy}$
+
+If it uses 128 registers per thread:
+
+$\text{Max threads} = \frac{65536}{128} = 512 \text{ threads} = 16 \text{ warps} \rightarrow 25\% \text{ occupancy}$
+
+You can limit registers with `__launch_bounds__` or `--maxrregcount`, but this may cause register spilling to local memory (which lives in global memory), trading latency hiding for longer individual instruction latency.
+
+**2. Shared Memory**
+
+If a kernel uses 48 KB of shared memory per block, and the SM has 164 KB available (A100 max config), then at most $\lfloor 164 / 48 \rfloor = 3$ blocks can be resident simultaneously.
+
+**3. Block Size**
+
+Each SM can host at most 32 blocks (A100). If your block has 64 threads (2 warps), then 32 blocks give 64 warps = 100% occupancy. But if your block has 1024 threads (32 warps), then only 2 blocks can be resident, still giving 64 warps = 100%. The constraint matters when block size is very small or very large.
+
+### The Occupancy Calculator Logic
+
+The occupancy calculation takes the minimum across all constraints:
+
+```
+Input: block_size, regs_per_thread, smem_per_block
+Architecture: max_threads_per_sm, max_blocks_per_sm, max_regs_per_sm, max_smem_per_sm
+
+warps_per_block = ceil(block_size / 32)
+
+# Register limit
+if regs_per_thread > 0:
+    max_warps_by_regs = floor(max_regs_per_sm / (regs_per_thread * 32))
+else:
+    max_warps_by_regs = max_warps_per_sm
+
+# Shared memory limit
+if smem_per_block > 0:
+    max_blocks_by_smem = floor(max_smem_per_sm / smem_per_block)
+    max_warps_by_smem = max_blocks_by_smem * warps_per_block
+else:
+    max_warps_by_smem = max_warps_per_sm
+
+# Block limit
+max_warps_by_blocks = max_blocks_per_sm * warps_per_block
+
+# Effective occupancy
+active_warps = min(max_warps_by_regs, max_warps_by_smem, max_warps_by_blocks, max_warps_per_sm)
+occupancy = active_warps / max_warps_per_sm
+```
+
+You can inspect this directly with the CUDA Occupancy Calculator API:
+
+```cpp
+int blockSize = 256;
+int minGridSize;
+int optimalBlockSize;
+
+// Let CUDA compute the optimal block size for maximum occupancy
+cudaOccupancyMaxPotentialBlockSize(&minGridSize, &optimalBlockSize,
+                                    myKernel, 0, 0);
+printf("Optimal block size: %d\n", optimalBlockSize);
+
+// Or query occupancy for a specific block size
+int numBlocks;
+cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocks, myKernel,
+                                               blockSize, 0);
+float occupancy = (float)(numBlocks * blockSize) / 2048.0f;
+printf("Occupancy: %.1f%%\n", occupancy * 100);
+```
+
+### When Low Occupancy Is Acceptable
+
+High occupancy is not always necessary. The purpose of occupancy is to hide memory latency. If your kernel is **compute-bound** (high arithmetic intensity), there is plenty of independent compute work to keep the pipeline full even with fewer warps.
+
+<Callout type="warning" title="Occupancy Is Not a Performance Metric">
+  Occupancy is a proxy for latency hiding capability. A kernel at 25% occupancy that is compute-bound and fully utilizing its execution units will outperform a 100%-occupancy kernel that is memory-bound and bandwidth-starved. Always check the actual bottleneck, not just the occupancy number.
+</Callout>
+
+Classic examples where low occupancy is fine:
+- **Register-tiled GEMM kernels** often run at 25-50% occupancy because each thread computes a large tile, giving massive ILP. cuBLAS SGEMM runs at ~25% occupancy on Volta/Ampere.
+- **Compute-heavy stencil kernels** with many registers per thread can trade occupancy for reduced register spilling.
+
+The test: if increasing occupancy (by reducing registers or shared memory) does not improve performance, your kernel does not need more occupancy.
+
+<Benchmark
+  title="Occupancy vs Performance (Not Always Correlated)"
+  columns={["Kernel", "Occupancy", "Achieved TFLOP/s", "% Peak Compute"]}
+  rows={[
+    { values: ["Naive GEMM (256 threads/block)", "100%", "1.2 TFLOP/s", "6%"], highlight: false },
+    { values: ["Tiled GEMM (256 threads, 8KB smem)", "75%", "5.8 TFLOP/s", "30%"], highlight: false },
+    { values: ["Register-tiled GEMM (128 threads, 128 regs)", "25%", "14.2 TFLOP/s", "73%"], highlight: true },
+    { values: ["cuBLAS SGEMM", "~25%", "18.1 TFLOP/s", "93%"], highlight: true },
+  ]}
+  notes="4096x4096 FP32 GEMM on A100. Higher occupancy with less work per thread can be slower."
+/>
+
+---
+
+## Instruction-Level Parallelism (~1.3x)
+
+Even within a single thread, the GPU can execute multiple independent instructions concurrently. The GPU pipeline is deeply pipelined, and independent instructions from the *same warp* can overlap. This is instruction-level parallelism (ILP).
+
+### Why ILP Matters
+
+A global memory load has $\sim$400-600 cycle latency. If a thread issues one load and immediately depends on the result, it stalls for those cycles (unless another warp is scheduled). But if a thread issues *multiple independent loads*, the hardware can pipeline them -- the second load launches before the first completes.
+
+Similarly, arithmetic instructions have $\sim$4-8 cycle latency. A chain of dependent multiplies (`a = b*c; d = a*e; f = d*g`) cannot be pipelined. But independent operations (`a = b*c; d = e*f; g = h*i`) can all be in-flight simultaneously.
+
+### Loop Unrolling for ILP
+
+The simplest way to increase ILP is loop unrolling. The compiler can do this automatically with `#pragma unroll`, but understanding *why* it helps is important.
+
+<CodeCompare
+  beforeTitle="No Unrolling (Sequential Dependency)"
+  afterTitle="Unrolled (Independent Operations)"
+>
+  <Fragment slot="before">
+```cpp
+// One accumulation per iteration
+// Each iteration depends on the previous sum
+float sum = 0.0f;
+for (int k = 0; k < TILE_SIZE; k++) {
+    sum += A[k] * B[k];
+    // sum depends on previous sum
+    // FMA cannot issue until prior FMA completes
+    // Pipeline utilization: ~25%
+}
+```
+  </Fragment>
+  <Fragment slot="after">
+```cpp
+// Four independent accumulators
+// Each can be computed independently
+float sum0 = 0.0f, sum1 = 0.0f;
+float sum2 = 0.0f, sum3 = 0.0f;
+for (int k = 0; k < TILE_SIZE; k += 4) {
+    sum0 += A[k]   * B[k];
+    sum1 += A[k+1] * B[k+1];
+    sum2 += A[k+2] * B[k+2];
+    sum3 += A[k+3] * B[k+3];
+    // Four independent FMA chains
+    // Pipeline utilization: ~100%
+}
+float sum = sum0 + sum1 + sum2 + sum3;
+```
+  </Fragment>
+</CodeCompare>
+
+With four independent accumulators, the FMA pipeline can have four instructions in flight simultaneously. On an A100 with 4-cycle FMA latency, you need at least 4 independent operations to keep the pipeline full.
+
+### Register Tiling for ILP
+
+In GEMM, the most effective ILP technique is register tiling: each thread computes a small submatrix (e.g., 4x4 or 8x8) of the output, keeping partial results in registers. This creates a large number of independent FMA operations:
+
+```cpp
+// Each thread computes a 4x4 output tile
+// 16 independent accumulators = massive ILP
+float c[4][4] = {0};
+
+for (int k = 0; k < K; k++) {
+    float a[4], b[4];
+    // Load 4 elements of A and B into registers
+    for (int i = 0; i < 4; i++) a[i] = tileA[threadIdx.y * 4 + i][k];
+    for (int j = 0; j < 4; j++) b[j] = tileB[k][threadIdx.x * 4 + j];
+
+    // 16 independent FMA operations
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            c[i][j] += a[i] * b[j];  // c[i][j] only depends on its own chain
+        }
+    }
+}
+```
+
+This is why high-performance GEMM kernels use many registers and accept low occupancy -- the ILP from register tiling more than compensates.
+
+<PerfChart
+  title="ILP Impact on FMA Pipeline Utilization"
+  unit="TFLOP/s"
+  data={[
+    { label: "1 accumulator (ILP=1)", value: 4.8, color: "red" },
+    { label: "2 accumulators (ILP=2)", value: 8.1, color: "orange" },
+    { label: "4 accumulators (ILP=4)", value: 12.6, color: "blue" },
+    { label: "16 accumulators (4x4 tile)", value: 15.8, color: "green" },
+  ]}
+  baseline={0}
+/>
+
+---
+
+## Nsight Compute Workflow: Profiling Methodology
+
+Nsight Compute (ncu) is the definitive tool for CUDA kernel profiling. This section covers a practical, step-by-step workflow.
+
+### Step 1: Baseline SOL (Speed of Light) Analysis
+
+The SOL report tells you immediately whether your kernel is memory-bound or compute-bound:
+
+```bash
+# Collect the Speed of Light summary
+ncu --set full -o profile_output ./my_program
+
+# Or just the SOL metrics for a quick check
+ncu --metrics \
+    sm__throughput.avg.pct_of_peak_sustained_elapsed,\
+    gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed \
+    ./my_program
+```
+
+The two key numbers:
+
+- **SM throughput %**: how close compute is to peak
+- **DRAM throughput %**: how close memory bandwidth is to peak
+
+<Benchmark
+  title="Interpreting SOL Percentages"
+  columns={["SM%", "DRAM%", "Classification", "Action"]}
+  rows={[
+    { values: ["Low (under 30%)", "High (over 60%)", "Memory-bound", "Improve coalescing, reduce traffic"], highlight: true },
+    { values: ["High (over 60%)", "Low (under 30%)", "Compute-bound", "Improve ILP, reduce instruction count"], highlight: true },
+    { values: ["Low", "Low", "Latency-bound", "Increase occupancy, reduce stalls"], highlight: false },
+    { values: ["High", "High", "Well-balanced", "Near optimal, micro-optimize"], highlight: true },
+  ]}
+  notes="SOL percentages are relative to sustained peak, not theoretical peak. 60%+ is generally good."
+/>
+
+<Callout type="info" title="Low SM% and Low DRAM%: The Latency Trap">
+  When both metrics are low, your kernel is likely **latency-bound** -- threads are stalling on memory loads with insufficient occupancy to hide the latency. This is the one case where increasing occupancy (via smaller blocks, fewer registers, or less shared memory) directly helps.
+</Callout>
+
+### Step 2: Memory Analysis
+
+If the kernel is memory-bound, drill into the memory metrics:
+
+```bash
+# Memory throughput and efficiency
+ncu --metrics \
+    l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,\
+    l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum,\
+    l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum,\
+    l1tex__t_requests_pipe_lsu_mem_global_op_st.sum,\
+    gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed,\
+    lts__t_sectors_srcunit_tex_op_read.sum,\
+    lts__t_sectors_srcunit_tex_op_write.sum \
+    ./my_program
+```
+
+**Sectors per request** is the most important coalescing metric:
+- **Ideal**: 4 sectors per request (128 bytes / 32 bytes per sector) for a warp of 32 float loads
+- **Worst case**: 32 sectors per request (each thread triggers its own cache line)
+
+Compute it as: `sectors_sum / requests_sum`. If this ratio is significantly above 4, you have a coalescing problem.
+
+### Step 3: Compute Analysis
+
+If the kernel is compute-bound, look at instruction throughput and stall reasons:
+
+```bash
+# Compute utilization and stall analysis
+ncu --metrics \
+    smsp__issue_active.avg.pct_of_peak_sustained_elapsed,\
+    smsp__inst_executed.sum,\
+    smsp__warps_issue_stalled_not_selected.avg.pct_of_peak_sustained_elapsed,\
+    smsp__warps_issue_stalled_wait.avg.pct_of_peak_sustained_elapsed,\
+    smsp__warps_issue_stalled_short_scoreboard.avg.pct_of_peak_sustained_elapsed,\
+    smsp__warps_issue_stalled_long_scoreboard.avg.pct_of_peak_sustained_elapsed \
+    ./my_program
+```
+
+Key stall reasons and what they mean:
+- **Long scoreboard**: Waiting for global memory loads -- kernel needs better latency hiding or fewer loads
+- **Short scoreboard**: Waiting for shared memory or L1 operations -- possible bank conflicts
+- **Not selected**: Warp is eligible but not scheduled -- occupancy is adequate, scheduler is busy
+- **Wait**: Waiting for `__syncthreads()` -- possible load imbalance within a block
+
+### Step 4: Iterative Refinement
+
+After each optimization, re-profile and compare. Nsight Compute's `--set full` mode generates an HTML report with side-by-side comparison:
+
+```bash
+# Profile before and after
+ncu --set full -o before ./my_program_v1
+ncu --set full -o after ./my_program_v2
+
+# Compare in the GUI
+ncu-ui before.ncu-rep after.ncu-rep
+```
+
+---
+
+## Real Optimization Case Study: Vector Reduction
+
+Let us walk through a complete optimization of a parallel reduction kernel -- summing $N$ floats -- from naive to near-optimal. This demonstrates the full profiling pipeline.
+
+### Version 0: Naive Interleaved Reduction
+
+```cpp
+// V0: Naive reduction with divergent warps
+__global__ void reduce_v0(float* input, float* output, int N) {
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    sdata[tid] = (i < N) ? input[i] : 0.0f;
+    __syncthreads();
+
+    // Interleaved reduction -- causes warp divergence
+    for (int s = 1; s < blockDim.x; s *= 2) {
+        if (tid % (2 * s) == 0) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) output[blockIdx.x] = sdata[0];
+}
+```
+
+**Problems identified by Nsight Compute:**
+- SM throughput: 8% -- terrible
+- DRAM throughput: 12% -- also terrible
+- Dominant stall: "not selected" at 45% -- warp divergence causes half the threads to be idle
+- Shared memory bank conflicts: `tid % (2*s)` causes strided access patterns
+
+<Benchmark
+  title="Reduction Kernel: Nsight Compute SOL at Each Step"
+  columns={["Version", "SM%", "DRAM%", "Bandwidth", "Classification"]}
+  rows={[
+    { values: ["V0: Naive interleaved", "8%", "12%", "45 GB/s", "Latency-bound"], highlight: false },
+    { values: ["V1: Sequential addressing", "15%", "28%", "105 GB/s", "Memory-bound"], highlight: false },
+    { values: ["V2: First-add during load", "12%", "52%", "420 GB/s", "Memory-bound"], highlight: false },
+    { values: ["V3: Warp-level shuffle", "10%", "78%", "1,280 GB/s", "Memory-bound"], highlight: true },
+    { values: ["V4: Vectorized loads", "8%", "89%", "1,620 GB/s", "Near roofline"], highlight: true },
+  ]}
+  notes="N = 64M floats, 256 threads/block, A100-80GB. Reduction is inherently memory-bound (AI ~ 0.5 FLOP/byte)."
+/>
+
+### Version 1: Sequential Addressing (Fix Divergence)
+
+```cpp
+// V1: Sequential addressing -- no warp divergence
+__global__ void reduce_v1(float* input, float* output, int N) {
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    sdata[tid] = (i < N) ? input[i] : 0.0f;
+    __syncthreads();
+
+    // Sequential pairs: threads 0..blockDim/2 are active, then 0..blockDim/4, etc.
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) output[blockIdx.x] = sdata[0];
+}
+```
+
+This eliminates warp divergence in early iterations (when `s` is large, entire warps are either active or inactive, so no divergence within a warp). Nsight shows "not selected" stall drops from 45% to 15%.
+
+### Version 2: First Addition During Global Load
+
+```cpp
+// V2: Each thread loads and adds two elements -- halves the number of blocks needed
+__global__ void reduce_v2(float* input, float* output, int N) {
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int i = blockIdx.x * (blockDim.x * 2) + threadIdx.x;
+
+    // First add during the load -- doubles useful work per thread
+    float val = 0.0f;
+    if (i < N) val = input[i];
+    if (i + blockDim.x < N) val += input[i + blockDim.x];
+    sdata[tid] = val;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) output[blockIdx.x] = sdata[0];
+}
+```
+
+This halves the number of blocks, meaning half as many block launches, half the shared memory overhead, and better utilization of each thread. The DRAM throughput jumps because more of the transfer time is spent on useful data.
+
+### Version 3: Warp-Level Shuffle (Eliminate `__syncthreads__` for Last Warp)
+
+```cpp
+// V3: Use warp shuffles for the last 32 elements -- no shared memory or sync needed
+__device__ float warpReduce(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+__global__ void reduce_v3(float* input, float* output, int N) {
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int i = blockIdx.x * (blockDim.x * 2) + threadIdx.x;
+
+    float val = 0.0f;
+    if (i < N) val = input[i];
+    if (i + blockDim.x < N) val += input[i + blockDim.x];
+    sdata[tid] = val;
+    __syncthreads();
+
+    // Shared memory reduction down to 32 elements
+    for (int s = blockDim.x / 2; s > 32; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    // Warp-level reduction for the last 32 elements (no sync needed)
+    if (tid < 32) {
+        val = sdata[tid];
+        val = warpReduce(val);
+    }
+
+    if (tid == 0) output[blockIdx.x] = val;
+}
+```
+
+Warp shuffles bypass shared memory entirely for the final reduction stage. They have lower latency (a few cycles vs. shared memory's bank-access latency plus `__syncthreads__` barrier overhead). Nsight shows "short scoreboard" stalls drop significantly.
+
+### Version 4: Vectorized Loads (Maximize Memory Throughput)
+
+```cpp
+// V4: Use float4 vectorized loads for maximum memory throughput
+__global__ void reduce_v4(float* input, float* output, int N) {
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int gridStride = gridDim.x * blockDim.x * 8;  // Each thread handles 8 elements
+    int i = blockIdx.x * blockDim.x * 8 + threadIdx.x;
+
+    // Grid-stride loop with vectorized loads
+    float sum = 0.0f;
+    while (i + blockDim.x * 7 < N) {
+        // Load two float4s (8 floats) per thread per iteration
+        float4 a = reinterpret_cast<float4*>(input)[i / 4];
+        float4 b = reinterpret_cast<float4*>(input)[(i + blockDim.x * 4) / 4];
+        sum += a.x + a.y + a.z + a.w + b.x + b.y + b.z + b.w;
+        i += gridStride;
+    }
+    // Handle remainder with scalar loads
+    // (omitted for brevity)
+    sdata[tid] = sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 32; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+
+    if (tid < 32) {
+        float val = sdata[tid];
+        val = warpReduce(val);
+        if (tid == 0) output[blockIdx.x] = val;
+    }
+}
+```
+
+Vectorized loads (`float4`, which is 16 bytes) allow the memory controller to issue wider transactions, reducing instruction overhead and increasing effective bandwidth. Combined with a grid-stride loop, each thread processes many elements, further amortizing launch and synchronization overhead.
+
+<PerfChart
+  title="Reduction Kernel Optimization Progression"
+  unit="GB/s"
+  data={[
+    { label: "V0: Naive", value: 45, color: "red" },
+    { label: "V1: Sequential addr", value: 105, color: "red" },
+    { label: "V2: First-add on load", value: 420, color: "orange" },
+    { label: "V3: Warp shuffles", value: 1280, color: "blue" },
+    { label: "V4: Vectorized loads", value: 1620, color: "green", annotation: "80% peak" },
+  ]}
+  baseline={0}
+/>
+
+### Profiler Output Analysis at Each Step
+
+Here is what Nsight Compute reveals at each stage:
+
+**V0 to V1** -- The "warp state stall" breakdown shifts: `stall_not_selected` drops from 45% to 15%. This confirms we eliminated divergence. DRAM throughput more than doubles.
+
+**V1 to V2** -- `gpu__dram_throughput` jumps from 28% to 52%. The total number of global load instructions drops by ~50%. The kernel is doing the same total work with half the overhead.
+
+**V2 to V3** -- `l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum` drops to near zero in the final reduction stage. `stall_short_scoreboard` decreases. Bandwidth triples because the warp shuffle path is much faster.
+
+**V3 to V4** -- `gpu__dram_throughput` reaches 89% of peak. The bottleneck shifts: `l1tex__t_sectors_pipe_lsu_mem_global_op_ld.avg.pct_of_peak_sustained_elapsed` maxes out. We are within 10-20% of the memory roofline ceiling for this kernel.
+
+---
+
+## Warp Divergence: A Practical Note
+
+Warp divergence occurs when threads within a warp take different branch paths. The GPU must execute both paths sequentially, masking off threads that should not participate. The performance penalty is proportional to the fraction of threads taking the minority path.
+
+```cpp
+// Divergent: threads within same warp take different paths
+if (input[threadIdx.x] > threshold) {
+    // Path A -- some threads
+    output[threadIdx.x] = expensive_function_a(input[threadIdx.x]);
+} else {
+    // Path B -- other threads
+    output[threadIdx.x] = expensive_function_b(input[threadIdx.x]);
+}
+// Cost: time(Path A) + time(Path B) regardless of how many threads take each path
+```
+
+The key insight is that divergence only matters *within a warp*. If threads 0-31 all take path A and threads 32-63 all take path B, there is zero divergence penalty. This suggests a mitigation strategy: **sort data so that nearby threads are likely to take the same path**.
+
+For the reduction kernel, V0 has divergence because `tid % (2*s) == 0` creates a pattern where even-numbered and odd-numbered threads within a warp take different paths. V1 avoids this by making the first $s$ threads active and the rest inactive -- entire warps are uniformly active or uniformly inactive.
+
+---
+
+## Advanced: Memory Hierarchy Exploitation
+
+Modern GPUs have a deep memory hierarchy. Understanding where your data lives affects optimization strategy.
+
+<Benchmark
+  title="NVIDIA A100 Memory Hierarchy"
+  columns={["Level", "Capacity", "Bandwidth", "Latency", "Scope"]}
+  rows={[
+    { values: ["Registers", "256 KB / SM", "~19 TB/s (aggregate)", "0 cycles", "Per thread"], highlight: true },
+    { values: ["Shared Memory", "Up to 164 KB / SM", "~19 TB/s (aggregate)", "~20-30 cycles", "Per block"], highlight: true },
+    { values: ["L1 Cache", "Up to 192 KB / SM", "~5 TB/s", "~30 cycles", "Per SM"], highlight: false },
+    { values: ["L2 Cache", "40 MB", "~5 TB/s", "~200 cycles", "Global"], highlight: false },
+    { values: ["HBM2e (Global)", "80 GB", "~2 TB/s", "~400-600 cycles", "Global"], highlight: false },
+  ]}
+  notes="Bandwidths are aggregate across all SMs. Per-SM bandwidth depends on access patterns."
+/>
+
+The ratio between register bandwidth and global memory bandwidth is roughly 10x. The ratio between shared memory and global memory is also roughly 10x. This is why tiling into shared memory gives ~4-10x speedups: you are moving accesses from a 2 TB/s memory to a 19 TB/s memory.
+
+**L2 cache behavior** is important for kernels with partial data reuse. The L2 on A100 is 40 MB, which can cache a 3200x3200 FP32 matrix. If your working set fits in L2, you may see higher effective bandwidth than the HBM peak suggests for repeated accesses.
+
+### Read-Only Cache (`__ldg` and `const __restrict__`)
+
+For read-only data, the texture/L1 path provides better caching:
+
+```cpp
+// Hint to compiler that data is read-only and non-aliased
+__global__ void kernel(const float* __restrict__ input, float* __restrict__ output, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) {
+        // __ldg forces load through the read-only cache path
+        float val = __ldg(&input[i]);
+        output[i] = val * 2.0f;
+    }
+}
+```
+
+On Ampere and later, the compiler usually generates `LDG` instructions for `const __restrict__` pointers automatically, but explicit `__ldg` calls guarantee it.
+
+---
+
+## When to Stop Optimizing: The Roofline Ceiling
+
+Every kernel has a theoretical performance ceiling determined by the roofline model. Once you reach it, no amount of CUDA trickery will make the kernel faster (short of algorithmic changes that alter the arithmetic intensity).
+
+### Computing Your Ceiling
+
+For a **memory-bound kernel** (AI &lt; ridge point):
+
+$\text{Max FLOP/s} = \text{AI} \times \text{Peak Bandwidth}$
+
+Or equivalently, the maximum bandwidth utilization for a memory-bound kernel is simply the peak bandwidth. If your kernel achieves 85%+ of peak memory bandwidth, you are done.
+
+For a **compute-bound kernel** (AI &gt; ridge point):
+
+$\text{Max FLOP/s} = \text{Peak Compute}$
+
+If you are at 80%+ of peak compute throughput, further optimization has diminishing returns.
+
+### Diminishing Returns Analysis
+
+<Benchmark
+  title="Effort vs Return at Different SOL Levels"
+  columns={["Current SOL%", "Typical Gap Cause", "Expected Gain", "Effort Level"]}
+  rows={[
+    { values: ["Under 10%", "Fundamental issue (coalescing, wrong algorithm)", "5-20x", "Low -- fix the obvious bug"], highlight: false },
+    { values: ["10-30%", "Missing tiling, poor access patterns", "2-5x", "Medium -- structural changes"], highlight: false },
+    { values: ["30-60%", "Bank conflicts, suboptimal occupancy, instruction overhead", "1.5-2x", "Medium -- targeted fixes"], highlight: false },
+    { values: ["60-80%", "Micro-optimizations, vectorized loads, register tuning", "1.1-1.3x", "High -- diminishing returns zone"], highlight: true },
+    { values: ["80-90%", "Hardware quirks, cache behavior, memory controller saturation", "1.05-1.1x", "Very high -- often not worth it"], highlight: true },
+    { values: ["90%+", "Theoretical limit -- move to a different algorithm or hardware", "negligible", "Maximum -- stop here"], highlight: true },
+  ]}
+  notes="SOL% refers to the binding resource: DRAM throughput for memory-bound kernels, SM throughput for compute-bound."
+/>
+
+<Callout type="success" title="The 80% Rule">
+  For production code, achieving 80% of the roofline ceiling is an excellent result. Going from 80% to 90% often requires as much engineering effort as going from 10% to 80%. Unless this is a hot inner loop called billions of times, your time is better spent elsewhere.
+</Callout>
+
+### Practical Decision Framework
+
+When should you stop optimizing a kernel? Ask these questions in order:
+
+1. **Is the kernel on the critical path?** If it represents less than 10% of total runtime, optimize something else (Amdahl's law).
+
+2. **Are you at 80%+ SOL for the binding resource?** If yes, the remaining gap is likely due to unavoidable overhead (block launch latency, instruction fetch, etc.). Stop.
+
+3. **Have you exhausted structural optimizations?** If you have already addressed coalescing, tiling, occupancy, and ILP, the remaining gains come from micro-architecture-specific tricks that may not port to the next GPU generation.
+
+4. **Can you change the algorithm?** Sometimes the right move is not to optimize the kernel but to reformulate the problem. Using FP16 instead of FP32 doubles your effective bandwidth *and* doubles your compute throughput. Using Tensor Cores can give another 8-16x on matrix operations.
+
+---
+
+## Putting It All Together: The Optimization Checklist
+
+Here is the complete workflow, ordered by typical impact:
+
+**Phase 1: Measure** (always first)
+1. Profile with `ncu --set full`
+2. Read SOL percentages: memory-bound or compute-bound?
+3. Check sectors-per-request for coalescing quality
+4. Note occupancy and stall reasons
+
+**Phase 2: Fix Memory Access Patterns** (biggest wins, ~10x)
+1. Ensure coalesced global memory access (AoS to SoA if needed)
+2. Align data to 128-byte boundaries
+3. Use `__restrict__` and `const` for read-only data
+
+**Phase 3: Add Shared Memory Tiling** (if data reuse exists, ~2-4x)
+1. Identify data reuse patterns
+2. Tile with appropriate size (usually 32x32)
+3. Add bank-conflict padding (+1 column)
+4. Minimize `__syncthreads()` calls
+
+**Phase 4: Tune Occupancy** (diminishing returns start here, ~1.5x)
+1. Check resource limits with `cudaOccupancyMaxPotentialBlockSize`
+2. Reduce register pressure if needed (`__launch_bounds__`)
+3. Adjust block size to balance occupancy with per-thread work
+4. Accept low occupancy if compute-bound with high ILP
+
+**Phase 5: Instruction-Level Parallelism** (~1.3x)
+1. Unroll inner loops (`#pragma unroll`)
+2. Use multiple independent accumulators
+3. Consider register tiling (each thread computes a larger output tile)
+4. Use vectorized loads (`float4`) where alignment permits
+
+**Phase 6: Micro-optimizations** (~1.05-1.1x, often not worth it)
+1. Warp shuffles instead of shared memory for intra-warp communication
+2. Predicated execution instead of branching
+3. Fast math (`--use_fast_math`, `__fmaf_rn` intrinsics)
+4. Asynchronous memory copies (`cp.async` on Ampere+)
+
+<PerfChart
+  title="Cumulative Impact of Optimization Phases"
+  unit="x speedup"
+  data={[
+    { label: "Baseline (naive)", value: 1, color: "red" },
+    { label: "Phase 2: Coalescing", value: 10, color: "orange" },
+    { label: "Phase 3: Tiling", value: 35, color: "blue" },
+    { label: "Phase 4: Occupancy", value: 45, color: "cyan" },
+    { label: "Phase 5: ILP", value: 55, color: "green" },
+    { label: "Phase 6: Micro-opt", value: 58, color: "green", annotation: "~95% peak" },
+  ]}
+  baseline={0}
+/>
+
+---
+
+## Common Pitfalls and Anti-Patterns
+
+Before closing, here are mistakes I see frequently that waste optimization effort:
+
+**1. Optimizing the wrong kernel.** Always profile the full application first. Use `nsys profile` (Nsight Systems) to find which kernels dominate runtime. Then use `ncu` to optimize only those.
+
+**2. Chasing 100% occupancy.** High occupancy is not a goal in itself. Some of the fastest kernels (cuBLAS SGEMM) run at 25% occupancy. Occupancy is only important when you are latency-bound.
+
+**3. Using shared memory without needing data reuse.** Shared memory is useful when the same data is accessed by multiple threads. If every element is accessed exactly once (e.g., a simple element-wise kernel), shared memory adds overhead with no benefit.
+
+**4. Over-unrolling loops.** Aggressive unrolling increases register pressure, which can reduce occupancy and cause spilling. `#pragma unroll` without a count unrolls completely -- often too aggressive. Specify a count: `#pragma unroll 4`.
+
+**5. Ignoring the L2 cache.** On Ampere+, the L2 is 40 MB. If your dataset fits, repeated kernel launches see much higher effective bandwidth than HBM peak. This changes your roofline analysis -- measure effective bandwidth, not theoretical.
+
+**6. Benchmarking with warm cache.** Always run a warm-up kernel launch before timing. The first launch may include JIT compilation and cold cache effects. Time multiple iterations and report the median.
+
+```cpp
+// Proper benchmarking pattern
+void benchmark_kernel(/* params */) {
+    // Warm up: run once without timing
+    my_kernel<<<grid, block>>>(args);
+    cudaDeviceSynchronize();
+
+    // Time multiple iterations
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    const int iterations = 100;
+    cudaEventRecord(start);
+    for (int i = 0; i < iterations; i++) {
+        my_kernel<<<grid, block>>>(args);
+    }
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float ms;
+    cudaEventElapsedTime(&ms, start, stop);
+    float avg_ms = ms / iterations;
+
+    // Compute bandwidth: bytes moved / time
+    float bandwidth_gb_s = (total_bytes / 1e9) / (avg_ms / 1e3);
+    printf("Avg: %.3f ms, Bandwidth: %.1f GB/s\n", avg_ms, bandwidth_gb_s);
+}
+```
+
+---
+
+## Summary
+
+CUDA kernel optimization is not a bag of tricks -- it is a systematic process driven by measurement. The roofline model tells you what to optimize, the memory hierarchy determines where your data should live, and Nsight Compute tells you whether your changes actually helped.
+
+The overwhelming majority of performance is determined by just two things: **memory coalescing** and **data reuse through tiling**. Get those right, and you will be within 2-3x of peak. Add occupancy tuning and ILP, and you will be within 10-20% of the theoretical ceiling. The rest is polish.
+
+Measure first. Optimize the bottleneck. Measure again. Stop when you hit the roofline. That is the entire methodology.

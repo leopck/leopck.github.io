@@ -1,139 +1,652 @@
 ---
 title: "LLM Inference Fundamentals: Prefill, Decode, and the Memory-Compute Divide"
 author: "stanley-phoong"
-description: "A performance-oriented introduction to LLM inference. We break down the two-phase execution model, explain why decode is memory-bound while prefill is compute-bound, and quantify the key metrics that determine serving efficiency."
-publishDate: 2019-07-22
+description: "A performance-oriented introduction to LLM inference. We break down the two-phase execution model, explain why decode is memory-bound while prefill is compute-bound, quantify the memory footprint of modern LLMs, and explore the serving challenges that drive systems like vLLM and TensorRT-LLM."
+publishDate: 2025-03-21
 category: llm-inference
-tags: [llm, inference, performance, prefill, decode, fundamentals]
+tags: [llm, inference, performance, prefill, decode, fundamentals, kv-cache, batching, serving]
 difficulty: intermediate
-readingTime: 12
+readingTime: 30
 ---
 
 import Callout from '@/components/mdx/Callout.astro';
 import PerfChart from '@/components/mdx/PerfChart.astro';
 import Benchmark from '@/components/mdx/Benchmark.astro';
-import MemoryLayout from '@/components/mdx/MemoryLayout.astro';
 
-LLM inference looks simple from the outside -- feed in a prompt, get text back. But the performance characteristics of the two phases (prefill and decode) are fundamentally different, and understanding this difference is the foundation for every inference optimization.
+LLM inference looks simple from the outside -- feed in a prompt, get text back. Under the hood, the story is radically different from training. Training processes entire sequences in parallel with known labels. Inference must generate tokens one at a time, where each new token depends on every token before it. This autoregressive bottleneck shapes every aspect of how we design, optimize, and deploy inference systems.
 
-## Two Phases, Two Bottlenecks
+This post is the foundational reference for understanding LLM inference performance. We will cover the two-phase execution model (prefill and decode), derive the arithmetic intensity of each phase from first principles, work through detailed memory calculations for the Llama 3 family (8B, 70B, and 405B), analyze how batching transforms the compute-to-memory ratio, discuss the serving challenges that arise at scale, and ground everything in real measured numbers on A100 and H100 hardware.
 
-Every LLM inference request has two distinct phases:
+If you work on ML infrastructure, model serving, or simply want to understand why your chatbot sometimes feels slow, this is the post to start with.
 
-<MemoryLayout
-  title="LLM Inference Execution Phases"
-  description="Prefill is compute-bound (big matrix multiplies). Decode is memory-bound (loading weights for one token at a time)."
-  layout={[
-    {
-      name: "Prefill Phase",
-      power: "Process all prompt tokens in parallel",
-      state: "Compute-bound: large batch matmul. O(N^2) attention + O(N) FFN per layer.",
-      color: "#3b82f6"
-    },
-    {
-      name: "Decode Phase",
-      power: "Generate tokens one at a time, autoregressively",
-      state: "Memory-bound: load full model weights for each single-token forward pass.",
-      color: "#ef4444"
-    }
-  ]}
-/>
+---
 
-### Prefill: Compute-Bound
+## Why Inference Differs from Training
 
-During prefill, all prompt tokens are processed simultaneously. A 512-token prompt creates a 512xd_model input matrix, which flows through attention and FFN layers as large matrix multiplications. These matmuls have high arithmetic intensity and keep tensor cores busy -- prefill is **compute-bound**.
+Before diving into the mechanics of inference, it is worth understanding why inference is a fundamentally different computational problem from training -- even though both execute the same neural network architecture.
 
-### Decode: Memory-Bound
+### Training: Full Parallelism
 
-During decode, you generate one token per step. Each step requires loading the entire model's weights from HBM to compute a single output token. For a 7B parameter model in FP16 (14 GB), generating one token requires reading 14 GB of weights for a few thousand FLOPs of actual computation. This is absurdly memory-bound -- arithmetic intensity is near zero.
+During training, we have the complete input-output sequence available upfront. A training step for a batch of sequences works like this:
 
-<Benchmark
-  title="Prefill vs Decode Characteristics (Llama-7B, A100-80GB)"
-  columns={["Metric", "Prefill (512 tokens)", "Decode (1 token)", "Ratio"]}
-  rows={[
-    { values: ["Input batch dimension", "512 tokens", "1 token", "512x"], highlight: false },
-    { values: ["Compute (FLOPS)", "~3.5 TFLOP", "~7 GFLOP", "500x"], highlight: true },
-    { values: ["Weight reads", "14 GB (once)", "14 GB (every step)", "Same per step"], highlight: true },
-    { values: ["Arithmetic intensity", "~250 FLOP/byte", "~0.5 FLOP/byte", "500x"], highlight: true },
-    { values: ["Bound", "Compute", "Memory bandwidth", "--"], highlight: false },
-    { values: ["Time", "~12 ms", "~7 ms per token", "--"], highlight: false },
-  ]}
-/>
+1. **Forward pass**: Process all tokens in every sequence simultaneously. For a batch of $B$ sequences each of length $S$, the input to each transformer layer is a matrix of shape $[B \times S, d_{model}]$. The matrix multiplications are large and keep GPU compute units fully occupied.
+2. **Loss computation**: Compare predicted tokens against ground-truth labels (which we already know) across all positions.
+3. **Backward pass**: Compute gradients through the full computational graph. The backward pass involves the same large matrix multiplications as the forward pass, roughly doubling the total compute.
+4. **Optimizer step**: Update all parameters using the computed gradients.
 
-<Callout type="perf" title="The Fundamental Insight">
-  Decode speed is limited by how fast you can read model weights from HBM, not by how fast you can compute. An A100 with 2 TB/s bandwidth reading a 14 GB model takes ~7 ms per token -- regardless of how many FLOPS the chip can do. This is why batching matters: serving 16 requests simultaneously reads weights once for 16 tokens' worth of computation.
+The critical insight is that training sees the entire sequence at once. There is no sequential dependency between generating token $t$ and token $t+1$ because we already have the ground truth for both. This means training is embarrassingly parallel across the sequence dimension, and the matrix multiplications are enormous -- exactly what GPUs are designed for.
+
+### Inference: The Autoregressive Bottleneck
+
+Inference is fundamentally sequential in the output dimension. To generate token $t+1$, the model must:
+
+1. Have already generated token $t$ (and all tokens before it).
+2. Run a full forward pass through all layers to produce a probability distribution over the vocabulary.
+3. Sample or select token $t+1$ from that distribution.
+4. Feed token $t+1$ back as input and repeat.
+
+This means we cannot generate the 50th output token until we have generated the first 49. Each forward pass during generation processes only a single new token (or, in speculative decoding, a small handful). The matrix multiplications shrink from $[B \times S, d_{model}] \times [d_{model}, d_{ff}]$ during training to $[B \times 1, d_{model}] \times [d_{model}, d_{ff}]$ during generation -- the input dimension collapses from $S$ (potentially thousands) down to $1$.
+
+This is the autoregressive bottleneck. It means that during token generation, GPU compute units sit largely idle while the chip spends most of its time simply reading model weights from memory. The problem is not a lack of compute power; it is a lack of enough work to do per byte of data loaded.
+
+<Callout type="perf" title="The Core Asymmetry">
+  Training is compute-bound: large matrix multiplications keep tensor cores busy. Inference generation is memory-bandwidth-bound: the model weights must be read from HBM for every single output token, but each token only requires a tiny amount of arithmetic per weight loaded. This asymmetry is the single most important fact in LLM inference.
 </Callout>
 
-## Key Performance Metrics
+### The Roofline Perspective
+
+The roofline model provides a clean framework for understanding this. A GPU has two ceilings: peak compute (measured in FLOPS) and peak memory bandwidth (measured in bytes/second). The ratio of these gives the **ridge point** -- the arithmetic intensity (FLOP/byte) at which a workload transitions from memory-bound to compute-bound.
+
+For an NVIDIA A100 SXM:
+- Peak FP16 tensor core compute: $312$ TFLOPS
+- Peak HBM bandwidth: $2.0$ TB/s
+- Ridge point: $312 / 2.0 = 156$ FLOP/byte
+
+For an NVIDIA H100 SXM:
+- Peak FP16 tensor core compute: $989$ TFLOPS
+- Peak HBM bandwidth: $3.35$ TB/s
+- Ridge point: $989 / 3.35 = 295$ FLOP/byte
+
+Any operation with arithmetic intensity below the ridge point is memory-bandwidth-bound. Any operation above it is compute-bound. As we will see, decode sits far below the ridge point, while prefill (with sufficiently long prompts) sits above it.
+
+---
+
+## Prefill vs Decode: Two Phases, Two Bottlenecks
+
+Every LLM inference request proceeds through two distinct phases that have opposite performance characteristics.
+
+### Phase 1: Prefill (Prompt Processing)
+
+During prefill, all input prompt tokens are processed simultaneously in a single forward pass. If the prompt has $P$ tokens, the input to each transformer layer is a matrix of shape $[P, d_{model}]$. This flows through:
+
+1. **Self-attention**: Query, key, and value projections are matrix multiplications of shape $[P, d_{model}] \times [d_{model}, d_{model}]$, producing $O(P \times d_{model}^2)$ FLOPs per projection (three projections plus the output projection). The attention score computation is $[P, d_{head}] \times [d_{head}, P]$ per head, which is $O(P^2 \times d_{head})$ per head.
+2. **Feed-forward network (FFN)**: Two (or three, for SwiGLU) matrix multiplications of shape $[P, d_{model}] \times [d_{model}, d_{ff}]$, producing $O(P \times d_{model} \times d_{ff})$ FLOPs each.
+
+The key observation is that $P$ appears as a dimension of the input matrix. When $P = 512$ or $P = 2048$, these are large GEMMs (general matrix multiplications) with high arithmetic intensity. The GPU's tensor cores are fully utilized.
+
+**Arithmetic intensity of prefill (FFN layer):**
+
+Consider a single FFN weight matrix of shape $[d_{model}, d_{ff}]$. The input is $[P, d_{model}]$.
+
+- Bytes loaded: $d_{model} \times d_{ff} \times 2$ bytes (FP16 weights) $+ P \times d_{model} \times 2$ bytes (input activations). For large $d_{ff}$, the weight matrix dominates.
+- FLOPs: $2 \times P \times d_{model} \times d_{ff}$ (multiply-accumulate).
+- Arithmetic intensity: approximately $\frac{2 \times P \times d_{model} \times d_{ff}}{d_{model} \times d_{ff} \times 2} = P$ FLOP/byte.
+
+For a prompt of $P = 512$ tokens, arithmetic intensity is $\sim 512$ FLOP/byte -- well above the ridge point of both A100 ($156$) and H100 ($295$). **Prefill is compute-bound.**
+
+In practice, prefill speed scales roughly linearly with prompt length (twice the prompt takes roughly twice as long, because there is twice the compute to do) until the prompt is so short that the operation falls below the ridge point.
+
+### Phase 2: Decode (Token Generation)
+
+During decode, each forward pass processes a single new token. The input to each layer is a vector of shape $[1, d_{model}]$. This changes the computational profile dramatically:
+
+1. **Self-attention**: The QKV projections become matrix-vector multiplications: $[1, d_{model}] \times [d_{model}, d_{model}]$. The attention computation reads the entire KV cache (all previous keys and values) but only produces one new query.
+2. **FFN**: The multiplications become $[1, d_{model}] \times [d_{model}, d_{ff}]$ -- again, matrix-vector products.
+
+**Arithmetic intensity of decode (FFN layer):**
+
+Same weight matrix $[d_{model}, d_{ff}]$, but now the input is $[1, d_{model}]$:
+
+- Bytes loaded: $d_{model} \times d_{ff} \times 2$ bytes (weights still fully loaded).
+- FLOPs: $2 \times 1 \times d_{model} \times d_{ff}$.
+- Arithmetic intensity: $\frac{2 \times d_{model} \times d_{ff}}{d_{model} \times d_{ff} \times 2} = 1$ FLOP/byte.
+
+An arithmetic intensity of $1$ FLOP/byte is catastrophically below the ridge point. The GPU's tensor cores are idle more than $99\%$ of the time during single-request decode. **Decode is memory-bandwidth-bound.**
 
 <Benchmark
-  title="LLM Inference Metrics"
-  columns={["Metric", "Definition", "Typical Range", "Optimization Lever"]}
+  title="Prefill vs Decode: Arithmetic Intensity Comparison"
+  columns={["Property", "Prefill (P=512)", "Decode (B=1)", "Ratio"]}
   rows={[
-    { values: ["Time to First Token (TTFT)", "Latency from request to first output token", "10-500 ms", "Prefill speed, queue depth"], highlight: true },
-    { values: ["Inter-Token Latency (ITL)", "Time between consecutive output tokens", "5-50 ms", "Decode speed, batch size"], highlight: true },
-    { values: ["Throughput (tok/s)", "Total tokens generated per second (all requests)", "100-10000", "Batch size, GPU utilization"], highlight: false },
-    { values: ["Time Per Output Token (TPOT)", "Average time per output token per request", "5-100 ms", "Model size, quantization"], highlight: false },
+    { values: ["Input shape to FFN", "[512, d_model]", "[1, d_model]", "512x"], highlight: false },
+    { values: ["FLOPs (per FFN matrix)", "2 * 512 * d * d_ff", "2 * 1 * d * d_ff", "512x"], highlight: true },
+    { values: ["Bytes loaded (weights)", "d * d_ff * 2", "d * d_ff * 2", "1x (same!)"], highlight: true },
+    { values: ["Arithmetic intensity", "~512 FLOP/byte", "~1 FLOP/byte", "512x"], highlight: true },
+    { values: ["Bottleneck", "Compute (tensor cores)", "Memory bandwidth (HBM)", "--"], highlight: false },
+    { values: ["A100 utilization (FP16)", "70-90%", "less than 1%", "--"], highlight: false },
   ]}
 />
 
-TTFT is dominated by prefill time (proportional to prompt length). ITL is dominated by decode time (proportional to model size / memory bandwidth). These two metrics often conflict: larger batch sizes improve throughput but increase both TTFT (queueing) and ITL (shared bandwidth).
+This table reveals the fundamental tragedy of LLM decode: you must read the entire model's weights from memory for every single output token, but each token only does a trivial amount of arithmetic with those weights. The hardware is designed for workloads at $\gt 150$ FLOP/byte, and decode delivers $\sim 1$ FLOP/byte.
 
-## Memory Layout
+### The KV Cache: Avoiding Redundant Computation
 
-Understanding where memory goes is critical for capacity planning:
+There is one crucial optimization that makes autoregressive generation practical at all: the **KV cache**. Without it, generating token $t$ would require recomputing attention over all $t-1$ previous tokens from scratch -- meaning the cost of generating a sequence of length $T$ would be $O(T^2)$ in the sequence dimension (and $O(T^3)$ total when accounting for the $O(T)$ attention computation at each step).
+
+The KV cache stores the key and value vectors computed during previous forward passes. When generating token $t$, we only need to:
+
+1. Compute the new query, key, and value for the current token.
+2. Append the new key and value to the cache.
+3. Compute attention between the single new query and all $t$ cached keys/values.
+
+This reduces the cost from $O(T^2)$ per step to $O(T)$ per step -- a critical optimization. But it comes at the cost of memory: the KV cache grows linearly with sequence length and must be stored in GPU memory. As we will see, this memory pressure becomes the dominant constraint at scale.
+
+---
+
+## Memory Math: Llama 3 Family
+
+Let us work through the memory requirements for the three sizes in the Llama 3 family: 8B, 70B, and 405B. Understanding these numbers is essential for capacity planning.
+
+### Model Weights
+
+The memory required for model weights depends on the number of parameters and the precision:
+
+- **FP16/BF16**: 2 bytes per parameter
+- **INT8**: 1 byte per parameter
+- **INT4**: 0.5 bytes per parameter
+
+<Benchmark
+  title="Llama 3 Model Weight Memory"
+  columns={["Model", "Parameters", "FP16 (GB)", "INT8 (GB)", "INT4 (GB)", "Min GPUs (FP16, 80GB)"]}
+  rows={[
+    { values: ["Llama 3 8B", "8.03B", "16.1", "8.0", "4.0", "1"], highlight: false },
+    { values: ["Llama 3 70B", "70.6B", "141.2", "70.6", "35.3", "2"], highlight: true },
+    { values: ["Llama 3 405B", "405.1B", "810.2", "405.1", "202.6", "11"], highlight: true },
+  ]}
+/>
+
+Just the weights for Llama 3 405B in FP16 require over 810 GB -- more than 10 A100-80GB GPUs just to hold the parameters with zero room for anything else. This is why quantization and model parallelism are not optional at this scale; they are mandatory.
+
+### KV Cache Memory
+
+The KV cache is where things get interesting -- and where most practitioners underestimate memory requirements. The KV cache stores key and value vectors for every layer, every head, and every token in every active request.
+
+**Per-token KV cache size:**
+
+$$\text{KV per token} = 2 \times n_{layers} \times n_{kv\_heads} \times d_{head} \times \text{bytes\_per\_element}$$
+
+The factor of $2$ accounts for both keys and values. Note that Llama 3 uses **Grouped Query Attention (GQA)**, where the number of KV heads ($n_{kv\_heads}$) is smaller than the number of query heads ($n_{q\_heads}$). This is specifically designed to reduce KV cache size.
+
+Let us compute for each model:
+
+**Llama 3 8B**: $n_{layers} = 32$, $n_{kv\_heads} = 8$ (GQA with 4:1 ratio from 32 query heads), $d_{head} = 128$
+
+$$\text{KV per token} = 2 \times 32 \times 8 \times 128 \times 2 = 131{,}072 \text{ bytes} = 0.125 \text{ MB}$$
+
+**Llama 3 70B**: $n_{layers} = 80$, $n_{kv\_heads} = 8$ (GQA with 8:1 ratio from 64 query heads), $d_{head} = 128$
+
+$$\text{KV per token} = 2 \times 80 \times 8 \times 128 \times 2 = 327{,}680 \text{ bytes} = 0.3125 \text{ MB}$$
+
+**Llama 3 405B**: $n_{layers} = 126$, $n_{kv\_heads} = 8$ (GQA with 16:1 ratio from 128 query heads), $d_{head} = 128$
+
+$$\text{KV per token} = 2 \times 126 \times 8 \times 128 \times 2 = 516{,}096 \text{ bytes} \approx 0.49 \text{ MB}$$
+
+Now let us scale this to realistic serving scenarios. A single request with a context length of $4{,}096$ tokens:
+
+<Benchmark
+  title="KV Cache Memory Per Request (context = 4,096 tokens, FP16)"
+  columns={["Model", "KV/token (MB)", "KV/request (GB)", "Model weights (GB)", "KV as % of weights"]}
+  rows={[
+    { values: ["Llama 3 8B", "0.125", "0.5", "16.1", "3.1%"], highlight: false },
+    { values: ["Llama 3 70B", "0.3125", "1.25", "141.2", "0.9%"], highlight: false },
+    { values: ["Llama 3 405B", "0.49", "1.96", "810.2", "0.2%"], highlight: false },
+  ]}
+/>
+
+At one request with 4K context, the KV cache is modest. But serving is not about one request -- it is about hundreds or thousands of concurrent requests.
+
+<Benchmark
+  title="KV Cache Memory at Scale (context = 4,096 tokens, FP16)"
+  columns={["Model", "Batch=1", "Batch=32", "Batch=128", "Batch=256"]}
+  rows={[
+    { values: ["Llama 3 8B", "0.5 GB", "16 GB", "64 GB", "128 GB"], highlight: false },
+    { values: ["Llama 3 70B", "1.25 GB", "40 GB", "160 GB", "320 GB"], highlight: true },
+    { values: ["Llama 3 405B", "1.96 GB", "62.7 GB", "250.9 GB", "501.8 GB"], highlight: true },
+  ]}
+/>
+
+<Callout type="warning" title="KV Cache Dominates at Scale">
+  For Llama 3 8B at batch=128 with 4K context, the KV cache requires 64 GB -- four times the 16 GB model weights. For Llama 3 70B at the same batch size, the KV cache requires 160 GB, exceeding the model weights (141 GB). At production batch sizes, the KV cache is the dominant memory consumer, not the model weights. This is why KV cache optimization (GQA, quantization, paged attention) is the most impactful area for serving efficiency.
+</Callout>
+
+With longer context lengths (32K, 128K, or the 128K context window that Llama 3 supports), the numbers become even more extreme. At 128K context with batch=32, Llama 3 8B would need $0.125 \times 131{,}072 \times 32 = 512$ GB of KV cache alone -- an impossible number for a single GPU. This is why long-context serving requires aggressive KV cache compression techniques like quantization to INT8 or INT4, sliding window attention, or offloading to CPU memory.
+
+### Activation Memory
+
+Activation memory is the working memory used during a forward pass to store intermediate results. Unlike model weights (which are constant) and the KV cache (which grows with sequence length), activation memory is proportional to the batch size and sequence length of the current forward pass.
+
+During **prefill**, activation memory can be significant because the full prompt is processed at once. The dominant terms are:
+
+- Attention scores: $O(B \times n_{heads} \times P^2)$ without FlashAttention, or $O(B \times n_{heads} \times P)$ with FlashAttention (which computes attention in tiles and does not materialize the full attention matrix).
+- Layer intermediate outputs: $O(B \times P \times d_{ff})$ per layer.
+
+For Llama 3 8B with $B=1$, $P=4096$: without FlashAttention, the attention matrix alone would be $32 \times 4096^2 \times 2$ bytes $= 1$ GB per layer, times 32 layers $= 32$ GB. With FlashAttention, this drops to a few hundred MB total. FlashAttention is not optional for long-context inference.
+
+During **decode**, activation memory is negligible because we process only one token per step. The intermediate tensors are tiny vectors rather than large matrices.
+
+### Total Memory Budget
+
+Let us put it all together for a concrete deployment scenario: Llama 3 70B on 2x A100-80GB (160 GB total) with FP16 weights, serving batch=32 at 4K context.
 
 <PerfChart
-  title="GPU Memory Breakdown (Llama-7B, A100-80GB, batch=16, seq=2048)"
+  title="GPU Memory Breakdown: Llama 3 70B on 2x A100-80GB (batch=32, 4K context)"
   unit="GB"
   data={[
-    { label: "Model weights (FP16)", value: 14, color: "blue" },
-    { label: "KV cache (16 requests)", value: 16, color: "red", annotation: "Grows with batch x seq_len" },
-    { label: "Activations", value: 3, color: "orange" },
-    { label: "CUDA overhead", value: 2, color: "gray" },
-    { label: "Available headroom", value: 45, color: "green" },
+    { label: "Model weights (FP16)", value: 141, color: "blue" },
+    { label: "KV cache (32 reqs x 4K)", value: 40, color: "red", annotation: "Grows with batch x seq_len" },
+    { label: "Activations + workspace", value: 4, color: "orange" },
+    { label: "CUDA context + overhead", value: 4, color: "gray" },
+    { label: "Remaining headroom", value: -29, color: "purple", annotation: "OVER BUDGET by 29 GB!" },
   ]}
 />
 
-At batch=16, KV cache already exceeds model weights. At batch=64, KV cache would consume 64 GB -- nearly the entire GPU. This is why KV cache optimization (quantization, paging, GQA) is the most impactful area for serving efficiency.
+We are 29 GB over budget! The solution space includes:
 
-## The Batch Size Throughput Curve
+1. **Quantize weights to INT8**: reduces weights from 141 GB to 70.6 GB, freeing 70 GB. Total becomes 119 GB -- fits with headroom.
+2. **Quantize KV cache to INT8**: reduces KV from 40 GB to 20 GB.
+3. **Reduce batch size**: batch=16 halves KV cache to 20 GB, total becomes 169 GB... still tight.
+4. **Add more GPUs**: 4x A100 gives 320 GB but increases communication overhead.
+
+In practice, production deployments use a combination of INT8 or INT4 weight quantization, INT8 KV cache quantization, and enough GPUs to provide headroom for burst traffic. The memory budget is always the binding constraint.
+
+---
+
+## Batch Size Effects: How Batching Changes Everything
+
+Batching is the single most important lever in LLM inference performance. It transforms decode from a catastrophically underutilized operation into something approaching reasonable GPU utilization.
+
+### The Mechanics of Batched Decode
+
+When we batch $B$ decode requests together, the forward pass processes $B$ tokens simultaneously. The FFN computation changes from a matrix-vector product to a matrix-matrix product:
+
+- **Unbatched**: $[1, d_{model}] \times [d_{model}, d_{ff}]$ -- matrix-vector
+- **Batched (B)**: $[B, d_{model}] \times [d_{model}, d_{ff}]$ -- matrix-matrix (small GEMM)
+
+The weight matrix $[d_{model}, d_{ff}]$ is loaded once from HBM regardless of batch size. But with batch size $B$, we perform $B$ times more FLOPs with that single read.
+
+**Arithmetic intensity of batched decode:**
+
+$$\text{Arithmetic intensity} = \frac{2 \times B \times d_{model} \times d_{ff}}{d_{model} \times d_{ff} \times 2} = B \text{ FLOP/byte}$$
+
+At $B=1$: $1$ FLOP/byte (memory-bound).
+At $B=32$: $32$ FLOP/byte (still memory-bound on A100, but much better).
+At $B=156$: $156$ FLOP/byte (at the ridge point for A100 -- balanced).
+At $B=295$: $295$ FLOP/byte (at the ridge point for H100 -- balanced).
+At $B \gt 295$: Compute-bound on H100 -- tensor cores become the bottleneck.
 
 <PerfChart
-  title="Decode Throughput vs Batch Size (Llama-7B, A100)"
-  unit="tok/s"
+  title="Arithmetic Intensity vs Batch Size During Decode"
+  unit="FLOP/byte"
   data={[
-    { label: "Batch 1", value: 45, color: "red", annotation: "Memory-latency bound" },
-    { label: "Batch 4", value: 160, color: "orange" },
-    { label: "Batch 8", value: 290, color: "blue" },
-    { label: "Batch 16", value: 480, color: "blue" },
-    { label: "Batch 32", value: 640, color: "green", annotation: "Approaching BW limit" },
-    { label: "Batch 64", value: 720, color: "green", annotation: "Saturated" },
+    { label: "B=1", value: 1, color: "red", annotation: "Catastrophically memory-bound" },
+    { label: "B=8", value: 8, color: "red" },
+    { label: "B=32", value: 32, color: "orange" },
+    { label: "B=64", value: 64, color: "orange" },
+    { label: "B=128", value: 128, color: "blue" },
+    { label: "B=156", value: 156, color: "green", annotation: "A100 ridge point" },
+    { label: "B=295", value: 295, color: "green", annotation: "H100 ridge point" },
   ]}
 />
 
-Throughput scales nearly linearly with batch size until memory bandwidth saturates. At batch=1, the GPU reads 14 GB of weights for 1 token. At batch=32, it reads the same 14 GB for 32 tokens -- 32x better utilization. Beyond batch=64, HBM bandwidth is fully utilized and adding more requests just increases latency.
+### Throughput vs Latency Tradeoff
 
-## Optimization Hierarchy
+Increasing batch size improves **throughput** (total tokens generated per second across all requests) but degrades **per-request latency** (time for an individual token). Here is why:
+
+- **Throughput**: Weight reads are amortized across $B$ requests. Total throughput scales roughly linearly with $B$ until we hit the compute ceiling or run out of memory.
+- **Latency**: With larger batches, each forward pass takes longer because there is more compute to do. The KV cache also grows, making the attention computation slower. For a single user, their tokens come slower.
+
+This is the fundamental tension in LLM serving: **maximizing throughput for the provider vs minimizing latency for the user**.
 
 <Benchmark
-  title="Inference Optimization Priority (by impact)"
-  columns={["Optimization", "Phase Affected", "Typical Speedup", "Complexity"]}
+  title="Batch Size Impact on Throughput and Latency (Llama 3 8B, A100-80GB, FP16)"
+  columns={["Batch Size", "Throughput (tok/s)", "Per-Request Latency (ms/tok)", "GPU Compute Util", "KV Cache (GB, 2K ctx)"]}
   rows={[
-    { values: ["Batching (1-over 32)", "Decode", "10-15x", "Low"], highlight: true },
-    { values: ["KV cache quantization (FP16->INT8)", "Decode", "1.5-2x (via larger batch)", "Low"], highlight: true },
-    { values: ["Weight quantization (FP16->INT4)", "Both", "1.5-2x", "Medium"], highlight: false },
-    { values: ["FlashAttention", "Prefill", "2-4x", "Medium"], highlight: true },
-    { values: ["Continuous batching", "Decode", "2-3x throughput", "Medium"], highlight: true },
-    { values: ["Speculative decoding", "Decode", "1.5-2.5x", "High"], highlight: false },
-    { values: ["Tensor parallelism", "Both", "~Nx (N GPUs)", "High"], highlight: false },
+    { values: ["1", "~140", "~7", "less than 1%", "0.25"], highlight: false },
+    { values: ["4", "~540", "~7.4", "~3%", "1.0"], highlight: false },
+    { values: ["16", "~2,000", "~8", "~10%", "4.0"], highlight: true },
+    { values: ["32", "~3,600", "~8.9", "~20%", "8.0"], highlight: true },
+    { values: ["64", "~5,800", "~11", "~40%", "16.0"], highlight: true },
+    { values: ["128", "~7,200", "~17.8", "~75%", "32.0"], highlight: false },
+    { values: ["256", "~7,800", "~32.8", "~95%", "64.0"], highlight: false },
   ]}
 />
 
-<Callout type="tip" title="Where to Start">
-  If you're optimizing LLM inference, start with batching (biggest single improvement), then FlashAttention (prefill), then KV cache quantization (decode throughput via larger batches). These three cover 80% of achievable gains with modest engineering effort.
+Several things to notice:
+
+1. **Throughput scales almost linearly** from batch 1 to batch 64, then starts to plateau as compute utilization approaches the ceiling.
+2. **Per-request latency stays relatively flat** up to batch 32 (the operation is still memory-bound, so adding work is "free"), then starts rising as we approach the compute ridge point.
+3. **KV cache memory scales linearly** with batch size -- at batch 256, it is 64 GB, consuming most of the A100's memory.
+4. The "sweet spot" for serving is typically in the range of batch 32-64, where throughput is high but latency is still acceptable and KV cache has not consumed all memory.
+
+### The Memory Wall
+
+The maximum achievable batch size is constrained by GPU memory:
+
+$$B_{max} = \frac{\text{GPU memory} - \text{weights} - \text{overhead}}{\text{KV per request}}$$
+
+For Llama 3 8B on A100-80GB with FP16 weights and 4K context:
+
+$$B_{max} = \frac{80 - 16.1 - 4}{0.5} = \frac{59.9}{0.5} = 119$$
+
+For Llama 3 70B on 2x A100-80GB with FP16 weights and 4K context:
+
+$$B_{max} = \frac{160 - 141.2 - 6}{1.25} = \frac{12.8}{1.25} = 10$$
+
+Only 10 concurrent requests! This is why weight quantization is so important for larger models -- it frees memory for KV cache, enabling larger batch sizes, which improves throughput. With INT8 weights (70.6 GB), the budget becomes:
+
+$$B_{max} = \frac{160 - 70.6 - 6}{1.25} = \frac{83.4}{1.25} = 66$$
+
+Quantizing weights from FP16 to INT8 increased max batch size from 10 to 66 -- a $6.6\times$ improvement in maximum throughput, just from weight quantization. This is why quantization is listed as a serving optimization, not just a model compression technique.
+
+<Callout type="tip" title="Quantization is a Serving Optimization">
+  Weight quantization is not just about making models smaller. In a serving context, its primary benefit is freeing GPU memory for KV cache, which enables larger batch sizes, which dramatically improves throughput. Reducing Llama 3 70B from FP16 to INT4 weights frees ~106 GB across 2 GPUs -- enough for ~85 additional concurrent 4K-context requests.
 </Callout>
+
+---
+
+## The Serving Problem
+
+Moving from a single inference request to a production serving system introduces a cascade of new challenges. Naive inference wastes enormous amounts of GPU resources, and the key innovations in LLM serving are all about closing this efficiency gap.
+
+### Why Naive Inference Wastes GPU
+
+Consider a naive serving setup: a queue of requests, processed one at a time. Each request goes through prefill, then generates tokens until completion (or max length), then the next request starts.
+
+The problems are severe:
+
+1. **Zero batching during decode**: Each decode step reads the full model weights for a single token. On A100, this means $\lt 1\%$ compute utilization during generation -- the most expensive hardware in the world is sitting idle.
+
+2. **Wasted prefill capacity**: While one request is decoding, the GPU could be prefilling new requests (prefill is compute-bound and decode is memory-bound -- they use different resources). But naive sequential processing cannot overlap them.
+
+3. **Variable request lengths**: Requests have different prompt lengths and generate different numbers of output tokens. With static batching, the entire batch waits for the longest request to finish. If one request generates 10 tokens and another generates 500, the GPU is idle for $98\%$ of the time after the short request finishes.
+
+4. **Memory fragmentation**: Different requests occupy different amounts of KV cache memory. As requests arrive and complete, the KV cache develops holes -- allocated but unused memory regions that cannot be reclaimed for new requests.
+
+### Static Batching: The First Improvement
+
+The simplest optimization is to batch multiple requests together: collect $B$ requests, prefill them all, then decode them all simultaneously. This improves throughput proportionally to the batch size (as discussed above).
+
+But static batching has a critical flaw: **all requests in a batch must start and end together.** When the first request in a batch finishes generating, its slot sits empty until the entire batch completes. In practice, output lengths vary widely (some responses are 20 tokens, others are 2,000), so the average utilization of a static batch can be as low as $40\%$-$60\%$.
+
+### Continuous Batching: The Key Innovation
+
+**Continuous batching** (also called **iteration-level scheduling** or **inflight batching**) solves this by making scheduling decisions at each decode step rather than at the batch level.
+
+The core idea:
+
+1. After each decode iteration, check if any requests in the batch have finished (hit EOS token or max length).
+2. If so, immediately evict them and insert waiting requests from the queue.
+3. The new requests go through prefill (which can be interleaved or chunked) and then join the decode batch.
+
+This means the batch stays full continuously -- as soon as one request finishes, another takes its place. Utilization jumps from $40\%$-$60\%$ to $85\%$-$95\%$ or higher.
+
+The engineering challenge is managing the KV cache for a dynamically changing set of requests. When a request finishes and a new one starts, the new request's KV cache must be allocated and the old one freed, without fragmenting the contiguous memory blocks that GPU kernels require.
+
+### Paged Attention and KV Cache Management
+
+**PagedAttention**, introduced by the vLLM system, applies the operating system concept of virtual memory paging to KV cache management. Instead of allocating a contiguous block of memory for each request's KV cache (which leads to internal fragmentation when requests have variable lengths), PagedAttention:
+
+1. Divides KV cache memory into fixed-size **blocks** (analogous to memory pages).
+2. Maintains a **block table** mapping each request's logical KV positions to physical memory blocks.
+3. Allocates blocks on demand as sequences grow, and frees them immediately when sequences complete.
+
+This eliminates nearly all internal fragmentation and enables near-optimal memory utilization. In practice, PagedAttention increases the effective KV cache capacity by $2\times$-$4\times$ compared to contiguous allocation, enabling proportionally larger batch sizes.
+
+The tradeoff is a small overhead from the indirection (looking up block tables during attention computation), but this is negligible compared to the throughput gains from better memory utilization.
+
+<Benchmark
+  title="Serving Strategy Comparison (Llama 3 8B, A100, mixed workload)"
+  columns={["Strategy", "Avg Throughput (tok/s)", "GPU Utilization", "Memory Waste", "Scheduling Overhead"]}
+  rows={[
+    { values: ["Sequential (B=1)", "140", "less than 1%", "None", "None"], highlight: false },
+    { values: ["Static batching (B=32)", "3,600", "~20%", "30-50%", "Low"], highlight: false },
+    { values: ["Continuous batching (B=32)", "5,400", "~30%", "10-20%", "Medium"], highlight: true },
+    { values: ["Continuous + PagedAttention", "7,000", "~45%", "less than 5%", "Medium"], highlight: true },
+    { values: ["+ Chunked prefill + overlap", "8,500", "~55%", "less than 5%", "High"], highlight: true },
+  ]}
+/>
+
+### Chunked Prefill and Prefill-Decode Overlap
+
+Another important serving optimization is **chunked prefill**: instead of processing the entire prompt in a single forward pass (which can cause latency spikes for long prompts), split the prompt into chunks and process each chunk in a separate iteration. This allows:
+
+1. **Interleaving with decode**: While processing a chunk of a new request's prompt, the decode tokens from existing requests can be included in the same forward pass. This prevents prefill from stalling ongoing decode requests.
+2. **Bounded latency**: No single iteration takes longer than a fixed time (determined by chunk size), making TTFT more predictable.
+3. **Better GPU utilization**: Each iteration has a mix of prefill tokens (compute-heavy) and decode tokens (memory-heavy), which better utilizes both compute and memory bandwidth simultaneously.
+
+The optimal chunk size balances prefill throughput (larger chunks = fewer overheads) against decode latency (larger chunks = longer iterations that delay decode tokens). Typical chunk sizes are 256-1024 tokens.
+
+### Request Scheduling and Preemption
+
+In a production system with limited GPU memory, sometimes accepting a new request requires evicting (preempting) a partially completed request. The evicted request's KV cache can be:
+
+1. **Dropped**: The request is re-queued and must restart from scratch (re-prefill). Simple but wasteful.
+2. **Swapped to CPU memory**: The KV cache is copied to CPU RAM (much larger but slower). When GPU memory becomes available, the cache is swapped back and decode resumes. This preserves work but adds swap latency.
+3. **Recomputed on demand**: A hybrid approach where the prompt portion of the KV cache is recomputed (via prefill) but only on the portions needed for resuming generation.
+
+Modern serving systems like vLLM, TensorRT-LLM, and SGLang implement sophisticated scheduling policies that balance throughput, latency, and fairness across concurrent requests.
+
+<Callout type="perf" title="The Serving Stack">
+  A modern LLM serving system combines multiple techniques: continuous batching for utilization, PagedAttention for memory efficiency, chunked prefill for latency predictability, weight quantization for capacity, and KV cache quantization for batch size. Each technique addresses a different bottleneck, and they are multiplicatively beneficial. This is why frameworks like vLLM, TensorRT-LLM, and SGLang exist -- the engineering surface area is enormous.
+</Callout>
+
+---
+
+## Real Numbers: Latency and Throughput on A100 and H100
+
+Theory is essential, but numbers are what matter for production decisions. The following benchmarks represent typical performance numbers for popular models on A100-80GB SXM and H100-80GB SXM GPUs, measured with optimized serving frameworks (vLLM, TensorRT-LLM) under realistic conditions. All numbers are approximate and vary with framework version, driver version, quantization calibration, and workload characteristics.
+
+### Hardware Comparison
+
+<Benchmark
+  title="A100 vs H100 SXM Specifications (Relevant to Inference)"
+  columns={["Specification", "A100 SXM", "H100 SXM", "H100/A100 Ratio"]}
+  rows={[
+    { values: ["HBM capacity", "80 GB (HBM2e)", "80 GB (HBM3)", "1.0x"], highlight: false },
+    { values: ["HBM bandwidth", "2.0 TB/s", "3.35 TB/s", "1.67x"], highlight: true },
+    { values: ["FP16 tensor TFLOPS", "312", "989", "3.17x"], highlight: true },
+    { values: ["INT8 tensor TOPS", "624", "1,978", "3.17x"], highlight: false },
+    { values: ["FP8 tensor TFLOPS", "N/A", "1,978", "N/A"], highlight: true },
+    { values: ["Ridge point (FP16)", "156 FLOP/byte", "295 FLOP/byte", "1.89x"], highlight: false },
+    { values: ["NVLink bandwidth (per GPU)", "600 GB/s", "900 GB/s", "1.5x"], highlight: false },
+    { values: ["TDP", "400W", "700W", "1.75x"], highlight: false },
+  ]}
+/>
+
+For memory-bound operations (decode), the H100's advantage is primarily from its $1.67\times$ higher memory bandwidth. For compute-bound operations (prefill), the advantage is $3.17\times$ (FP16) or even higher with FP8.
+
+### Llama 3 8B: Single GPU Performance
+
+<Benchmark
+  title="Llama 3 8B Inference Performance (Single GPU, 2K input / 512 output tokens)"
+  columns={["Metric", "A100 FP16", "A100 INT8", "H100 FP16", "H100 FP8"]}
+  rows={[
+    { values: ["TTFT (B=1)", "~45 ms", "~35 ms", "~18 ms", "~12 ms"], highlight: false },
+    { values: ["ITL (B=1)", "~7.1 ms", "~5.8 ms", "~4.2 ms", "~3.5 ms"], highlight: true },
+    { values: ["Decode tok/s (B=1)", "~140", "~172", "~238", "~286"], highlight: false },
+    { values: ["Decode tok/s (B=32)", "~3,600", "~4,200", "~6,100", "~7,800"], highlight: true },
+    { values: ["Decode tok/s (B=64)", "~5,800", "~7,000", "~9,800", "~13,500"], highlight: true },
+    { values: ["Max batch (4K ctx)", "~120", "~200", "~120", "~240"], highlight: false },
+  ]}
+/>
+
+Key observations for the 8B model:
+
+- At batch=1, throughput is determined almost entirely by memory bandwidth. The H100's $1.67\times$ bandwidth advantage translates to a $1.7\times$ speedup in decode.
+- INT8 quantization on A100 provides a $\sim 1.2\times$ throughput improvement at small batch sizes (from reduced memory reads) and $\sim 1.2\times$ at large batch sizes (from fitting more requests).
+- FP8 on H100 provides the best overall performance: faster compute for prefill and reduced memory footprint for larger batches.
+- The maximum batch size approximately doubles with quantization (halving the weight memory frees room for more KV cache).
+
+### Llama 3 70B: Multi-GPU Performance
+
+<Benchmark
+  title="Llama 3 70B Inference Performance (4K input / 1K output tokens)"
+  columns={["Config", "TTFT (B=1)", "ITL (B=1)", "Throughput B=1", "Throughput B=32", "Max batch"]}
+  rows={[
+    { values: ["2x A100 FP16 (TP=2)", "~320 ms", "~15 ms", "~67 tok/s", "~1,400 tok/s", "~10"], highlight: false },
+    { values: ["4x A100 INT8 (TP=4)", "~95 ms", "~6.5 ms", "~154 tok/s", "~3,800 tok/s", "~100"], highlight: true },
+    { values: ["2x H100 FP16 (TP=2)", "~130 ms", "~9 ms", "~111 tok/s", "~2,400 tok/s", "~10"], highlight: false },
+    { values: ["4x H100 FP8 (TP=4)", "~35 ms", "~3.5 ms", "~286 tok/s", "~7,200 tok/s", "~120"], highlight: true },
+    { values: ["8x H100 FP8 (TP=8)", "~20 ms", "~2.2 ms", "~455 tok/s", "~12,000 tok/s", "~280"], highlight: true },
+  ]}
+/>
+
+Key observations for the 70B model:
+
+- **Tensor parallelism (TP) is essential.** On 2x A100 with FP16 weights, max batch is only ~10 -- barely viable for production. The memory is almost entirely consumed by weights.
+- **4x H100 with FP8 is the sweet spot** for many production deployments: good single-request latency (~3.5 ms/tok ITL), strong throughput at batch 32 (7,200 tok/s), and enough memory for 120 concurrent requests.
+- **8x H100 provides diminishing returns per GPU** but offers the lowest absolute latency (2.2 ms/tok ITL) and highest throughput for latency-sensitive applications.
+- TTFT varies dramatically with tensor parallelism: more GPUs = faster prefill (compute splits across GPUs, though NVLink communication adds overhead).
+
+### Llama 3 405B: The Scale Challenge
+
+<Benchmark
+  title="Llama 3 405B Inference Performance (2K input / 512 output tokens)"
+  columns={["Config", "TTFT (B=1)", "ITL (B=1)", "Throughput B=1", "Throughput B=16", "Min GPUs"]}
+  rows={[
+    { values: ["16x A100 INT8 (TP=8, PP=2)", "~380 ms", "~22 ms", "~45 tok/s", "~600 tok/s", "16"], highlight: false },
+    { values: ["8x H100 FP8 (TP=8)", "~120 ms", "~11 ms", "~91 tok/s", "~1,200 tok/s", "8"], highlight: true },
+    { values: ["16x H100 FP8 (TP=8, PP=2)", "~75 ms", "~7 ms", "~143 tok/s", "~2,000 tok/s", "16"], highlight: true },
+  ]}
+/>
+
+At 405B parameters, the operational reality is stark:
+
+- **Minimum 8 H100s** (with FP8) just to fit the model in memory with room for a modest batch. With FP16, you need 16+ GPUs.
+- **Pipeline parallelism (PP)** becomes necessary alongside tensor parallelism when model weights exceed the combined memory of a single NVLink domain (typically 8 GPUs). PP adds pipeline bubbles that reduce efficiency by $10\%$-$20\%$.
+- **Cost per token is extremely high.** At $\sim 2,000$ tok/s on 16x H100 with batch=16, the cost is roughly $8\times$ higher per token compared to the 70B model on 4x H100 at batch=32.
+- For most production use cases, the 70B model with good quantization provides a much better cost-performance tradeoff than the 405B model.
+
+<Callout type="tip" title="Practical Guidance on GPU Selection">
+  For Llama 3 8B: a single H100 (or A100 with INT8) handles most workloads comfortably. For Llama 3 70B: 4x H100 with FP8 is the production sweet spot. For Llama 3 405B: evaluate whether the quality improvement over 70B justifies $4\times$-$8\times$ higher serving cost -- for many applications, it does not.
+</Callout>
+
+### Decode Throughput Scaling Curves
+
+To illustrate how throughput scales with batch size on real hardware, here are measured curves for Llama 3 8B:
+
+<PerfChart
+  title="Llama 3 8B Decode Throughput vs Batch Size (A100 FP16)"
+  unit="tok/s"
+  data={[
+    { label: "Batch 1", value: 140, color: "red", annotation: "Memory-latency bound" },
+    { label: "Batch 4", value: 530, color: "red" },
+    { label: "Batch 8", value: 980, color: "orange" },
+    { label: "Batch 16", value: 1850, color: "orange" },
+    { label: "Batch 32", value: 3600, color: "blue" },
+    { label: "Batch 64", value: 5800, color: "blue", annotation: "Approaching BW limit" },
+    { label: "Batch 128", value: 7200, color: "green", annotation: "Near BW saturation" },
+    { label: "Batch 256", value: 7800, color: "green", annotation: "Compute starts limiting" },
+  ]}
+/>
+
+<PerfChart
+  title="Llama 3 8B Decode Throughput vs Batch Size (H100 FP16)"
+  unit="tok/s"
+  data={[
+    { label: "Batch 1", value: 238, color: "red", annotation: "1.7x over A100 (BW ratio)" },
+    { label: "Batch 4", value: 900, color: "red" },
+    { label: "Batch 8", value: 1700, color: "orange" },
+    { label: "Batch 16", value: 3200, color: "orange" },
+    { label: "Batch 32", value: 6100, color: "blue" },
+    { label: "Batch 64", value: 9800, color: "blue" },
+    { label: "Batch 128", value: 14200, color: "green", annotation: "Approaching BW limit" },
+    { label: "Batch 256", value: 16500, color: "green", annotation: "Compute starts limiting" },
+  ]}
+/>
+
+The scaling pattern is consistent: near-linear throughput growth with batch size in the memory-bound regime, followed by a plateau as compute becomes the bottleneck. The H100's higher memory bandwidth pushes the transition point to a higher batch size, and its higher compute ceiling raises the plateau.
+
+---
+
+## Putting It All Together: The Mental Model
+
+Let us synthesize everything into a coherent mental model for LLM inference performance.
+
+### The Three Resources
+
+LLM inference performance is determined by three scarce resources:
+
+1. **Compute (FLOPS)**: Tensor core throughput. Limits prefill speed and decode throughput at high batch sizes.
+2. **Memory bandwidth (GB/s)**: HBM read throughput. Limits single-request decode speed and decode throughput at low-to-moderate batch sizes.
+3. **Memory capacity (GB)**: Total HBM. Limits model size, maximum batch size (via KV cache), and maximum context length.
+
+At any given moment, one of these is the binding constraint. The art of inference optimization is shifting the bottleneck to a different resource (typically from memory bandwidth to compute, via batching) or expanding the binding resource (more GPUs, faster memory, quantization to reduce capacity pressure).
+
+### Decision Framework
+
+When evaluating an inference deployment, ask these questions in order:
+
+**1. Can the model fit in memory?**
+Calculate: weights + KV cache (at target batch size and context length) + overhead. If this exceeds available GPU memory, you need more GPUs, quantization, or a smaller model.
+
+**2. What is the decode bottleneck?**
+Calculate arithmetic intensity at your target batch size. If $B \lt$ ridge point, you are memory-bandwidth-bound: faster memory or more batching helps; more compute does not. If $B \gt$ ridge point, you are compute-bound: faster compute helps; more memory bandwidth does not.
+
+**3. What limits batch size?**
+Usually KV cache memory. Calculate $B_{max}$ as shown above. If $B_{max}$ is below the ridge point, you will never fully utilize compute -- consider KV cache quantization, GQA, or more memory to increase $B_{max}$.
+
+**4. What are the latency requirements?**
+TTFT is bounded by prefill time (proportional to prompt length, inversely proportional to compute throughput). ITL is bounded by decode step time (inversely proportional to memory bandwidth at low batch, or compute at high batch). If latency requirements are strict, you may need to sacrifice throughput (smaller batch) or add more GPUs (split work).
+
+### The Optimization Stack
+
+Each optimization targets a specific bottleneck:
+
+<Benchmark
+  title="Inference Optimization Hierarchy"
+  columns={["Optimization", "Target Bottleneck", "Typical Impact", "When to Apply"]}
+  rows={[
+    { values: ["Batching (B=1 to B=32+)", "BW utilization", "10-30x throughput", "Always -- this is non-negotiable"], highlight: true },
+    { values: ["Continuous batching", "GPU utilization", "2-3x throughput", "Any multi-request serving"], highlight: true },
+    { values: ["Weight quantization (FP16 to INT4/8)", "Memory capacity", "2-4x batch capacity", "When memory-constrained"], highlight: true },
+    { values: ["KV cache quantization", "Memory capacity", "1.5-2x batch capacity", "Long context or large batch"], highlight: true },
+    { values: ["PagedAttention", "Memory fragmentation", "2-4x effective capacity", "Variable-length serving"], highlight: true },
+    { values: ["FlashAttention", "Prefill compute + memory", "2-4x prefill speed", "Always for long prompts"], highlight: false },
+    { values: ["Tensor parallelism", "Single-GPU limits", "~Nx (N GPUs) w/ overhead", "Model exceeds 1 GPU"], highlight: false },
+    { values: ["Speculative decoding", "Decode latency", "1.5-3x per-request speed", "Latency-sensitive apps"], highlight: false },
+    { values: ["Prefix caching", "Redundant prefill", "2-10x TTFT for repeated prefixes", "RAG, system prompts"], highlight: false },
+    { values: ["FP8 (H100/B200)", "Compute + capacity", "1.5-2x over FP16", "When hardware supports it"], highlight: false },
+  ]}
+/>
+
+### The Cost Equation
+
+Ultimately, inference is about cost per token. The cost equation is:
+
+$$\text{Cost per token} = \frac{\text{GPU cost per second}}{\text{Throughput (tok/s)}}$$
+
+Every optimization that increases throughput (without proportionally increasing GPU cost) reduces cost per token. This is why batching is so powerful: it increases throughput by $10$-$30\times$ with zero additional hardware cost.
+
+For a concrete example: Llama 3 70B on 4x H100 (cost: $\sim\$16$/hour in cloud pricing):
+
+- **Batch=1**: $\sim 286$ tok/s, cost = $\$16 / 3600 / 286 \approx \$0.0000155$ per token ($\$15.5$ per million tokens)
+- **Batch=32**: $\sim 7{,}200$ tok/s, cost = $\$16 / 3600 / 7200 \approx \$0.00000062$ per token ($\$0.62$ per million tokens)
+
+Batching reduced cost by $25\times$. This is why API providers can offer LLM inference at prices that seem impossibly low -- they are batching aggressively across thousands of concurrent requests.
+
+---
 
 ## Conclusion
 
-LLM inference has two phases with opposite performance profiles: prefill is compute-bound (optimize with FlashAttention, tensor parallelism), decode is memory-bound (optimize with batching, quantization, efficient KV management). The single most impactful optimization is increasing batch size during decode, which amortizes the cost of reading model weights across more useful output tokens. Everything else -- KV quantization, continuous batching, paged allocation -- ultimately serves the goal of fitting more concurrent requests into the available GPU memory.
+LLM inference is defined by a fundamental asymmetry: prefill is compute-bound (large matrix multiplications that saturate tensor cores), while decode is memory-bandwidth-bound (full model weight reads for each single generated token). This asymmetry, rooted in the autoregressive nature of language generation, drives every design decision in the inference stack.
+
+The key quantitative relationships to internalize:
+
+- **Arithmetic intensity during decode = batch size** (in FLOP/byte). At batch=1, utilization is below $1\%$. The ridge point for A100 is $\sim 156$, for H100 is $\sim 295$.
+- **KV cache scales as** $2 \times n_{layers} \times n_{kv\_heads} \times d_{head} \times \text{seq\_len} \times \text{batch\_size}$. It dominates memory at production batch sizes.
+- **Maximum batch size is memory-limited**, and quantization's primary serving benefit is freeing memory for larger batches.
+- **Throughput scales linearly with batch size** until compute saturation, then plateaus.
+
+The serving innovations -- continuous batching, PagedAttention, chunked prefill, KV cache quantization -- all serve a single goal: maximize the number of concurrent requests the GPU can process, thereby amortizing the fixed cost of reading model weights across more useful output tokens.
+
+If you take away one thing from this post: **LLM decode performance is not about making the GPU compute faster. It is about giving the GPU more useful work to do with each byte it reads from memory.** Every optimization in the inference stack -- from batching to quantization to paged memory management -- is ultimately in service of this principle.

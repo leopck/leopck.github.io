@@ -1,716 +1,976 @@
 ---
-title: "GPipe vs PipeDream: Pipeline Parallelism Performance Analysis (Jul 2019)"
+title: "Pipeline Parallelism: From GPipe to DualPipe -- Eliminating the Bubble"
 author: "stanley-phoong"
-description: "A comparative analysis of GPipe and PipeDream pipeline parallelism techniques for training large neural networks, examining their performance characteristics and trade-offs."
-publishDate: 2019-07-01
+description: "A deep analysis of pipeline parallelism schedules for distributed training: GPipe micro-batching, PipeDream 1F1B, Megatron interleaved stages, and DeepSeek DualPipe. Covers the bubble problem, memory trade-offs, activation checkpointing, and how PP combines with TP and DP for training 405B+ parameter models."
+publishDate: 2025-03-21
 category: distributed-training
-tags: [gpipe, pipedream, pipeline, parallelism, distributed-training]
+tags: [pipeline-parallelism, gpipe, pipedream, dualpipe, distributed-training, megatron, deepseek]
 ---
 
-import { PerfChart, Benchmark, Callout } from '@/components/mdx';
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+import MemoryLayout from '@/components/mdx/MemoryLayout.astro';
 
-## Introduction
+## The Problem: Models That Do Not Fit on One GPU
 
-By July 2019, training extremely large neural networks had become computationally prohibitive on single GPUs due to memory constraints. Pipeline parallelism emerged as a crucial solution, allowing models to be split across multiple devices. Two prominent approaches gained attention: Google's GPipe and Microsoft's PipeDream, each offering distinct advantages for different scenarios.
+A single NVIDIA H100 has 80 GB of HBM3. A Llama 3 405B model in BF16 requires roughly 810 GB just for its parameters -- before accounting for optimizer states, gradients, or activations. That is more than ten H100s worth of memory for weights alone. The model physically cannot reside on a single device. It must be split across multiple GPUs, and the way you split it determines whether your expensive cluster sits idle or actually trains.
 
-This analysis compares the performance characteristics, implementation details, and trade-offs between these two pipeline parallelism techniques.
+There are three fundamental strategies for distributing a model across devices:
 
-## Background: The Need for Pipeline Parallelism
+1. **Data parallelism (DP)** -- replicate the full model on every device, split the data. This does not help when the model itself exceeds one device's memory.
+2. **Tensor parallelism (TP)** -- split individual operations (matrix multiplications, attention heads) across devices. Every operation requires an all-reduce across participating GPUs, so it demands extremely high-bandwidth interconnect. Within a single node using NVLink (900 GB/s bidirectional on H100), TP works well. Across nodes over InfiniBand (50-100 GB/s per link), the latency and bandwidth penalty is severe.
+3. **Pipeline parallelism (PP)** -- split the model by layers. Device 0 holds layers 0-9, device 1 holds layers 10-19, and so on. Only activation tensors cross device boundaries, and they cross in one direction at a time. The communication volume is dramatically smaller than TP's all-reduce pattern.
 
-Traditional data parallelism becomes inefficient for very large models due to memory constraints:
-
-```python
-# Traditional data parallelism - each GPU stores full model
-def data_parallel_forward(model, input_batch, devices):
-    """
-    Inefficient for large models - each device holds complete model
-    """
-    # Split batch across devices
-    split_batches = split_batch(input_batch, len(devices))
-    outputs = []
-    
-    for i, device in enumerate(devices):
-        with torch.cuda.device(device):
-            # Each GPU loads full model - memory intensive
-            output = model(split_batches[i])
-            outputs.append(output)
-    
-    return torch.cat(outputs, dim=0)
-
-# Memory usage per device = model_size + batch_size
-# For 1B parameter model: ~4GB model + batch overhead
-```
-
-<Benchmark
-  title="Memory Requirements Comparison"
-  columns={["Method", "Model Size", "Per-Device Memory", "Max Model Size (8GB GPU)"]}
-  rows={[
-    { values: ["Data Parallel", "1B params", "4GB × devices", "2B params"], highlight: false },
-    { values: ["Model Parallel", "1B params", "4GB ÷ devices", "∞"], highlight: false },
-    { values: ["Pipeline Parallel", "1B params", "2GB", "4B params"], highlight: false },
-  ]}
-/>
-
-## GPipe: Google's Pipeline Parallelism
-
-GPipe divides the model into segments and processes microbatches in a pipeline fashion:
-
-```python
-class GPipeEngine:
-    def __init__(self, model_segments, devices, num_microbatches):
-        self.segments = model_segments  # Model split into segments
-        self.devices = devices
-        self.num_microbatches = num_microbatches
-        self.microbatch_size = None
-        
-    def forward_backward_pipeline(self, input_batch, target_batch):
-        # Split batch into microbatches
-        micro_inputs = self.split_into_microbatches(input_batch)
-        micro_targets = self.split_into_microbatches(target_batch)
-        
-        # Store intermediate activations for backward pass
-        activations = [[] for _ in range(len(self.segments))]
-        
-        # Forward pass - fill pipeline
-        for step in range(self.num_microbatches + len(self.segments) - 1):
-            # Forward phase
-            if step < self.num_microbatches:
-                for seg_idx in range(len(self.segments)):
-                    if step >= seg_idx:
-                        mb_idx = step - seg_idx
-                        if mb_idx < len(micro_inputs):
-                            with torch.cuda.device(self.devices[seg_idx]):
-                                segment_input = micro_inputs[mb_idx] if seg_idx == 0 else activations[seg_idx-1][mb_idx]
-                                output = self.segments[seg_idx](segment_input)
-                                activations[seg_idx].append(output)
-        
-        # Backward pass - drain pipeline
-        gradients = [None] * len(micro_inputs)
-        for step in range(self.num_microbatches + len(self.segments) - 1):
-            # Backward phase
-            if step < self.num_microbatches:
-                for seg_idx in reversed(range(len(self.segments))):
-                    back_step = self.num_microbatches - 1 - step
-                    if back_step >= len(self.segments) - 1 - seg_idx:
-                        mb_idx = back_step - (len(self.segments) - 1 - seg_idx)
-                        if mb_idx < len(micro_inputs):
-                            with torch.cuda.device(self.devices[seg_idx]):
-                                # Compute gradients
-                                grad_input = self.compute_gradients(
-                                    self.segments[seg_idx],
-                                    activations[seg_idx][mb_idx],
-                                    gradients[mb_idx] if seg_idx == len(self.segments)-1 else None
-                                )
-                                gradients[mb_idx] = grad_input
-        
-        return self.aggregate_gradients()
-```
-
-<PerfChart
-  title="GPipe Pipeline Schedule"
-  type="bar"
-  unit="Time Steps"
-/>
-
-### GPipe Performance Characteristics
-
-```python
-def analyze_gpipe_performance(model_size_gb, num_devices, batch_size, microbatch_size):
-    """
-    Analyze GPipe performance characteristics
-    """
-    # Memory per device calculation
-    memory_per_device = model_size_gb / num_devices + microbatch_size
-    
-    # Pipeline efficiency
-    total_steps = batch_size // microbatch_size + num_devices - 1
-    useful_steps = batch_size // microbatch_size
-    pipeline_efficiency = useful_steps / total_steps
-    
-    # Communication overhead
-    comm_overhead = (num_devices - 1) * (microbatch_size * 4)  # 4 bytes per float
-    
-    return {
-        'memory_per_device_gb': memory_per_device,
-        'pipeline_efficiency': pipeline_efficiency,
-        'communication_overhead_mb': comm_overhead / (1024*1024),
-        'speedup_theoretical': min(num_devices, 1.0/pipeline_efficiency)
-    }
-```
-
-<Benchmark
-  title="GPipe Performance Analysis"
-  columns={["Devices", "Microbatch Size", "Efficiency", "Memory/Device (GB)", "Speedup"]}
-  rows={[
-    { values: ["2", "16", "0.89", "2.1", "1.8x"], highlight: false },
-    { values: ["4", "8", "0.75", "1.2", "3.0x"], highlight: false },
-    { values: ["8", "4", "0.56", "0.7", "4.5x"], highlight: false },
-    { values: ["16", "2", "0.32", "0.5", "5.2x"], highlight: false },
-  ]}
-/>
-
-## PipeDream: Microsoft's 1F1B Scheduling
-
-PipeDream improves upon GPipe with a 1F1B (1 Forward, 1 Backward) scheduling strategy:
-
-```python
-class PipeDreamEngine:
-    def __init__(self, model_segments, devices, num_microbatches):
-        self.segments = model_segments
-        self.devices = devices
-        self.num_microbatches = num_microbatches
-        # Warmup steps = number of segments - 1
-        self.warmup_steps = len(model_segments) - 1
-        # Total steps = warmup + 2*num_microbatches (forward + backward)
-        self.total_steps = self.warmup_steps + 2 * num_microbatches
-        
-    def pipe dream_schedule(self, input_batch, target_batch):
-        micro_inputs = self.split_into_microbatches(input_batch)
-        micro_targets = self.split_into_microbatches(target_batch)
-        
-        # Stages: forward, backward, forward, backward, ...
-        stage_map = {}  # Maps (step, device_idx) -> action
-        activations = [[] for _ in range(len(self.segments))]
-        gradients = [[] for _ in range(len(self.segments))]
-        
-        for step in range(self.total_steps):
-            # Determine what each device should do at this step
-            for device_idx in range(len(self.devices)):
-                if self.should_do_forward(step, device_idx):
-                    # Forward pass
-                    mb_idx = self.get_microbatch_idx(step, device_idx, forward=True)
-                    if mb_idx < len(micro_inputs):
-                        with torch.cuda.device(self.devices[device_idx]):
-                            segment_input = self.get_forward_input(
-                                micro_inputs[mb_idx] if device_idx == 0 else activations[device_idx-1][mb_idx]
-                            )
-                            output = self.segments[device_idx](segment_input)
-                            activations[device_idx].append(output)
-                
-                elif self.should_do_backward(step, device_idx):
-                    # Backward pass
-                    mb_idx = self.get_microbatch_idx(step, device_idx, forward=False)
-                    if mb_idx < len(micro_targets):
-                        with torch.cuda.device(self.devices[device_idx]):
-                            grad_output = self.get_backward_input(
-                                gradients[device_idx+1][mb_idx] if device_idx < len(self.segments)-1 else micro_targets[mb_idx]
-                            )
-                            grad_input = self.segments[device_idx].backward(grad_output)
-                            gradients[device_idx].append(grad_input)
-        
-        return self.aggregate_results()
-    
-    def should_do_forward(self, step, device_idx):
-        return step >= device_idx and step < self.warmup_steps + self.num_microbatches
-    
-    def should_do_backward(self, step, device_idx):
-        start_backward = self.warmup_steps + self.num_microbatches
-        return step >= start_backward + device_idx and step < start_backward + self.num_microbatches
-```
-
-<PerfChart
-  title="PipeDream 1F1B Pipeline Schedule"
-  type="bar"
-  unit="Time Steps"
-/>
-
-### 1F1B vs Standard Pipeline Comparison
-
-<Benchmark
-  title="1F1B vs Standard Pipeline Comparison"
-  columns={["Metric", "Standard Pipeline", "1F1B Pipeline", "Improvement"]}
-  rows={[
-    { values: ["Bubble Stalls", "High", "Minimized", "40-60%"], highlight: false },
-    { values: ["Memory Usage", "Lower", "Higher", "-20%"], highlight: false },
-    { values: ["Communication", "Phased", "Overlapped", "Better"], highlight: false },
-    { values: ["Implementation", "Simple", "Complex", "N/A"], highlight: false },
-  ]}
-/>
-
-## Performance Analysis and Comparison
-
-### Memory vs Computation Trade-offs
-
-Both approaches optimize for different aspects of the memory-computation trade-off:
-
-```python
-def compare_pipeline_strategies(model_params, num_devices, batch_size):
-    """
-    Compare GPipe and PipeDream strategies
-    """
-    # GPipe: Balanced memory usage across devices
-    gpipe_memory = model_params / (4 * num_devices)  # 4 bytes per parameter
-    
-    # PipeDream: Higher memory usage due to overlapping forward/backward
-    pipedream_memory = model_params / (4 * num_devices) * 1.5  # Approximation
-    
-    # Throughput calculations
-    gpipe_throughput = calculate_gpipe_throughput(batch_size, num_devices)
-    pipedream_throughput = calculate_pipedream_throughput(batch_size, num_devices)
-    
-    return {
-        'gpipe': {
-            'memory_gb': gpipe_memory / (1024**3),
-            'throughput': gpipe_throughput,
-            'efficiency': gpipe_throughput / (num_devices * base_throughput)
-        },
-        'pipedream': {
-            'memory_gb': pipedream_memory / (1024**3),
-            'throughput': pipedream_throughput,
-            'efficiency': pipedream_throughput / (num_devices * base_throughput)
-        }
-    }
-
-def calculate_gpipe_throughput(batch_size, num_devices):
-    """
-    Calculate GPipe throughput considering pipeline bubble
-    """
-    microbatches = batch_size
-    total_steps = microbatches + num_devices - 1
-    useful_steps = microbatches
-    efficiency = useful_steps / total_steps
-    return efficiency * num_devices
-
-def calculate_pipedream_throughput(batch_size, num_devices):
-    """
-    Calculate PipeDream throughput with 1F1B scheduling
-    """
-    microbatches = batch_size
-    # In ideal case, PipeDream has better overlap
-    efficiency = microbatches / (microbatches + num_devices - 1)
-    return efficiency * num_devices * 1.1  # 10% improvement factor
-```
-
-<PerfChart
-  title="Throughput Comparison: GPipe vs PipeDream"
-  type="line"
-  unit="Samples/sec"
-/>
-
-### Communication Overhead Analysis
-
-Pipeline parallelism introduces communication overhead between stages:
-
-```python
-def analyze_communication_overhead(num_devices, microbatch_size, hidden_size):
-    """
-    Analyze communication overhead for pipeline parallelism
-    """
-    activation_size = microbatch_size * hidden_size * 4  # 4 bytes per float
-    
-    # GPipe communication pattern
-    gpipe_comm_steps = num_devices - 1  # Activations passed between devices
-    gpipe_total_comm = gpipe_comm_steps * activation_size * 2  # Forward + backward
-    
-    # PipeDream communication (more frequent but potentially overlapped)
-    pipedream_comm_steps = (num_devices - 1) * 2  # More frequent due to 1F1B
-    pipedream_total_comm = pipedream_comm_steps * activation_size
-    
-    return {
-        'gpipe': {
-            'comm_volume_mb': gpipe_total_comm / (1024 * 1024),
-            'comm_steps': gpipe_comm_steps
-        },
-        'pipedream': {
-            'comm_volume_mb': pipedream_total_comm / (1024 * 1024),
-            'comm_steps': pipedream_comm_steps
-        }
-    }
-```
-
-<Benchmark
-  title="Communication Overhead Comparison"
-  columns={["Devices", "Hidden Size", "GPipe Comm (MB)", "PipeDream Comm (MB)", "Bandwidth Req (GB/s)"]}
-  rows={[
-    { values: ["4", "2048", "0.064", "0.128", "12.8"], highlight: false },
-    { values: ["8", "4096", "0.256", "0.512", "25.6"], highlight: false },
-    { values: ["16", "8192", "1.024", "2.048", "51.2"], highlight: false },
-  ]}
-/>
-
-## Implementation Considerations
-
-### Microbatch Size Optimization
-
-Choosing the right microbatch size is crucial for both approaches:
-
-```python
-def find_optimal_microbatch_size(model_memory_gb, device_memory_gb, num_devices):
-    """
-    Find optimal microbatch size considering memory constraints
-    """
-    available_memory = device_memory_gb - model_memory_gb/num_devices
-    max_microbatch_size = int(available_memory * 1024 * 1024 * 1024 / (4 * hidden_size))
-    
-    # Consider pipeline efficiency
-    efficiency_scores = {}
-    for mb_size in [1, 2, 4, 8, 16, 32]:
-        if mb_size <= max_microbatch_size:
-            efficiency = calculate_pipeline_efficiency(mb_size, num_devices)
-            throughput = calculate_throughput(mb_size, efficiency)
-            efficiency_scores[mb_size] = throughput
-    
-    optimal_size = max(efficiency_scores, key=efficiency_scores.get)
-    return optimal_size
-
-def calculate_pipeline_efficiency(microbatch_size, num_devices):
-    """
-    Calculate pipeline efficiency based on microbatch size
-    """
-    # Efficiency improves with larger microbatch sizes
-    # but too large reduces pipeline parallelism effectiveness
-    return min(1.0, 0.7 + 0.3 * (microbatch_size / (microbatch_size + num_devices)))
-```
-
-<PerfChart
-  title="Microbatch Size Impact on Efficiency"
-  type="line"
-  unit="Efficiency"
-/>
-
-### Gradient Accumulation Strategies
-
-Both methods require careful gradient accumulation:
-
-```python
-class GradientAccumulator:
-    def __init__(self, accumulation_steps):
-        self.accumulation_steps = accumulation_steps
-        self.current_step = 0
-        self.accumulated_gradients = {}
-    
-    def accumulate_gradients(self, gradients):
-        """
-        Accumulate gradients across microbatches
-        """
-        for param_name, grad in gradients.items():
-            if param_name not in self.accumulated_gradients:
-                self.accumulated_gradients[param_name] = torch.zeros_like(grad)
-            
-            self.accumulated_gradients[param_name] += grad
-            self.current_step += 1
-            
-            if self.current_step == self.accumulation_steps:
-                # Apply accumulated gradients
-                final_grads = self.accumulated_gradients
-                self.accumulated_gradients = {}
-                self.current_step = 0
-                return final_grads
-        
-        return None  # Not ready to apply gradients
-```
-
-## Advanced Optimizations
-
-### Interleaved Schedule (PipeDream-Flush)
-
-An enhanced version of PipeDream with improved scheduling:
-
-```python
-class PipeDreamFlush:
-    def __init__(self, model_segments, devices, num_microbatches):
-        self.segments = model_segments
-        self.devices = devices
-        self.num_microbatches = num_microbatches
-        self.stages = len(model_segments)
-    
-    def flush_schedule(self):
-        """
-        Improved schedule that flushes pipeline cleanly
-        """
-        total_steps = self.stages + 2 * self.num_microbatches
-        
-        # Stage mapping: forward, backward, or idle
-        for step in range(total_steps):
-            for device_idx in range(self.stages):
-                # Determine action based on step and device position
-                action = self.determine_action(step, device_idx)
-                
-                if action == 'forward':
-                    self.execute_forward(step, device_idx)
-                elif action == 'backward':
-                    self.execute_backward(step, device_idx)
-                # else idle
-    
-    def determine_action(self, step, device_idx):
-        """
-        Determine what action device should take at given step
-        """
-        # Forward phase
-        if step < self.stages + self.num_microbatches:
-            forward_start = device_idx
-            forward_end = self.stages + self.num_microbatches - 1
-            if forward_start <= step <= forward_end:
-                return 'forward'
-        
-        # Backward phase
-        backward_start = self.stages + self.num_microbatches + device_idx
-        backward_end = 2 * self.stages + 2 * self.num_microbatches - 1
-        if backward_start <= step <= backward_end:
-            return 'backward'
-        
-        return 'idle'
-```
-
-<Benchmark
-  title="Schedule Comparison Performance"
-  columns={["Schedule", "Bubble Time", "Memory Usage", "Throughput", "Complexity"]}
-  rows={[
-    { values: ["GPipe", "High", "Low", "Medium", "Simple"], highlight: false },
-    { values: ["1F1B", "Low", "Medium", "High", "Medium"], highlight: false },
-    { values: ["Flush", "Low", "High", "Highest", "Complex"], highlight: false },
-  ]}
-/>
-
-## Hardware Considerations
-
-### Interconnect Bandwidth Requirements
-
-Pipeline parallelism performance depends heavily on inter-device communication:
-
-```python
-def evaluate_interconnect_requirements(num_devices, batch_size, sequence_length, hidden_size):
-    """
-    Evaluate interconnect requirements for pipeline parallelism
-    """
-    activation_size = (batch_size // num_devices) * sequence_length * hidden_size * 4
-    
-    # GPipe communication pattern
-    gpipe_bandwidth_requirement = activation_size * (num_devices - 1) / 1e9  # GB
-    
-    # PipeDream communication (more frequent)
-    pipedream_bandwidth_requirement = activation_size * (num_devices - 1) * 1.5 / 1e9
-    
-    return {
-        'gpipe': gpipe_bandwidth_requirement,
-        'pipedream': pipedream_bandwidth_requirement,
-        'recommended_interconnect': 'NVLink' if num_devices > 4 else 'PCIe'
-    }
-```
-
-### GPU Memory Hierarchy Impact
-
-```python
-def analyze_memory_hierarchy_impact():
-    """
-    Analyze how memory hierarchy affects pipeline performance
-    """
-    memory_characteristics = {
-        'HBM2': {
-            'bandwidth': 900,  # GB/s
-            'latency': 150,    # ns
-            'gpipe_benefit': 'High',
-            'pipedream_benefit': 'High'
-        },
-        'GDDR6': {
-            'bandwidth': 600,  # GB/s
-            'latency': 200,    # ns
-            'gpipe_benefit': 'Medium',
-            'pipedream_benefit': 'Medium'
-        },
-        'Unified Memory': {
-            'bandwidth': 200,  # GB/s
-            'latency': 500,    # ns
-            'gpipe_benefit': 'Low',
-            'pipedream_benefit': 'Low'
-        }
-    }
-    
-    return memory_characteristics
-```
-
-<PerfChart
-  title="Interconnect Bandwidth Impact on Pipeline Performance"
-  type="line"
-  unit="TFLOPS"
-/>
-
-## Practical Implementation Guidelines
-
-### When to Use Each Approach
-
-<Callout type="tip" title="Pipeline Parallelism Selection">
-GPipe is better for: (1) Memory-constrained environments, (2) Simpler implementation needs, (3) Fewer devices. PipeDream is better for: (1) Performance-critical applications, (2) Many devices, (3) Well-connected hardware.
+<Callout type="info" title="Why Not Just Use Tensor Parallelism Everywhere?">
+  Tensor parallelism requires two all-reduce operations per transformer layer (one for the attention projection, one for the MLP). For a model with hidden dimension $h = 8192$ and sequence length $s = 4096$, each all-reduce communicates $O(s \times h)$ bytes. Over InfiniBand at 50 GB/s effective bandwidth, this adds 100-200 microseconds of latency per layer. With 80+ layers, cross-node TP can spend more time communicating than computing. Pipeline parallelism replaces this with a single point-to-point transfer of activations between adjacent stages -- orders of magnitude less communication.
 </Callout>
 
+Pipeline parallelism is the natural choice for inter-node distribution. You assign consecutive layers to each node, and the only data that crosses the (slow) inter-node network is the activation tensor at layer boundaries. For a transformer with hidden size $h$ and micro-batch size $b$ with sequence length $s$, the activation tensor at each boundary is $b \times s \times h$ elements. Compare this to TP, which would require all-reduce of the same size tensor *twice per layer* across all nodes.
+
 <Benchmark
-  title="Selection Guidelines"
-  columns={["Criteria", "GPipe", "PipeDream", "Recommendation"]}
+  title="Communication Volume Per Training Step (80-layer Transformer, h=8192)"
+  columns={["Strategy", "Nodes", "Per-Layer Comm", "Total Comm", "Interconnect Need"]}
   rows={[
-    { values: ["# Devices", "< 8", "≥ 8", "Use PipeDream for ≥8"], highlight: false },
-    { values: ["Memory", "Constrained", "Adequate", "GPipe for tight memory"], highlight: false },
-    { values: ["Dev Complexity", "Low", "High", "GPipe for simplicity"], highlight: false },
-    { values: ["Target Perf", "Good", "Best", "PipeDream for max perf"], highlight: false },
+    { values: ["TP across 8 nodes", "8", "2 all-reduce of b*s*h", "160 all-reduces", "NVLink-class"], highlight: false },
+    { values: ["PP across 8 nodes", "8", "1 point-to-point of b*s*h", "7 point-to-point", "InfiniBand OK"], highlight: true },
+    { values: ["TP intra-node + PP inter-node", "8", "2 all-reduce (local) + 1 p2p", "Hybrid", "Optimal"], highlight: true },
   ]}
 />
 
-### Hybrid Approaches
+But pipeline parallelism has a fundamental problem: the pipeline bubble.
 
-Combining pipeline with other parallelism techniques:
+## The Bubble Problem
 
-```python
-class HybridParallelEngine:
-    def __init__(self, model, dp_degree, pp_degree, tp_degree):
-        """
-        Combine data, pipeline, and tensor parallelism
-        """
-        self.dp_degree = dp_degree  # Data parallelism degree
-        self.pp_degree = pp_degree  # Pipeline parallelism degree  
-        self.tp_degree = tp_degree  # Tensor parallelism degree
-        
-        # Validate degrees multiply to available devices
-        assert dp_degree * pp_degree * tp_degree == get_available_devices()
-        
-        # Partition model accordingly
-        self.model_partitions = self.partition_model(model)
-        
-    def partition_model(self, model):
-        """
-        Partition model for hybrid parallelism
-        """
-        # First, tensor parallelism within each pipeline stage
-        tp_partitions = self.tensor_parallel_partition(model, self.tp_degree)
-        
-        # Then, pipeline parallelism across stages
-        pp_partitions = self.pipeline_partition(tp_partitions, self.pp_degree)
-        
-        # Finally, data parallelism across replica groups
-        return self.data_parallel_replicate(pp_partitions, self.dp_degree)
-    
-    def forward_backward_hybrid(self, batch):
-        """
-        Execute forward/backward with hybrid parallelism
-        """
-        # Distribute batch for data parallelism
-        dp_batches = self.split_for_dp(batch)
-        
-        for dp_rank, dp_batch in enumerate(dp_batches):
-            # Within each DP replica, execute PP schedule
-            pp_outputs = self.execute_pipeline_schedule(
-                dp_batch, 
-                self.model_partitions[dp_rank]
-            )
-        
-        # Synchronize gradients across DP replicas
-        self.allreduce_gradients()
+Consider a naive pipeline with $P = 4$ stages processing a single mini-batch. Stage 0 computes the forward pass for layers 0-19, then sends the activation to stage 1. Stage 1 computes layers 20-39, sends to stage 2, and so on. During this entire forward cascade, stages 1, 2, and 3 are idle while waiting for their input. Then during the backward pass, stages cascade in reverse. The result is that each stage is active for only a small fraction of the total time.
+
+```
+Naive Pipeline (P=4, single batch):
+
+Time -->  |  1  |  2  |  3  |  4  |  5  |  6  |  7  |  8  |
+Stage 0:  | F0  |     |     |     |     |     |     | B0  |
+Stage 1:  |     | F0  |     |     |     |     | B0  |     |
+Stage 2:  |     |     | F0  |     |     | B0  |     |     |
+Stage 3:  |     |     |     | F0  | B0  |     |     |     |
+
+F0 = forward micro-batch 0, B0 = backward micro-batch 0
+Empty cells = GPU sitting idle (the "bubble")
 ```
 
-## Performance Bottleneck Analysis
+The idle fraction in this naive schedule is:
 
-### Identifying Pipeline Bubbles
+$$\text{Bubble fraction} = \frac{P - 1}{P}$$
+
+For $P = 8$ pipeline stages, this means $7/8 = 87.5\%$ of GPU time is wasted. You are paying for 8 GPUs but getting the throughput of slightly more than 1. This is unacceptable.
+
+<PerfChart
+  title="Naive Pipeline Bubble Fraction by Number of Stages"
+  data={[
+    { label: "P=2", value: 50, color: "green", annotation: "50% idle" },
+    { label: "P=4", value: 75, color: "orange", annotation: "75% idle" },
+    { label: "P=8", value: 87.5, color: "red", annotation: "87.5% idle" },
+    { label: "P=16", value: 93.75, color: "red", annotation: "93.75% idle" },
+    { label: "P=32", value: 96.88, color: "red", annotation: "96.88% idle" }
+  ]}
+  unit="%"
+  baseline={0}
+/>
+
+The entire history of pipeline parallelism research is, in essence, the quest to shrink this bubble.
+
+## GPipe: Micro-Batching to Shrink the Bubble
+
+GPipe (Huang et al., 2019) introduced the foundational insight: split the mini-batch into $M$ micro-batches and pipeline them through the stages. Instead of waiting for the entire forward pass to complete before starting the backward pass, you feed micro-batches into the pipeline one after another. While stage 0 is processing micro-batch 1, stage 1 is processing micro-batch 0 from the previous time step.
+
+```
+GPipe Schedule (P=4, M=8 micro-batches):
+
+Time -->  | 1  | 2  | 3  | 4  | 5  | 6  | 7  | 8  | 9  | 10 | 11 | ... | 19 |
+Stage 0:  | F0 | F1 | F2 | F3 | F4 | F5 | F6 | F7 |    |    |    |     | B0 |
+Stage 1:  |    | F0 | F1 | F2 | F3 | F4 | F5 | F6 | F7 |    |    |     |    |
+Stage 2:  |    |    | F0 | F1 | F2 | F3 | F4 | F5 | F6 | F7 |    |     |    |
+Stage 3:  |    |    |    | F0 | F1 | F2 | F3 | F4 | F5 | F6 | F7 | B7  |    |
+
+All forward passes complete, then all backward passes run.
+Bubble is only the fill and drain phases: (P-1) time slots at each end.
+```
+
+The key schedule is: all $M$ micro-batches execute their forward passes in pipeline fashion, then all $M$ micro-batches execute their backward passes. Gradients are accumulated across micro-batches and the optimizer step happens once per mini-batch.
+
+The bubble fraction becomes:
+
+$$\text{Bubble fraction (GPipe)} = \frac{P - 1}{P - 1 + M}$$
+
+This is a dramatic improvement. With $P = 8$ stages and $M = 32$ micro-batches:
+
+$$\text{Bubble} = \frac{7}{7 + 32} = \frac{7}{39} \approx 17.9\%$$
+
+Compare this to 87.5% with the naive approach.
+
+<Benchmark
+  title="GPipe Bubble Fraction: Effect of Micro-batch Count M"
+  columns={["Micro-batches (M)", "P=4", "P=8", "P=16", "P=32"]}
+  rows={[
+    { values: ["M=4", "42.9%", "63.6%", "78.9%", "88.6%"], highlight: false },
+    { values: ["M=8", "27.3%", "46.7%", "65.2%", "79.5%"], highlight: false },
+    { values: ["M=16", "15.8%", "30.4%", "48.4%", "66.0%"], highlight: false },
+    { values: ["M=32", "8.6%", "17.9%", "32.6%", "49.2%"], highlight: true },
+    { values: ["M=64", "4.5%", "9.9%", "19.0%", "32.6%"], highlight: true },
+    { values: ["M=128", "2.3%", "5.2%", "10.5%", "19.5%"], highlight: false },
+  ]}
+/>
 
 ```python
-def analyze_pipeline_bottlenecks():
+class GPipeSchedule:
     """
-    Analyze common pipeline bottlenecks
+    GPipe micro-batch pipeline schedule.
+
+    All forwards run first (fill phase), then all backwards (drain phase).
+    Gradient accumulation happens across micro-batches.
     """
-    bottlenecks = {
-        'stage_imbalance': {
-            'description': 'Unequal computational load across stages',
-            'impact': 'Creates pipeline bubbles',
-            'solution': 'Balanced partitioning',
-            'severity': 'High'
+    def __init__(self, stages: int, num_microbatches: int):
+        self.P = stages
+        self.M = num_microbatches
+
+    def bubble_fraction(self) -> float:
+        return (self.P - 1) / (self.P - 1 + self.M)
+
+    def execute(self, mini_batch):
+        micro_batches = split(mini_batch, self.M)
+
+        # Phase 1: All forward passes (pipeline fill + steady state)
+        # Each micro-batch flows through all P stages
+        activations = {}  # (stage, mb_idx) -> activation tensor
+        for mb_idx in range(self.M):
+            for stage in range(self.P):
+                input_act = micro_batches[mb_idx] if stage == 0 \
+                           else activations[(stage - 1, mb_idx)]
+                activations[(stage, mb_idx)] = self.forward(stage, input_act)
+
+        # Phase 2: All backward passes (pipeline drain)
+        # Must store ALL activations from forward phase -- memory intensive
+        accumulated_grads = [zeros_like(p) for p in self.parameters()]
+        for mb_idx in reversed(range(self.M)):
+            for stage in reversed(range(self.P)):
+                grads = self.backward(stage, activations[(stage, mb_idx)])
+                accumulate(accumulated_grads, grads)
+
+        # Phase 3: Single optimizer step
+        self.optimizer_step(accumulated_grads)
+```
+
+<Callout type="warning" title="GPipe Memory Problem">
+  GPipe must store activations for ALL $M$ micro-batches across ALL $P$ stages simultaneously during the forward phase, because backward passes do not begin until all forward passes complete. For $M = 32$ micro-batches with hidden size $h = 8192$ and sequence length $s = 4096$ in BF16, each activation tensor is $b \times s \times h \times 2$ bytes. Even with micro-batch size $b = 1$, that is 64 MB per activation. Storing 32 of these per stage means 2 GB of activation memory per stage -- and this is just one layer boundary. The actual activation memory across all layers in a stage is much larger.
+</Callout>
+
+### GPipe's Gradient Accumulation Semantics
+
+A subtle but important property of GPipe: because all forward passes complete before any backward pass begins, the gradient computation is mathematically identical to processing the full mini-batch at once (up to floating-point ordering differences). Each micro-batch's forward pass uses the same model weights. The accumulated gradients across micro-batches equal the gradient of the full mini-batch loss.
+
+This is a clean semantic guarantee. The training dynamics are identical to single-device training with the same effective batch size. No weight staleness, no approximation.
+
+## PipeDream 1F1B: Interleaving Forward and Backward
+
+PipeDream (Narayanan et al., 2019) and its successor PipeDream-Flush (also called the "1F1B schedule") address GPipe's memory problem by interleaving forward and backward passes. Instead of completing all forwards before starting any backward, each stage alternates: one forward, one backward, one forward, one backward.
+
+```
+1F1B Schedule (P=4, M=8 micro-batches):
+
+Time -->  | 1  | 2  | 3  | 4  | 5  | 6  | 7  | 8  | 9  | 10 | 11 | 12 | ...
+Stage 0:  | F0 | F1 | F2 | F3 | B0 | F4 | B1 | F5 | B2 | F6 | B3 | F7 | ...
+Stage 1:  |    | F0 | F1 | F2 | F3 | B0 | F4 | B1 | F5 | B2 | F6 | B3 | ...
+Stage 2:  |    |    | F0 | F1 | F2 | F3 | B0 | F4 | B1 | F5 | B2 | F6 | ...
+Stage 3:  |    |    |    | F0 | F1 | F2 | F3 | B0 | F4 | B1 | F5 | B2 | ...
+
+Warmup: each stage does (P - stage_id - 1) extra forwards before entering steady state.
+Steady state: strictly alternating 1 forward + 1 backward.
+Cooldown: remaining backwards drain the pipeline.
+```
+
+The schedule has three phases:
+
+1. **Warmup phase**: Stage $i$ performs $(P - 1 - i)$ forward passes to fill the pipeline. Stage 0 does $(P-1)$ forwards, stage 1 does $(P-2)$, and so on. The last stage does 0 warmup forwards.
+2. **Steady-state phase**: Each stage alternates exactly one forward pass and one backward pass (hence "1F1B"). This is the bulk of the computation.
+3. **Cooldown phase**: Remaining backward passes drain the pipeline.
+
+The bubble fraction is the same as GPipe: $(P-1)/(P-1+M)$. The critical difference is in memory.
+
+### The Memory Advantage of 1F1B
+
+In GPipe, all $M$ forward passes complete before any backward pass starts. This means every stage must store activations for all $M$ micro-batches simultaneously. The peak activation memory per stage scales as $O(M)$.
+
+In 1F1B, once a stage enters steady state, it performs a backward pass immediately after each forward pass. The backward pass for micro-batch $k$ frees the activations for micro-batch $k$. At any point during steady state, a stage has at most $P$ micro-batches' activations in flight -- one from each of the stages ahead of it in the warmup, plus the current one.
+
+$$\text{Peak activations (GPipe)} = M \text{ micro-batches}$$
+$$\text{Peak activations (1F1B)} = P \text{ micro-batches}$$
+
+Since typically $M \gg P$ (you want many micro-batches to reduce the bubble), this is a major memory saving.
+
+<MemoryLayout
+  title="Activation Memory: GPipe vs 1F1B (P=4 stages)"
+  description="Peak number of micro-batch activations stored simultaneously per stage"
+  layout={[
+    {
+      name: "GPipe: M=32 micro-batch activations stored",
+      power: "32 x activation_size per stage",
+      state: "All forwards complete before any backward begins",
+      color: "#ef4444"
+    },
+    {
+      name: "1F1B: P=4 micro-batch activations stored",
+      power: "4 x activation_size per stage",
+      state: "Backward frees memory as soon as forward finishes",
+      color: "#22c55e"
+    },
+    {
+      name: "Memory savings with 1F1B",
+      power: "8x reduction (32/4) in activation memory",
+      state: "Enables larger micro-batches or larger models",
+      color: "#3b82f6"
+    }
+  ]}
+/>
+
+```python
+class OneFOneBSchedule:
+    """
+    1F1B (One Forward One Backward) pipeline schedule.
+
+    Key insight: interleaving forward and backward passes limits
+    the number of in-flight micro-batches to P (not M).
+    """
+    def __init__(self, stages: int, num_microbatches: int):
+        self.P = stages
+        self.M = num_microbatches
+
+    def peak_activations(self) -> int:
+        """Max micro-batch activations stored at any stage."""
+        return self.P  # Not M! This is the key advantage.
+
+    def schedule_for_stage(self, stage_id: int):
+        """Generate the action sequence for a single stage."""
+        warmup_forwards = self.P - 1 - stage_id
+        steady_state_pairs = self.M - warmup_forwards
+        cooldown_backwards = warmup_forwards
+
+        actions = []
+
+        # Phase 1: Warmup -- only forwards
+        for i in range(warmup_forwards):
+            actions.append(('forward', i))
+
+        # Phase 2: Steady state -- alternating 1F1B
+        fwd_idx = warmup_forwards
+        bwd_idx = 0
+        for _ in range(steady_state_pairs):
+            actions.append(('forward', fwd_idx))
+            actions.append(('backward', bwd_idx))
+            fwd_idx += 1
+            bwd_idx += 1
+
+        # Phase 3: Cooldown -- only backwards
+        for i in range(cooldown_backwards):
+            actions.append(('backward', bwd_idx + i))
+
+        return actions
+```
+
+<Benchmark
+  title="Memory Comparison: GPipe vs 1F1B"
+  columns={["Config", "GPipe Activations", "1F1B Activations", "Memory Reduction"]}
+  rows={[
+    { values: ["P=4, M=16", "16 per stage", "4 per stage", "4x"], highlight: false },
+    { values: ["P=4, M=32", "32 per stage", "4 per stage", "8x"], highlight: true },
+    { values: ["P=8, M=32", "32 per stage", "8 per stage", "4x"], highlight: false },
+    { values: ["P=8, M=64", "64 per stage", "8 per stage", "8x"], highlight: true },
+    { values: ["P=16, M=128", "128 per stage", "16 per stage", "8x"], highlight: true },
+  ]}
+/>
+
+<Callout type="tip" title="Weight Staleness in Original PipeDream">
+  The original PipeDream paper proposed asynchronous weight updates -- each stage would apply its gradient immediately without waiting for other stages. This introduces weight staleness: forward and backward passes for the same micro-batch may use different weight versions. PipeDream-Flush (and Megatron-LM's 1F1B implementation) eliminated this by using synchronous gradient accumulation, exactly like GPipe. The 1F1B schedule as used in practice today does NOT have weight staleness.
+</Callout>
+
+## Interleaved Pipeline Stages (Megatron-LM)
+
+Narayanan et al. (2021) in the Megatron-LM paper introduced interleaved pipeline stages, also known as "virtual pipeline stages." The idea: instead of assigning each GPU a single contiguous block of layers, assign each GPU $V$ non-consecutive blocks ("virtual stages").
+
+For example, with $P = 4$ GPUs, $L = 32$ layers, and $V = 2$ virtual stages per GPU:
+
+```
+Standard pipeline (V=1):
+  GPU 0: layers  0- 7   (stage 0)
+  GPU 1: layers  8-15   (stage 1)
+  GPU 2: layers 16-23   (stage 2)
+  GPU 3: layers 24-31   (stage 3)
+
+Interleaved pipeline (V=2):
+  GPU 0: layers  0- 3   (virtual stage 0) + layers 16-19 (virtual stage 4)
+  GPU 1: layers  4- 7   (virtual stage 1) + layers 20-23 (virtual stage 5)
+  GPU 2: layers  8-11   (virtual stage 2) + layers 24-27 (virtual stage 6)
+  GPU 3: layers 12-15   (virtual stage 3) + layers 28-31 (virtual stage 7)
+```
+
+The total number of virtual pipeline stages is $P \times V$. The pipeline sees $P \times V$ stages, but each "stage" is smaller (fewer layers). A micro-batch passes through all $P \times V$ virtual stages, bouncing between GPUs multiple times. The critical insight: each virtual stage takes $1/V$ the time to compute, so the pipeline fill and drain time is divided by $V$.
+
+The bubble fraction becomes:
+
+$$\text{Bubble fraction (interleaved)} = \frac{P - 1}{M \times V}$$
+
+Note that $V$ appears in the denominator multiplicatively. With $P = 8$, $M = 32$, $V = 4$:
+
+$$\text{Bubble} = \frac{7}{32 \times 4} = \frac{7}{128} \approx 5.5\%$$
+
+Compare this to GPipe's $7/39 \approx 17.9\%$ with the same $M$.
+
+<PerfChart
+  title="Bubble Fraction: Standard vs Interleaved Pipeline (P=8)"
+  data={[
+    { label: "GPipe M=32", value: 17.9, color: "orange", annotation: "(P-1)/(P-1+M)" },
+    { label: "Interleaved V=2, M=32", value: 10.9, color: "blue", annotation: "(P-1)/(M*V)" },
+    { label: "Interleaved V=4, M=32", value: 5.5, color: "green", annotation: "(P-1)/(M*V)" },
+    { label: "Interleaved V=8, M=32", value: 2.7, color: "green", annotation: "(P-1)/(M*V)" },
+    { label: "Interleaved V=4, M=64", value: 2.7, color: "cyan", annotation: "(P-1)/(M*V)" }
+  ]}
+  unit="%"
+  baseline={0}
+/>
+
+### The Communication Cost of Interleaving
+
+There is no free lunch. With $V$ virtual stages per GPU, a micro-batch must transfer activations between GPUs $P \times V - 1$ times instead of $P - 1$ times. Each transfer is smaller (fewer layers means smaller activation tensors -- actually the same size since it is the same hidden dimension, but the *number* of transfers increases by $V$).
+
+More precisely, with standard pipeline, there are $P - 1$ inter-device activation transfers per micro-batch per direction. With interleaved pipeline (V virtual stages), there are $P \times V - 1$ transfers. The volume per transfer is identical (same hidden dimension), so total communication increases by roughly a factor of $V$.
+
+This trade-off works well when:
+- The network bandwidth between GPUs is high relative to compute time per stage
+- The bubble reduction from interleaving outweighs the communication overhead
+- You use NVLink within a node (where bandwidth is abundant)
+
+It works poorly when:
+- Stages are already communication-bound
+- Inter-node bandwidth is limited (the extra transfers saturate the link)
+
+```python
+class InterleavedPipelineSchedule:
+    """
+    Interleaved (virtual) pipeline stages as in Megatron-LM.
+
+    Each GPU holds V non-consecutive chunks of layers.
+    Bubble fraction: (P-1) / (M*V) instead of (P-1) / (P-1+M).
+    Communication increases by factor V.
+    """
+    def __init__(self, num_gpus: int, virtual_stages: int, num_microbatches: int):
+        self.P = num_gpus
+        self.V = virtual_stages
+        self.M = num_microbatches
+        self.total_virtual_stages = num_gpus * virtual_stages
+
+    def bubble_fraction(self) -> float:
+        return (self.P - 1) / (self.M * self.V)
+
+    def communication_overhead_ratio(self) -> float:
+        """Ratio of communication vs standard pipeline."""
+        standard_transfers = self.P - 1
+        interleaved_transfers = self.P * self.V - 1
+        return interleaved_transfers / standard_transfers
+
+    def layer_assignment(self, gpu_id: int, total_layers: int) -> list:
+        """Which layers does this GPU hold?"""
+        layers_per_virtual_stage = total_layers // self.total_virtual_stages
+        assigned = []
+        for v in range(self.V):
+            virtual_stage_id = gpu_id + v * self.P
+            start = virtual_stage_id * layers_per_virtual_stage
+            end = start + layers_per_virtual_stage
+            assigned.extend(range(start, end))
+        return assigned
+```
+
+<Benchmark
+  title="Interleaved Pipeline: Bubble vs Communication Trade-off (P=8, M=32)"
+  columns={["Virtual Stages (V)", "Bubble %", "Comm Overhead vs V=1", "Net Throughput Gain"]}
+  rows={[
+    { values: ["V=1 (standard)", "17.9%", "1.0x", "Baseline"], highlight: false },
+    { values: ["V=2", "10.9%", "2.1x", "+5-8%"], highlight: false },
+    { values: ["V=4", "5.5%", "4.4x", "+8-12%"], highlight: true },
+    { values: ["V=8", "2.7%", "9.0x", "+5-10%"], highlight: false },
+    { values: ["V=16", "1.4%", "18.1x", "Comm-bound"], highlight: false },
+  ]}
+/>
+
+<Callout type="perf" title="Optimal V in Practice">
+  Megatron-LM experiments show $V = 2$ to $V = 4$ is usually optimal for inter-node pipeline parallelism. Beyond $V = 4$, the communication overhead from extra activation transfers typically outweighs the bubble reduction. For intra-node pipelines over NVLink, higher $V$ can be beneficial because NVLink bandwidth is abundant.
+</Callout>
+
+## DualPipe: Bidirectional Pipeline (DeepSeek-V3)
+
+DeepSeek-V3 (Dai et al., 2024) introduced DualPipe, a bidirectional pipeline schedule that achieves near-zero bubble overhead. The core idea: send micro-batches from *both ends* of the pipeline simultaneously. Half the micro-batches flow forward (stage 0 to stage P-1) and the other half flow backward (stage P-1 to stage 0).
+
+The insight is that when a GPU is executing the forward pass for a micro-batch flowing left-to-right, it can simultaneously execute the backward pass for a micro-batch flowing right-to-left. The forward computation of one micro-batch overlaps with the backward computation of another -- they use different parts of the compute resources (forward is mostly matrix multiplications and activations; backward includes gradient computation and weight gradient accumulation).
+
+```
+DualPipe Schedule (P=4, simplified):
+
+Left-to-right micro-batches: L0, L1, L2, L3
+Right-to-left micro-batches: R0, R1, R2, R3
+
+Time -->   |   1   |   2   |   3   |   4   |   5   |   6   |
+Stage 0:   | F(L0) | F(L1) |F(L2)+B(R0)|F(L3)+B(R1)| B(R2) | B(R3) |
+Stage 1:   |       | F(L0) |F(L1)+B(R1)|F(L2)+B(R0)| ...   |       |
+Stage 2:   |       | F(R0) |F(R1)+B(L0)|F(R0)+B(L1)| ...   |       |
+Stage 3:   | F(R0) | F(R1) |F(R2)+B(L0)|F(R3)+B(L1)| B(L2) | B(L3) |
+
+In steady state, each GPU runs forward + backward simultaneously.
+The bubble is only the initial fill and final drain.
+```
+
+The key innovation: in steady state, every GPU is executing both a forward pass and a backward pass at every time step. The forward pass for one direction's micro-batch overlaps with the backward pass for the other direction's micro-batch. This means the bubble is only in the pipeline fill and drain, which is minimal.
+
+DualPipe achieves an effective bubble fraction that approaches:
+
+$$\text{Bubble fraction (DualPipe)} \approx \frac{P - 1}{2M}$$
+
+The factor of 2 improvement over standard 1F1B comes from the bidirectional overlap. For $P = 8$, $M = 32$:
+
+$$\text{Bubble} \approx \frac{7}{64} \approx 10.9\%$$
+
+But in practice, the overlap between forward and backward computation can hide even more of the bubble. DeepSeek reports near-zero effective bubble with sufficient micro-batches.
+
+<PerfChart
+  title="Bubble Comparison Across Pipeline Schedules (P=8, M=32)"
+  data={[
+    { label: "Naive (no micro-batch)", value: 87.5, color: "red", annotation: "(P-1)/P" },
+    { label: "GPipe", value: 17.9, color: "orange", annotation: "(P-1)/(P-1+M)" },
+    { label: "1F1B", value: 17.9, color: "blue", annotation: "Same bubble, less memory" },
+    { label: "Interleaved V=4", value: 5.5, color: "green", annotation: "(P-1)/(M*V)" },
+    { label: "DualPipe", value: 10.9, color: "cyan", annotation: "(P-1)/(2M), further hidden by overlap" }
+  ]}
+  unit="%"
+  baseline={0}
+/>
+
+```python
+class DualPipeSchedule:
+    """
+    DualPipe bidirectional pipeline schedule (DeepSeek-V3).
+
+    Micro-batches flow from both ends simultaneously.
+    Forward of left-to-right overlaps with backward of right-to-left.
+    """
+    def __init__(self, stages: int, num_microbatches: int):
+        self.P = stages
+        self.M = num_microbatches
+        # Split micro-batches into two streams
+        self.M_left = num_microbatches // 2   # flow left-to-right
+        self.M_right = num_microbatches // 2  # flow right-to-left
+
+    def bubble_fraction(self) -> float:
+        """Theoretical bubble before overlap hiding."""
+        return (self.P - 1) / (2 * self.M)
+
+    def effective_bubble(self, overlap_efficiency: float = 0.8) -> float:
+        """
+        Effective bubble after forward/backward overlap.
+        overlap_efficiency: fraction of bubble hidden by overlapping
+        forward and backward of different micro-batches.
+        """
+        theoretical = self.bubble_fraction()
+        return theoretical * (1 - overlap_efficiency)
+
+    def schedule_for_stage(self, stage_id: int):
+        """
+        Each stage handles two streams:
+        - Left stream: micro-batches 0..M_left-1 flowing stage 0 -> P-1
+        - Right stream: micro-batches 0..M_right-1 flowing stage P-1 -> 0
+
+        In steady state, forward(left) overlaps with backward(right)
+        and forward(right) overlaps with backward(left).
+        """
+        actions = []
+
+        # Warmup: fill pipeline from both ends
+        for t in range(stage_id):
+            actions.append(('idle', t))
+
+        # Steady state: overlapped forward + backward
+        for mb in range(self.M_left):
+            actions.append(('forward_left + backward_right', mb))
+
+        # Cooldown: drain from both ends
+        for t in range(self.P - 1 - stage_id):
+            actions.append(('drain', t))
+
+        return actions
+```
+
+<Callout type="info" title="DualPipe Requirements">
+  DualPipe requires that forward and backward computation can overlap efficiently on the same GPU. This works well for transformer models where forward is dominated by matrix multiplications and backward by gradient matrix multiplications -- they can overlap on different CUDA streams if the GPU has sufficient compute units and memory bandwidth. Models with heavy sequential dependencies or irregular computation patterns may not overlap as well.
+</Callout>
+
+## Memory Analysis: The Activation Storage Problem
+
+Every pipeline schedule must store activations (intermediate results from the forward pass) until the corresponding backward pass consumes them. The number of stored activations determines peak memory usage, which directly limits model size and micro-batch size.
+
+### Activation Memory Per Micro-Batch
+
+For a transformer layer with hidden dimension $h$, sequence length $s$, and micro-batch size $b$, the stored activations include:
+
+- Input to each layer: $b \times s \times h$ elements
+- Attention intermediate states: $b \times n_{heads} \times s \times s$ elements (for full attention)
+- MLP intermediate activations: $b \times s \times 4h$ elements (for standard FFN)
+- Layer norm inputs: $b \times s \times h$ elements
+
+In BF16 (2 bytes per element), a single transformer layer's activations are approximately:
+
+$$\text{Act per layer} \approx b \times s \times (10h + n_{heads} \times s) \times 2 \text{ bytes}$$
+
+For typical values ($b = 1$, $s = 4096$, $h = 8192$, $n_{heads} = 64$):
+
+$$\text{Act per layer} \approx 1 \times 4096 \times (81920 + 262144) \times 2 \approx 2.8 \text{ GB}$$
+
+If a pipeline stage has 10 layers, the activation memory per micro-batch per stage is roughly 28 GB. Now multiply by the number of in-flight micro-batches.
+
+<MemoryLayout
+  title="GPU Memory Budget Per Pipeline Stage (H100 80GB)"
+  description="Memory allocation for a single pipeline stage in a 405B model across 8 GPUs"
+  regions={[
+    { start: "0x0000", end: "0x3200", name: "Model Parameters (BF16)", size: "~12.5 GB", color: "blue", notes: "405B / 8 stages / 2 (TP within node) = ~25B params = 50 GB / 4 (with TP=4) = 12.5 GB" },
+    { start: "0x3200", end: "0x6400", name: "Optimizer States (Adam)", size: "~25 GB", color: "purple", notes: "FP32 master weights + momentum + variance = 4x parameter memory in FP32" },
+    { start: "0x6400", end: "0x7D00", name: "Gradients (BF16)", size: "~12.5 GB", color: "orange", notes: "Same size as parameters" },
+    { start: "0x7D00", end: "0xA000", name: "Activations (in-flight)", size: "~20-30 GB", color: "red", notes: "P micro-batch activations for 1F1B, or M for GPipe" },
+    { start: "0xA000", end: "0xC800", name: "Available / Buffers", size: "~0-10 GB", color: "gray", notes: "Communication buffers, temporary tensors, CUDA overhead" }
+  ]}
+/>
+
+<Benchmark
+  title="Activation Memory Per Stage: GPipe vs 1F1B (10 layers/stage, b=1, s=4096, h=8192)"
+  columns={["Schedule", "In-Flight MBs", "Activation Memory", "Feasible on 80GB H100?"]}
+  rows={[
+    { values: ["GPipe M=4", "4", "~11 GB", "Yes (tight)"], highlight: false },
+    { values: ["GPipe M=16", "16", "~45 GB", "No -- exceeds budget"], highlight: false },
+    { values: ["GPipe M=32", "32", "~90 GB", "No -- far exceeds"], highlight: false },
+    { values: ["1F1B P=4", "4", "~11 GB", "Yes"], highlight: true },
+    { values: ["1F1B P=8", "8", "~22 GB", "Yes"], highlight: true },
+    { values: ["1F1B P=16", "16", "~45 GB", "Marginal"], highlight: false },
+  ]}
+/>
+
+### Activation Checkpointing (Recomputation)
+
+Activation checkpointing (also called gradient checkpointing or activation recomputation) is the standard solution to the activation memory problem. Instead of storing all intermediate activations, you store only the input activation at each layer boundary and recompute the intermediate activations during the backward pass.
+
+The trade-off is straightforward: you trade compute for memory. With full activation checkpointing, you store only 1 activation tensor per layer instead of ~4-5, reducing activation memory by roughly 4-5x. The cost is recomputing the forward pass during backward, adding approximately 33% more total compute (the forward pass is about 1/3 of the total forward + backward compute).
+
+```python
+class ActivationCheckpointing:
+    """
+    Activation checkpointing reduces memory by recomputing
+    activations during backward pass instead of storing them.
+    """
+    def __init__(self, checkpoint_every_n_layers: int = 1):
+        self.checkpoint_interval = checkpoint_every_n_layers
+
+    def memory_reduction(self, layers_per_stage: int) -> float:
+        """Factor of memory reduction vs no checkpointing."""
+        # Without checkpointing: store all activations for all layers
+        # With checkpointing: store only checkpoint activations
+        checkpoints = layers_per_stage // self.checkpoint_interval
+        # Each checkpoint stores only the input tensor (not intermediates)
+        # Intermediates are ~4-5x the input tensor
+        return layers_per_stage * 5 / (checkpoints + layers_per_stage)
+
+    def compute_overhead(self) -> float:
+        """Additional compute as a fraction of total."""
+        # Recompute forward pass during backward
+        # Forward = ~1/3 of total (forward + backward)
+        # So recomputation adds ~33% to total compute
+        return 0.33
+
+    def forward_with_checkpointing(self, layers, input_tensor):
+        """
+        Only store activations at checkpoint boundaries.
+        Recompute intermediates during backward.
+        """
+        checkpointed_activations = [input_tensor]
+        x = input_tensor
+
+        for i, layer in enumerate(layers):
+            # Use torch.utils.checkpoint to wrap the forward
+            # This stores input but not intermediate activations
+            x = torch.utils.checkpoint.checkpoint(layer, x)
+
+            if (i + 1) % self.checkpoint_interval == 0:
+                checkpointed_activations.append(x)
+
+        return x, checkpointed_activations
+```
+
+Selective activation checkpointing is a refinement: only recompute the cheap-to-recompute activations (like attention scores, which are memory-heavy but compute-cheap relative to matrix multiplications). This gives most of the memory savings with less compute overhead.
+
+<Benchmark
+  title="Activation Checkpointing Trade-offs"
+  columns={["Strategy", "Memory Savings", "Compute Overhead", "Typical Use Case"]}
+  rows={[
+    { values: ["No checkpointing", "0%", "0%", "Small models, abundant memory"], highlight: false },
+    { values: ["Full checkpointing", "~80%", "~33%", "Very large models, memory-constrained"], highlight: true },
+    { values: ["Selective (attn only)", "~50-60%", "~10-15%", "Medium models, balanced trade-off"], highlight: true },
+    { values: ["Every-2-layers", "~50%", "~16%", "Moderate memory pressure"], highlight: false },
+  ]}
+/>
+
+## Combining Pipeline, Tensor, and Data Parallelism
+
+In practice, large-scale training uses all three parallelism strategies simultaneously. The typical recipe for a cluster with $N$ total GPUs, where each node has $G$ GPUs connected by NVLink:
+
+- **Tensor parallelism (TP)** within a node: $TP = G$ (e.g., 8 GPUs per node). All-reduce operations stay on NVLink.
+- **Pipeline parallelism (PP)** across nodes: $PP = $ number of nodes in a pipeline. Point-to-point activation transfers go over InfiniBand.
+- **Data parallelism (DP)** across pipeline replicas: $DP = N / (TP \times PP)$. Gradient all-reduce across DP replicas.
+
+Total GPUs: $N = TP \times PP \times DP$.
+
+```
+Example: Training Llama 405B on 1024 H100s (128 nodes, 8 GPUs/node)
+
+TP = 8  (within each node, NVLink)
+PP = 8  (across 8 nodes per pipeline, InfiniBand)
+DP = 16 (16 pipeline replicas, InfiniBand)
+
+Total = 8 * 8 * 16 = 1024 GPUs
+
+Each pipeline replica:
+  - 8 nodes, 64 GPUs
+  - Each node holds one pipeline stage
+  - Within each node, 8 GPUs share one stage via TP
+  - Model: 126 layers / 8 stages = ~16 layers per stage
+  - Each TP group of 8 GPUs holds 16 layers with weights sharded 8-way
+
+Data parallelism:
+  - 16 replicas of this 64-GPU pipeline
+  - Global batch split 16 ways
+  - Gradient all-reduce across 16 replicas after each mini-batch
+```
+
+<MemoryLayout
+  title="3D Parallelism Layout: 1024 GPUs for 405B Model"
+  description="TP=8 (intra-node NVLink), PP=8 (inter-node IB), DP=16 (across pods)"
+  layout={[
+    {
+      name: "Tensor Parallel Group (TP=8)",
+      power: "8 GPUs within one node, connected by NVLink (900 GB/s)",
+      state: "All-reduce per layer, highest communication volume",
+      color: "#3b82f6"
+    },
+    {
+      name: "Pipeline Parallel Group (PP=8)",
+      power: "8 nodes (64 GPUs), connected by InfiniBand (400 Gb/s)",
+      state: "Point-to-point activation transfers at stage boundaries",
+      color: "#22c55e"
+    },
+    {
+      name: "Data Parallel Group (DP=16)",
+      power: "16 pipeline replicas (1024 GPUs total)",
+      state: "All-reduce gradients once per mini-batch, overlapped with compute",
+      color: "#a855f7"
+    }
+  ]}
+/>
+
+### Communication Patterns in 3D Parallelism
+
+Each parallelism dimension has a distinct communication pattern:
+
+**Tensor parallelism** (most frequent, highest bandwidth):
+- 2 all-reduce operations per transformer layer
+- Volume: $O(b \times s \times h)$ per all-reduce
+- Must complete within the compute time of one layer
+- Requires NVLink-class bandwidth (hundreds of GB/s)
+
+**Pipeline parallelism** (moderate frequency, moderate bandwidth):
+- 1 point-to-point transfer per pipeline stage boundary per micro-batch
+- Volume: $O(b \times s \times h)$ per transfer
+- Can overlap with compute at adjacent stages
+- InfiniBand sufficient (tens of GB/s)
+
+**Data parallelism** (least frequent, can overlap):
+- 1 all-reduce of all gradients per mini-batch
+- Volume: $O(\text{total parameters})$
+- Can overlap with backward pass computation (ring all-reduce)
+- InfiniBand sufficient, can use network efficiently
+
+```python
+class ThreeDParallelConfig:
+    """
+    Configuration for 3D parallelism: TP + PP + DP.
+    """
+    def __init__(self, tp: int, pp: int, dp: int,
+                 gpus_per_node: int = 8):
+        self.tp = tp
+        self.pp = pp
+        self.dp = dp
+        self.total_gpus = tp * pp * dp
+        self.gpus_per_node = gpus_per_node
+        self.nodes = self.total_gpus // gpus_per_node
+
+        # Validate: TP should fit within a node
+        assert tp <= gpus_per_node, \
+            f"TP={tp} exceeds GPUs per node={gpus_per_node}"
+
+    def communication_volume_per_step(self, model_params: int,
+                                       hidden: int, seq_len: int,
+                                       micro_batch: int,
+                                       layers_per_stage: int) -> dict:
+        """Estimate communication volumes per training step."""
+        activation_size = micro_batch * seq_len * hidden * 2  # BF16
+
+        # TP: 2 all-reduces per layer, within node
+        tp_volume = 2 * layers_per_stage * activation_size * (self.tp - 1) / self.tp
+        tp_link = "NVLink"
+
+        # PP: 1 point-to-point per stage boundary per micro-batch
+        # Number of micro-batches depends on schedule
+        pp_volume = activation_size  # per micro-batch per boundary
+        pp_link = "InfiniBand" if self.tp == self.gpus_per_node else "NVLink"
+
+        # DP: all-reduce of all gradients, once per mini-batch
+        dp_volume = model_params * 2  # BF16 gradients
+        dp_link = "InfiniBand"
+
+        return {
+            'tp': {'volume_bytes': tp_volume, 'link': tp_link,
+                   'frequency': 'per layer per micro-batch'},
+            'pp': {'volume_bytes': pp_volume, 'link': pp_link,
+                   'frequency': 'per micro-batch per boundary'},
+            'dp': {'volume_bytes': dp_volume, 'link': dp_link,
+                   'frequency': 'once per mini-batch (overlapped)'},
+        }
+```
+
+<Benchmark
+  title="Communication Volume by Parallelism Dimension (405B, h=13824, s=4096, b=1)"
+  columns={["Dimension", "Volume Per Event", "Frequency", "Link Type", "Latency Sensitivity"]}
+  rows={[
+    { values: ["TP (all-reduce)", "~214 MB", "2x per layer per MB", "NVLink", "Very high"], highlight: true },
+    { values: ["PP (point-to-point)", "~107 MB", "1x per stage boundary", "InfiniBand", "Moderate"], highlight: false },
+    { values: ["DP (all-reduce)", "~810 GB", "1x per mini-batch", "InfiniBand", "Low (overlapped)"], highlight: false },
+  ]}
+/>
+
+### Expert Parallelism and MoE
+
+For Mixture-of-Experts models like DeepSeek-V3, there is a fourth dimension: expert parallelism (EP). Experts are distributed across GPUs, and an all-to-all communication pattern routes tokens to the correct expert. This adds another layer of complexity to the parallelism strategy but is orthogonal to pipeline parallelism.
+
+## Practical Concerns: Load Balancing Pipeline Stages
+
+For pipeline parallelism to be efficient, every stage must take approximately the same time to compute. If one stage takes twice as long, every other stage waits for it, creating a bottleneck worse than the inherent bubble.
+
+Transformer models are relatively easy to balance because every layer has the same architecture and roughly the same compute cost. You simply assign equal numbers of layers per stage: $L / P$ layers each. The first and last stages may have slight additional work (embedding lookup, output projection), but this is minor.
+
+Non-uniform architectures (models with varying layer sizes, skip connections across stages, or different computation at different depths) are harder to balance. Profiling each layer's compute time and partitioning to equalize stage times is necessary.
+
+```python
+def balance_pipeline_stages(layer_compute_times: list, num_stages: int) -> list:
+    """
+    Partition layers into stages with balanced compute times.
+    Uses dynamic programming to minimize the maximum stage time.
+
+    Args:
+        layer_compute_times: list of per-layer compute times in ms
+        num_stages: number of pipeline stages P
+
+    Returns:
+        list of (start_layer, end_layer) tuples per stage
+    """
+    n = len(layer_compute_times)
+    prefix_sum = [0] * (n + 1)
+    for i in range(n):
+        prefix_sum[i + 1] = prefix_sum[i] + layer_compute_times[i]
+
+    # dp[i][j] = min possible max-stage-time using i stages for first j layers
+    INF = float('inf')
+    dp = [[INF] * (n + 1) for _ in range(num_stages + 1)]
+    dp[0][0] = 0
+
+    for s in range(1, num_stages + 1):
+        for j in range(s, n + 1):
+            for k in range(s - 1, j):
+                stage_time = prefix_sum[j] - prefix_sum[k]
+                dp[s][j] = min(dp[s][j], max(dp[s-1][k], stage_time))
+
+    # Backtrack to find partition
+    # (omitted for brevity -- standard DP backtracking)
+    return partition_from_dp(dp, prefix_sum, num_stages)
+```
+
+<Callout type="warning" title="Embedding and Output Layers">
+  The first pipeline stage typically includes the token embedding layer, and the last stage includes the output projection (language model head). For large-vocabulary models (e.g., 128K tokens), the embedding and output projection can be significant: a 128K vocabulary with hidden size 8192 in BF16 is about 2 GB. This asymmetry means the first and last stages have more memory pressure and slightly different compute profiles. Some implementations split the embedding across stages or tie the embedding and output projection weights to mitigate this.
+</Callout>
+
+## When Pipeline Parallelism Is the Wrong Choice
+
+Pipeline parallelism is not always the answer. There are scenarios where it introduces more overhead than it solves:
+
+### 1. Models That Fit on One Node
+
+If a model fits within a single node's aggregate GPU memory (e.g., a 70B model on 8 H100s with 640 GB total), tensor parallelism alone is usually better. TP within a node over NVLink has:
+- Lower latency than PP's pipeline bubble
+- No idle time from fill/drain phases
+- Simpler implementation and debugging
+
+Pipeline parallelism only becomes necessary when you need to span multiple nodes, where TP's all-reduce latency over InfiniBand becomes prohibitive.
+
+### 2. Very Small Micro-Batch Sizes
+
+When the global batch size is small or cannot be divided into enough micro-batches, the bubble dominates. If $M$ is close to $P$, the bubble fraction approaches 50% even with 1F1B:
+
+$$\frac{P - 1}{P - 1 + M} \xrightarrow{M = P} \frac{P - 1}{2P - 1} \approx 50\%$$
+
+At small $M$, you are better off using fewer pipeline stages (accepting less parallelism) or using other strategies entirely.
+
+### 3. Latency-Sensitive Inference
+
+Pipeline parallelism is designed for throughput, not latency. For a single request:
+- The request must pass through all $P$ stages sequentially
+- Latency = $P \times \text{per-stage latency} + (P-1) \times \text{inter-stage communication}$
+- No opportunity for micro-batching (only one sequence)
+
+For inference, tensor parallelism is preferred because it reduces per-request latency by parallelizing each layer's computation. Pipeline parallelism can help inference throughput when processing many concurrent requests (similar to micro-batching), but for latency-critical single-request scenarios, it adds overhead.
+
+### 4. Heterogeneous Hardware
+
+Pipeline parallelism assumes all stages take equal time. If your cluster has mixed GPU generations (e.g., some A100s and some H100s), the slowest GPU becomes the bottleneck for every stage. DP is more forgiving of heterogeneous hardware because slower workers simply process smaller batch portions.
+
+<Benchmark
+  title="When to Use Each Parallelism Strategy"
+  columns={["Scenario", "Best Strategy", "Why Not PP?", "Recommendation"]}
+  rows={[
+    { values: ["70B on 8xH100 (1 node)", "TP=8", "No bubble, NVLink fast enough", "TP only"], highlight: false },
+    { values: ["405B on 64 GPUs (8 nodes)", "TP=8, PP=8", "Need PP for inter-node", "TP + PP"], highlight: true },
+    { values: ["405B on 1024 GPUs", "TP=8, PP=8, DP=16", "Full 3D parallelism", "TP + PP + DP"], highlight: true },
+    { values: ["7B model, many GPUs", "DP only", "Model fits on 1 GPU, PP bubble wasted", "DP"], highlight: false },
+    { values: ["Single-request inference", "TP", "PP adds latency, no micro-batching", "TP"], highlight: false },
+    { values: ["High-throughput inference", "TP + PP", "PP helps throughput with batched requests", "TP + PP"], highlight: false },
+  ]}
+/>
+
+## Summary of Pipeline Schedules
+
+The evolution of pipeline parallelism schedules represents steady progress toward eliminating the bubble:
+
+<Benchmark
+  title="Pipeline Schedule Evolution"
+  columns={["Schedule", "Year", "Bubble Formula", "Peak Activations", "Key Innovation"]}
+  rows={[
+    { values: ["Naive", "N/A", "(P-1)/P", "1", "No micro-batching"], highlight: false },
+    { values: ["GPipe", "2019", "(P-1)/(P-1+M)", "M", "Micro-batch pipelining"], highlight: false },
+    { values: ["1F1B (PipeDream-Flush)", "2019", "(P-1)/(P-1+M)", "P", "Interleaved F/B, less memory"], highlight: true },
+    { values: ["Interleaved (Megatron)", "2021", "(P-1)/(M*V)", "P", "Virtual stages, smaller bubble"], highlight: true },
+    { values: ["DualPipe (DeepSeek-V3)", "2024", "~(P-1)/(2M)", "~2P", "Bidirectional, overlap F+B"], highlight: true },
+  ]}
+/>
+
+```python
+def compare_schedules(P: int, M: int, V: int = 1) -> dict:
+    """
+    Compare bubble fractions and memory requirements
+    across pipeline parallelism schedules.
+
+    Args:
+        P: number of pipeline stages
+        M: number of micro-batches
+        V: number of virtual stages (for interleaved schedule)
+    """
+    return {
+        'naive': {
+            'bubble': (P - 1) / P,
+            'peak_activations': 1,
+            'description': 'Single batch, no pipelining'
         },
-        'microbatch_small': {
-            'description': 'Too few microbatches relative to stages',
-            'impact': 'Increased bubble time',
-            'solution': 'Increase microbatch count',
-            'severity': 'Medium'
+        'gpipe': {
+            'bubble': (P - 1) / (P - 1 + M),
+            'peak_activations': M,
+            'description': 'All forwards then all backwards'
         },
-        'comm_slow': {
-            'description': 'Slow inter-device communication',
-            'impact': 'Stalls pipeline',
-            'solution': 'High-bandwidth interconnect',
-            'severity': 'High'
+        '1f1b': {
+            'bubble': (P - 1) / (P - 1 + M),
+            'peak_activations': P,
+            'description': 'Alternating forward and backward'
         },
-        'memory_bound': {
-            'description': 'Memory bandwidth limits',
-            'impact': 'Reduced compute utilization',
-            'solution': 'Optimized data layouts',
-            'severity': 'Medium'
+        'interleaved': {
+            'bubble': (P - 1) / (M * V),
+            'peak_activations': P,
+            'communication_factor': V,
+            'description': f'Virtual stages V={V}, more comm but less bubble'
+        },
+        'dualpipe': {
+            'bubble': (P - 1) / (2 * M),
+            'peak_activations': 2 * P,  # approximate
+            'description': 'Bidirectional, forward+backward overlap'
         }
     }
-    
-    return bottlenecks
+
+# Example: P=8 stages, M=32 micro-batches, V=4 virtual stages
+results = compare_schedules(P=8, M=32, V=4)
+# naive:       87.5% bubble
+# gpipe:       17.9% bubble, 32 activations
+# 1f1b:        17.9% bubble, 8 activations
+# interleaved: 5.5% bubble, 8 activations, 4x comm
+# dualpipe:    10.9% bubble (before overlap hiding), ~16 activations
 ```
 
-<Benchmark
-  title="Bottleneck Impact Analysis"
-  columns={["Bottleneck", "Performance Impact", "Mitigation Effort", "Priority"]}
-  rows={[
-    { values: ["Stage Imbalance", "30-50% loss", "Medium", "High"], highlight: false },
-    { values: ["Small Microbatches", "20-30% loss", "Low", "Medium"], highlight: false },
-    { values: ["Slow Comm", "40-60% loss", "High", "High"], highlight: false },
-    { values: ["Memory Bound", "10-20% loss", "Medium", "Low"], highlight: false },
+<PerfChart
+  title="Effective Throughput Relative to Ideal (P=8, M=32)"
+  data={[
+    { label: "Ideal (no bubble)", value: 100, color: "gray", annotation: "Theoretical max" },
+    { label: "Naive", value: 12.5, color: "red", annotation: "87.5% bubble" },
+    { label: "GPipe", value: 82.1, color: "orange", annotation: "17.9% bubble" },
+    { label: "1F1B", value: 82.1, color: "blue", annotation: "Same throughput, 4x less memory" },
+    { label: "Interleaved V=4", value: 94.5, color: "green", annotation: "5.5% bubble" },
+    { label: "DualPipe", value: 96, color: "cyan", annotation: "~4% effective with overlap" }
   ]}
+  unit="% of ideal"
+  baseline={0}
 />
 
-## Limitations and Considerations
+## Implementation Reference: Frameworks and Their Schedules
 
-### Model Partitioning Challenges
+Major distributed training frameworks implement different subsets of these schedules:
 
-```python
-def partitioning_considerations():
-    """
-    Considerations for model partitioning
-    """
-    constraints = {
-        'activation_recomputation': 'Trade memory for computation',
-        'parameter_sync_frequency': 'Affects convergence',
-        'load_balancing': 'Critical for performance',
-        'gradient_accumulation': 'Must preserve training dynamics'
-    }
-    
-    return constraints
-```
+**Megatron-LM** (NVIDIA): Supports 1F1B and interleaved schedules. The de facto standard for large-scale LLM training. Tight integration with TP and DP.
 
-### Numerical Precision Effects
+**DeepSpeed** (Microsoft): Supports GPipe-style and 1F1B schedules via its pipeline engine. Part of the ZeRO ecosystem for memory optimization.
 
-Pipeline parallelism can affect numerical precision due to gradient accumulation:
+**FairScale / PyTorch FSDP**: PyTorch-native pipeline parallelism with 1F1B schedule. Integrates with FSDP for data parallelism.
+
+**DeepSeek's training infrastructure**: Custom DualPipe implementation. Not yet available as a general-purpose library (as of early 2025).
 
 ```python
-def analyze_numerical_effects():
-    """
-    Analyze numerical precision effects of pipeline parallelism
-    """
-    effects = {
-        'gradient_accumulation_error': {
-            'cause': 'Multiple additions in accumulator',
-            'mitigation': 'Use higher precision accumulators',
-            'impact': 'Minimal with proper implementation'
-        },
-        'activation_quantization': {
-            'cause': 'Activations passed between devices',
-            'mitigation': 'Careful quantization schemes',
-            'impact': 'Depends on quantization method'
-        }
-    }
-    
-    return effects
+# Megatron-LM example configuration for 3D parallelism
+megatron_config = {
+    'tensor_model_parallel_size': 8,        # TP = 8 (intra-node)
+    'pipeline_model_parallel_size': 8,       # PP = 8 (inter-node)
+    'data_parallel_size': 16,                # DP = 16
+    'virtual_pipeline_model_parallel_size': 4,  # V = 4 (interleaved)
+    'num_micro_batches': 32,                 # M = 32
+    'global_batch_size': 2048,               # split across DP replicas
+    'micro_batch_size': 4,                   # per micro-batch
+    'sequence_length': 4096,
+    'num_layers': 126,                       # Llama 405B
+    'hidden_size': 13824,
+    'num_attention_heads': 128,
+    'fp16': False,
+    'bf16': True,
+    'recompute_activations': True,           # activation checkpointing
+    'recompute_granularity': 'selective',     # only recompute attention
+}
 ```
-
-## Future Developments
-
-By July 2019, both approaches were evolving:
-
-<Benchmark
-  title="Pipeline Parallelism Evolution"
-  columns={["Year", "Development", "Impact", "Performance Gain"]}
-  rows={[
-    { values: ["2018", "Initial GPipe concept", "Foundation", "Base"], highlight: false },
-    { values: ["2019", "PipeDream introduction", "Better scheduling", "15-30%"], highlight: false },
-    { values: ["2019", "1F1B scheduling", "Reduced bubbles", "20-40%"], highlight: false },
-    { values: ["2020", "Advanced scheduling", "Optimized overlap", "30-50%"], highlight: false },
-  ]}
-/>
 
 ## Conclusion
 
-GPipe and PipeDream represent two complementary approaches to pipeline parallelism, each optimized for different scenarios:
+Pipeline parallelism exists to solve a specific problem: training models that exceed single-node memory while avoiding the bandwidth penalty of cross-node tensor parallelism. The core challenge is the pipeline bubble -- idle GPU time during pipeline fill and drain.
 
-- **GPipe** offers simpler implementation with balanced memory usage, making it suitable for memory-constrained environments and fewer devices
-- **PipeDream** provides superior performance through 1F1B scheduling, better for performance-critical applications with well-connected hardware
+The evolution from naive pipelining through GPipe, 1F1B, interleaved stages, and DualPipe represents a progression from 87.5% idle time to under 5% effective idle time for typical configurations. Each advance either shrinks the bubble (more micro-batches, virtual stages, bidirectional flow) or reduces the memory cost of shrinking it (1F1B's bounded activation storage, activation checkpointing).
 
-The choice between approaches depends on specific requirements regarding memory, performance, and implementation complexity. By July 2019, both techniques had established pipeline parallelism as a crucial tool for training large neural networks, setting the foundation for even more sophisticated parallelization strategies in subsequent years.
+The practical recipe for large-scale training has converged: tensor parallelism within a node (where NVLink provides the bandwidth for frequent all-reduce), pipeline parallelism across nodes (where only activation tensors cross the slower InfiniBand links), and data parallelism across pipeline replicas (where gradient all-reduce can overlap with backward computation). Understanding the trade-offs between bubble fraction, activation memory, and communication volume is essential for configuring these systems efficiently.
 
-The key insight is that pipeline parallelism effectiveness depends on careful balance of microbatch sizing, stage partitioning, and hardware characteristics. Properly implemented, both GPipe and PipeDream can significantly extend the scale of models that can be trained effectively.
+The bubble is the tax you pay for splitting a model across devices. The history of pipeline parallelism is the history of minimizing that tax.

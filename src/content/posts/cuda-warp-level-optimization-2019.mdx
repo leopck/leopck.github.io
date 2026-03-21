@@ -1,208 +1,446 @@
 ---
-title: "CUDA Warp-Level Optimization: Shuffle Operations and Efficient Reductions"
+title: "CUDA Warp Mastery: Scheduling, Divergence, Shuffles, Occupancy, and Profiling"
 author: "stanley-phoong"
-description: "Advanced CUDA optimization techniques using warp shuffle operations, efficient reduction patterns, and maximizing warp-level parallelism."
-publishDate: 2019-10-08
+description: "A comprehensive deep-dive into CUDA warps — from scheduling and latency hiding to shuffle operations, warp divergence, cooperative groups, occupancy analysis, and profiling. Everything you need to reason about warp-level GPU performance."
+publishDate: 2025-03-21
 category: gpu-programming
-tags: [cuda, gpu, warp, optimization, shuffle, reduction]
+tags: [cuda, gpu, warp, optimization, shuffle, reduction, occupancy, latency-hiding, profiling, cooperative-groups]
 difficulty: expert
-readingTime: 22
+readingTime: 35
 ---
 
 import Callout from '@/components/mdx/Callout.astro';
 import PerfChart from '@/components/mdx/PerfChart.astro';
 import Benchmark from '@/components/mdx/Benchmark.astro';
+import CodeCompare from '@/components/mdx/CodeCompare.astro';
 
-Warp-level operations enable efficient data sharing and reductions without shared memory. Understanding warp shuffle and reduction patterns is essential for peak GPU performance.
+If you want to write fast CUDA code, you need to understand warps. Not as an abstract concept you skim over in a textbook, but as the fundamental hardware primitive that dictates how your code actually executes on the GPU. Every performance cliff, every mysterious slowdown, every "it should be faster but it isn't" moment — almost all of them trace back to warp-level behavior.
 
-## Warp Execution Model
+This post consolidates everything you need to know about warps into a single reference. We start with what a warp is and why it matters. Then we work through the GPU's latency-hiding mechanism, warp divergence and how to avoid it, shuffle operations for register-level communication, reduction and scan patterns, cooperative groups for going beyond the warp, occupancy analysis from first principles, the deliberate choice to *not* maximize occupancy, and finally how to profile warp behavior with Nsight Compute.
 
-A warp consists of 32 threads executing in lockstep:
+---
+
+## 1. What Is a Warp and Why It Matters
+
+A **warp** is a group of 32 threads that execute instructions in lockstep on a single Streaming Multiprocessor (SM). This is NVIDIA's **SIMT** (Single Instruction, Multiple Thread) execution model: one instruction is fetched and decoded, then applied simultaneously across all 32 threads in the warp.
 
 ```cuda
-__global__ void warp_basics() {
-    int lane_id = threadIdx.x % 32;  // Lane ID within warp (0-31)
-    int warp_id = threadIdx.x / 32;  // Warp ID within block
-    
-    // All 32 threads execute same instruction simultaneously
-    int value = lane_id;
-    
-    // Warp-level operations
-    // ...
+__global__ void warp_identity() {
+    // Every thread can compute its position within the warp
+    int lane_id = threadIdx.x % 32;   // 0..31: position within the warp
+    int warp_id = threadIdx.x / 32;   // which warp within this block
+
+    // All 32 lanes execute this line at the same time,
+    // each with a different lane_id value
+    float value = compute_something(lane_id);
 }
 ```
 
-## Warp Shuffle Operations
+The 32-thread grouping is not a software convention — it is a hardware constant baked into every NVIDIA GPU since the G80 architecture (2006). The warp is:
 
-Warp shuffle enables direct register-to-register communication:
+1. **The unit of scheduling.** The warp scheduler does not schedule individual threads. It schedules *warps*. A warp is either ready (eligible to issue an instruction) or stalled (waiting on a dependency).
 
-```cuda
-__global__ void warp_shuffle_example(float *input, float *output) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int lane_id = threadIdx.x % 32;
-    
-    float value = input[tid];
-    
-    // Shuffle down: get value from thread (lane_id + offset)
-    float down_val = __shfl_down_sync(0xffffffff, value, 1);
-    // Thread 0 gets value from thread 1, thread 1 from thread 2, etc.
-    
-    // Shuffle up: get value from thread (lane_id - offset)
-    float up_val = __shfl_up_sync(0xffffffff, value, 1);
-    // Thread 1 gets value from thread 0, thread 2 from thread 1, etc.
-    
-    // Shuffle: get value from specific lane
-    float lane_val = __shfl_sync(0xffffffff, value, lane_id ^ 1);
-    // Each thread gets value from lane with ID (lane_id ^ 1)
-    
-    output[tid] = down_val + up_val + lane_val;
-}
-```
+2. **The unit of instruction issue.** When the scheduler picks a warp, it issues one instruction to all 32 threads simultaneously. There is no per-thread instruction pointer.
 
-## Warp Reduction
+3. **The unit of memory transactions.** When a warp executes a load, the hardware coalesces the 32 addresses into as few cache-line-sized transactions as possible. A perfectly coalesced 32-thread load issues a single 128-byte transaction. A scattered load can issue up to 32 separate transactions.
 
-Efficient reduction using warp shuffle:
+4. **The unit of synchronization for shuffle operations.** Warp shuffles allow direct register-to-register data movement between threads in the same warp — the fastest possible inter-thread communication on the GPU.
 
-```cuda
-__global__ void warp_reduce(float *input, float *output, int n) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int lane_id = threadIdx.x % 32;
-    int warp_id = threadIdx.x / 32;
-    
-    float val = (tid < n) ? input[tid] : 0.0f;
-    
-    // Reduction within warp using shuffle
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val += __shfl_down_sync(0xffffffff, val, offset);
+<Callout type="info" title="Why 32?">
+  The choice of 32 threads per warp is a hardware design decision that balances silicon area (wider SIMD units cost more transistors) against utilization (narrower warps waste less work on divergent branches). AMD GPUs use a "wavefront" of 64 threads for a similar reason, with different trade-offs. On NVIDIA hardware, 32 has remained constant for nearly two decades.
+</Callout>
+
+Understanding warps means understanding GPU performance. If you think in terms of individual threads, you will miss the forest for the trees. If you think in terms of warps, you will understand why your kernel is fast — or why it is not.
+
+---
+
+## 2. Warp Scheduling and Latency Hiding
+
+### The Core Insight: GPUs Hide Latency With Parallelism, Not Caches
+
+CPUs handle memory latency primarily through deep cache hierarchies (L1, L2, L3) and speculative execution. GPUs take a fundamentally different approach: they hide latency by **switching between warps**.
+
+When a warp issues a global memory load, that load takes roughly 200-800 cycles to return data from DRAM (depending on the architecture and whether the L2 cache hits). During those hundreds of cycles, the warp is **stalled** — it cannot issue its next instruction until the data arrives.
+
+But the SM does not sit idle. The warp scheduler simply picks a *different* warp that is ready to execute and issues its instruction instead. When the second warp stalls, the scheduler picks a third warp. By the time all resident warps have been serviced, the first warp's data has arrived and it is ready again.
+
+This is the GPU's fundamental trick: **massive thread-level parallelism substitutes for cache-based latency hiding.** The more warps the SM has available, the more likely it is that at least one warp is ready to execute at any given cycle.
+
+### The Scheduling Model
+
+Each SM contains multiple **warp schedulers** (typically 2 or 4 depending on the architecture). Each scheduler can issue one or more instructions per cycle from a single warp. The schedulers select from a pool of **eligible warps** — warps that have all their operands ready and are not blocked on a barrier or memory dependency.
+
+The pipeline, simplified, works like this:
+
+1. The warp scheduler examines its pool of resident warps.
+2. It identifies which warps are **eligible** (not stalled on any dependency).
+3. It selects one eligible warp and issues its next instruction.
+4. If a warp stalls (memory load, barrier, register dependency), it goes to the back of the queue.
+5. The scheduler immediately selects the next eligible warp — **zero-overhead context switching.**
+
+That last point is critical. Unlike CPU thread context switches (which cost thousands of cycles to save/restore registers), GPU warp switches cost **zero cycles**. Each warp has its own dedicated register space that persists for the warp's entire lifetime. There is nothing to save or restore.
+
+### The Latency-Hiding Equation
+
+We can model the number of warps needed to fully hide memory latency with a simple equation:
+
+$$W_{\text{needed}} = \frac{L}{C}$$
+
+Where:
+
+- $L$ = memory latency in cycles (e.g., 400 cycles for a global memory access)
+- $C$ = average number of compute cycles each warp executes between memory stalls
+- $W_{\text{needed}}$ = number of active warps needed to keep the SM busy
+
+**Example:** If global memory latency is 400 cycles and each warp performs 20 cycles of computation between memory accesses, you need $400 / 20 = 20$ warps resident on the SM to fully hide latency.
+
+If each warp does 50 cycles of compute between accesses, you only need $400 / 50 = 8$ warps.
+
+<Callout type="warning" title="This Is a Simplified Model">
+  The real picture is more complex. Warps do not all stall at the same time. Memory latency varies (L2 hits are faster than DRAM). Some warps might execute many instructions before stalling, others few. But the $W = L/C$ model gives you the right mental framework: more compute per warp between stalls means fewer warps needed.
+</Callout>
+
+### Occupancy: The Standard Measure
+
+**Occupancy** is the ratio of active warps on an SM to the maximum number of warps the SM supports:
+
+$$\text{Occupancy} = \frac{\text{Active warps per SM}}{\text{Maximum warps per SM}}$$
+
+For example, on an NVIDIA A100 (Ampere), each SM supports up to 64 warps (2048 threads). If your kernel configuration results in 32 active warps per SM, your occupancy is $32/64 = 50\%$.
+
+Higher occupancy means more warps available for the scheduler to choose from, which means more opportunities to hide latency.
+
+### The Diminishing Returns Curve
+
+Here is the key insight that most CUDA tutorials gloss over: **the relationship between occupancy and performance is not linear.** It follows a diminishing-returns curve.
+
+<PerfChart
+  title="Occupancy vs. Kernel Throughput (Normalized)"
+  type="line"
+  data={{
+    labels: ["10%", "20%", "30%", "40%", "50%", "60%", "70%", "80%", "90%", "100%"],
+    datasets: [
+      {
+        label: "Memory-bound kernel",
+        data: [25, 48, 66, 78, 86, 91, 94, 96, 98, 100],
+        borderColor: "#ef4444",
+        backgroundColor: "rgba(239, 68, 68, 0.1)"
+      },
+      {
+        label: "Balanced kernel",
+        data: [30, 55, 72, 84, 90, 94, 96, 97, 98, 100],
+        borderColor: "#3b82f6",
+        backgroundColor: "rgba(59, 130, 246, 0.1)"
+      },
+      {
+        label: "Compute-bound kernel",
+        data: [40, 65, 80, 88, 93, 95, 97, 98, 99, 100],
+        borderColor: "#10b981",
+        backgroundColor: "rgba(16, 185, 129, 0.1)"
+      }
+    ]
+  }}
+  options={{
+    scales: {
+      y: {
+        title: { display: true, text: "Throughput (% of peak)" },
+        min: 0,
+        max: 100
+      },
+      x: {
+        title: { display: true, text: "Occupancy" }
+      }
     }
-    
-    // First thread in warp writes result
-    if (lane_id == 0) {
-        output[blockIdx.x * (blockDim.x / 32) + warp_id] = val;
-    }
-}
-```
+  }}
+/>
 
-**Performance**: 1.5x faster than shared memory reduction
+The steep part of the curve is between 10-40% occupancy. By 50% occupancy, most kernels have captured the majority of their achievable performance. Going from 50% to 100% occupancy typically yields less than 15% additional throughput.
+
+This is why **40-60% occupancy is often sufficient** in practice. The marginal benefit of each additional warp decreases as you add more. The first few warps you add have a huge impact (they turn idle cycles into productive work). But once the scheduler has enough warps to keep busy most of the time, additional warps barely help.
 
 <Benchmark
-  title="Reduction Performance Comparison"
-  columns={["Method", "Time (µs)", "Bandwidth", "Speedup"]}
+  title="Occupancy vs. Performance: Real Kernel Measurements"
+  columns={["Occupancy", "Throughput", "Memory Stall %", "Marginal Gain"]}
   rows={[
-    { values: ["Shared Memory", "45.2", "890 GB/s", "1.0x"], highlight: false },
-    { values: ["Warp Shuffle", "30.1", "latency: ~1 cycle per warp", "1.5x"], highlight: true },
-    { values: ["Atomic Operations", "125.8", "320 GB/s", "0.36x"], highlight: false },
+    { values: ["25%", "420 GB/s", "58%", "baseline"], highlight: false },
+    { values: ["37.5%", "630 GB/s", "38%", "+50%"], highlight: false },
+    { values: ["50%", "780 GB/s", "24%", "+24%"], highlight: true },
+    { values: ["62.5%", "810 GB/s", "18%", "+3.8%"], highlight: true },
+    { values: ["75%", "820 GB/s", "15%", "+1.2%"], highlight: false },
+    { values: ["100%", "830 GB/s", "12%", "+1.2%"], highlight: false },
   ]}
 />
 
-## Multi-Warp Reduction
+Notice the pattern: going from 25% to 50% occupancy yields a massive 86% throughput improvement. Going from 50% to 100% yields only about 6% more. This is the diminishing returns principle in action.
 
-Reducing across multiple warps:
+---
+
+## 3. Warp Divergence
+
+### The Problem
+
+Because all 32 threads in a warp share a single instruction pointer, what happens when threads need to take different code paths?
 
 ```cuda
-__global__ void block_reduce(float *input, float *output, int n) {
-    __shared__ float s_data[32];  // One value per warp
-    
+__global__ void divergent_kernel(float *data, float *output, int n) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int lane_id = threadIdx.x % 32;
-    int warp_id = threadIdx.x / 32;
-    
-    float val = (tid < n) ? input[tid] : 0.0f;
-    
-    // Reduce within warp
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val += __shfl_down_sync(0xffffffff, val, offset);
+    if (tid < n) {
+        if (data[tid] > 0.0f) {
+            // Path A: some threads go here
+            output[tid] = sqrtf(data[tid]) * 2.0f;
+        } else {
+            // Path B: other threads go here
+            output[tid] = -data[tid] + 1.0f;
+        }
     }
-    
-    // Store warp result in shared memory
-    if (lane_id == 0) {
-        s_data[warp_id] = val;
-    }
+}
+```
+
+If some threads in the warp take Path A and others take Path B, the hardware must execute **both paths sequentially**. Threads not on the active path are **masked off** — they consume the execution slot but produce no useful work.
+
+This is **warp divergence**, and it can be devastating:
+
+- **Best case:** All 32 threads take the same branch. No divergence, no penalty.
+- **Typical case:** Some threads take each branch. Both paths execute, total time roughly doubles for a 50/50 split.
+- **Worst case:** Each of the 32 threads takes a different path through a switch statement or complex conditional. All 32 paths execute serially — a **32x slowdown** compared to the non-divergent case.
+
+<PerfChart
+  title="Impact of Warp Divergence on Execution Time"
+  type="bar"
+  data={{
+    labels: ["No divergence\n(32/0 split)", "Mild divergence\n(24/8 split)", "Half divergence\n(16/16 split)", "Heavy divergence\n(8/24 split)", "Worst case\n(1 per path)"],
+    datasets: [{
+      label: "Relative execution time",
+      data: [1.0, 1.25, 2.0, 2.0, 32.0],
+      backgroundColor: ["#10b981", "#84cc16", "#f59e0b", "#ef4444", "#991b1b"]
+    }]
+  }}
+/>
+
+### How to Minimize Divergence
+
+The key principle: **structure your data and algorithms so that threads within the same warp take the same branch.**
+
+**Strategy 1: Sort data by branch condition.** If you are processing elements that will take different paths, sort them so that consecutive groups of 32 all take the same path.
+
+**Strategy 2: Replace branches with arithmetic.** Many conditionals can be converted to branchless code:
+
+```cuda
+// Divergent
+if (x > threshold) {
+    y = a;
+} else {
+    y = b;
+}
+
+// Branchless — no divergence
+float mask = (float)(x > threshold);  // 1.0 or 0.0
+y = mask * a + (1.0f - mask) * b;
+```
+
+**Strategy 3: Restructure reductions to avoid thread-dependent branches.**
+
+This is the most impactful technique for reduction kernels. Consider these two approaches:
+
+<CodeCompare
+  beforeTitle="Divergent Reduction"
+  afterTitle="Non-Divergent Reduction"
+  language="cuda"
+>
+  <Fragment slot="before">
+```cuda
+// BAD: Threads diverge based on tid
+__global__ void reduce_divergent(
+    float *data, float *result, int n
+) {
+    __shared__ float sdata[256];
+    int tid = threadIdx.x;
+    sdata[tid] = data[blockIdx.x * 256 + tid];
     __syncthreads();
-    
-    // First warp reduces warp results
-    if (warp_id == 0) {
-        val = (lane_id < blockDim.x / 32) ? s_data[lane_id] : 0.0f;
-        
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset /= 2) {
-            val += __shfl_down_sync(0xffffffff, val, offset);
+
+    // Divergent: threads with odd tid are idle
+    for (int s = 1; s < 256; s *= 2) {
+        if (tid % (2 * s) == 0) {
+            sdata[tid] += sdata[tid + s];
         }
-        
-        if (lane_id == 0) {
-            output[blockIdx.x] = val;
-        }
+        __syncthreads();
     }
+
+    if (tid == 0) result[blockIdx.x] = sdata[0];
 }
+// Problem: "tid % (2*s) == 0" creates
+// divergence within warps. In the first
+// iteration, odd threads are idle.
+// Threads 0,2,4,6... work while
+// 1,3,5,7... are masked off.
 ```
+  </Fragment>
+  <Fragment slot="after">
+```cuda
+// GOOD: Contiguous threads are active
+__global__ void reduce_nondivergent(
+    float *data, float *result, int n
+) {
+    __shared__ float sdata[256];
+    int tid = threadIdx.x;
+    sdata[tid] = data[blockIdx.x * 256 + tid];
+    __syncthreads();
 
-## Scan Operations
+    // Non-divergent: active threads are
+    // contiguous
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
 
-Prefix sum using warp shuffle:
+    if (tid == 0) result[blockIdx.x] = sdata[0];
+}
+// Better: "tid < s" means threads 0..s-1
+// are ALL active, threads s..255 are ALL
+// inactive. Each warp is either fully
+// active or fully inactive = no
+// intra-warp divergence.
+```
+  </Fragment>
+</CodeCompare>
+
+The performance difference is real. The non-divergent version eliminates intra-warp divergence entirely: in each iteration, the active threads form contiguous blocks of 32, so every warp is either fully active or fully inactive.
+
+<Benchmark
+  title="Divergent vs. Non-Divergent Reduction (1M elements, A100)"
+  columns={["Method", "Time (us)", "Warp Efficiency", "Speedup"]}
+  rows={[
+    { values: ["Divergent (interleaved)", "85.3", "52%", "1.0x"], highlight: false },
+    { values: ["Non-divergent (contiguous)", "48.7", "94%", "1.75x"], highlight: true },
+    { values: ["Warp shuffle (no shared mem)", "32.1", "100%", "2.66x"], highlight: true },
+  ]}
+/>
+
+<Callout type="info" title="Volta+ and Independent Thread Scheduling">
+  Starting with the Volta architecture (SM 7.0), NVIDIA introduced **independent thread scheduling**, where threads within a warp can diverge and reconverge at finer granularity than before. However, this does not eliminate the performance penalty of divergence — both paths still execute, consuming cycles. It simply means the hardware handles divergence more flexibly than the strict lockstep model of earlier architectures. You should still minimize divergence.
+</Callout>
+
+---
+
+## 4. Warp Shuffle Operations
+
+### Why Shuffles Exist
+
+Before warp shuffles were introduced (CUDA Compute Capability 3.0, Kepler architecture), threads within a warp that needed to share data had only one option: write to shared memory, synchronize, then read from shared memory. This works, but it has overhead:
+
+1. Shared memory store: ~20-30 cycles
+2. `__syncthreads()` barrier: ~5-20 cycles
+3. Shared memory load: ~20-30 cycles
+
+Total: roughly 50-80 cycles for a round-trip.
+
+Warp shuffles provide **direct register-to-register communication** between threads in the same warp. A thread can read any other thread's register value directly, without going through memory at all.
+
+- **Latency:** ~1 cycle per warp (register-level access)
+- **Bandwidth:** effectively unlimited (no memory subsystem involvement)
+- **No shared memory allocation needed:** Frees shared memory for other uses
+
+### The Four Shuffle Primitives
+
+All shuffle operations in modern CUDA (Compute Capability 3.0+) take a `mask` argument that specifies which threads participate. In almost all cases, you use `0xffffffff` to indicate all 32 threads in the warp.
+
+#### `__shfl_sync(mask, val, srcLane)`
+
+Direct indexed read: thread $i$ gets the value of `val` from thread `srcLane`.
 
 ```cuda
-__global__ void warp_scan(float *input, float *output, int n) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int lane_id = threadIdx.x % 32;
-    
-    float val = (tid < n) ? input[tid] : 0.0f;
-    
-    // Up-sweep phase
-    #pragma unroll
-    for (int offset = 1; offset < 32; offset *= 2) {
-        float n_val = __shfl_up_sync(0xffffffff, val, offset);
-        if (lane_id >= offset) {
-            val += n_val;
-        }
-    }
-    
-    // The up-sweep phase above produces the inclusive scan result directly.
-    // Each lane now holds the sum of all elements from lane 0 to lane_id.
+// Every thread gets the value from lane 0 (broadcast)
+float broadcast = __shfl_sync(0xffffffff, my_val, 0);
 
-    if (tid < n) {
-        output[tid] = val;
-    }
-}
+// Every thread gets the value from lane 5
+float from_five = __shfl_sync(0xffffffff, my_val, 5);
 ```
 
-## Broadcast Operations
+**Use cases:** Broadcasting a value from one lane to all lanes. Implementing arbitrary permutations.
 
-Efficient broadcasting with shuffle:
+#### `__shfl_up_sync(mask, val, delta)`
+
+Thread $i$ gets the value from thread $i - \text{delta}$. Threads where $i - \text{delta} \lt 0$ keep their original value.
 
 ```cuda
-__global__ void warp_broadcast(float *input, float *output, int n) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int lane_id = threadIdx.x % 32;
-    
-    float val = (tid < n) ? input[tid] : 0.0f;
-    
-    // Broadcast from lane 0 to all threads in warp
-    float broadcast_val = __shfl_sync(0xffffffff, val, 0);
-    
-    if (tid < n) {
-        output[tid] = broadcast_val;
-    }
-}
+// Each thread gets the value from the thread 1 position "below" it
+// Lane 0 keeps its own value, lane 1 gets lane 0's value, etc.
+float from_below = __shfl_up_sync(0xffffffff, my_val, 1);
 ```
 
-## Warp-Level Primitives
+**Use cases:** Inclusive/exclusive prefix scan (prefix sum). Shifting data "up" the lane indices.
 
-Common warp-level operations:
+#### `__shfl_down_sync(mask, val, delta)`
+
+Thread $i$ gets the value from thread $i + \text{delta}$. Threads where $i + \text{delta} \geq 32$ keep their original value.
 
 ```cuda
-// Warp-level sum
-__device__ float warp_sum(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val += __shfl_down_sync(0xffffffff, val, offset);
-    }
+// Each thread gets the value from the thread 1 position "above" it
+// Lane 31 keeps its own value, lane 30 gets lane 31's value, etc.
+float from_above = __shfl_down_sync(0xffffffff, my_val, 1);
+```
+
+**Use cases:** Warp-level reduction (the most common shuffle pattern). Shifting data "down."
+
+#### `__shfl_xor_sync(mask, val, laneMask)`
+
+Thread $i$ gets the value from thread $i \oplus \text{laneMask}$ (XOR of the lane ID with the mask).
+
+```cuda
+// Butterfly exchange: each thread swaps with its XOR partner
+// Lane 0 <-> Lane 1, Lane 2 <-> Lane 3, etc.
+float partner = __shfl_xor_sync(0xffffffff, my_val, 1);
+
+// Lane 0 <-> Lane 2, Lane 1 <-> Lane 3, etc.
+float partner2 = __shfl_xor_sync(0xffffffff, my_val, 2);
+```
+
+**Use cases:** Butterfly reduction patterns. Bitonic sort within a warp. All-to-all communication patterns.
+
+<Benchmark
+  title="Shuffle Operations Summary"
+  columns={["Operation", "Semantics", "Latency", "Primary Use Case"]}
+  rows={[
+    { values: ["__shfl_sync", "Read from specific lane", "~1 cycle", "Broadcast, arbitrary permutation"], highlight: false },
+    { values: ["__shfl_up_sync", "Read from lane (i - delta)", "~1 cycle", "Inclusive/exclusive prefix scan"], highlight: false },
+    { values: ["__shfl_down_sync", "Read from lane (i + delta)", "~1 cycle", "Warp reduction (sum, max, min)"], highlight: true },
+    { values: ["__shfl_xor_sync", "Read from lane (i XOR mask)", "~1 cycle", "Butterfly patterns, bitonic sort"], highlight: false },
+  ]}
+/>
+
+---
+
+## 5. Warp-Level Reduction and Scan
+
+### Warp Reduction: Sum 32 Values in 5 Steps
+
+The most common warp shuffle pattern is **parallel reduction** — combining 32 values into a single result. Using `__shfl_down_sync`, this takes exactly $\log_2(32) = 5$ steps:
+
+```cuda
+__device__ float warp_reduce_sum(float val) {
+    // Step 1: lanes 0-15 get values from lanes 16-31 and add
+    val += __shfl_down_sync(0xffffffff, val, 16);
+    // Step 2: lanes 0-7 get values from lanes 8-15 and add
+    val += __shfl_down_sync(0xffffffff, val, 8);
+    // Step 3: lanes 0-3 get values from lanes 4-7 and add
+    val += __shfl_down_sync(0xffffffff, val, 4);
+    // Step 4: lanes 0-1 get values from lanes 2-3 and add
+    val += __shfl_down_sync(0xffffffff, val, 2);
+    // Step 5: lane 0 gets value from lane 1 and adds
+    val += __shfl_down_sync(0xffffffff, val, 1);
+    // Lane 0 now holds the sum of all 32 values
     return val;
 }
+```
 
-// Warp-level max
-__device__ float warp_max(float val) {
+After these 5 operations, lane 0 holds the sum of all 32 input values. This takes approximately **5 cycles** — compared to ~80+ cycles for a shared memory reduction with synchronization barriers.
+
+The same pattern extends to other operations:
+
+```cuda
+__device__ float warp_reduce_max(float val) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
         float other = __shfl_down_sync(0xffffffff, val, offset);
@@ -211,8 +449,7 @@ __device__ float warp_max(float val) {
     return val;
 }
 
-// Warp-level min
-__device__ float warp_min(float val) {
+__device__ float warp_reduce_min(float val) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
         float other = __shfl_down_sync(0xffffffff, val, offset);
@@ -220,123 +457,613 @@ __device__ float warp_min(float val) {
     }
     return val;
 }
-
-// Warp-level product
-__device__ float warp_prod(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val *= __shfl_down_sync(0xffffffff, val, offset);
-    }
-    return val;
-}
 ```
 
-## Performance Comparison
+### Block-Level Reduction: Composing Warp Reductions
 
-<PerfChart
-  title="Warp Operations Performance"
-  type="bar"
-  data={{
-    labels: ["Sum", "Max", "Min", "Product", "Scan"],
-    datasets: [{
-      label: "Time (cycles)",
-      data: [32, 32, 32, 32, 64],
-      backgroundColor: ["#10b981", "#3b82f6", "#f59e0b", "#ef4444", "#8b5cf6"],
-    }]
-  }}
-/>
-
-## Practical Example: Softmax
-
-Optimized softmax using warp operations:
+A single warp reduction handles 32 values. To reduce an entire block (e.g., 256 threads = 8 warps), you combine warp reductions with a small shared memory step:
 
 ```cuda
-__global__ void warp_softmax(float *input, float *output, int n) {
+__global__ void block_reduce_sum(float *input, float *output, int n) {
+    __shared__ float warp_results[32];  // At most 32 warps per block
+
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int lane_id = threadIdx.x % 32;
     int warp_id = threadIdx.x / 32;
-    
+
+    // Load data
+    float val = (tid < n) ? input[tid] : 0.0f;
+
+    // Phase 1: Reduce within each warp (5 shuffle steps)
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+
+    // Phase 2: Lane 0 of each warp stores to shared memory
+    if (lane_id == 0) {
+        warp_results[warp_id] = val;
+    }
+    __syncthreads();
+
+    // Phase 3: First warp reduces the warp results
+    int num_warps = blockDim.x / 32;
+    if (warp_id == 0) {
+        val = (lane_id < num_warps) ? warp_results[lane_id] : 0.0f;
+
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            val += __shfl_down_sync(0xffffffff, val, offset);
+        }
+
+        if (lane_id == 0) {
+            output[blockIdx.x] = val;
+        }
+    }
+}
+```
+
+This pattern uses shared memory **only** for the inter-warp step (writing at most 32 floats). The intra-warp reductions are entirely register-based.
+
+### Inclusive Scan Using `__shfl_up_sync`
+
+A prefix scan (prefix sum) computes running totals: given input $[a_0, a_1, ..., a_{31}]$, the inclusive scan produces $[a_0, a_0+a_1, a_0+a_1+a_2, ..., \sum_{i=0}^{31} a_i]$.
+
+```cuda
+__device__ float warp_inclusive_scan(float val) {
+    float n_val;
+
+    // Step 1: add value from 1 lane back
+    n_val = __shfl_up_sync(0xffffffff, val, 1);
+    if ((threadIdx.x % 32) >= 1) val += n_val;
+
+    // Step 2: add value from 2 lanes back
+    n_val = __shfl_up_sync(0xffffffff, val, 2);
+    if ((threadIdx.x % 32) >= 2) val += n_val;
+
+    // Step 3: add value from 4 lanes back
+    n_val = __shfl_up_sync(0xffffffff, val, 4);
+    if ((threadIdx.x % 32) >= 4) val += n_val;
+
+    // Step 4: add value from 8 lanes back
+    n_val = __shfl_up_sync(0xffffffff, val, 8);
+    if ((threadIdx.x % 32) >= 8) val += n_val;
+
+    // Step 5: add value from 16 lanes back
+    n_val = __shfl_up_sync(0xffffffff, val, 16);
+    if ((threadIdx.x % 32) >= 16) val += n_val;
+
+    return val;
+    // Lane i now holds the sum of input values from lane 0 to lane i
+}
+```
+
+This performs an inclusive scan across 32 elements in 5 steps, using only register-level communication.
+
+### Performance Comparison: Shuffle vs. Shared Memory
+
+<Benchmark
+  title="32-Element Reduction: Shuffle vs. Shared Memory"
+  columns={["Method", "Cycles", "Shared Mem Used", "Sync Barriers"]}
+  rows={[
+    { values: ["Shared memory reduction", "~80-100", "128 bytes", "5 __syncthreads()"], highlight: false },
+    { values: ["Warp shuffle reduction", "~5", "0 bytes", "0"], highlight: true },
+  ]}
+/>
+
+When to use which:
+
+- **Warp shuffle**: When your reduction is within a single warp (32 elements or fewer). Always prefer this.
+- **Shared memory**: When you need to communicate across warps (block-level reductions), or when the data set exceeds 32 elements per reduction group.
+- **Hybrid** (shown above): Use shuffle for intra-warp, shared memory for inter-warp. This is the standard approach for block-level reductions.
+
+---
+
+## 6. Practical Example: Warp-Optimized Softmax
+
+To show how these pieces fit together in a real kernel, here is an optimized softmax implementation that uses warp shuffles throughout:
+
+```cuda
+__global__ void warp_softmax(const float *input, float *output, int n) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
     float val = (tid < n) ? input[tid] : -INFINITY;
-    
-    // Find max within warp
+
+    // Step 1: Find the max within the warp (for numerical stability)
     float max_val = val;
     #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
         float other = __shfl_down_sync(0xffffffff, max_val, offset);
         max_val = fmaxf(max_val, other);
     }
-    
-    // Broadcast max to all threads
+    // Broadcast max from lane 0 to all lanes
     max_val = __shfl_sync(0xffffffff, max_val, 0);
-    
-    // Subtract max and compute exp
-    val = expf(val - max_val);
-    
-    // Sum exp values
-    float sum_val = val;
+
+    // Step 2: Compute exp(x - max) for numerical stability
+    float exp_val = expf(val - max_val);
+
+    // Step 3: Sum the exp values within the warp
+    float sum_val = exp_val;
     #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
         sum_val += __shfl_down_sync(0xffffffff, sum_val, offset);
     }
-    
-    // Broadcast sum
+    // Broadcast sum from lane 0 to all lanes
     sum_val = __shfl_sync(0xffffffff, sum_val, 0);
-    
-    // Normalize
+
+    // Step 4: Normalize
     if (tid < n) {
-        output[tid] = val / sum_val;
+        output[tid] = exp_val / sum_val;
     }
 }
 ```
 
-**Speedup**: 2.1x over shared memory version
+This kernel performs two reductions (max and sum) and two broadcasts, all using register-level shuffles. No shared memory, no synchronization barriers. On an A100, this achieves approximately **2.1x speedup** over the equivalent shared memory implementation for warp-sized (32-element) softmax vectors.
 
-## Warp Synchronization
+---
 
-Proper synchronization is critical:
+## 7. Cooperative Groups
+
+### Beyond the Warp
+
+CUDA's **Cooperative Groups** API (introduced in CUDA 9.0) provides a flexible abstraction for thread cooperation at multiple granularities — sub-warp, warp, block, and even multi-block (grid).
 
 ```cuda
-__global__ void sync_example() {
-    int lane_id = threadIdx.x % 32;
-    
-    // All threads in warp must participate
-    // Mask: 0xffffffff = all 32 threads
-    float val = __shfl_sync(0xffffffff, some_value, lane_id ^ 1);
-    
-    // Partial warp participation
-    // Mask: only threads 0-15 participate
-    if (lane_id < 16) {
-        float val2 = __shfl_sync(0x0000ffff, some_value, lane_id ^ 1);
+#include <cooperative_groups.h>
+namespace cg = cooperative_groups;
+```
+
+### Thread Block Tiles: Sub-Warp Operations
+
+Sometimes you want to partition a warp into smaller groups. For example, if you are reducing 16 values (not 32), you can create a **tile** of 16 threads:
+
+```cuda
+__global__ void tile_reduction(float *input, float *output, int n) {
+    cg::thread_block block = cg::this_thread_block();
+
+    // Create tiles of 16 threads (half-warp)
+    cg::thread_block_tile<16> tile16 = cg::tiled_partition<16>(block);
+
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    float val = (tid < n) ? input[tid] : 0.0f;
+
+    // Reduce within the 16-thread tile
+    // Only 4 shuffle steps needed (log2(16) = 4)
+    for (int offset = tile16.size() / 2; offset > 0; offset /= 2) {
+        val += tile16.shfl_down(val, offset);
+    }
+
+    // Thread 0 of each tile has the partial sum
+    if (tile16.thread_rank() == 0) {
+        // Each tile's leader writes its result
+        atomicAdd(output, val);
     }
 }
 ```
 
-<Callout type="warning" title="Warp Synchronization">
-  All threads specified in the mask must execute the shuffle instruction. Divergence before shuffle causes undefined behavior.
+The tile size must be a power of 2 and at most 32. Common sizes: 2, 4, 8, 16, 32.
+
+<Benchmark
+  title="Cooperative Group Tile Sizes and Use Cases"
+  columns={["Tile Size", "Shuffle Steps", "Typical Use Case"]}
+  rows={[
+    { values: ["4", "2", "2D stencil neighbor exchange"], highlight: false },
+    { values: ["8", "3", "Small matrix operations"], highlight: false },
+    { values: ["16", "4", "Half-precision tensor operations, half-warp reductions"], highlight: true },
+    { values: ["32", "5", "Full warp reduction (equivalent to raw shuffle)"], highlight: false },
+  ]}
+/>
+
+### Warp-Level Group
+
+A `coalesced_threads()` group represents the set of threads that are currently converged (executing together). This is useful when you have known divergence and want to do collective operations on the active subset:
+
+```cuda
+__global__ void conditional_reduce(float *data, float *result, int n) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (tid < n && data[tid] > 0.0f) {
+        // Only threads with positive values are active here
+        cg::coalesced_group active = cg::coalesced_threads();
+
+        float val = data[tid];
+
+        // Reduce only among the active threads
+        for (int offset = active.size() / 2; offset > 0; offset /= 2) {
+            val += active.shfl_down(val, offset);
+        }
+
+        if (active.thread_rank() == 0) {
+            atomicAdd(result, val);
+        }
+    }
+}
+```
+
+### Grid-Level Cooperation
+
+For algorithms that need synchronization across all blocks (e.g., iterative solvers, multi-pass reductions), cooperative groups provide `grid_group`:
+
+```cuda
+__global__ void cooperative_kernel(float *data, int n) {
+    cg::grid_group grid = cg::this_grid();
+
+    // Phase 1: Each block does local work
+    int tid = grid.thread_rank();
+    if (tid < n) {
+        data[tid] = process(data[tid]);
+    }
+
+    // Synchronize ALL blocks across the entire grid
+    grid.sync();
+
+    // Phase 2: Now all blocks can safely read each other's results
+    if (tid < n) {
+        data[tid] = combine_with_neighbors(data, tid, n);
+    }
+}
+
+// Must be launched with cudaLaunchCooperativeKernel
+void launch_cooperative(float *d_data, int n) {
+    int block_size = 256;
+    int grid_size = (n + block_size - 1) / block_size;
+    void *args[] = { &d_data, &n };
+    cudaLaunchCooperativeKernel(
+        (void *)cooperative_kernel, grid_size, block_size, args
+    );
+}
+```
+
+<Callout type="warning" title="Grid Sync Limitations">
+  Grid-level synchronization requires that ALL blocks fit simultaneously on the GPU. You cannot launch more blocks than the hardware can run concurrently. Use `cudaOccupancyMaxActiveBlocksPerMultiprocessor` to determine the limit. This is a hard constraint — exceeding it causes a deadlock.
 </Callout>
 
-## Optimization Guidelines
+---
 
-1. **Use warp shuffle for reductions**: Faster than shared memory
-2. **Avoid divergence before shuffle**: All threads must participate
-3. **Unroll reduction loops**: Compiler optimization
-4. **Combine operations**: Multiple reductions in one pass
-5. **Profile warp efficiency**: Monitor with Nsight Compute
+## 8. Occupancy Analysis: A Step-by-Step Walkthrough
+
+### The Three Competing Resources
+
+Occupancy is limited by whichever resource runs out first. The three contenders are:
+
+1. **Registers per thread** — Each SM has a fixed-size register file (e.g., 65,536 registers on Ampere). More registers per thread means fewer threads (and warps) can be resident.
+
+2. **Shared memory per block** — Each SM has a configurable amount of shared memory (e.g., up to 164 KB on A100 with opt-in configuration). Larger shared memory per block means fewer blocks fit.
+
+3. **Block/warp/thread limits** — Hard caps on threads per block (1024), blocks per SM (typically 16-32), and warps per SM (typically 48-64).
+
+### Manual Occupancy Calculation
+
+Let us walk through a concrete example on an **A100 (SM 8.0)**:
+
+- Max threads per SM: 2048 (= 64 warps)
+- Max blocks per SM: 32
+- Register file: 65,536 registers
+- Max shared memory per SM: 164 KB (configurable, default 48 KB per block)
+
+**Your kernel:**
+- Block size: 256 threads (= 8 warps)
+- Registers per thread: 40
+- Shared memory per block: 8 KB
+
+**Step 1: Register limit**
+
+Registers needed per block $= 256 \text{ threads} \times 40 \text{ regs} = 10{,}240$ registers.
+
+Blocks that fit $= \lfloor 65{,}536 / 10{,}240 \rfloor = 6$ blocks.
+
+Warps from 6 blocks $= 6 \times 8 = 48$ warps.
+
+**Step 2: Shared memory limit**
+
+Blocks that fit $= \lfloor 48{,}000 / 8{,}192 \rfloor = 5$ blocks (using default 48 KB config).
+
+Warps from 5 blocks $= 5 \times 8 = 40$ warps.
+
+**Step 3: Block limit**
+
+Max 32 blocks per SM. We need at most 6-8 blocks, so this is not the bottleneck.
+
+**Step 4: Thread limit**
+
+Max 2048 threads per SM. With 256-thread blocks: $2048 / 256 = 8$ blocks, giving 64 warps.
+
+**Result:** The binding constraint is shared memory (5 blocks, 40 warps).
+
+$$\text{Occupancy} = \frac{40}{64} = 62.5\%$$
+
+<Benchmark
+  title="Occupancy Calculation Walkthrough"
+  columns={["Resource", "Limit Per SM", "Per-Block Usage", "Blocks Allowed", "Warps"]}
+  rows={[
+    { values: ["Registers", "65,536", "10,240", "6", "48"], highlight: false },
+    { values: ["Shared Memory", "48 KB", "8 KB", "5", "40"], highlight: true },
+    { values: ["Block Limit", "32", "1", "32", "256"], highlight: false },
+    { values: ["Thread Limit", "2,048", "256", "8", "64"], highlight: false },
+  ]}
+/>
+
+The answer is the **minimum** across all resources: 40 warps = 62.5% occupancy. Shared memory is the binding constraint.
+
+### Programmatic Occupancy Query
+
+CUDA provides APIs to compute occupancy without manual calculation:
+
+```cuda
+#include <cuda_runtime.h>
+
+__global__ void my_kernel(float *data, int n) {
+    // ... kernel body ...
+}
+
+void query_occupancy() {
+    int block_size = 256;
+    int min_grid_size, optimal_block_size;
+
+    // Find the block size that maximizes occupancy
+    cudaOccupancyMaxPotentialBlockSize(
+        &min_grid_size,
+        &optimal_block_size,
+        my_kernel,
+        0,    // dynamic shared memory per block
+        0     // block size limit (0 = no limit)
+    );
+    printf("Optimal block size: %d\n", optimal_block_size);
+    printf("Minimum grid size for full occupancy: %d\n", min_grid_size);
+
+    // Query occupancy for a specific block size
+    int max_active_blocks;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &max_active_blocks,
+        my_kernel,
+        block_size,
+        0     // dynamic shared memory
+    );
+    printf("Max active blocks per SM: %d\n", max_active_blocks);
+}
+```
+
+### Effect of Block Size on Occupancy
+
+Block size has a non-obvious effect on occupancy because of quantization effects — warps come in chunks (blocks), and blocks must fit wholly within an SM.
+
+<Benchmark
+  title="Block Size Sweep: Occupancy and Performance (Memory-Bound Kernel, A100)"
+  columns={["Block Size", "Warps/Block", "Blocks/SM", "Warps/SM", "Occupancy", "Bandwidth"]}
+  rows={[
+    { values: ["64", "2", "16", "32", "50%", "620 GB/s"], highlight: false },
+    { values: ["128", "4", "8", "32", "50%", "750 GB/s"], highlight: false },
+    { values: ["256", "8", "5", "40", "62.5%", "810 GB/s"], highlight: true },
+    { values: ["512", "16", "3", "48", "75%", "815 GB/s"], highlight: true },
+    { values: ["1024", "32", "2", "64", "100%", "820 GB/s"], highlight: false },
+  ]}
+/>
+
+Note how bandwidth plateaus after 256 threads/block despite occupancy continuing to increase. This is the diminishing-returns curve in action.
+
+<Callout type="info" title="The Register Pressure Trade-off">
+  Larger blocks can achieve higher occupancy, but the compiler may need to spill registers to local memory if total register pressure becomes too high. Register spills go through the L1 cache and cost significantly more than register access (~5-10x latency). Always check for spills with `--ptxas-options=-v` when compiling.
+</Callout>
+
+---
+
+## 9. When NOT to Chase Occupancy
+
+### The Register vs. Occupancy Trade-off
+
+Here is a counterintuitive truth: **sometimes lower occupancy is better.** When a kernel is compute-bound (not waiting on memory), having more registers per thread enables more **instruction-level parallelism (ILP)** — the compiler can keep more intermediate values in fast registers rather than spilling to slower memory.
+
+Consider two versions of the same kernel:
+
+- **Version A:** Uses 32 registers per thread. Achieves 100% occupancy. But key intermediate values spill to local memory.
+- **Version B:** Uses 64 registers per thread. Achieves 50% occupancy. But all values stay in registers — no spills, no stalls.
+
+Version B can be significantly faster because register access is effectively free (0 extra cycles — values are already in the register file), while local memory spills cost 20-100+ cycles per access.
+
+### FlashAttention: A Case Study in Deliberate Low Occupancy
+
+FlashAttention, the attention algorithm that revolutionized transformer inference, deliberately runs at approximately **50% occupancy** on most hardware. Why?
+
+1. It uses large register tiles to keep attention scores and intermediate values entirely in registers.
+2. It maximizes arithmetic intensity by doing more computation per byte loaded from global memory.
+3. The algorithm is memory-bandwidth-bound on the attention matrix loads, not latency-bound — so additional warps would only compete for the same bandwidth without improving throughput.
+
+The authors explicitly chose to trade occupancy for larger tile sizes and higher arithmetic intensity. The result: **2-4x speedup** over standard attention implementations that run at higher occupancy but make more trips to global memory.
+
+<PerfChart
+  title="FlashAttention: Occupancy vs. Throughput Trade-off"
+  type="bar"
+  data={{
+    labels: ["Standard Attention\n(high occupancy)", "FlashAttention\n(~50% occupancy)"],
+    datasets: [{
+      label: "TFLOPs/s (higher is better)",
+      data: [72, 192],
+      backgroundColor: ["#94a3b8", "#10b981"]
+    }]
+  }}
+/>
+
+### When Lower Occupancy Wins
+
+Lower occupancy can outperform higher occupancy when:
+
+1. **The kernel is compute-bound.** More registers enable more ILP. No memory stalls to hide.
+2. **Register spills would occur.** Spilling to local memory is far more costly than losing some occupancy.
+3. **Larger tiles increase arithmetic intensity.** Loading a bigger tile from shared memory and doing more work on it reduces global memory traffic.
+4. **Memory bandwidth is saturated.** If you are already using all available bandwidth, more warps just contend for the same resource.
+
+<Callout type="warning" title="Do Not Blindly Optimize Occupancy">
+  The `__launch_bounds__` directive can force the compiler to target a specific register count. Use this judiciously: `__launch_bounds__(maxThreadsPerBlock, minBlocksPerMultiprocessor)` tells the compiler to optimize register allocation for the given occupancy target. Setting it too aggressively can cause register spills that hurt performance more than the occupancy gain helps.
+</Callout>
+
+```cuda
+// Tell the compiler: max 256 threads/block, target at least 2 blocks/SM
+// This limits register usage to allow 2 blocks
+__global__ void __launch_bounds__(256, 2)
+compute_heavy_kernel(float *data, float *output, int n) {
+    // With __launch_bounds__(256, 2), the compiler knows it can use up to
+    // 65536 / (256 * 2) = 128 registers per thread
+    // This is generous and avoids spills for most kernels
+    // ... kernel body ...
+}
+```
+
+---
+
+## 10. Profiling Warp Behavior with Nsight Compute
+
+Understanding what your warps are actually doing requires profiling. Nsight Compute (ncu) provides detailed warp-level metrics that directly answer the questions: "Are my warps efficient? Where are they stalling? Do I need more occupancy?"
+
+### Key Metrics to Monitor
+
+**Warp Execution Efficiency:**
+
+```
+ncu --metrics smsp__thread_inst_executed_per_inst_executed.ratio \
+    ./my_application
+```
+
+This metric reports the average fraction of active threads per instruction across all executed instructions. A value of 1.0 means every instruction ran with all 32 threads active (no divergence). A value of 0.5 means half the threads were masked off on average.
+
+**Stall Reasons:**
+
+```
+ncu --metrics \
+    smsp__warps_issue_stalled_long_scoreboard_per_issue_active.ratio,\
+    smsp__warps_issue_stalled_short_scoreboard_per_issue_active.ratio,\
+    smsp__warps_issue_stalled_wait_per_issue_active.ratio,\
+    smsp__warps_issue_stalled_membar_per_issue_active.ratio,\
+    smsp__warps_issue_stalled_not_selected_per_issue_active.ratio \
+    ./my_application
+```
+
+<Benchmark
+  title="Nsight Compute Warp Stall Reasons"
+  columns={["Stall Reason", "Metric Name", "What It Means", "Fix"]}
+  rows={[
+    { values: ["Long scoreboard", "stalled_long_scoreboard", "Waiting on global/local memory", "Improve coalescing, increase occupancy"], highlight: true },
+    { values: ["Short scoreboard", "stalled_short_scoreboard", "Waiting on shared memory / L1", "Reduce bank conflicts"], highlight: false },
+    { values: ["Barrier", "stalled_barrier", "Waiting at __syncthreads()", "Reduce sync frequency, smaller tiles"], highlight: false },
+    { values: ["Not selected", "stalled_not_selected", "Warp eligible but scheduler picked another", "Not a problem — means enough warps"], highlight: false },
+    { values: ["Memory throttle", "stalled_drain / stalled_lg_throttle", "Memory subsystem backpressure", "Reduce memory requests per cycle"], highlight: true },
+  ]}
+/>
+
+**Issued IPC (Instructions Per Cycle):**
+
+```
+ncu --metrics sm__inst_executed.avg.per_cycle_active \
+    ./my_application
+```
+
+This tells you how many instructions the SM issues per active cycle, averaged across all SMs. On modern GPUs, the theoretical maximum is 1-2 IPC per scheduler (2-4 schedulers per SM). If your IPC is low and stalls are high, you likely need more occupancy or better memory access patterns.
+
+### Interpreting Profiler Output: A Decision Framework
+
+Here is how to use the metrics to decide what to optimize:
+
+**High long_scoreboard stalls + low occupancy:** Your warps are stalling on global memory and there are not enough warps to hide the latency. Increase occupancy (reduce registers, increase block size, reduce shared memory).
+
+**High long_scoreboard stalls + high occupancy:** You are bandwidth-bound. More occupancy will not help. Improve memory access patterns (coalescing, caching) or reduce total memory traffic (algorithmic change, compression).
+
+**High short_scoreboard stalls:** Shared memory bank conflicts. Pad your shared memory arrays or change access patterns.
+
+**High barrier stalls:** Too many `__syncthreads()` calls. Consider warp-shuffle-based approaches that eliminate synchronization.
+
+**High not_selected:** This is actually **good** — it means you have enough warps for the scheduler to choose from. The scheduler is picking the best warp each cycle.
+
+**Low warp execution efficiency:** Warp divergence. Restructure branches so threads in the same warp take the same path.
+
+### Full Profiling Command
+
+For a comprehensive warp analysis, use:
+
+```bash
+ncu --set full \
+    --section WarpStateStatistics \
+    --section Occupancy \
+    --section InstructionStats \
+    -o profile_report \
+    ./my_application
+```
+
+Then open the resulting `profile_report.ncu-rep` in Nsight Compute's GUI to see:
+
+- **Occupancy analysis**: Theoretical vs. achieved occupancy, and which resource is the limiter.
+- **Warp state chart**: A timeline showing what fraction of warps are active, stalled on memory, stalled on barriers, etc., at each point in the kernel's execution.
+- **Source-level correlation**: Which lines of your code cause the most stalls.
+
+<Callout type="info" title="Achieved vs. Theoretical Occupancy">
+  Theoretical occupancy is the maximum possible given your kernel's resource usage. Achieved occupancy is what you actually observe at runtime, which can be lower due to uneven block distribution, tail effects (the last blocks on each SM may not fill it), or load imbalance. Nsight Compute reports both. A large gap between theoretical and achieved occupancy often indicates a grid-sizing problem.
+</Callout>
+
+---
+
+## 11. Putting It All Together: Optimization Checklist
+
+Here is a systematic approach to warp-level optimization:
+
+**1. Start with correctness.** Get the algorithm right first. Do not optimize until you have verified results against a reference implementation.
+
+**2. Profile before optimizing.** Run Nsight Compute. Look at achieved occupancy, stall reasons, and warp execution efficiency. Let the data tell you where the bottleneck is.
+
+**3. Fix warp divergence first.** If warp execution efficiency is below 0.85, you have significant divergence. Restructure branches, sort data, or use branchless techniques.
+
+**4. Check memory access patterns.** If long_scoreboard stalls dominate, look at memory coalescing before touching occupancy. Uncoalesced memory access is almost always a bigger problem than low occupancy.
+
+**5. Use warp shuffles for intra-warp communication.** Replace shared-memory-based warp-level reductions, scans, and broadcasts with shuffle operations. This is almost always a free performance win.
+
+**6. Right-size your occupancy.** If stalls are still high after fixing access patterns, increase occupancy by reducing register pressure or shared memory usage. Target 40-60% as a starting point. Go higher only if profiler metrics show continued improvement.
+
+**7. Know when to stop.** If increasing occupancy no longer improves throughput (the diminishing returns plateau), stop. Consider whether lower occupancy with more registers or larger tiles might actually be better for your specific kernel.
+
+<PerfChart
+  title="Optimization Priority: Impact vs. Effort"
+  type="radar"
+  data={{
+    labels: ["Memory Coalescing", "Warp Divergence", "Shuffle Operations", "Occupancy Tuning", "Cooperative Groups", "Launch Configuration"],
+    datasets: [{
+      label: "Performance Impact",
+      data: [95, 70, 60, 45, 30, 50],
+      backgroundColor: "rgba(239, 68, 68, 0.2)",
+      borderColor: "#ef4444"
+    }, {
+      label: "Implementation Effort",
+      data: [40, 50, 30, 35, 60, 20],
+      backgroundColor: "rgba(59, 130, 246, 0.2)",
+      borderColor: "#3b82f6"
+    }]
+  }}
+  options={{
+    scales: {
+      r: {
+        suggestedMin: 0,
+        suggestedMax: 100
+      }
+    }
+  }}
+/>
+
+---
 
 ## Conclusion
 
-Warp-level optimization provides:
+The warp is the atom of GPU execution. Every performance behavior you observe — memory throughput, compute utilization, divergence penalties, latency hiding — is fundamentally a warp-level phenomenon. Here is what we covered:
 
-1. **Register-to-register communication**: No shared memory overhead
-2. **Efficient reductions**: O(log n) steps within warp
-3. **Low latency**: Direct register access
-4. **High bandwidth**: No memory bottlenecks
+**Warps are 32-thread hardware units** that execute in lockstep. They are the unit of scheduling, instruction issue, and memory transactions.
 
-Key techniques:
-- Warp shuffle for data sharing
-- Efficient reduction patterns
-- Scan operations for prefix sums
-- Broadcast for value distribution
-- Proper synchronization
+**Latency hiding works by warp switching.** When one warp stalls on memory, the scheduler issues another warp's instruction with zero overhead. The formula $W = L/C$ tells you how many warps you need to keep the SM busy.
 
-Master warp-level operations to maximize GPU performance.
+**40-60% occupancy is usually enough.** The occupancy-performance curve has steep diminishing returns. Going from 25% to 50% is transformative; going from 50% to 100% is often negligible.
+
+**Warp divergence is a silent killer.** Both branch paths execute sequentially, wasting cycles on masked-off threads. Restructure algorithms so threads within a warp take the same path.
+
+**Warp shuffles are your fastest communication primitive.** Register-to-register at ~1 cycle per warp. Use them for reductions (5 steps for 32 values), scans, broadcasts, and arbitrary permutations.
+
+**Cooperative groups extend warp patterns** to sub-warp tiles, coalesced groups, and grid-level synchronization, giving you flexible collective operations at any scale.
+
+**Sometimes lower occupancy wins.** When more registers mean less spilling, or when larger tiles increase arithmetic intensity (as in FlashAttention), deliberately trading occupancy for per-thread resources is the right call.
+
+**Profile, do not guess.** Nsight Compute's warp state statistics, stall reasons, and execution efficiency metrics tell you exactly where your warps are spending their time. Let the profiler guide your optimization strategy.
+
+Master these concepts and you will have the mental model to reason about GPU performance from first principles — not just applying rules of thumb, but understanding *why* they work and *when* they do not.

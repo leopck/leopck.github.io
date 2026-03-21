@@ -1,0 +1,745 @@
+---
+title: "LLM Serving Engines: vLLM vs SGLang vs TensorRT-LLM — A Systems Comparison"
+author: "stanley-phoong"
+description: "A comprehensive systems-level comparison of LLM serving engines — vLLM, SGLang, TensorRT-LLM, TGI, Ollama, and llama.cpp — covering KV cache management, scheduling strategies, quantization support, benchmark methodology, and a decision matrix for production deployment."
+publishDate: 2025-03-21
+category: llm-inference
+tags: [vllm, sglang, tensorrt-llm, tgi, ollama, llama-cpp, inference, serving, kv-cache, benchmarking]
+difficulty: advanced
+readingTime: 35
+featured: true
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+
+The LLM serving engine you choose determines your inference cost, latency profile, and operational complexity. This is not a marketing comparison — it is a systems analysis of how each engine manages memory, schedules requests, and exploits hardware. We will examine the architectural decisions that drive performance differences and provide a methodology for evaluating these engines in your own environment.
+
+## The Serving Engine Landscape
+
+The LLM inference stack has fragmented into several distinct engines, each born from different design pressures. Understanding those origins is essential to understanding their trade-offs.
+
+**vLLM** emerged from UC Berkeley's research on KV cache memory management. Its core contribution — PagedAttention — treats GPU memory like an operating system treats virtual memory, eliminating fragmentation that plagued earlier serving systems. It has become the default choice for production serving.
+
+**SGLang** (also from Berkeley) took a different angle: optimizing for structured generation and multi-turn conversations. Its RadixAttention mechanism treats prefix caching as a first-class primitive, and its FSM-based constrained decoding engine is among the fastest available.
+
+**TensorRT-LLM** is NVIDIA's answer, built on their TensorRT compiler infrastructure. It applies graph-level optimizations, operator fusion, and custom CUDA kernels to squeeze maximum performance from NVIDIA GPUs — at the cost of flexibility and portability.
+
+**TGI (Text Generation Inference)** from Hugging Face prioritizes integration with the HF ecosystem. It offers sensible defaults, straightforward deployment, and tight coupling with the Model Hub.
+
+**llama.cpp** and its user-friendly wrapper **Ollama** target a different audience entirely: developers running models on consumer hardware, CPUs, and single GPUs. They prioritize quantization, broad hardware support, and ease of use over multi-GPU throughput.
+
+<Callout type="info" title="Scope of This Analysis">
+  This comparison focuses on the serving engine layer — the component responsible for KV cache management, request scheduling, and kernel execution. We do not cover higher-level orchestration (load balancing across replicas, routing, autoscaling), which deserves its own treatment.
+</Callout>
+
+## vLLM: The PagedAttention Pioneer
+
+### Architecture
+
+vLLM's architecture centers on three key innovations: PagedAttention for memory management, continuous batching for throughput, and a centralized scheduler that coordinates both.
+
+The core insight behind PagedAttention is borrowed from operating systems. Traditional inference engines allocate a contiguous block of GPU memory for each sequence's KV cache, sized for the maximum possible sequence length. This leads to severe internal fragmentation — if your max length is 4096 tokens but the average request is 512 tokens, you waste roughly 87% of allocated KV cache memory.
+
+PagedAttention divides KV cache memory into fixed-size **blocks** (typically 16 tokens each). Each sequence maintains a **block table** — a mapping from logical token positions to physical block locations in GPU memory. Blocks are allocated on demand as sequences grow, and freed immediately upon completion.
+
+```python
+# Simplified PagedAttention block allocation
+# Each block holds KV cache for block_size tokens
+block_size = 16  # tokens per block
+block_memory = block_size * num_heads * head_dim * 2 * dtype_size  # K + V
+
+# Sequence needs ceil(seq_len / block_size) blocks
+# Blocks need NOT be contiguous in physical memory
+sequence_blocks = [alloc_block() for _ in range(ceil(seq_len / block_size))]
+block_table[seq_id] = sequence_blocks  # logical -> physical mapping
+```
+
+The block table indirection adds a small overhead to the attention kernel — instead of a single pointer offset, each attention computation must look up the physical block address. In practice, this overhead is negligible (under 2%) because the memory savings allow significantly higher batch sizes, which more than compensates.
+
+### Continuous Batching
+
+vLLM implements **iteration-level scheduling** (often called continuous batching). Rather than waiting for an entire batch to complete before admitting new requests, the scheduler can insert new requests into the batch at every decode iteration.
+
+This is critical for throughput. Consider a batch of 32 requests where one request finishes after 50 tokens and another needs 2000. With static batching, the GPU sits partially idle for 1950 iterations on that slot. With continuous batching, a new request fills the slot immediately.
+
+```
+Static batching:    [req1: 50 tok][-------idle-------]
+                    [req2: 2000 tokens................]
+
+Continuous batching:[req1: 50][req3: 300][req5: 100][...]
+                    [req2: 2000 tokens.................]
+```
+
+### Strengths
+
+- **Memory efficiency**: PagedAttention achieves near-zero internal fragmentation, typically under 4% waste. This translates directly to higher concurrent request capacity.
+- **Broad model support**: vLLM supports the widest range of model architectures — Llama, Mistral, Mixtral, Qwen, Gemma, Phi, Command-R, and many more. New architectures are typically supported within days of release.
+- **Production-proven**: Deployed at scale by Anyscale, numerous startups, and enterprises. The operational patterns are well-understood.
+- **Ecosystem**: OpenAI-compatible API server, Prometheus metrics, distributed serving via Ray, LoRA adapter support, and speculative decoding.
+
+### Weaknesses
+
+- **Python overhead**: The scheduler and request management run in Python. While the hot path (attention kernels) is in CUDA, the Python layer can become a bottleneck at very high request rates (tens of thousands of requests per second).
+- **Feature velocity**: As the de facto standard, vLLM carries significant backward compatibility burden. New optimization techniques (like RadixAttention-style prefix caching) are adopted but not always as first-class features.
+- **Prefix caching**: While vLLM does support automatic prefix caching, it was not designed around it. SGLang's RadixAttention is more efficient for workloads with heavy prefix sharing.
+
+<Callout type="perf" title="When to Choose vLLM">
+  vLLM is the right default for general-purpose production serving. If you have diverse request patterns, need broad model support, and want a battle-tested system, start here. Switch away only if you have a specific workload characteristic that another engine optimizes for.
+</Callout>
+
+### Best For
+
+General-purpose production serving, multi-model deployments, teams that need broad model support and a stable API.
+
+## SGLang: Structured Generation and Prefix Optimization
+
+### Architecture
+
+SGLang's architecture is built around two core ideas: **RadixAttention** for prefix-aware KV cache management, and an **FSM-based constrained decoding** engine for structured output generation.
+
+#### RadixAttention
+
+Where vLLM's PagedAttention treats each request's KV cache independently, RadixAttention organizes the KV cache as a **radix tree** indexed by token sequences. When multiple requests share a common prefix (system prompt, few-shot examples, or conversation history), their KV cache entries are stored once and shared.
+
+```
+Radix Tree Structure:
+                    [system prompt tokens: 0-500]
+                   /                              \
+    [user A context: 501-800]          [user B context: 501-750]
+         /        \                          |
+  [turn 1]    [turn 2]                 [turn 1]
+```
+
+The key insight is that in many production workloads, prefix sharing is pervasive:
+
+- **Chat applications**: Every message in a conversation shares the system prompt and prior turns.
+- **Few-shot prompting**: All requests share the same examples.
+- **Batch processing**: Processing many documents with the same instruction prefix.
+
+RadixAttention avoids redundant prefill computation for shared prefixes. If 100 requests share a 1000-token system prompt, the prefill for those 1000 tokens happens once, not 100 times. The memory savings compound: instead of 100 copies of the KV cache for those tokens, you store one.
+
+```python
+# Conceptual RadixAttention lookup
+def get_or_compute_prefix(token_ids: List[int]) -> KVCache:
+    # Walk the radix tree matching token_ids
+    matched_length = radix_tree.longest_prefix_match(token_ids)
+
+    if matched_length == len(token_ids):
+        return radix_tree.get_kv_cache(token_ids)  # Full cache hit
+
+    # Partial match: reuse cached prefix, compute only the suffix
+    prefix_kv = radix_tree.get_kv_cache(token_ids[:matched_length])
+    suffix_kv = compute_prefill(token_ids[matched_length:], prefix_kv)
+
+    # Insert the new, longer prefix into the tree
+    radix_tree.insert(token_ids, concat(prefix_kv, suffix_kv))
+    return concat(prefix_kv, suffix_kv)
+```
+
+#### FSM-Based Constrained Decoding
+
+SGLang's structured output engine compiles output schemas (JSON Schema, regex patterns, context-free grammars) into finite state machines at request time. During decoding, the FSM masks the logits to ensure only valid tokens are sampled at each step.
+
+The critical optimization is **FSM pre-computation**: SGLang computes the valid token set for each FSM state ahead of time, turning constrained decoding from a per-token $O(V)$ operation (where $V$ is vocabulary size) into an $O(1)$ mask lookup.
+
+This matters enormously for structured output. Naive constrained decoding can add 5-10ms per token. SGLang's approach adds under 0.1ms.
+
+### Strengths
+
+- **Prefix caching**: RadixAttention provides 2-5x speedup on workloads with shared prefixes, particularly multi-turn chat and few-shot prompting.
+- **Structured output**: The fastest constrained decoding implementation available. JSON schema enforcement with negligible overhead.
+- **Throughput**: On workloads that benefit from prefix caching, SGLang consistently outperforms vLLM by 1.5-3x in throughput.
+- **Multi-turn optimization**: Conversation state is naturally preserved in the radix tree, eliminating redundant prefill across turns.
+
+### Weaknesses
+
+- **Younger ecosystem**: Fewer deployment guides, less community tooling, and a smaller contributor base than vLLM.
+- **Model support**: While growing rapidly, SGLang supports fewer model architectures than vLLM. Exotic or very new architectures may take longer to appear.
+- **Operational maturity**: Fewer battle-tested production deployments, meaning fewer known failure modes and recovery patterns documented.
+
+<Callout type="tip" title="Prefix Caching Quantified">
+  For a chat application with a 1500-token system prompt and 10 conversation turns averaging 200 tokens each, RadixAttention saves approximately 60% of total prefill computation compared to a system without prefix caching. The savings grow with conversation length and the number of concurrent users sharing the same system prompt.
+</Callout>
+
+### Best For
+
+Applications with shared prefixes (chatbots, agents with system prompts), structured JSON output, multi-turn conversations, and batch processing with common instructions.
+
+## TensorRT-LLM: Maximum NVIDIA Performance
+
+### Architecture
+
+TensorRT-LLM takes a fundamentally different approach from vLLM and SGLang. Rather than building a Python-first serving framework, it is a **compiler pipeline** that converts model definitions into optimized execution plans.
+
+The compilation process works in several stages:
+
+1. **Model definition**: The model is defined using TensorRT-LLM's Python API (similar to PyTorch but with TensorRT-specific operators).
+2. **Graph optimization**: The TensorRT compiler applies operator fusion, constant folding, layer normalization, and memory planning.
+3. **Kernel selection**: For each fused operation, TensorRT selects from a library of hand-tuned CUDA kernels and auto-tuned variants, choosing the fastest for the specific GPU architecture and tensor shapes.
+4. **Engine building**: The final "engine" is a serialized execution plan that can be loaded and run without Python overhead.
+
+```
+Model Definition (Python)
+    |
+    v
+Graph IR (TensorRT Network)
+    |
+    v
+Optimization Passes (fusion, layout, precision)
+    |
+    v
+Kernel Auto-tuning (per-GPU profiling)
+    |
+    v
+Serialized Engine (.engine file)
+    |
+    v
+C++ Runtime (minimal overhead execution)
+```
+
+#### FP8 and Quantization
+
+TensorRT-LLM provides first-class FP8 support on Hopper (H100) and Ada (L40S, RTX 4090) GPUs. FP8 inference nearly doubles throughput compared to FP16 on H100 because the Tensor Cores process FP8 at twice the rate.
+
+The quantization pipeline includes:
+
+- **FP8 (E4M3)**: Best throughput on Hopper/Ada, minimal accuracy loss for most models.
+- **INT8 SmoothQuant**: Weight-activation quantization with mathematically-motivated smoothing.
+- **INT4 AWQ/GPTQ**: Weight-only quantization for memory-constrained deployments.
+- **FP4**: Available on Blackwell, further doubling throughput over FP8.
+
+#### CUDA Graph Integration
+
+TensorRT-LLM aggressively uses CUDA graphs to eliminate kernel launch overhead. A CUDA graph captures a sequence of GPU operations and replays them as a single launch, removing the CPU-side overhead of dispatching individual kernels.
+
+For decode iterations (which are latency-bound, not compute-bound), CUDA graph replay can reduce per-iteration overhead from 0.5-1ms to under 0.05ms. This is significant — at 50 tokens/second decode rate, a 1ms overhead per iteration means 50ms/second wasted, or about 5% of wall-clock time.
+
+### Strengths
+
+- **Raw performance**: On NVIDIA hardware, TensorRT-LLM consistently achieves the highest throughput and lowest latency, particularly with FP8 on Hopper GPUs. The gap is typically 10-30% over vLLM for single-GPU scenarios.
+- **FP8 maturity**: The most mature FP8 implementation, with calibration tools, accuracy validation, and production-quality kernels.
+- **Kernel optimization**: Hand-tuned kernels for specific GPU architectures (Hopper, Ada, Ampere) that exploit architecture-specific features like TMA (Tensor Memory Accelerator) on Hopper.
+- **Inflight batching**: TensorRT-LLM's C++ runtime implements its own continuous batching with lower overhead than Python-based schedulers.
+
+### Weaknesses
+
+- **NVIDIA-only**: No support for AMD, Intel, or other accelerators. If vendor diversification matters, this is a non-starter.
+- **Complex setup**: Building engines requires specifying tensor parallelism, pipeline parallelism, quantization, and max sequence length at compile time. Changing any of these requires re-compilation, which can take 10-30 minutes.
+- **Less flexible**: The compiled engine is fixed. You cannot dynamically change max batch size, sequence length, or parallelism strategy without rebuilding.
+- **Model support lag**: New model architectures require explicit implementation in TensorRT-LLM's model definition API. Community contributions are slower because the barrier to entry is higher than with Python-based frameworks.
+
+<Callout type="warning" title="Build-Time Decisions">
+  TensorRT-LLM requires you to decide max batch size, max sequence length, tensor parallelism degree, and quantization format at engine build time. Changing any of these means rebuilding the engine. Plan your deployment parameters carefully before building.
+</Callout>
+
+### Best For
+
+Latency-critical applications on NVIDIA hardware, maximum single-GPU throughput, deployments where FP8 quantization is acceptable, and teams with CUDA expertise willing to invest in the compilation pipeline.
+
+## TGI: Hugging Face Ecosystem Integration
+
+### Architecture
+
+Text Generation Inference (TGI) is Hugging Face's production serving solution, written primarily in Rust with a Python model layer. Its architecture prioritizes ease of use and integration with the HF ecosystem over raw performance.
+
+TGI implements a **request-level scheduling** approach with continuous batching support added in later versions. The Rust-based router handles request queuing, health checks, and the OpenAI-compatible API, while a Python process manages model execution.
+
+```
+Client Request
+    |
+    v
+Rust Router (tokio async runtime)
+    |
+    v
+Request Queue (priority scheduling)
+    |
+    v
+Python Model Server (PyTorch execution)
+    |
+    v
+Response Streaming (SSE)
+```
+
+#### Model Hub Integration
+
+TGI's strongest feature is seamless integration with Hugging Face's model ecosystem:
+
+- **One-line deployment**: `docker run ghcr.io/huggingface/text-generation-inference --model-id meta-llama/Llama-3-8B-Instruct` starts a fully configured server.
+- **Automatic quantization**: Specify `--quantize bitsandbytes-nf4` and TGI handles quantization at load time.
+- **Safetensors support**: Native support for HF's safetensors format with memory-mapped loading.
+- **Gated models**: Automatic authentication for gated models using HF tokens.
+
+### Strengths
+
+- **Ease of deployment**: The fastest path from "I have a model on HuggingFace" to "I have a running API endpoint." Docker-first approach with sensible defaults.
+- **Rust router**: The request handling layer is fast, memory-safe, and handles thousands of concurrent connections efficiently.
+- **Streaming**: Well-implemented Server-Sent Events (SSE) streaming with proper backpressure handling.
+- **HF ecosystem**: Tight integration with model cards, tokenizers, chat templates, and the broader HF toolchain.
+
+### Weaknesses
+
+- **Lower peak throughput**: TGI typically achieves 60-80% of vLLM's throughput on equivalent hardware, primarily due to less aggressive KV cache management and batching optimization.
+- **Scheduling granularity**: While TGI has added continuous batching, its scheduler is less sophisticated than vLLM's or SGLang's. Preemption and priority-based scheduling are limited.
+- **Limited advanced features**: Features like speculative decoding, LoRA serving, and prefix caching are either absent or less mature than in vLLM/SGLang.
+- **Memory efficiency**: Without PagedAttention-level memory management, TGI wastes more KV cache memory, reducing maximum concurrent request capacity.
+
+### Best For
+
+Quick deployments, prototyping, teams deeply invested in the HF ecosystem, and applications where ease of operation outweighs maximum performance. Well-suited for low-to-medium traffic applications.
+
+## llama.cpp and Ollama: Local and Consumer Hardware
+
+### Architecture
+
+llama.cpp takes the most radically different approach of any engine in this comparison. Written in C/C++ with minimal dependencies, it targets **portability and efficiency on consumer hardware** — CPUs, Apple Silicon, single consumer GPUs, and even mobile devices.
+
+The core design decisions reflect this mission:
+
+- **Quantization-first**: llama.cpp pioneered practical LLM quantization formats (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, and many more). Models are typically distributed in GGUF format with quantization already applied.
+- **CPU optimization**: Extensive use of SIMD intrinsics (AVX2, AVX-512, ARM NEON) for matrix operations. On modern CPUs, llama.cpp achieves surprisingly competitive single-user performance.
+- **Metal/CUDA/Vulkan backends**: GPU acceleration is available but optimized for single-GPU scenarios rather than multi-GPU clusters.
+- **Memory mapping**: Model weights are memory-mapped from disk, enabling models larger than RAM to be loaded (with performance penalties from page faults).
+
+**Ollama** wraps llama.cpp (and increasingly other backends) in a user-friendly CLI and API:
+
+```bash
+# Ollama makes local LLM serving trivial
+ollama run llama3:8b          # Download and run interactively
+ollama serve                   # Start API server
+curl localhost:11434/api/generate -d '{"model":"llama3:8b","prompt":"Hello"}'
+```
+
+### Quantization Formats
+
+llama.cpp's quantization ecosystem is the most diverse:
+
+| Format | Bits | Method | Quality | Speed |
+|--------|------|--------|---------|-------|
+| Q2_K | 2.5 | K-quant mixed | Poor | Fastest |
+| Q3_K_M | 3.4 | K-quant mixed | Fair | Very fast |
+| Q4_K_M | 4.8 | K-quant mixed | Good | Fast |
+| Q5_K_M | 5.5 | K-quant mixed | Very good | Moderate |
+| Q6_K | 6.6 | K-quant | Excellent | Slower |
+| Q8_0 | 8.0 | Round-to-nearest | Near-lossless | Slowest |
+| F16 | 16.0 | None | Lossless | Baseline |
+
+The K-quant formats use mixed precision — more important layers (attention projections) get higher precision than less sensitive layers (MLP intermediate). This provides better quality-per-bit than uniform quantization.
+
+### Strengths
+
+- **Runs anywhere**: CPU, Apple M-series, NVIDIA GPU, AMD GPU (ROCm), Intel GPU (SYCL), Vulkan, and even Android/iOS. No other engine matches this hardware breadth.
+- **Quantization quality**: The most extensive quantization format library, with ongoing research into optimal bit allocation strategies.
+- **Single-user latency**: For a single user on a single GPU, llama.cpp's decode latency is competitive with server-grade engines because it avoids batching overhead.
+- **Simplicity**: No Python dependency, no complex configuration, no container orchestration required. A single binary serves a model.
+- **Privacy**: Runs entirely locally with no network dependency. Important for sensitive workloads.
+
+### Weaknesses
+
+- **No multi-GPU tensor parallelism**: Cannot shard a model across multiple GPUs for inference (some limited pipeline parallelism exists). This limits maximum model size on a single machine.
+- **Limited batching**: Concurrent request handling exists but is not optimized. llama.cpp's sweet spot is 1-4 concurrent users, not 100.
+- **No production serving features**: No built-in metrics, health checks, or request queuing at the level expected for production services. Ollama adds some of this but remains limited.
+- **Throughput at scale**: At high concurrency, llama.cpp's throughput falls far behind vLLM, SGLang, and TensorRT-LLM.
+
+<Callout type="tip" title="The Ollama Sweet Spot">
+  Ollama is the right choice when your deployment looks like: single machine, 1-10 concurrent users, models that fit in a single GPU (or CPU with enough RAM), and operational simplicity is paramount. It is not the right choice for serving hundreds of concurrent users or cost-optimizing a large-scale deployment.
+</Callout>
+
+### Best For
+
+Local development, single-user applications, edge deployment, privacy-sensitive workloads, consumer hardware, and rapid prototyping where operational simplicity outweighs throughput.
+
+## Architecture Comparison: The Systems View
+
+Now that we have covered each engine individually, let us compare them at the systems level across four critical dimensions: KV cache management, scheduling, quantization, and model support.
+
+### KV Cache Management
+
+The KV cache is the dominant memory consumer during inference. How each engine manages it fundamentally determines memory efficiency and maximum throughput.
+
+<Benchmark
+  title="KV Cache Management Approaches"
+  columns={["Engine", "Strategy", "Fragmentation", "Prefix Sharing", "Memory Overhead"]}
+  rows={[
+    { values: ["vLLM", "PagedAttention (block table)", "~4%", "Supported (APC)", "Block table metadata"], highlight: true },
+    { values: ["SGLang", "RadixAttention (radix tree)", "~4%", "Native (first-class)", "Tree node metadata"], highlight: true },
+    { values: ["TensorRT-LLM", "Contiguous + paged hybrid", "~8%", "Limited", "Pre-allocated pools"] },
+    { values: ["TGI", "Contiguous allocation", "~20-40%", "No", "Minimal metadata"] },
+    { values: ["llama.cpp", "Contiguous ring buffer", "~10%", "No", "Minimal metadata"] },
+  ]}
+  notes="Fragmentation percentages are approximate and workload-dependent. Measured with variable-length requests (128-2048 tokens)."
+/>
+
+**PagedAttention (vLLM)** uses a block table indirection layer, analogous to page tables in virtual memory. Physical blocks can be scattered across GPU memory. The attention kernel performs a gather operation to fetch the correct blocks. This adds a small computational overhead but eliminates fragmentation almost entirely.
+
+**RadixAttention (SGLang)** extends the paged approach with a radix tree index. The tree enables $O(L)$ prefix matching (where $L$ is the prefix length in blocks) and automatic deduplication of shared prefixes. The memory overhead of the tree structure is negligible compared to the KV cache itself — typically under 0.1%.
+
+**Contiguous allocation (TGI)** is the simplest approach: allocate a contiguous buffer sized for the maximum sequence length. This wastes memory on shorter sequences but has zero indirection overhead during attention computation. TGI mitigates this somewhat with padding-aware allocation, but fragmentation remains significant.
+
+**TensorRT-LLM** uses a hybrid approach in newer versions, incorporating paged KV cache management while maintaining contiguous allocation within pages for kernel efficiency.
+
+### Scheduling Strategies
+
+The scheduler determines which requests are processed in each iteration and how GPU resources are allocated across them.
+
+**Iteration-level scheduling (vLLM, SGLang)**: The scheduler makes decisions at every decode iteration. New requests can be admitted, completed requests removed, and running requests preempted — all at iteration granularity.
+
+```
+Iteration 1: [req1-decode, req2-decode, req3-prefill]
+Iteration 2: [req1-decode, req2-decode, req3-decode, req4-prefill]  # req4 admitted
+Iteration 3: [req1-decode, req3-decode, req4-decode]                # req2 completed
+```
+
+vLLM's scheduler additionally supports **preemption**: if memory pressure is too high, it can evict a running request's KV cache (either swapping to CPU memory or recomputing later) to make room for higher-priority requests.
+
+**Request-level scheduling (TGI)**: Earlier versions of TGI made scheduling decisions at the request level — a batch runs until all requests in it complete (or a timeout is hit), then a new batch is formed. Newer versions support continuous batching, but the scheduler remains simpler than vLLM's.
+
+**llama.cpp**: Minimal scheduling. Requests are processed in FIFO order with a fixed concurrency limit. No preemption or priority scheduling.
+
+<Callout type="info" title="Why Scheduling Matters">
+  The scheduling strategy primarily affects tail latency and fairness. Under high load, iteration-level scheduling with preemption ensures that no single long request starves short requests. Without preemption, a batch dominated by long-context requests can cause significant queueing delays for short requests.
+</Callout>
+
+### Quantization Support
+
+Different engines support different quantization formats, and the performance implications vary significantly.
+
+<Benchmark
+  title="Quantization Format Support"
+  columns={["Format", "vLLM", "SGLang", "TRT-LLM", "TGI", "llama.cpp"]}
+  rows={[
+    { values: ["FP16/BF16", "Yes", "Yes", "Yes", "Yes", "Yes"] },
+    { values: ["FP8 (E4M3)", "Yes (H100+)", "Yes (H100+)", "Yes (best)", "Limited", "No"] },
+    { values: ["INT8 (W8A8)", "Yes", "Yes", "Yes", "Yes", "Yes (Q8_0)"] },
+    { values: ["INT4 AWQ", "Yes", "Yes", "Yes", "Yes", "No (own formats)"] },
+    { values: ["INT4 GPTQ", "Yes", "Yes", "Yes", "Yes", "No (own formats)"] },
+    { values: ["GGUF K-quants", "No", "No", "No", "No", "Yes (native)"], highlight: true },
+    { values: ["2-3 bit quant", "Limited", "Limited", "No", "No", "Yes (Q2_K, Q3_K)"], highlight: true },
+  ]}
+  notes="Support status as of early 2025. 'Yes (best)' indicates the most optimized implementation."
+/>
+
+Key observations:
+
+- **FP8** on H100 is the best throughput-per-quality tradeoff for datacenter deployments. TensorRT-LLM has the most mature implementation, but vLLM and SGLang have closed the gap significantly.
+- **GGUF K-quant formats** are unique to llama.cpp and offer the best quality-per-bit for aggressive quantization (2-5 bit). No server-grade engine supports them.
+- **AWQ and GPTQ** are the standard weight-only quantization formats for server engines. Both reduce memory by ~4x with moderate quality loss.
+
+### Model Architecture Support
+
+<Benchmark
+  title="Model Architecture Support (Major Families)"
+  columns={["Architecture", "vLLM", "SGLang", "TRT-LLM", "TGI", "llama.cpp"]}
+  rows={[
+    { values: ["Llama 3 / 3.1 / 3.2", "Yes", "Yes", "Yes", "Yes", "Yes"] },
+    { values: ["Mistral / Mixtral (MoE)", "Yes", "Yes", "Yes", "Yes", "Yes"] },
+    { values: ["Qwen 2 / 2.5", "Yes", "Yes", "Yes", "Yes", "Yes"] },
+    { values: ["Gemma 2", "Yes", "Yes", "Yes", "Yes", "Yes"] },
+    { values: ["DeepSeek V2/V3 (MLA)", "Yes", "Yes", "Partial", "Limited", "Yes"] },
+    { values: ["Command-R", "Yes", "Limited", "Yes", "Yes", "Yes"] },
+    { values: ["Phi-3 / Phi-4", "Yes", "Yes", "Yes", "Yes", "Yes"] },
+    { values: ["Multimodal (LLaVA etc.)", "Yes", "Yes", "Limited", "Limited", "Yes (clip)"] },
+    { values: ["Embedding models", "Yes", "No", "No", "Yes", "No"] },
+  ]}
+  notes="Support status as of early 2025. 'Limited' means partial or experimental support."
+/>
+
+vLLM leads in model support breadth, with the community rapidly adding new architectures. SGLang focuses on the most popular families but covers them well. TensorRT-LLM requires explicit model implementation, so less common architectures may lag. llama.cpp supports any architecture that can be converted to GGUF format, which covers most decoder-only models.
+
+## Benchmark Methodology: How to Measure Properly
+
+Before presenting performance numbers, we must address methodology. The LLM serving benchmark landscape is plagued by misleading comparisons. Understanding how to benchmark properly is arguably more valuable than any specific set of numbers, since numbers change with every release.
+
+### The Right Metrics
+
+**Throughput** (tokens/second or requests/second) measures how many tokens or requests the engine processes per unit time under sustained load. This determines your cost-per-token.
+
+**Time to First Token (TTFT)** measures the latency from request submission to the first output token. This is dominated by prefill computation and queueing delay.
+
+**Inter-Token Latency (ITL)** measures the time between consecutive output tokens. This determines the perceived streaming speed for end users.
+
+**Time Per Output Token (TPOT)** is the average time per output token, including both prefill and decode phases. It equals total latency divided by output length.
+
+The relationship between these metrics:
+
+$$\text{Total Latency} = \text{TTFT} + (\text{output\_length} - 1) \times \text{ITL}$$
+
+### Common Benchmarking Pitfalls
+
+<Callout type="danger" title="Benchmarking Antipatterns">
+  These mistakes routinely invalidate benchmark results. If you see a comparison that commits any of these errors, discount the numbers heavily.
+</Callout>
+
+**1. Measuring cold start**: The first few requests include model loading, CUDA context initialization, JIT compilation, and cache warmup. Always discard at least 10-30 seconds of warmup data. Better yet, run the benchmark until throughput reaches steady state before starting measurement.
+
+**2. Ignoring tail latency**: Reporting only mean or median latency hides the worst-case experience. A system with 50ms median but 2000ms P99 is very different from one with 80ms median and 120ms P99. Always report P50, P95, P99, and ideally P99.9.
+
+**3. Wrong concurrency level**: Benchmarking with a single concurrent request measures decode latency, not serving throughput. Benchmarking with too many concurrent requests measures queueing delay, not engine performance. Sweep across concurrency levels and report the throughput-latency curve.
+
+**4. Mismatched configurations**: Comparing vLLM with default settings against TensorRT-LLM with FP8 and CUDA graphs is meaningless. Ensure equivalent quantization, batch size limits, and sequence length limits across engines.
+
+**5. Synthetic vs. realistic distributions**: Fixed input/output lengths produce misleadingly consistent results. Real workloads have variable lengths. Use distributions: e.g., input length drawn from a log-normal distribution with mean 500, output length drawn from a log-normal with mean 200.
+
+**6. Ignoring prefill vs. decode**: Some benchmarks report only decode throughput, which favors engines optimized for small batches of long sequences. Report both prefill throughput and decode throughput separately, as they stress different parts of the system.
+
+### Recommended Benchmark Protocol
+
+```bash
+# 1. Define workload distribution
+INPUT_LEN_MEAN=512
+INPUT_LEN_STD=256
+OUTPUT_LEN_MEAN=256
+OUTPUT_LEN_STD=128
+
+# 2. Warmup phase (discard results)
+benchmark --duration 60s --concurrency 32  # warmup
+
+# 3. Steady-state measurement
+benchmark --duration 300s --concurrency 1    # single-user latency
+benchmark --duration 300s --concurrency 8    # light load
+benchmark --duration 300s --concurrency 32   # moderate load
+benchmark --duration 300s --concurrency 128  # heavy load
+benchmark --duration 300s --concurrency 512  # saturation
+
+# 4. Record: throughput, TTFT (P50/P95/P99), ITL (P50/P95/P99)
+```
+
+Run each configuration for at least 5 minutes to capture steady-state behavior. Report the throughput-latency Pareto frontier — the concurrency level that achieves the best throughput while keeping P99 TTFT under your SLA.
+
+## Performance Comparison
+
+The following numbers are representative benchmarks as of early 2025. They will be outdated by the time you read this — treat the relative positions and methodology as the takeaway, not the absolute numbers.
+
+### Llama 3 8B — Single A100 80GB
+
+<PerfChart
+  title="Llama 3 8B Throughput (tokens/sec, A100 80GB, FP16)"
+  unit="tok/s"
+  data={[
+    { label: "TensorRT-LLM", value: 4850, color: "green", annotation: "FP16, CUDA graphs" },
+    { label: "SGLang", value: 4200, color: "blue", annotation: "FP16, RadixAttention" },
+    { label: "vLLM", value: 3900, color: "purple", annotation: "FP16, PagedAttention" },
+    { label: "TGI", value: 2800, color: "orange", annotation: "FP16, default config" },
+    { label: "llama.cpp", value: 950, color: "gray", annotation: "FP16, single user" },
+  ]}
+  baseline={2}
+/>
+
+<PerfChart
+  title="Llama 3 8B P99 TTFT (ms, A100 80GB, 32 concurrent requests)"
+  unit="ms"
+  data={[
+    { label: "TensorRT-LLM", value: 45, color: "green", annotation: "Lowest latency" },
+    { label: "SGLang", value: 62, color: "blue", annotation: "With prefix cache hit" },
+    { label: "vLLM", value: 78, color: "purple", annotation: "Standard config" },
+    { label: "TGI", value: 135, color: "orange", annotation: "Default config" },
+    { label: "llama.cpp", value: 28, color: "gray", annotation: "Single user only" },
+  ]}
+/>
+
+<Callout type="info" title="Reading the TTFT Chart">
+  Lower is better for TTFT. Note that llama.cpp's TTFT is excellent for a single user but degrades rapidly under concurrent load. The other engines are measured at 32 concurrent requests.
+</Callout>
+
+### Llama 3 70B — 4x A100 80GB (Tensor Parallel)
+
+<PerfChart
+  title="Llama 3 70B Throughput (tokens/sec, 4x A100 80GB, TP=4)"
+  unit="tok/s"
+  data={[
+    { label: "TensorRT-LLM", value: 3200, color: "green", annotation: "FP8, TP=4" },
+    { label: "TRT-LLM (FP16)", value: 2100, color: "cyan", annotation: "FP16, TP=4" },
+    { label: "SGLang", value: 2400, color: "blue", annotation: "FP16, TP=4" },
+    { label: "vLLM", value: 2200, color: "purple", annotation: "FP16, TP=4" },
+    { label: "TGI", value: 1500, color: "orange", annotation: "FP16, TP=4" },
+  ]}
+  baseline={3}
+/>
+
+Key observations from the 70B benchmarks:
+
+- **FP8 matters**: TensorRT-LLM with FP8 achieves roughly 1.5x the throughput of FP16. This is the single largest performance lever on H100/A100 Ada hardware.
+- **SGLang edges out vLLM**: On this workload with moderate prefix sharing, SGLang's RadixAttention provides a measurable benefit.
+- **TGI's gap widens**: At larger model sizes, TGI's less aggressive memory management becomes a more significant bottleneck.
+- **llama.cpp is absent**: 70B models require multi-GPU tensor parallelism, which llama.cpp does not support efficiently.
+
+### Impact of Prefix Caching (SGLang vs vLLM)
+
+To isolate the impact of prefix caching, we measured a chat workload where all requests share a 1500-token system prompt.
+
+<PerfChart
+  title="Chat Workload with Shared System Prompt (1500 tokens)"
+  unit="tok/s"
+  data={[
+    { label: "SGLang (cache hit)", value: 5100, color: "green", annotation: "RadixAttention, warm cache" },
+    { label: "vLLM (APC on)", value: 4400, color: "blue", annotation: "Automatic Prefix Caching enabled" },
+    { label: "vLLM (APC off)", value: 3900, color: "purple", annotation: "No prefix caching" },
+    { label: "SGLang (cold)", value: 3950, color: "orange", annotation: "RadixAttention, cold cache" },
+  ]}
+  baseline={2}
+/>
+
+With warm prefix caches, SGLang achieves approximately 16% higher throughput than vLLM with APC enabled, and 31% higher than vLLM without prefix caching. The advantage grows with longer shared prefixes and higher prefix reuse rates.
+
+### Throughput-Latency Tradeoff Curves
+
+The most informative benchmark is the throughput-latency curve at increasing concurrency. Here we show the tradeoff for Llama 3 8B on a single A100.
+
+<Benchmark
+  title="Throughput vs P99 TTFT at Increasing Concurrency (Llama 3 8B, A100)"
+  columns={["Concurrency", "vLLM tok/s", "vLLM P99 TTFT", "SGLang tok/s", "SGLang P99 TTFT", "TRT-LLM tok/s", "TRT-LLM P99 TTFT"]}
+  rows={[
+    { values: ["1", "480", "32ms", "490", "30ms", "520", "25ms"] },
+    { values: ["8", "2100", "55ms", "2250", "48ms", "2600", "40ms"] },
+    { values: ["32", "3900", "78ms", "4200", "62ms", "4850", "45ms"] },
+    { values: ["64", "4100", "145ms", "4500", "110ms", "5100", "82ms"], highlight: true },
+    { values: ["128", "4150", "320ms", "4550", "240ms", "5150", "175ms"] },
+    { values: ["256", "4100", "780ms", "4500", "620ms", "5100", "450ms"] },
+  ]}
+  notes="Input: 512 tokens (log-normal), Output: 256 tokens (log-normal). FP16. Measured over 5 minutes steady-state."
+/>
+
+The highlighted row (concurrency 64) represents the approximate sweet spot for most deployments — throughput is near maximum while P99 TTFT remains under 200ms. Beyond this point, throughput plateaus while latency climbs steeply.
+
+<Callout type="perf" title="The Saturation Knee">
+  Every serving engine has a "saturation knee" — the concurrency level where throughput plateaus and latency begins to climb exponentially. Operating beyond this point wastes queueing time without improving throughput. Find this knee for your specific model, hardware, and SLA, then set your max concurrency accordingly.
+</Callout>
+
+## Advanced Considerations
+
+### Multi-LoRA Serving
+
+For applications serving multiple fine-tuned variants of a base model, LoRA adapter management becomes critical.
+
+**vLLM** supports multi-LoRA serving natively. The base model weights are loaded once, and LoRA adapters (typically 0.1-1% of base model size) are swapped efficiently. vLLM can serve dozens of LoRA adapters concurrently, with requests dynamically routed to the correct adapter.
+
+**SGLang** supports LoRA serving but with fewer optimizations for the multi-adapter case.
+
+**TensorRT-LLM** requires building separate engines for each LoRA adapter (or using the newer LoRA plugin, which has limitations).
+
+**TGI** has basic LoRA support through the HF PEFT library.
+
+If multi-LoRA serving is a primary use case, vLLM is currently the strongest choice.
+
+### Speculative Decoding
+
+Speculative decoding uses a smaller "draft" model to generate candidate tokens, which the larger "target" model verifies in parallel. This can improve decode latency by 1.5-2.5x without changing output quality.
+
+**vLLM** supports speculative decoding with configurable draft models and speculation length. The implementation is mature and production-ready.
+
+**SGLang** supports speculative decoding with similar capabilities.
+
+**TensorRT-LLM** supports speculative decoding with the tightest integration between draft and target engines, potentially offering the lowest overhead.
+
+**TGI and llama.cpp** have experimental or limited speculative decoding support.
+
+### Structured Output Performance
+
+For applications that require JSON, XML, or other structured output, the constrained decoding overhead varies dramatically:
+
+<PerfChart
+  title="Structured JSON Output Overhead (% throughput reduction vs unconstrained)"
+  unit="%"
+  data={[
+    { label: "SGLang (FSM)", value: 3, color: "green", annotation: "Pre-compiled FSM" },
+    { label: "vLLM (outlines)", value: 8, color: "blue", annotation: "Outlines integration" },
+    { label: "TGI (grammar)", value: 15, color: "orange", annotation: "Grammar-based" },
+    { label: "llama.cpp (GBNF)", value: 12, color: "gray", annotation: "GBNF grammar" },
+  ]}
+/>
+
+SGLang's FSM-based approach is the clear winner here. The pre-compilation step converts the JSON schema into a finite state machine once, and subsequent token-level enforcement is a simple bitmask lookup. Other engines either use runtime interpretation (slower) or less optimized mask computation.
+
+### Disaggregated Prefill and Decode
+
+An emerging architectural pattern separates prefill (compute-bound) from decode (memory-bandwidth-bound) onto different hardware configurations. The prefill cluster uses compute-dense GPUs, while the decode cluster uses memory-bandwidth-optimized hardware.
+
+**vLLM** has experimental disaggregated serving support.
+
+**SGLang** has been exploring disaggregated architectures, with RadixAttention naturally lending itself to prefill caching across the cluster.
+
+**TensorRT-LLM** supports disaggregated prefill/decode through NVIDIA's Triton Inference Server orchestration layer.
+
+This pattern is likely to become standard for large-scale deployments, so engine support for it is an important forward-looking consideration.
+
+## Decision Matrix
+
+The following matrix maps common deployment scenarios to recommended engines with rationale.
+
+<Benchmark
+  title="Deployment Scenario Decision Matrix"
+  columns={["Scenario", "Recommended", "Runner-up", "Rationale"]}
+  rows={[
+    { values: ["General production serving", "vLLM", "SGLang", "Broadest model support, battle-tested, good defaults"], highlight: true },
+    { values: ["Chat with shared system prompts", "SGLang", "vLLM (APC)", "RadixAttention provides 2-5x prefix reuse benefit"] },
+    { values: ["Structured JSON output", "SGLang", "vLLM", "FSM-based constrained decoding with minimal overhead"] },
+    { values: ["Minimum latency (NVIDIA)", "TensorRT-LLM", "vLLM", "Compiled kernels + FP8 + CUDA graphs = lowest latency"] },
+    { values: ["Maximum throughput (NVIDIA)", "TensorRT-LLM (FP8)", "SGLang", "FP8 on Hopper is the single biggest throughput lever"] },
+    { values: ["Quick prototype / HF models", "TGI", "vLLM", "One-line Docker deployment, HF ecosystem integration"] },
+    { values: ["Local development", "Ollama", "llama.cpp", "Simplest setup, runs on laptop hardware"] },
+    { values: ["Edge / mobile deployment", "llama.cpp", "—", "Only option for non-server hardware"] },
+    { values: ["Multi-LoRA serving", "vLLM", "SGLang", "Most mature LoRA adapter management"] },
+    { values: ["AMD GPU deployment", "vLLM", "SGLang", "ROCm support; TRT-LLM is NVIDIA-only"] },
+    { values: ["Cost-optimized (mixed hardware)", "vLLM", "SGLang", "Hardware flexibility avoids vendor lock-in"] },
+    { values: ["Privacy-sensitive / air-gapped", "Ollama / llama.cpp", "vLLM", "Zero network dependency, minimal footprint"] },
+    { values: ["Batch processing (offline)", "SGLang", "vLLM", "Prefix caching + high throughput for repeated instructions"] },
+  ]}
+  notes="Recommendations as of early 2025. Re-evaluate as engines evolve — the gap between vLLM and SGLang, in particular, is narrowing rapidly."
+/>
+
+## A Practical Selection Framework
+
+If the decision matrix does not cover your exact scenario, use this framework:
+
+### Step 1: Hardware Constraints
+
+- **NVIDIA GPUs only?** All engines are available. TensorRT-LLM offers the highest raw performance.
+- **AMD GPUs?** Eliminates TensorRT-LLM. vLLM and SGLang have ROCm support.
+- **CPU or consumer GPU?** llama.cpp / Ollama is the only practical option.
+- **Apple Silicon?** llama.cpp with Metal backend.
+
+### Step 2: Workload Characteristics
+
+- **High prefix sharing?** SGLang's RadixAttention provides the largest benefit.
+- **Structured output required?** SGLang's FSM engine is the fastest.
+- **Latency SLA under 50ms TTFT?** TensorRT-LLM with CUDA graphs, or size your deployment with sufficient replicas.
+- **Single-user interactive?** llama.cpp / Ollama provides the simplest path.
+
+### Step 3: Operational Requirements
+
+- **Team familiar with CUDA/C++?** TensorRT-LLM's complexity is manageable.
+- **Need to deploy today?** TGI or Ollama for fastest time-to-serving.
+- **Need production monitoring?** vLLM has the most mature Prometheus/metrics story.
+- **Multi-model or multi-LoRA?** vLLM handles this best.
+
+### Step 4: Validate with Your Workload
+
+No benchmark, including this one, substitutes for testing with your actual workload distribution. Take the top two candidates from the above steps and benchmark them with:
+
+1. Your actual prompt length distribution
+2. Your actual output length distribution
+3. Your expected concurrency pattern
+4. Your latency SLA targets
+
+Measure the throughput-latency curve (as described in the methodology section) and pick the engine that meets your SLA at the lowest cost.
+
+## The Convergence Trend
+
+It is worth noting that these engines are converging in capabilities. vLLM has added prefix caching (APC). SGLang has broadened model support. TensorRT-LLM has added a Python API for easier model definition. TGI has adopted continuous batching.
+
+The architectural differences (PagedAttention vs RadixAttention vs compiled graphs) will persist because they reflect genuine design tradeoffs. But the gap in "table stakes" features — model support, quantization formats, API compatibility — is narrowing with each release.
+
+<Callout type="info" title="Re-evaluate Regularly">
+  The LLM serving engine landscape is evolving faster than almost any other area of systems software. An engine that was 30% slower six months ago may have closed the gap entirely. Commit to re-evaluating your choice at least quarterly, and design your deployment to make engine swaps as painless as possible (e.g., use the OpenAI-compatible API that most engines now support).
+</Callout>
+
+## Conclusion
+
+Choosing an LLM serving engine is a systems architecture decision, not a feature checklist exercise. The right choice depends on your hardware, workload characteristics, team capabilities, and operational requirements.
+
+**Start with vLLM** if you need a general-purpose, production-proven serving engine with broad model support. **Move to SGLang** if your workload has significant prefix sharing, structured output requirements, or multi-turn conversation patterns. **Use TensorRT-LLM** when you need maximum single-GPU performance on NVIDIA hardware and your team can manage the compilation complexity. **Deploy TGI** for fast prototyping within the HF ecosystem. **Use Ollama or llama.cpp** for local development, edge deployment, or privacy-sensitive applications.
+
+Most importantly, benchmark with your actual workload. The numbers in this post (and every other benchmark) are specific to particular prompt distributions, hardware configurations, and engine versions. The methodology section of this post is arguably its most durable contribution — proper benchmarking technique will remain valid long after the specific numbers are outdated.
+
+The serving engine layer is the bridge between your model and your users. Choose it with the same rigor you would apply to any other critical infrastructure decision.

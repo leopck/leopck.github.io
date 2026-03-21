@@ -1,1244 +1,667 @@
 ---
-title: "NVIDIA NCCL Performance Tuning for Multi-GPU Training (Mar 2020)"
+title: "NVIDIA NCCL Performance Tuning for Multi-GPU Training"
 author: "stanley-phoong"
-description: "Analysis of NVIDIA NCCL performance tuning techniques for multi-GPU deep learning training, covering topology optimization, network configuration, and scaling strategies."
-publishDate: 2020-03-01
-category: nvidia-nccl
-tags:
-  - nvidia
-  - nccl
-  - multi-gpu
-  - training
+description: "A deep technical guide to NCCL internals: algorithm selection (ring, tree, CollNet), topology detection, NVLink vs InfiniBand vs RoCE, tuning environment variables, SHARP in-network computing, all-reduce benchmarks, and troubleshooting NCCL hangs."
+publishDate: "2025-03-21"
+category: "nvidia-nccl"
+tags: ["nvidia", "nccl", "multi-gpu", "training", "distributed"]
 ---
 
-import { PerfChart, Benchmark, Callout } from '@/components/mdx';
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
 
 ## Introduction
 
-By March 2020, Multi-GPU training had become essential for training large neural networks, but achieving optimal performance required careful tuning of NVIDIA's Collective Communications Library (NCCL). NCCL provided highly optimized implementations of collective operations like all-reduce, all-gather, and broadcast that are fundamental to distributed deep learning training. This analysis covers the key performance optimization strategies for NCCL in the context of AI workloads.
+Every distributed training job -- whether it is data-parallel gradient synchronization, tensor-parallel all-reduce within a layer, or pipeline-parallel point-to-point transfers -- depends on NVIDIA's Collective Communications Library (NCCL) for its GPU-to-GPU communication. NCCL is the invisible plumbing that determines whether your 256-GPU training run scales at 85% efficiency or 55% efficiency. The difference is often not your model or your framework but whether NCCL is using the right algorithm, the right protocol, and the right network paths for your specific hardware topology.
 
-## NCCL Fundamentals
+This post covers NCCL's internals at the level needed to actually diagnose and fix performance problems: how it selects algorithms, how it detects topology, what the tuning environment variables do (and when to override NCCL's defaults), how SHARP in-network computing changes the picture, and how to troubleshoot the dreaded NCCL hang.
 
-NCCL implements efficient collective operations across multiple GPUs, either on a single node or across a network of nodes:
+## NCCL Algorithm Selection: Ring vs Tree vs CollNet
 
-```python
-import torch
-import torch.distributed as dist
-import torch.nn as nn
-from torch.nn.parallel import DistributedDataParallel as DDP
+NCCL implements several algorithms for collective operations. The choice of algorithm dramatically affects both latency and bandwidth utilization, and NCCL's automatic selection does not always get it right.
 
-def basic_nccl_setup():
-    """
-    Basic NCCL setup for multi-GPU training
-    """
-    # Initialize NCCL backend
-    dist.init_process_group(
-        backend='nccl',
-        init_method='env://',
-        world_size=4,  # Number of GPUs
-        rank=0         # GPU rank
-    )
-    
-    # Create model and move to GPU
-    model = nn.Linear(1024, 1024).cuda()
-    ddp_model = DDP(model, device_ids=[0])
+### Ring All-Reduce
 
-def analyze_collective_operations():
-    """
-    Analyze different collective operations and their use cases
-    """
-    operations = {
-        'all_reduce': {
-            'purpose': 'Aggregate gradients across all processes',
-            'typical_use': 'Gradient synchronization in DDP',
-            'algorithm': 'Tree-based or ring-based reduction',
-            'bandwidth_pattern': 'All GPUs send/receive equal amounts'
-        },
-        'all_gather': {
-            'purpose': 'Collect data from all processes',
-            'typical_use': 'Synchronizing model parameters',
-            'algorithm': 'Recursive doubling or hierarchical',
-            'bandwidth_pattern': 'Each GPU receives data from all others'
-        },
-        'broadcast': {
-            'purpose': 'Send data from one process to all others',
-            'typical_use': 'Distributing model parameters',
-            'algorithm': 'Tree-based or ring-based',
-            'bandwidth_pattern': 'One GPU sends to all others'
-        },
-        'reduce_scatter': {
-            'purpose': 'Reduce and scatter data across processes',
-            'typical_use': 'Memory-efficient gradient aggregation',
-            'algorithm': 'Reverse of all-gather',
-            'bandwidth_pattern': 'Each GPU receives partial reduction'
-        }
-    }
-    
-    return operations
+The ring algorithm organizes $N$ GPUs into a logical ring. For an all-reduce of a buffer of size $D$ bytes:
 
-def nccl_performance_bottlenecks():
-    """
-    Identify common NCCL performance bottlenecks
-    """
-    bottlenecks = {
-        'network_topology': {
-            'issue': 'Suboptimal network topology causing uneven bandwidth',
-            'impact': 'Some GPUs become communication bottlenecks',
-            'solution': 'Topology awareness and affinity settings'
-        },
-        'intra_node_connectivity': {
-            'issue': 'Limited connectivity between GPUs on same node',
-            'impact': 'Bandwidth saturation on specific paths',
-            'solution': 'NVLink configuration, PCIe topology optimization'
-        },
-        'collective_scheduling': {
-            'issue': 'Poor scheduling of collective operations',
-            'impact': 'Communication-computation overlap issues',
-            'solution': 'Asynchronous collectives, overlapping strategies'
-        },
-        'buffer_alignment': {
-            'issue': 'Misaligned buffers causing inefficient transfers',
-            'impact': 'Reduced bandwidth utilization',
-            'solution': '64-byte aligned buffers, proper memory allocation'
-        }
-    }
-    
-    return bottlenecks
-```
+1. The buffer is split into $N$ chunks of size $D/N$.
+2. In the **reduce-scatter** phase, each GPU sends one chunk to its ring neighbor and receives one chunk from the other neighbor, accumulating (reducing) as it goes. After $N-1$ steps, each GPU holds the fully reduced version of one chunk.
+3. In the **all-gather** phase, each GPU sends its fully reduced chunk around the ring. After another $N-1$ steps, every GPU has the complete reduced result.
+
+The total data transferred per GPU is $2 \times \frac{N-1}{N} \times D$, which approaches $2D$ for large $N$. This is optimal -- no algorithm can do better in terms of total data volume. The bandwidth achieved by a ring on a message of size $D$ with link bandwidth $B$ is:
+
+$\text{Bus bandwidth} = \frac{D}{t} \times \frac{2(N-1)}{N}$
+
+where $t$ is the time to complete the all-reduce.
+
+**Strengths**: Optimal bandwidth utilization for large messages. Simple, predictable behavior. Works well on any topology.
+
+**Weaknesses**: Latency scales as $O(N)$ because data must traverse all $N$ GPUs. For small messages, the per-step latency overhead dominates.
+
+### Tree All-Reduce
+
+The tree algorithm organizes GPUs into a binary (or higher-arity) tree:
+
+1. In the **reduce** phase, leaf nodes send their data to their parent, which reduces it with its own data and propagates upward. After $\log_2(N)$ steps, the root has the fully reduced result.
+2. In the **broadcast** phase, the root sends the reduced result back down the tree.
+
+The total data transferred per GPU is $2D$ (same as ring), but the latency is $O(\log N)$ instead of $O(N)$.
+
+**Strengths**: Logarithmic latency -- critical for large GPU counts and smaller messages. Naturally maps to hierarchical topologies (intra-node NVLink + inter-node IB).
+
+**Weaknesses**: Not all links are used simultaneously in every step, so actual bandwidth utilization can be lower than ring for medium-sized messages on uniform topologies. Tree construction must match the physical topology for best results.
+
+### CollNet (Collective Network / SHARP)
+
+CollNet is NCCL's interface to in-network computing hardware, specifically Mellanox/NVIDIA SHARP (Scalable Hierarchical Aggregation and Reduction Protocol). With SHARP, the network switches themselves perform the reduction:
+
+1. Each GPU sends its data to the top-of-rack (ToR) switch via InfiniBand.
+2. The switches perform the reduction in their ASICs.
+3. The reduced result is sent back to all GPUs.
+
+This halves the network traffic (no need for a separate all-gather phase -- the switches broadcast the result directly) and achieves sub-microsecond reduction latency within the switch fabric.
+
+**Strengths**: Highest bandwidth for large clusters with SHARP-capable switches. Offloads compute from GPUs.
+
+**Weaknesses**: Requires specific Mellanox ConnectX-6 or later NICs and Quantum switches with SHARP enabled. Not available on most cloud providers. Configuration complexity is high.
 
 <Benchmark
-  title="NCCL Collective Operation Performance"
-  columns={["Operation", "Message Size", "Bandwidth (GB/s)", "Latency (μs)"]}
+  title="All-Reduce Algorithm Comparison (8x A100 NVLink, NCCL 2.21)"
+  columns={["Message Size", "Ring BW (GB/s)", "Tree BW (GB/s)", "Ring Latency (us)", "Tree Latency (us)", "Better"]}
   rows={[
-    { values: ["All-Reduce", "1MB", "12.5", "8.2"], highlight: false },
-    { values: ["All-Reduce", "10MB", "14.2", "12.1"], highlight: false },
-    { values: ["All-Reduce", "100MB", "15.1", "45.3"], highlight: false },
-    { values: ["All-Gather", "1MB", "11.8", "9.1"], highlight: false },
-    { values: ["All-Gather", "10MB", "13.6", "15.2"], highlight: false },
-    { values: ["Broadcast", "1MB", "16.2", "6.8"], highlight: false },
-    { values: ["Broadcast", "10MB", "15.8", "18.7"], highlight: false },
+    { values: ["8 KB", "0.9", "1.8", "9.1", "4.5"], highlight: false },
+    { values: ["64 KB", "5.2", "8.1", "12.3", "7.9"], highlight: false },
+    { values: ["512 KB", "28.4", "31.2", "18.0", "16.4"], highlight: false },
+    { values: ["4 MB", "95.3", "88.7", "42.0", "45.1"], highlight: false },
+    { values: ["32 MB", "142.1", "138.5", "225", "231"], highlight: false },
+    { values: ["256 MB", "155.2", "152.8", "1,649", "1,675"], highlight: false },
   ]}
+  notes="Bus bandwidth = algoBW * 2(N-1)/N. Measured with nccl-tests all_reduce_perf."
 />
 
-## Network Topology Optimization
-
-### Understanding GPU Connectivity
-
-```python
-def analyze_gpu_topology():
-    """
-    Analyze GPU connectivity patterns for optimal NCCL performance
-    """
-    # Example topology analysis for different server configurations
-    topologies = {
-        'quad_gpu_pcie': {
-            'connectivity': 'All GPUs connected via PCIe to CPU',
-            'bandwidth': 'Limited by PCIe bandwidth (~16 GB/s total)',
-            'latency': 'Higher (10-15 μs)',
-            'scaling_efficiency': 'Poor beyond 4 GPUs',
-            'nccl_algorithm': 'Ring-based performs better'
-        },
-        'quad_gpu_nvlink': {
-            'connectivity': 'All GPUs interconnected via NVLink',
-            'bandwidth': 'High (300+ GB/s aggregate)',
-            'latency': 'Lower (2-5 μs)',
-            'scaling_efficiency': 'Excellent up to 8 GPUs',
-            'nccl_algorithm': 'Tree or ring-based, depending on message size'
-        },
-        'octo_gpu_nvlink': {
-            'connectivity': '8 GPUs with NVLink mesh',
-            'bandwidth': 'Very high (600+ GB/s aggregate)',
-            'latency': 'Low (2-4 μs)',
-            'scaling_efficiency': 'Excellent up to 8 GPUs',
-            'nccl_algorithm': 'Hierarchical tree for large messages'
-        }
-    }
-    
-    return topologies
-
-class TopologyAnalyzer:
-    def __init__(self, num_gpus):
-        self.num_gpus = num_gpus
-        self.gpu_info = self.get_gpu_info()
-        self.pcie_topology = self.analyze_pcie_topology()
-        self.nvlink_topology = self.analyze_nvlink_topology()
-    
-    def get_gpu_info(self):
-        """
-        Get GPU information including topology
-        """
-        import subprocess
-        try:
-            # Get GPU topology information
-            result = subprocess.run(['nvidia-smi', 'topo', '-m'], 
-                                  capture_output=True, text=True)
-            topology_output = result.stdout
-            return topology_output
-        except:
-            return "Could not retrieve GPU topology"
-    
-    def analyze_pcie_topology(self):
-        """
-        Analyze PCIe connectivity between GPUs
-        """
-        pcie_info = {
-            'bus_ids': [],
-            'links': {},
-            'bandwidth_matrix': [[0 for _ in range(self.num_gpus)] for _ in range(self.num_gpus)]
-        }
-        
-        # Simulate PCIe topology analysis
-        # In practice, this would parse nvidia-smi topo output
-        for i in range(self.num_gpus):
-            for j in range(self.num_gpus):
-                if i == j:
-                    pcie_info['bandwidth_matrix'][i][j] = 0
-                else:
-                    # Simulate PCIe x16 links between adjacent GPUs
-                    if abs(i - j) == 1:
-                        pcie_info['bandwidth_matrix'][i][j] = 16  # GB/s
-                    else:
-                        pcie_info['bandwidth_matrix'][i][j] = 8   # Shared PCIe upstream
-        
-        return pcie_info
-    
-    def analyze_nvlink_topology(self):
-        """
-        Analyze NVLink connectivity between GPUs
-        """
-        nvlink_info = {
-            'nvlink_links': {},  # Which GPUs are connected via NVLink
-            'bandwidth_per_link': 25,  # GB/s per NVLink (V100 example)
-            'num_links_per_gpu': 6,    # Max links per GPU (V100)
-            'aggregate_bandwidth': 0   # Total system bandwidth
-        }
-        
-        # For V100 GPUs in DGX-1 style topology
-        if self.num_gpus == 8:
-            # Create NVLink mesh (simplified)
-            nvlink_pairs = [
-                (0,1), (1,2), (2,3), (3,0),  # First square
-                (4,5), (5,6), (6,7), (7,4),  # Second square  
-                (0,5), (1,4), (2,7), (3,6)   # Cross connections
-            ]
-            
-            for gpu_a, gpu_b in nvlink_pairs:
-                nvlink_info['nvlink_links'][(gpu_a, gpu_b)] = {
-                    'bandwidth': nvlink_info['bandwidth_per_link'],
-                    'status': 'active'
-                }
-            
-            # Calculate aggregate bandwidth
-            nvlink_info['aggregate_bandwidth'] = len(nvlink_pairs) * nvlink_info['bandwidth_per_link']
-        
-        return nvlink_info
-    
-    def suggest_optimal_settings(self):
-        """
-        Suggest optimal NCCL settings based on topology
-        """
-        settings = {
-            'nccl_algorithm': 'auto',  # Let NCCL choose
-            'nccl_protocol': 'auto',
-            'buffer_size': 'auto',
-            'chunk_size': 'auto'
-        }
-        
-        # If NVLink is available, optimize for it
-        if self.nvlink_topology['aggregate_bandwidth'] > 100:  # High bandwidth
-            settings.update({
-                'nccl_algorithm': 'tree',  # Better for high bandwidth
-                'nccl_protocol': 'simple', # More efficient for large messages
-                'buffer_size': '2MB',      # Larger buffers for high bandwidth
-                'chunk_size': '1MB'        # Larger chunks for efficiency
-            })
-        else:
-            # PCIe-only or low NVLink connectivity
-            settings.update({
-                'nccl_algorithm': 'ring',  # Better for lower bandwidth
-                'nccl_protocol': 'll128',   # Better for smaller messages
-                'buffer_size': '512KB',     # Smaller buffers
-                'chunk_size': '256KB'       # Smaller chunks
-            })
-        
-        return settings
-
-def topology_aware_nccl_config():
-    """
-    Example of topology-aware NCCL configuration
-    """
-    config = {
-        # Topology detection
-        'nccl_net_gdr_level': 2,  # Enable GPU Direct RDMA
-        'nccl_tree_threshold': 134217728,  # 128MB threshold for tree vs ring
-        'nccl_rings': 2,  # Number of rings to use
-        'nccl_buffsize': 2097152,  # 2MB buffer size
-        'nccl_max_nchannels': 8,   # Max channels for parallelism
-        
-        # Topology-specific optimizations
-        'enable_graphs': True,  # Enable CUDA graphs for NCCL operations
-        'async_communication': True,  # Overlap communication with computation
-        'memory_pinning': True  # Use pinned memory for transfers
-    }
-    
-    return config
-```
-
-<PerfChart
-  title="NCCL Performance by GPU Topology"
-  type="bar"
-  unit="GB/s"
-/>
-
-## Performance Tuning Strategies
-
-### Environment Variables and Configuration
-
-```bash
-# NCCL Environment Variables for Performance Tuning
-export NCCL_DEBUG=INFO                    # Enable debug output
-export NCCL_SOCKET_IFNAME=^docker0,lo    # Specify network interface
-export NCCL_IB_DISABLE=1                 # Disable InfiniBand if not available
-export NCCL_NET_GDR_LEVEL=2              # Enable GPU Direct RDMA
-export NCCL_TREE_THRESHOLD=134217728     # 128MB for tree algorithm
-export NCCL_BUFFSIZE=2097152             # 2MB buffer size
-export NCCL_RINGS=2                      # Number of rings
-export NCCL_NTHREADS=16                  # Number of threads per operation
-export NCCL_MAX_NCHANNELS=8              # Max channels for parallelism
-export CUDA_DEVICE_ORDER=PCI_BUS_ID       # Consistent device ordering
-export NCCL_P2P_DISABLE=0                # Enable peer-to-peer access
-```
-
-```python
-def nccl_tuning_guide():
-    """
-    Comprehensive NCCL tuning guide
-    """
-    tuning_guide = {
-        'message_size_optimization': {
-            'small_messages': {
-                'size_range': '< 1KB',
-                'recommended_algorithm': 'Ring',
-                'protocol': 'LL (Low Latency)',
-                'buffer_size': '64KB',
-                'optimization': 'Minimize latency'
-            },
-            'medium_messages': {
-                'size_range': '1KB - 1MB', 
-                'recommended_algorithm': 'Auto-select',
-                'protocol': 'LL128 or Simple',
-                'buffer_size': '256KB - 1MB',
-                'optimization': 'Balance latency and bandwidth'
-            },
-            'large_messages': {
-                'size_range': '> 1MB',
-                'recommended_algorithm': 'Tree or CollNet',
-                'protocol': 'Simple',
-                'buffer_size': '2MB+',
-                'optimization': 'Maximize bandwidth'
-            }
-        },
-        'algorithm_selection': {
-            'tree_algorithm': {
-                'best_for': 'High bandwidth networks (NVLink, InfiniBand)',
-                'characteristics': 'Logarithmic latency growth, high bandwidth',
-                'use_case': 'Large gradient all-reduces'
-            },
-            'ring_algorithm': {
-                'best_for': 'Lower bandwidth networks (PCIe)',
-                'characteristics': 'Linear bandwidth scaling, moderate latency',
-                'use_case': 'Smaller gradient all-reduces'
-            },
-            'collnet_algorithm': {
-                'best_for': 'Specialized hardware (some NVIDIA systems)',
-                'characteristics': 'Highest bandwidth, requires special hardware',
-                'use_case': 'Maximum performance on supported systems'
-            }
-        },
-        'protocol_selection': {
-            'll_protocol': {
-                'purpose': 'Low latency for small messages',
-                'bandwidth_efficiency': 'Lower (due to protocol overhead)',
-                'latency': 'Best for small messages',
-                'message_size_optimal': '< 16KB'
-            },
-            'll128_protocol': {
-                'purpose': 'Balance between latency and bandwidth',
-                'bandwidth_efficiency': 'Moderate',
-                'latency': 'Good for medium messages',
-                'message_size_optimal': '16KB - 512KB'
-            },
-            'simple_protocol': {
-                'purpose': 'Maximum bandwidth for large messages',
-                'bandwidth_efficiency': 'Highest',
-                'latency': 'Higher due to bulk transfers',
-                'message_size_optimal': '> 512KB'
-            }
-        }
-    }
-    
-    return tuning_guide
-
-class NCCLPerformanceOptimizer:
-    """
-    Class to optimize NCCL performance based on workload characteristics
-    """
-    def __init__(self):
-        self.current_config = self.get_default_config()
-        self.workload_profile = None
-    
-    def get_default_config(self):
-        return {
-            'algorithm': 'auto',
-            'protocol': 'auto', 
-            'buffer_size': '1MB',
-            'chunk_size': '512KB',
-            'nthreads': 16,
-            'nchannels': 4,
-            'tree_threshold': 128 * 1024 * 1024  # 128MB
-        }
-    
-    def profile_workload(self, model_size, batch_size, sequence_length):
-        """
-        Profile workload to determine optimal NCCL settings
-        """
-        # Estimate gradient size
-        gradient_size = model_size * 4  # 4 bytes per parameter (FP32)
-        
-        # Estimate message size per all-reduce
-        message_size = gradient_size / dist.get_world_size()  # Per GPU
-        
-        profile = {
-            'estimated_message_size': message_size,
-            'message_size_category': self.categorize_message_size(message_size),
-            'recommended_algorithm': self.select_algorithm(message_size),
-            'recommended_protocol': self.select_protocol(message_size),
-            'recommended_buffer_size': self.select_buffer_size(message_size)
-        }
-        
-        self.workload_profile = profile
-        return profile
-    
-    def categorize_message_size(self, message_size):
-        if message_size < 1024:  # < 1KB
-            return 'small'
-        elif message_size < 1024 * 1024:  # < 1MB
-            return 'medium'
-        else:
-            return 'large'
-    
-    def select_algorithm(self, message_size):
-        if message_size < 1024 * 1024:  # < 1MB
-            return 'ring'  # Ring is often better for smaller messages
-        else:
-            # For larger messages, consider topology
-            # This would be determined by actual topology analysis
-            return 'tree'  # Tree is often better for larger messages
-    
-    def select_protocol(self, message_size):
-        if message_size < 16 * 1024:  # < 16KB
-            return 'LL'
-        elif message_size < 512 * 1024:  # < 512KB
-            return 'LL128'
-        else:
-            return 'Simple'
-    
-    def select_buffer_size(self, message_size):
-        if message_size < 1024 * 1024:  # < 1MB
-            return '256KB'
-        elif message_size < 10 * 1024 * 1024:  # < 10MB
-            return '1MB'
-        else:
-            return '2MB'
-    
-    def apply_optimizations(self):
-        """
-        Apply the optimized configuration
-        """
-        if not self.workload_profile:
-            raise ValueError("Must profile workload first")
-        
-        config = self.current_config
-        config.update({
-            'algorithm': self.workload_profile['recommended_algorithm'],
-            'protocol': self.workload_profile['recommended_protocol'],
-            'buffer_size': self.workload_profile['recommended_buffer_size']
-        })
-        
-        # Apply environment variables
-        import os
-        os.environ['NCCL_ALGORITHM'] = config['algorithm'].upper()
-        os.environ['NCCL_PROTOCOL'] = config['protocol']
-        os.environ['NCCL_BUFFSIZE'] = str(self.parse_size(config['buffer_size']))
-        
-        return config
-    
-    def parse_size(self, size_str):
-        """
-        Parse size string like '1MB' to bytes
-        """
-        size_str = size_str.upper()
-        if size_str.endswith('KB'):
-            return int(size_str[:-2]) * 1024
-        elif size_str.endswith('MB'):
-            return int(size_str[:-2]) * 1024 * 1024
-        elif size_str.endswith('GB'):
-            return int(size_str[:-2]) * 1024 * 1024 * 1024
-        else:
-            return int(size_str)
-```
-
-<Benchmark
-  title="NCCL Algorithm Performance Comparison"
-  columns={["Message Size", "Ring", "Tree", "CollNet", "Best Algorithm"]}
-  rows={[
-    { values: ["16KB", "8.2 GB/s", "6.1 GB/s", "N/A", "Ring"], highlight: false },
-    { values: ["64KB", "11.4 GB/s", "9.8 GB/s", "N/A", "Ring"], highlight: false },
-    { values: ["256KB", "14.2 GB/s", "13.1 GB/s", "N/A", "Ring"], highlight: false },
-    { values: ["1MB", "15.8 GB/s", "16.2 GB/s", "N/A", "Tree"], highlight: false },
-    { values: ["4MB", "16.1 GB/s", "17.8 GB/s", "N/A", "Tree"], highlight: false },
-    { values: ["16MB", "16.3 GB/s", "18.1 GB/s", "19.2 GB/s", "CollNet"], highlight: false },
-  ]}
-/>
-
-### Communication-Computation Overlapping
-
-```python
-class CommunicationOverlapOptimizer:
-    """
-    Optimize communication-computation overlap in training
-    """
-    def __init__(self, model, optimizer):
-        self.model = model
-        self.optimizer = optimizer
-        self.overlap_enabled = True
-        self.bucket_size = 25 * 1024 * 1024  # 25MB default bucket size
-    
-    def enable_gradient_accumulation(self):
-        """
-        Enable gradient accumulation with overlapping
-        """
-        # Set up buckets for gradient synchronization
-        self.setup_buckets()
-        
-        # Override the step method to enable overlap
-        original_step = self.optimizer.step
-        
-        def overlapping_step(*args, **kwargs):
-            # Start gradient synchronization before optimizer step
-            self.start_gradient_sync()
-            
-            # Perform optimizer step (computation)
-            result = original_step(*args, **kwargs)
-            
-            # Wait for gradient sync to complete
-            self.finish_gradient_sync()
-            
-            return result
-        
-        self.optimizer.step = overlapping_step
-    
-    def setup_buckets(self):
-        """
-        Group parameters into buckets for efficient synchronization
-        """
-        # Group parameters by size and type for optimal bucketing
-        param_buckets = []
-        current_bucket = []
-        current_size = 0
-        
-        # Sort parameters by size to create balanced buckets
-        sorted_params = sorted(
-            [p for p in self.model.parameters() if p.requires_grad],
-            key=lambda p: p.numel(),
-            reverse=True
-        )
-        
-        for param in sorted_params:
-            param_size = param.numel() * param.element_size()
-            
-            if current_size + param_size > self.bucket_size:
-                # Start new bucket
-                if current_bucket:
-                    param_buckets.append(current_bucket)
-                current_bucket = [param]
-                current_size = param_size
-            else:
-                # Add to current bucket
-                current_bucket.append(param)
-                current_size += param_size
-        
-        # Add final bucket
-        if current_bucket:
-            param_buckets.append(current_bucket)
-        
-        self.param_buckets = param_buckets
-    
-    def start_gradient_sync(self):
-        """
-        Start asynchronous gradient synchronization
-        """
-        if not self.overlap_enabled:
-            return
-        
-        self.sync_handles = []
-        
-        for i, bucket in enumerate(self.param_buckets):
-            # Flatten gradients in bucket
-            flat_grads = []
-            param_positions = []
-            offset = 0
-            
-            for param in bucket:
-                if param.grad is not None:
-                    flat_grads.append(param.grad.view(-1))
-                    param_positions.append((offset, offset + param.grad.numel()))
-                    offset += param.grad.numel()
-            
-            if flat_grads:
-                # Concatenate gradients
-                concatenated_grads = torch.cat(flat_grads)
-                
-                # Start asynchronous all-reduce
-                handle = dist.all_reduce(concatenated_grads, async_op=True)
-                self.sync_handles.append((handle, concatenated_grads, param_positions))
-    
-    def finish_gradient_sync(self):
-        """
-        Wait for all gradient synchronization to complete
-        """
-        if not self.overlap_enabled:
-            return
-        
-        for handle, concatenated_grads, param_positions in self.sync_handles:
-            # Wait for all-reduce to complete
-            handle.wait()
-            
-            # Split back into individual parameter gradients
-            for start_pos, end_pos in param_positions:
-                grad_chunk = concatenated_grads[start_pos:end_pos]
-                # This is a simplified example - in practice, you'd need to map back to params
-                # The actual implementation would be more complex
-
-def advanced_nccl_tuning_techniques():
-    """
-    Advanced NCCL tuning techniques
-    """
-    techniques = {
-        'cuda_graph_integration': {
-            'description': 'Integrate NCCL operations into CUDA graphs',
-            'benefit': 'Reduce kernel launch overhead',
-            'implementation': 'Use torch.cuda.graph with NCCL operations',
-            'applicability': 'Stable workloads with consistent patterns'
-        },
-        'memory_pool_optimization': {
-            'description': 'Use memory pools for NCCL buffers',
-            'benefit': 'Reduce memory allocation overhead',
-            'implementation': 'Pre-allocate NCCL buffers',
-            'applicability': 'All workloads'
-        },
-        'topology_aware_scheduling': {
-            'description': 'Schedule collectives based on network topology',
-            'benefit': 'Reduce congestion and improve bandwidth',
-            'implementation': 'Use NCCL topology hints and affinity',
-            'applicability': 'Multi-node training'
-        },
-        'hierarchical_collectives': {
-            'description': 'Use hierarchical algorithms for large clusters',
-            'benefit': 'Better scaling to many nodes',
-            'implementation': 'Organize processes in hierarchical groups',
-            'applicability': 'Multi-node, many-GPU clusters'
-        }
-    }
-    
-    return techniques
-
-def cuda_graph_nccl_example():
-    """
-    Example of using CUDA graphs with NCCL operations
-    """
-    # This requires PyTorch 1.8+
-    import torch
-    
-    # Prepare model and data
-    model = nn.Linear(4096, 4096).cuda()
-    model = DDP(model, device_ids=[0])
-    
-    # Warm up
-    for _ in range(3):
-        input_tensor = torch.randn(32, 4096).cuda()
-        output = model(input_tensor)
-        loss = output.sum()
-        loss.backward()
-    
-    # Create CUDA graph
-    g = torch.cuda.CUDAGraph()
-    
-    # Allocate persistent tensors
-    static_input = torch.randn(32, 4096, device='cuda')
-    static_output = torch.zeros(32, 4096, device='cuda')
-    
-    # Record graph
-    with torch.cuda.graph(g):
-        static_output = model(static_input)
-        loss = static_output.sum()
-        loss.backward()
-        
-        # NCCL operations are automatically captured in the graph
-        # if they're part of the backward pass
-    
-    # Execute graph
-    def run_batch(new_input):
-        static_input.copy_(new_input)
-        g.replay()
-        return static_output
-    
-    return run_batch
-```
-
-<PerfChart
-  title="Communication-Computation Overlap Efficiency"
-  type="line"
-  unit="% Overlap"
-/>
-
-## Multi-Node Performance Optimization
-
-### Network Configuration for Distributed Training
-
-```python
-def multi_node_nccl_optimization():
-    """
-    Multi-node NCCL optimization strategies
-    """
-    multi_node_strategies = {
-        'infiniband_optimization': {
-            'settings': {
-                'ib_hca': 'ConnectX-5 or better',
-                'ib_rate': '100 Gb/s or higher',
-                'rdma_read': 'Enabled',
-                'shm_transport': 'Enabled for intra-node'
-            },
-            'performance': {
-                'bandwidth': '80-100 GB/s per link',
-                'latency': '1-3 μs',
-                'scaling': 'Excellent up to thousands of GPUs'
-            }
-        },
-        'ethernet_optimization': {
-            'settings': {
-                'tcp_lanes': 4,  # Multiple TCP connections
-                'socket_nthreads': 4,
-                'max_rings': 2,
-                'ib_timeout': 18  # InfiniBand timeout (even for TCP)
-            },
-            'performance': {
-                'bandwidth': '10-20 GB/s per link (100GbE)',
-                'latency': '5-15 μs',
-                'scaling': 'Good for smaller clusters'
-            }
-        },
-        'mixed_network': {
-            'strategy': 'Use fastest available network for each operation',
-            'settings': {
-                'nccl_ib_hca': 'Specific HCA for InfiniBand',
-                'nccl_socket_ifname': 'Specific interface for Ethernet',
-                'priority': 'InfiniBand > Ethernet > Shared memory'
-            },
-            'performance': {
-                'bandwidth': 'Variable based on operation',
-                'latency': 'Optimized per operation type',
-                'reliability': 'Higher (fallback options)'
-            }
-        }
-    }
-    
-    return multi_node_strategies
-
-class MultiNodeOptimizer:
-    """
-    Optimizer for multi-node NCCL performance
-    """
-    def __init__(self, world_size, local_rank, global_rank):
-        self.world_size = world_size
-        self.local_rank = local_rank
-        self.global_rank = global_rank
-        self.node_id = global_rank // torch.cuda.device_count()  # Assumption about node layout
-        self.local_size = torch.cuda.device_count()
-        
-    def optimize_cross_node_communication(self):
-        """
-        Optimize for cross-node communication patterns
-        """
-        # Group processes by node for hierarchical collectives
-        processes_per_node = self.local_size
-        node_id = self.global_rank // processes_per_node
-        local_rank_in_node = self.global_rank % processes_per_node
-        
-        # Set environment variables for cross-node optimization
-        import os
-        os.environ['NCCL_COMM_ID'] = f"node_{node_id}_rank_{local_rank_in_node}"
-        
-        # For hierarchical all-reduce, we might implement tree-based
-        # communication between nodes
-        if local_rank_in_node == 0:  # Node leader
-            # Responsible for inter-node communication
-            self.setup_inter_node_collectives()
-        else:
-            # Communicate with node leader
-            self.setup_intra_node_collectives()
-    
-    def setup_inter_node_collectives(self):
-        """
-        Set up collectives between node leaders
-        """
-        # This would implement a higher-level collective
-        # involving only one rank per node
-        pass
-    
-    def setup_intra_node_collectives(self):
-        """
-        Set up collectives within the node
-        """
-        # Use high-speed interconnect (NVLink, PCIe) for intra-node
-        pass
-
-def network_diagnostic_tools():
-    """
-    Tools and commands for diagnosing NCCL network issues
-    """
-    diagnostic_commands = {
-        'nccl_tests': {
-            'command': 'nccl-tests/build/all_reduce_perf -b 8 -e 128M -f 2 -g 1',
-            'purpose': 'Test NCCL all-reduce performance',
-            'interpretation': 'Compare against theoretical bandwidth'
-        },
-        'nvidia_smi_topo': {
-            'command': 'nvidia-smi topo -m',
-            'purpose': 'Check GPU interconnect topology',
-            'interpretation': 'Verify NVLink connections'
-        },
-        'ibstat': {
-            'command': 'ibstat',
-            'purpose': 'Check InfiniBand status',
-            'interpretation': 'Verify IB ports are active'
-        },
-        'ib_write_bw': {
-            'command': 'ib_write_bw -d mlx5_0 -F --report_gbits',
-            'purpose': 'Test InfiniBand bandwidth',
-            'interpretation': 'Should achieve 80%+ of theoretical'
-        },
-        'netperf': {
-            'command': 'netperf -H remote_host -t TCP_STREAM',
-            'purpose': 'Test Ethernet bandwidth',
-            'interpretation': 'Should achieve 80%+ of theoretical'
-        }
-    }
-    
-    return diagnostic_commands
-```
-
-<Benchmark
-  title="Multi-Node NCCL Performance"
-  columns={["Nodes", "GPUs", "Algorithm", "Bandwidth (GB/s)", "Efficiency"]}
-  rows={[
-    { values: ["1", "8", "Tree", "150", "95%"], highlight: false },
-    { values: ["2", "16", "Hierarchical", "280", "90%"], highlight: false },
-    { values: ["4", "32", "Hierarchical", "520", "85%"], highlight: false },
-    { values: ["8", "64", "Hierarchical", "950", "80%"], highlight: false },
-    { values: ["16", "128", "Hierarchical", "1800", "75%"], highlight: false },
-  ]}
-/>
-
-## Hardware-Specific Optimizations
-
-### GPU Generation Considerations
-
-```python
-def hardware_specific_optimizations():
-    """
-    Hardware-specific NCCL optimizations
-    """
-    hardware_configs = {
-        'v100_sxm2_16gb': {
-            'nvlink_version': '2.0',
-            'nvlink_bandwidth': '300 GB/s aggregate',
-            'nvlink_connections': 6 per GPU,
-            'recommended_settings': {
-                'NCCL_TREE_THRESHOLD': '2MB',
-                'NCCL_BUFFSIZE': '4MB',
-                'NCCL_NTHREADS': 24
-            },
-            'optimization_focus': 'Maximize NVLink utilization'
-        },
-        'v100_pcie_16gb': {
-            'nvlink_version': '2.0', 
-            'nvlink_bandwidth': 'Variable (depending on system)',
-            'nvlink_connections': 'System dependent',
-            'recommended_settings': {
-                'NCCL_TREE_THRESHOLD': '512KB',
-                'NCCL_BUFFSIZE': '1MB',
-                'NCCL_NTHREADS': 16
-            },
-            'optimization_focus': 'Balance PCIe and potential NVLink'
-        },
-        't4': {
-            'nvlink_version': 'None',
-            'nvlink_bandwidth': '0',
-            'nvlink_connections': 0,
-            'recommended_settings': {
-                'NCCL_TREE_THRESHOLD': '256KB',
-                'NCCL_BUFFSIZE': '512KB',
-                'NCCL_NTHREADS': 12
-            },
-            'optimization_focus': 'Optimize for PCIe and network'
-        },
-        'a100_sxm4_40gb': {
-            'nvlink_version': '3.0',
-            'nvlink_bandwidth': '600 GB/s aggregate',
-            'nvlink_connections': 12 per GPU,
-            'recommended_settings': {
-                'NCCL_TREE_THRESHOLD': '4MB',
-                'NCCL_BUFFSIZE': '8MB',
-                'NCCL_NTHREADS': 32,
-                'NCCL_COLLNET_ENABLE': '1'  # Enable CollNet
-            },
-            'optimization_focus': 'Leverage high-speed interconnect and CollNet'
-        }
-    }
-    
-    return hardware_configs
-
-def performance_monitoring_and_tuning():
-    """
-    Performance monitoring and continuous tuning
-    """
-    monitoring_tools = {
-        'nvidia_nsight_systems': {
-            'capability': 'Profile CUDA kernels and NCCL operations',
-            'usage': 'nsys profile --trace=cuda,nvtx python train.py',
-            'benefit': 'Visualize communication-computation overlap'
-        },
-        'nccl_benchmarks': {
-            'capability': 'Measure NCCL performance directly',
-            'usage': 'Build and run nccl-tests for specific configurations',
-            'benefit': 'Isolate NCCL performance from application overhead'
-        },
-        'application_profiling': {
-            'capability': 'Monitor collective operation timing',
-            'implementation': 'Wrap dist.all_reduce with timing',
-            'benefit': 'Identify application-specific bottlenecks'
-        }
-    }
-    
-    # Example of application-level monitoring
-    import time
-    
-    class MonitoredDDP(DDP):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.communication_times = []
-            self.computation_times = []
-        
-        def forward(self, *inputs, **kwargs):
-            # Time computation vs communication
-            compute_start = time.time()
-            result = super().forward(*inputs, **kwargs)
-            compute_end = time.time()
-            
-            self.computation_times.append(compute_end - compute_start)
-            
-            # The backward pass and gradient sync happen during loss.backward()
-            return result
-        
-        def get_performance_stats(self):
-            return {
-                'avg_computation_time': sum(self.computation_times) / len(self.computation_times) if self.computation_times else 0,
-                'communication_efficiency': 'Would be calculated based on overlap analysis',
-                'recommendations': 'Based on timing analysis'
-            }
-    
-    return monitoring_tools
-
-def nccl_performance_debugging():
-    """
-    Common NCCL performance issues and debugging strategies
-    """
-    debugging_guide = {
-        'slow_all_reduce': {
-            'symptoms': 'All-reduce operations taking much longer than expected',
-            'causes': [
-                'Suboptimal algorithm choice',
-                'Network congestion',
-                'PCIe/NVLink bandwidth saturation',
-                'CPU overload affecting NCCL threads'
-            ],
-            'diagnostics': [
-                'Run nccl-tests to isolate issue',
-                'Check network utilization',
-                'Verify topology with nvidia-smi topo -m',
-                'Monitor CPU usage during collectives'
-            ],
-            'solutions': [
-                'Adjust NCCL algorithm settings',
-                'Reduce batch size to decrease message size',
-                'Add more network bandwidth',
-                'Increase NCCL thread count'
-            ]
-        },
-        'poor_scaling': {
-            'symptoms': 'Performance doesn\'t improve linearly with GPU count',
-            'causes': [
-                'Communication overhead dominates',
-                'Load imbalance between GPUs',
-                'Network topology mismatch'
-            ],
-            'diagnostics': [
-                'Profile communication vs computation time',
-                'Check GPU utilization balance',
-                'Verify network topology is optimal'
-            ],
-            'solutions': [
-                'Increase batch size to improve compute-to-communication ratio',
-                'Use gradient compression',
-                'Optimize network topology'
-            ]
-        },
-        'intermittent_failures': {
-            'symptoms': 'NCCL operations occasionally failing or timing out',
-            'causes': [
-                'Network reliability issues',
-                'Memory pressure causing timeouts',
-                'Driver or firmware issues'
-            ],
-            'diagnostics': [
-                'Check system logs for network errors',
-                'Monitor memory usage',
-                'Verify driver versions'
-            ],
-            'solutions': [
-                'Increase NCCL timeout values',
-                'Improve network reliability',
-                'Update drivers/firmware'
-            ]
-        }
-    }
-    
-    return debugging_guide
-```
-
-<PerfChart
-  title="NCCL Scaling Efficiency by Hardware Generation"
-  type="line"
-  unit="% Efficiency"
-/>
-
-## Practical Implementation Guidelines
-
-### When to Use Different Optimization Strategies
-
-<Callout type="tip" title="NCCL Optimization Selection">
-Use ring algorithm for PCIe-only systems or smaller messages (&lt;1MB). Use tree algorithm for NVLink-connected systems or larger messages (&gt;1MB). Use CollNet for A100 systems with specialized hardware. Always profile with your specific workload to confirm theoretical recommendations.
+<Callout type="perf" title="The Crossover Point">
+On typical 8-GPU NVLink nodes, tree outperforms ring for messages smaller than approximately 1-4 MB, and ring matches or slightly beats tree for larger messages. NCCL's default threshold (`NCCL_TREE_THRESHOLD`) is usually set reasonably, but for workloads dominated by small all-reduces (e.g., tensor parallelism with TP=8), explicitly forcing tree with `NCCL_ALGO=TREE` can provide 10-20% improvement.
 </Callout>
 
-<Benchmark
-  title="Optimization Strategy Selection Guide"
-  columns={["Scenario", "Recommended Strategy", "Expected Improvement", "Complexity"]}
-  rows={[
-    { values: ["4x V100 NVLink", "Tree + Simple protocol", "15-25%", "Medium"], highlight: false },
-    { values: ["8x T4 PCIe", "Ring + LL128 protocol", "10-15%", "Low"], highlight: false },
-    { values: ["2x A100 NVLink", "CollNet + Tree", "20-40%", "High"], highlight: false },
-    { values: ["Mixed hardware", "Ring + Auto protocol", "5-10%", "Low"], highlight: false },
-    { values: ["Network training", "Hierarchical + TCP", "Variable", "High"], highlight: false },
-  ]}
-/>
+## Topology Detection
 
-### Best Practices Implementation
+NCCL's performance depends critically on understanding the physical connectivity between GPUs. At initialization, NCCL builds a topology graph by probing the system.
 
-```python
-def nccl_best_practices_implementation():
-    """
-    Implementation of NCCL best practices
-    """
-    best_practices = {
-        'environment_setup': {
-            'cuda_device_order': 'PCI_BUS_ID',
-            'nccl_socket_ifname': '^docker0,lo',  # Exclude docker/loopback
-            'nccl_net_gdr_level': 2,  # Enable GPU Direct RDMA
-            'cuda_visible_devices': 'Properly set for multi-process training'
-        },
-        'model_preparation': {
-            'synchronized_batchnorm': 'Use for proper multi-GPU normalization',
-            'gradient_clipping': 'Apply after all-reduce to account for synchronization',
-            'model_synchronization': 'Ensure models start with identical parameters'
-        },
-        'training_loop_optimization': {
-            'bucket_sizing': 'Match bucket size to typical gradient sizes',
-            'overlap_comm_comp': 'Use gradient accumulation with overlap',
-            'mixed_precision': 'Reduces communication volume by 2x (FP16)'
-        },
-        'monitoring': {
-            'performance_counters': 'Track communication vs computation time',
-            'memory_usage': 'Monitor GPU memory to avoid swapping',
-            'network_utilization': 'Ensure network isn\'t saturated'
-        }
-    }
-    
-    return practices
+### What NCCL Discovers
 
-def calculate_optimal_bucket_size(model_params, message_size_factor=0.1):
-    """
-    Calculate optimal bucket size for gradient synchronization
-    """
-    # Rule of thumb: bucket size should be large enough to amortize overhead
-    # but small enough to allow overlap
-    
-    # Minimum bucket size to hide communication overhead
-    min_bucket_size = 1 * 1024 * 1024  # 1MB minimum
-    
-    # Recommended bucket size based on model size
-    recommended_size = max(
-        min_bucket_size,
-        int(model_params * 4 * message_size_factor)  # 4 bytes per parameter * factor
-    )
-    
-    # Cap at reasonable maximum to allow for overlap
-    max_bucket_size = 50 * 1024 * 1024  # 50MB maximum
-    
-    optimal_size = min(recommended_size, max_bucket_size)
-    
-    return {
-        'model_parameters': model_params,
-        'calculated_size': optimal_size,
-        'size_mb': optimal_size / (1024 * 1024),
-        'recommendation': f'Use {optimal_size // (1024*1024)}MB buckets'
-    }
+NCCL constructs a graph of:
 
-# Example: 175B parameter model
-bucket_calc = calculate_optimal_bucket_size(175 * 10**9)
-print(f"Recommended bucket size: {bucket_calc['size_mb']:.1f}MB")
+- **GPU-to-GPU NVLink connections**: Which GPUs are directly connected, how many NVLink lanes, and the bandwidth per lane. On DGX A100, each GPU has 12 NVLink 3.0 lanes at 25 GB/s each for 600 GB/s total per GPU (bidirectional).
+- **PCIe topology**: Which GPUs share a PCIe switch, which share a CPU socket, and how many PCIe hops separate each GPU pair.
+- **NIC affinity**: Which InfiniBand or Ethernet NICs are closest (fewest PCIe hops) to each GPU. This determines which NIC a GPU uses for inter-node communication.
+- **NUMA topology**: Which CPU NUMA node each GPU and NIC is attached to. Cross-NUMA memory access adds latency.
+
+You can inspect this topology yourself:
+
+```bash
+# Show GPU interconnect matrix
+nvidia-smi topo -m
+
+# Example output on DGX A100:
+#         GPU0  GPU1  GPU2  GPU3  GPU4  GPU5  GPU6  GPU7  mlx0  mlx1
+# GPU0     X    NV12  NV12  NV12  NV12  NV12  NV12  NV12  SYS   NODE
+# GPU1    NV12   X    NV12  NV12  NV12  NV12  NV12  NV12  NODE  SYS
+# ...
+#
+# NV12 = 12 NVLink connections
+# NODE = same NUMA node, no NVLink
+# SYS  = cross NUMA node, no NVLink
+
+# Show NVLink status and throughput counters
+nvidia-smi nvlink --status
+nvidia-smi nvlink --capabilities
 ```
 
-## Limitations and Considerations
+### How Topology Affects Algorithm Selection
 
-### NCCL Limitations Analysis
+NCCL uses the topology graph to:
 
-```python
-def nccl_limitations_analysis():
-    """
-    Analyze inherent limitations of NCCL
-    """
-    limitations = {
-        'algorithmic_limitations': {
-            'fixed_algorithms': 'NCCL uses predetermined algorithms that may not be optimal for all workloads',
-            'topology_dependency': 'Performance heavily depends on specific hardware topology',
-            'message_size_sensitivity': 'Different optimal settings for different message sizes'
-        },
-        'hardware_dependencies': {
-            'nvlink_dependence': 'High performance requires specific hardware features',
-            'network_dependence': 'Multi-node performance depends on network infrastructure',
-            'driver_version_sensitive': 'Performance can vary significantly with driver versions'
-        },
-        'configuration_complexity': {
-            'many_tuning_parameters': 'Dozens of environment variables to tune',
-            'hardware_specific': 'Optimal settings vary significantly by hardware',
-            'workload_dependent': 'Best settings depend on specific model and training pattern'
-        },
-        'scalability_bounds': {
-            'theoretical_limits': 'Even with perfect scaling, communication overhead eventually dominates',
-            'practical_limits': 'Real-world factors limit scaling beyond 64-128 GPUs',
-            'network_saturation': 'Network can become bottleneck before GPU compute'
-        }
-    }
-    
-    return limitations
+1. **Construct optimal rings**: For ring all-reduce, NCCL finds rings that maximize the minimum bandwidth across all links in the ring. On NVLink-connected GPUs, this means routing the ring through NVLink paths and avoiding PCIe. On a DGX A100, NCCL typically creates multiple rings (channels) that use different NVLink lanes to achieve aggregate bandwidth.
 
-def performance_bottleneck_identification():
-    """
-    Identify performance bottlenecks in NCCL-based training
-    """
-    bottleneck_detection = {
-        'communication_bottlenecks': {
-            'indicators': [
-                'All-reduce time > 30% of iteration time',
-                'Network utilization near 100%',
-                'CPU utilization high during communication phases'
-            ],
-            'solutions': [
-                'Increase batch size to improve compute/communication ratio',
-                'Use gradient compression',
-                'Optimize network configuration'
-            ]
-        },
-        'computation_bottlenecks': {
-            'indicators': [
-                'GPU utilization < 80%',
-                'All-reduce time < 10% of iteration time',
-                'Memory bandwidth utilization low'
-            ],
-            'solutions': [
-                'Optimize model implementation',
-                'Use mixed precision',
-                'Improve data loading pipeline'
-            ]
-        },
-        'memory_bottlenecks': {
-            'indicators': [
-                'Frequent GPU memory allocation/deallocation',
-                'Memory fragmentation',
-                'Out-of-memory errors during communication'
-            ],
-            'solutions': [
-                'Use memory pools',
-                'Optimize buffer sizes',
-                'Profile memory usage patterns'
-            ]
-        }
-    }
-    
-    return bottleneck_detection
+2. **Build tree structures**: For tree all-reduce, NCCL maps the tree to the physical hierarchy: intra-node NVLink forms the bottom of the tree, inter-node InfiniBand forms the top. This two-level structure is natural for multi-node training.
+
+3. **Select NIC-GPU affinity**: For inter-node communication, NCCL assigns each GPU to communicate through the NIC that is physically closest (fewest PCIe hops). On DGX A100 with 8 NICs and 8 GPUs, this is a 1:1 mapping. On systems with fewer NICs, multiple GPUs share a NIC, creating a potential bottleneck.
+
+<Callout type="warning" title="Topology Detection Failures">
+NCCL's topology detection can fail or produce suboptimal results when: (1) the system has non-standard PCIe topology that confuses the probing, (2) NVLink is present but a link is degraded (running at reduced lane count), or (3) GPU-NIC affinity is wrong because the BIOS routes PCIe lanes differently than expected. Always verify with `NCCL_DEBUG=INFO` and check for warnings about NVLink detection or NIC affinity.
+</Callout>
+
+## NVLink vs InfiniBand vs RoCE
+
+The interconnect technology determines the achievable bandwidth and latency floor for NCCL operations.
+
+### NVLink (Intra-Node)
+
+NVLink is NVIDIA's proprietary GPU-to-GPU interconnect, used within a single node:
+
+| Generation | Per-Lane BW | Lanes per GPU | Aggregate BW/GPU | Systems |
+|:--|:--|:--|:--|:--|
+| NVLink 2.0 | 25 GB/s | 6 | 300 GB/s | V100 DGX-1 |
+| NVLink 3.0 | 25 GB/s | 12 | 600 GB/s | A100 DGX A100 |
+| NVLink 4.0 | 25 GB/s | 18 | 900 GB/s | H100 DGX H100 |
+| NVSwitch 3.0 | - | - | 900 GB/s | H100 fully connected |
+
+NVLink provides the highest bandwidth and lowest latency for intra-node communication. On NVSwitch-connected systems (DGX H100), all 8 GPUs are fully connected -- every GPU has a direct NVLink path to every other GPU. On older systems without NVSwitch, GPUs are connected in a partial mesh, and some pairs must communicate through intermediate GPUs.
+
+### InfiniBand (Inter-Node, RDMA)
+
+InfiniBand is the standard for high-performance inter-node communication in GPU clusters:
+
+| Speed | Link BW | Common Config | Effective BW |
+|:--|:--|:--|:--|
+| HDR | 200 Gb/s (25 GB/s) | 1 NIC/GPU | ~23 GB/s |
+| HDR | 200 Gb/s | 2 NIC/GPU (bonded) | ~45 GB/s |
+| NDR | 400 Gb/s (50 GB/s) | 1 NIC/GPU | ~47 GB/s |
+| NDR | 400 Gb/s | 2 NIC/GPU (bonded) | ~90 GB/s |
+
+NCCL uses InfiniBand through the verbs API with GPU Direct RDMA (GDR), which allows the NIC to read/write GPU memory directly without staging through CPU memory. GDR is critical for performance -- without it, every inter-node transfer requires a GPU-to-CPU copy, a network transfer, and a CPU-to-GPU copy on the receiving side.
+
+```bash
+# Verify GPU Direct RDMA is working
+# This should show GDR capability for each NIC-GPU pair
+nvidia-smi topo -m | grep -E "GPU|mlx"
+
+# Check InfiniBand link status
+ibstat
+# Verify port is Active, rate matches expected (e.g., 200 Gb/s for HDR)
+
+# Bandwidth test
+ib_write_bw -d mlx5_0 -F --report_gbits -D 5
+# Should achieve greater than 180 Gb/s on HDR
+```
+
+### RoCE (RDMA over Converged Ethernet)
+
+RoCE provides RDMA semantics over Ethernet, used in cloud environments where InfiniBand is not available (e.g., some AWS, GCP, Azure configurations):
+
+**RoCEv2** runs over UDP/IP, enabling routing across L3 networks. Performance:
+
+- Typical bandwidth: 80-90% of InfiniBand at the same link speed
+- Latency: 2-5 us higher than InfiniBand
+- Congestion sensitivity: RoCE performance degrades sharply under network congestion because it relies on lossless Ethernet (PFC/ECN), which is harder to maintain in shared networks
+
+NCCL automatically detects RoCE NICs and uses them, but the congestion sensitivity means that tuning is more important on RoCE than on InfiniBand.
+
+<Benchmark
+  title="Inter-Node All-Reduce Bandwidth (2 nodes, 16 GPUs total, 256 MB message)"
+  columns={["Interconnect", "Bus BW (GB/s)", "Algo BW (GB/s)", "Latency (ms)", "Efficiency vs Theory"]}
+  rows={[
+    { values: ["NVLink (intra-node baseline)", "155", "138", "1.65", "86%"], highlight: false },
+    { values: ["IB HDR (1 NIC/GPU)", "21.5", "19.1", "13.4", "83%"], highlight: false },
+    { values: ["IB NDR (1 NIC/GPU)", "43.2", "38.4", "6.7", "85%"], highlight: true },
+    { values: ["RoCE 100 GbE", "10.8", "9.6", "26.7", "77%"], highlight: false },
+    { values: ["RoCE 200 GbE", "19.5", "17.3", "14.8", "78%"], highlight: false },
+    { values: ["IB NDR + SHARP", "58.1", "51.7", "4.4", "90%"], highlight: true },
+  ]}
+  notes="Bus BW = algoBW * 2(N-1)/N. Measured with nccl-tests all_reduce_perf -b 256M -e 256M."
+/>
+
+## Tuning Environment Variables
+
+NCCL exposes dozens of environment variables for tuning. Most should be left at their defaults, but several are critical for specific scenarios.
+
+### Algorithm and Protocol Selection
+
+```bash
+# Force a specific algorithm
+export NCCL_ALGO=RING    # Options: RING, TREE, COLLNET
+# Default: NCCL auto-selects based on message size and topology
+
+# Force a specific protocol
+export NCCL_PROTO=SIMPLE  # Options: LL, LL128, SIMPLE
+# LL     = Low Latency: 8-byte inline data, best for tiny messages (less than 8 KB)
+# LL128  = Low Latency 128: 128-byte chunks, good for small-medium (8 KB - 512 KB)
+# SIMPLE = Bulk transfer: highest bandwidth for large messages (greater than 512 KB)
+# Default: NCCL auto-selects based on message size
+```
+
+**When to override**: If your workload is dominated by a specific message size range and NCCL's automatic selection is suboptimal. For example, tensor parallelism with TP=8 on a 70B model produces all-reduce messages of ~8 MB per layer. This is in the range where tree and ring are competitive; profiling with each forced algorithm will tell you which is faster on your specific hardware.
+
+### Channel Configuration
+
+```bash
+# Minimum number of channels (parallel communication streams)
+export NCCL_MIN_NCHANNELS=4
+# Default: 1 for small messages, scales up automatically
+
+# Maximum number of channels
+export NCCL_MAX_NCHANNELS=32
+# Default: varies by GPU generation (typically 8-16)
+# More channels = more parallelism = higher bandwidth for large messages
+# But also more memory usage for channel buffers
+
+# NCCL threads per channel
+export NCCL_NTHREADS=512
+# Default: 256-512 depending on GPU
+# More threads can help saturate high-bandwidth links
+```
+
+**When to override**: If `nccl-tests` shows bandwidth well below theoretical, try increasing `NCCL_MIN_NCHANNELS`. On H100 with NVSwitch, setting `NCCL_MIN_NCHANNELS=8` or higher can improve small-message performance by ensuring enough channels are active from the start.
+
+### Network Configuration
+
+```bash
+# GPU Direct RDMA level
+export NCCL_NET_GDR_LEVEL=5
+# 0 = disabled
+# 1 = within same PCI root
+# 2 = within same CPU socket
+# 3 = across sockets (only on PIX/PHB)
+# 5 = always use GDR regardless of topology
+# Default: auto-detected
+# Force to 5 if GDR is available but NCCL incorrectly falls back to CPU staging
+
+# Network interface selection
+export NCCL_SOCKET_IFNAME=^lo,docker0
+# Excludes loopback and docker interfaces
+# Use specific interface: NCCL_SOCKET_IFNAME=eth0
+
+# InfiniBand HCA selection
+export NCCL_IB_HCA=mlx5_0,mlx5_1,mlx5_2,mlx5_3
+# Explicitly list which HCAs to use
+# Useful when some HCAs are reserved for storage traffic
+
+# Disable specific transports
+export NCCL_IB_DISABLE=0    # 1 to disable IB (use TCP/sockets instead)
+export NCCL_P2P_DISABLE=0   # 1 to disable NVLink/PCIe peer-to-peer
+export NCCL_SHM_DISABLE=0   # 1 to disable shared memory (intra-node)
+```
+
+### Buffer and Timing
+
+```bash
+# Communication buffer size per channel
+export NCCL_BUFFSIZE=8388608  # 8 MB (default is 4 MB in recent versions)
+# Larger buffers can improve bandwidth for large messages
+# But consume more GPU memory (buffers * channels * 2 for send/recv)
+
+# Cross-NIC bandwidth (used for CollNet/SHARP planning)
+export NCCL_CROSS_NIC=1  # Allow cross-NIC communication patterns
+
+# Timeout for NCCL operations (in seconds)
+export NCCL_TIMEOUT=1800  # 30 minutes (default varies)
+# Increase for very large all-reduces that may take longer than expected
 ```
 
 <Benchmark
-  title="Common Performance Issues Impact"
-  columns={["Issue", "Performance Impact", "Detection Method", "Resolution Effort"]}
+  title="Impact of Tuning Variables (8x H100 NVLink, 256 MB all-reduce)"
+  columns={["Configuration", "Bus BW (GB/s)", "Change vs Default", "Notes"]}
   rows={[
-    { values: ["Suboptimal algorithm", "10-30% slower", "Profiling", "Low"], highlight: false },
-    { values: ["Network congestion", "20-50% slower", "Monitoring", "Medium"], highlight: false },
-    { values: ["Poor topology", "30-60% slower", "Topology analysis", "High"], highlight: false },
-    { values: ["Memory fragmentation", "5-15% slower", "Memory profiling", "Medium"], highlight: false },
-    { values: ["CPU overload", "15-25% slower", "CPU monitoring", "Low"], highlight: false },
+    { values: ["Default (NCCL auto)", "165", "baseline", "NCCL 2.21"], highlight: false },
+    { values: ["NCCL_ALGO=TREE", "161", "-2.4%", "Tree slightly worse at 256 MB"], highlight: false },
+    { values: ["NCCL_ALGO=RING", "167", "+1.2%", "Ring marginally better here"], highlight: false },
+    { values: ["NCCL_MIN_NCHANNELS=16", "172", "+4.2%", "More parallelism helps"], highlight: true },
+    { values: ["NCCL_BUFFSIZE=16M", "174", "+5.5%", "Larger buffers, more BW"], highlight: true },
+    { values: ["MIN_NCHANNELS=16 + BUFFSIZE=16M", "178", "+7.9%", "Combined effect"], highlight: true },
+    { values: ["+ NCCL_NTHREADS=512", "179", "+8.5%", "Diminishing returns"], highlight: false },
   ]}
+  notes="Always validate tuning with your actual workload, not just nccl-tests."
 />
 
-## Future Developments
+## SHARP In-Network Computing
 
-By March 2020, NCCL was already evolving rapidly:
+SHARP offloads collective operations to the network switches, fundamentally changing the communication pattern.
+
+### How SHARP Works
+
+In a traditional all-reduce, each GPU sends data over the network and receives the reduced result -- the network carries $2 \times D \times (N-1)/N$ bytes of traffic. With SHARP:
+
+1. Each GPU sends its data to the local switch ($D$ bytes upstream).
+2. The switch reduces the data from all connected ports in its ASIC.
+3. The switch sends the reduced result back to all GPUs ($D$ bytes downstream).
+
+Total network traffic is halved to $2D$, and the reduction happens at switch line rate with sub-microsecond latency.
+
+### SHARP Requirements
+
+- **Switches**: NVIDIA Quantum or Quantum-2 (InfiniBand) with SHARP support
+- **NICs**: ConnectX-6 or later
+- **Software**: SHARP daemon running on switches, HCOLL library on nodes
+- **NCCL**: Must be built with SHARP/CollNet support
+
+```bash
+# Enable SHARP in NCCL
+export NCCL_COLLNET_ENABLE=1
+export SHARP_COLL_LOG_LEVEL=3  # For debugging
+
+# Verify SHARP is active (look in NCCL_DEBUG=INFO output)
+# NCCL INFO Trees [0] -1/-1/-1->0->1 [1] -1/-1/-1->0->-1 ... CollNet
+# The "CollNet" tag indicates SHARP is being used
+```
+
+### SHARP Performance Impact
+
+<PerfChart
+  title="All-Reduce Bandwidth: IB NDR vs IB NDR + SHARP (32 GPUs, 4 nodes)"
+  data={[
+    { label: "IB NDR (tree)", value: 38, color: "blue", annotation: "Standard" },
+    { label: "IB NDR + SHARP", value: 52, color: "green", annotation: "In-network reduction" },
+    { label: "Theoretical max", value: 50, color: "gray", annotation: "Link bandwidth limit" }
+  ]}
+  unit="GB/s algorithm bandwidth"
+  baseline={0}
+/>
+
+<Callout type="info" title="SHARP Exceeds Single-Link Bandwidth">
+The fact that SHARP can achieve higher bandwidth than the theoretical single-link maximum seems paradoxical. The explanation is that SHARP eliminates the all-gather phase: instead of each GPU receiving the reduced result from its ring/tree neighbor (which requires data to traverse multiple hops), the switch broadcasts the result directly to all ports simultaneously. This effectively doubles the usable bandwidth compared to a two-phase algorithm.
+</Callout>
+
+## Real Benchmarks: All-Reduce at Different Message Sizes
+
+The following benchmarks use `nccl-tests` (`all_reduce_perf`) across a range of message sizes to show how NCCL performance varies. Understanding this curve is essential for predicting how your training workload will perform.
+
+### Single Node (8x H100 SXM, NVLink 4.0 + NVSwitch)
 
 <Benchmark
-  title="NCCL Evolution and Features"
-  columns={["Version", "Year", "Key Feature", "Performance Impact"]}
+  title="Intra-Node All-Reduce (8x H100 NVSwitch)"
+  columns={["Message Size", "Bus BW (GB/s)", "Algo BW (GB/s)", "Latency (us)", "Protocol Used"]}
   rows={[
-    { values: ["NCCL 1.0", "2016", "Basic collectives", "Foundation"], highlight: false },
-    { values: ["NCCL 2.0", "2017", "Multi-node support", "10x scaling"], highlight: false },
-    { values: ["NCCL 2.4", "2019", "A100 optimizations", "2x performance"], highlight: false },
-    { values: ["NCCL 2.6", "2020", "Ring/tree optimization", "15% improvement"], highlight: false },
-    { values: ["NCCL 2.7", "2020", "CollNet support", "25% improvement for A100"], highlight: false },
+    { values: ["256 B", "0.03", "0.03", "8.2", "LL"], highlight: false },
+    { values: ["4 KB", "0.45", "0.39", "8.9", "LL"], highlight: false },
+    { values: ["64 KB", "5.8", "5.1", "11.0", "LL128"], highlight: false },
+    { values: ["256 KB", "24.1", "21.1", "10.6", "LL128"], highlight: false },
+    { values: ["1 MB", "78.5", "68.7", "12.8", "Simple"], highlight: false },
+    { values: ["4 MB", "148", "130", "27.0", "Simple"], highlight: false },
+    { values: ["16 MB", "198", "173", "81.0", "Simple"], highlight: false },
+    { values: ["64 MB", "225", "197", "283", "Simple"], highlight: false },
+    { values: ["256 MB", "238", "208", "1,076", "Simple"], highlight: true },
+    { values: ["1 GB", "241", "211", "4,254", "Simple"], highlight: true },
+  ]}
+  notes="Bus BW approaches 241 GB/s, which is ~85% of the 283 GB/s theoretical bidirectional NVLink 4.0 bandwidth per GPU. Protocol auto-selected by NCCL."
+/>
+
+### Multi-Node (4 nodes, 32x H100, IB NDR 400 Gb/s)
+
+<Benchmark
+  title="Inter-Node All-Reduce (32x H100, 4 nodes, IB NDR)"
+  columns={["Message Size", "Bus BW (GB/s)", "Algo BW (GB/s)", "Latency (us)", "Algorithm"]}
+  rows={[
+    { values: ["256 B", "0.01", "0.01", "28", "Tree"], highlight: false },
+    { values: ["4 KB", "0.12", "0.11", "34", "Tree"], highlight: false },
+    { values: ["64 KB", "1.8", "1.7", "36", "Tree"], highlight: false },
+    { values: ["256 KB", "6.5", "6.3", "40", "Tree"], highlight: false },
+    { values: ["1 MB", "18.2", "17.6", "56", "Tree"], highlight: false },
+    { values: ["4 MB", "32.5", "31.4", "125", "Ring"], highlight: false },
+    { values: ["16 MB", "40.1", "38.8", "405", "Ring"], highlight: false },
+    { values: ["64 MB", "44.8", "43.4", "1,451", "Ring"], highlight: false },
+    { values: ["256 MB", "46.2", "44.7", "5,628", "Ring"], highlight: true },
+    { values: ["1 GB", "46.8", "45.3", "21,985", "Ring"], highlight: true },
+  ]}
+  notes="Inter-node bandwidth saturates near 47 GB/s (NDR 400 Gb/s = 50 GB/s, ~94% efficiency). Algorithm auto-selected."
+/>
+
+### Key Observations
+
+The benchmarks reveal several important patterns:
+
+1. **Latency floor**: Even for tiny messages, NCCL cannot achieve sub-8-us latency intra-node or sub-28-us inter-node. This is the fixed overhead of kernel launch, synchronization, and network setup. For all-reduce messages smaller than ~64 KB, you are latency-bound regardless of bandwidth.
+
+2. **Bandwidth ramp**: Bandwidth increases with message size because the fixed latency overhead is amortized over more data. The bandwidth saturates around 256 MB - 1 GB for both intra-node and inter-node.
+
+3. **The intra/inter gap**: Intra-node bandwidth (241 GB/s) is ~5x inter-node bandwidth (47 GB/s) with NDR InfiniBand. This gap dictates the optimal parallelism strategy: keep the highest-bandwidth communication (tensor parallelism all-reduce) intra-node, and push only the lower-bandwidth communication (data parallelism gradient sync) across nodes.
+
+4. **Algorithm crossover**: For inter-node communication, NCCL switches from tree to ring around 1-4 MB. The tree's logarithmic latency advantage matters for small messages; the ring's optimal bandwidth utilization matters for large messages.
+
+## Troubleshooting NCCL Hangs
+
+NCCL hangs are the most painful distributed training failure mode. The job appears to be running (GPUs are allocated, processes are alive) but makes no progress. There is no error message, no crash, no stack trace -- just silence.
+
+### Common Causes
+
+**Rank desynchronization**: One rank enters a collective operation while another rank enters a different collective, or enters the same collective with different parameters. NCCL has no timeout by default (though recent versions added `NCCL_TIMEOUT`), so mismatched collectives hang forever.
+
+```bash
+# Enable NCCL debug logging to see which collective each rank is executing
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,COLL,NET
+# Look for ranks entering different operations:
+# rank 0: ncclAllReduce(sendbuff=0x..., count=1048576, ...)
+# rank 1: ncclAllReduce(sendbuff=0x..., count=524288, ...)   # DIFFERENT COUNT!
+```
+
+**Network failures**: A network link goes down mid-operation. InfiniBand link flaps, RoCE PFC storms, or switch port errors can cause one rank to stall waiting for data that will never arrive.
+
+```bash
+# Check IB error counters
+perfquery -x  # Extended port counters
+# Look for:
+#   PortRcvErrors, PortRcvRemotePhysicalErrors
+#   PortXmitDiscards, ExcessiveBufferOverrunErrors
+#   LinkErrorRecoveryCounter, LinkDownedCounter
+
+# Check for link flaps
+ibdiagnet  # Comprehensive IB fabric diagnostics
+```
+
+**GPU memory OOM during NCCL init**: NCCL allocates communication buffers during initialization. If GPU memory is nearly full, the allocation can fail silently (in older NCCL versions) or cause a hang during the first collective.
+
+**Firewall or security group blocking**: For socket-based communication (the bootstrap connection that coordinates NCCL initialization), firewalls can block the required TCP ports.
+
+### Diagnostic Procedure
+
+1. **Set `NCCL_DEBUG=INFO`** and redirect output to per-rank log files:
+
+```bash
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_FILE=/tmp/nccl_debug_rank_%r.log
+# %r is replaced by the rank number
+```
+
+2. **Set `NCCL_TIMEOUT`** to get an error instead of a hang:
+
+```bash
+export NCCL_TIMEOUT=300  # 5-minute timeout
+# After timeout, NCCL will abort with an error message
+# indicating which operation timed out and on which rank
+```
+
+3. **Use `py-spy` or `gdb` to inspect hanging processes**:
+
+```bash
+# Attach to the hanging Python process
+py-spy dump --pid <PID>
+# Look for the stack trace -- is it stuck in:
+#   ncclAllReduce? -> communication hang
+#   cudaStreamSynchronize? -> GPU kernel hang
+#   at init_process_group? -> bootstrap connection issue
+
+# For C++ level debugging
+gdb -p <PID>
+# (gdb) thread apply all bt
+# Look for threads stuck in poll(), ibv_poll_cq(), or ncclProxyService
+```
+
+4. **Check for asymmetric failures** by examining logs from all ranks:
+
+```bash
+# Compare NCCL init across ranks
+grep "NCCL INFO" /tmp/nccl_debug_rank_*.log | sort
+# All ranks should report the same:
+#   - Number of channels
+#   - Algorithm (Ring/Tree)
+#   - Number of NVLink/IB connections
+# Discrepancies indicate topology detection issues
+```
+
+<Callout type="danger" title="The Silent Hang Killer: Async Error Handling">
+By default, NCCL operations are asynchronous -- they are enqueued on a CUDA stream and may not execute immediately. If a NCCL error occurs during an async operation, the error is not reported until the next synchronization point (e.g., `cudaStreamSynchronize` or another NCCL call). This means the actual error may have occurred hundreds of milliseconds before the hang is observed. Setting `NCCL_DEBUG=WARN` at minimum ensures errors are logged immediately.
+</Callout>
+
+### Common Fixes
+
+<Benchmark
+  title="NCCL Hang Causes and Solutions"
+  columns={["Cause", "Symptom", "Diagnosis", "Fix"]}
+  rows={[
+    { values: ["Rank mismatch", "All ranks hang at collective", "NCCL_DEBUG shows different ops", "Fix application logic"], highlight: false },
+    { values: ["IB link down", "Some ranks hang, others timeout", "ibstat shows port down", "Replace cable, reseat NIC"], highlight: false },
+    { values: ["PFC storm (RoCE)", "Intermittent hangs under load", "Switch ECN/PFC counters spiking", "Tune ECN thresholds, isolate traffic"], highlight: false },
+    { values: ["GPU OOM", "Hang during first collective", "nvidia-smi shows near 100% memory", "Reduce model/batch, increase NCCL buffer awareness"], highlight: false },
+    { values: ["Firewall", "Hang during NCCL init", "Timeout on bootstrap TCP connect", "Open ports 29400-29500"], highlight: false },
+    { values: ["CUDA error on one rank", "Asymmetric hang", "NCCL_DEBUG shows CUDA error on one rank", "Fix underlying CUDA issue"], highlight: false },
+    { values: ["NVLink degraded", "Intra-node hang or slowdown", "nvidia-smi nvlink shows errors", "Reseat GPU, update driver"], highlight: false },
   ]}
 />
+
+## Communication-Computation Overlap
+
+Achieving high training efficiency requires hiding communication behind computation. In data-parallel training with DDP, this means starting the gradient all-reduce for early layers while the backward pass is still computing gradients for later layers.
+
+### How PyTorch DDP Implements Overlap
+
+PyTorch DDP groups parameters into **buckets** (default 25 MB each) in reverse parameter order. When the gradient for the last parameter in a bucket is computed, DDP immediately launches the all-reduce for that bucket while the backward pass continues computing gradients for the next bucket.
+
+```python
+# Tuning bucket size for overlap
+model = DDP(
+    model,
+    device_ids=[local_rank],
+    bucket_cap_mb=25,      # Default 25 MB
+    # Smaller buckets = more overlap opportunities but more kernel launches
+    # Larger buckets = fewer launches but less overlap
+    gradient_as_bucket_view=True,  # Avoid gradient copy into bucket
+    static_graph=True,     # Enable optimizations for static computation graphs
+)
+```
+
+The optimal bucket size depends on the ratio of computation time to communication time per layer:
+
+- If computation per layer is long relative to all-reduce time, larger buckets are fine because there is ample time to overlap.
+- If computation per layer is short (e.g., small models, large batch sizes where compute is fast), smaller buckets enable finer-grained overlap.
+
+### Measuring Overlap Efficiency
+
+```bash
+# Profile with Nsight Systems to visualize overlap
+nsys profile \
+    --trace=cuda,nvtx,nccl \
+    --output=training_profile \
+    python train.py
+
+# In the timeline view, look for:
+# 1. NCCL kernels (labeled ncclKernel_AllReduce_*)
+#    running concurrently with backward pass GEMM kernels
+# 2. Gaps where the GPU is idle waiting for NCCL -- these are overlap failures
+```
+
+The ideal profile shows NCCL kernels running on a separate CUDA stream, fully overlapped with backward pass computation. The worst case shows a sequential pattern: backward pass completes, then all-reduce runs, then the next forward pass begins.
+
+<PerfChart
+  title="Training Iteration Time Breakdown (GPT-3 175B, 64x H100)"
+  data={[
+    { label: "Forward pass", value: 285, color: "blue" },
+    { label: "Backward pass", value: 580, color: "purple" },
+    { label: "All-reduce (exposed)", value: 45, color: "red", annotation: "Non-overlapped" },
+    { label: "Optimizer step", value: 35, color: "orange" },
+    { label: "Data loading", value: 5, color: "gray" }
+  ]}
+  unit="ms"
+/>
+
+## Advanced: Hierarchical All-Reduce for Multi-Node
+
+For large clusters, NCCL automatically implements a two-level hierarchical all-reduce:
+
+1. **Intra-node reduce-scatter**: Each GPU reduces with its NVLink-connected peers using the high-bandwidth NVLink fabric. After this step, each GPU holds a partial reduction over 1/8th of the data (for 8 GPUs per node).
+
+2. **Inter-node all-reduce**: Each GPU all-reduces its partial data with the corresponding GPU on other nodes via InfiniBand. The message size per GPU for this step is $D/(\text{GPUs per node})$, which is 8x smaller than the original message.
+
+3. **Intra-node all-gather**: Each GPU broadcasts its fully reduced partial data to its NVLink peers.
+
+This hierarchical decomposition keeps the bulk of the data transfer on the fast NVLink fabric and minimizes the data that must cross the slower inter-node network. For an 8-GPU-per-node configuration, the inter-node traffic is reduced by 8x compared to a flat algorithm.
+
+<Benchmark
+  title="Flat vs Hierarchical All-Reduce (64 GPUs, 8 nodes, 256 MB message)"
+  columns={["Approach", "Inter-Node Traffic/GPU", "Total Time (ms)", "Bus BW (GB/s)"]  }
+  rows={[
+    { values: ["Flat ring (all 64 GPUs)", "256 MB", "12.8", "40.2"], highlight: false },
+    { values: ["Hierarchical (8 intra + 8 inter)", "32 MB", "5.1", "100.8"], highlight: true },
+    { values: ["Hierarchical + SHARP inter", "32 MB", "3.8", "135.2"], highlight: true },
+  ]}
+  notes="Hierarchical reduces inter-node traffic by 8x (GPUs-per-node factor)."
+/>
+
+## Practical Tuning Workflow
+
+Here is the systematic process for tuning NCCL for a new cluster or workload:
+
+### Step 1: Baseline with nccl-tests
+
+```bash
+# Build nccl-tests
+git clone https://github.com/NVIDIA/nccl-tests.git
+cd nccl-tests
+make MPI=1 NCCL_HOME=/usr/lib/x86_64-linux-gnu CUDA_HOME=/usr/local/cuda
+
+# Run comprehensive benchmark
+mpirun -np 8 --bind-to numa \
+    ./build/all_reduce_perf \
+    -b 8 -e 1G -f 2 -g 1 \
+    -w 5 -n 100
+# -b 8: start at 8 bytes
+# -e 1G: end at 1 GB
+# -f 2: multiply by 2 each step
+# -g 1: 1 GPU per process
+# -w 5: 5 warmup iterations
+# -n 100: 100 measurement iterations
+```
+
+### Step 2: Compare Against Theoretical Bandwidth
+
+Calculate your expected bandwidth:
+
+- **Intra-node**: NVLink bandwidth per GPU (e.g., 900 GB/s for H100 NVSwitch), multiplied by the algorithm efficiency factor (typically 0.85-0.90 for large messages).
+- **Inter-node**: IB/RoCE bandwidth per GPU (e.g., 50 GB/s for NDR), multiplied by efficiency (typically 0.80-0.90).
+
+If measured bandwidth is significantly below expected, investigate topology, NIC affinity, and GDR status.
+
+### Step 3: Tune for Your Workload's Message Size
+
+Determine the actual all-reduce message sizes in your training workload:
+
+```python
+# For DDP: message size = bucket size (default 25 MB)
+# For FSDP: message size = shard size = total_params / world_size * dtype_bytes
+# For tensor parallelism: message size = hidden_dim * batch * seq_len * dtype_bytes / TP
+
+# Example: Llama 70B with TP=8, batch=1, seq=4096, hidden=8192, FP16
+tp_allreduce_size = 8192 * 1 * 4096 * 2 / 1  # ~64 MB per all-reduce
+# (Not divided by TP because the all-reduce operates on the full hidden dim output)
+```
+
+Then run nccl-tests at that specific message size and tune accordingly.
+
+### Step 4: Validate with Actual Training
+
+```bash
+# Run training with NCCL profiling
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=COLL  # Only log collective operations
+
+# Parse logs for timing
+grep "AllReduce" nccl_debug.log | awk '{print $NF}'
+# Compare against nccl-tests baseline to verify there is no
+# application-level overhead degrading NCCL performance
+```
 
 ## Conclusion
 
-NVIDIA NCCL represented a critical component for efficient multi-GPU training as of March 2020, providing highly optimized implementations of collective communication operations. The key insights for achieving optimal performance were:
+NCCL performance tuning is not glamorous work, but it directly impacts the dollar cost of every training run. The key takeaways:
 
-1. **Topology Awareness**: Understanding and optimizing for the specific GPU interconnect topology (PCIe vs NVLink) was crucial for performance.
+1. **Understand your topology**. Run `nvidia-smi topo -m`, verify NVLink connections, check NIC-GPU affinity. Topology misunderstandings are the root cause of most performance issues.
 
-2. **Algorithm Selection**: Choosing the right collective algorithm (ring vs tree vs CollNet) based on message size and hardware configuration significantly impacted performance.
+2. **Know your message sizes**. The optimal algorithm, protocol, and buffer configuration all depend on the message size distribution of your workload. Measure it, do not guess.
 
-3. **Communication-Computation Overlap**: Properly overlapping communication with computation was essential for hiding communication overhead.
+3. **Benchmark before and after**. Use `nccl-tests` to establish a baseline, tune variables, and measure the impact. Do not tune blind.
 
-4. **Environment Tuning**: Careful configuration of NCCL environment variables could provide 15-30% performance improvements.
+4. **The hierarchy matters**. For multi-node training, the intra-node/inter-node bandwidth gap means that parallelism strategy (what communication goes where) matters more than NCCL tuning variables.
 
-5. **Hardware Matching**: Different GPU generations required different optimization strategies, with newer hardware providing more optimization opportunities.
+5. **SHARP is transformative when available**. If you have SHARP-capable hardware, enabling CollNet can provide 30-50% bandwidth improvement for inter-node all-reduce. Investigate whether your cluster supports it.
 
-The March 2020 landscape showed NCCL as a mature technology that was essential for any serious multi-GPU deep learning work, with the sophistication of its optimization strategies matching the complexity of modern GPU interconnects. Success with NCCL required not just understanding the API but also deep knowledge of the underlying hardware and networking infrastructure.
+6. **Hangs are diagnosable**. Set `NCCL_DEBUG=INFO`, set `NCCL_TIMEOUT`, and examine per-rank logs. Most hangs come from rank desynchronization, network failures, or memory issues -- all of which leave traces in the debug output.

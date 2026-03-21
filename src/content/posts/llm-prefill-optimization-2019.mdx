@@ -1,249 +1,774 @@
 ---
-title: "LLM Prefill Phase Optimization: Maximizing Throughput for Prompt Processing"
+title: "LLM Prefill Phase Optimization: Why Prompt Processing Is Compute-Bound and How to Fix It"
 author: "stanley-phoong"
-description: "Comprehensive analysis of LLM prefill phase optimization, parallelizing attention computation, and optimizing memory access patterns for prompt processing."
-publishDate: 2019-12-17
+description: "Deep analysis of LLM prefill phase optimization — why prefill is fundamentally different from decode, its computational profile, chunked prefill, FlashAttention, tensor parallelism, prefix caching, and prompt optimization techniques."
+publishDate: 2025-03-21
 category: llm-inference
-tags: [llm, prefill, optimization, attention, inference, performance]
+tags: [llm, prefill, optimization, attention, inference, performance, flashattention, tensor-parallelism]
 difficulty: advanced
-readingTime: 21
+readingTime: 28
 ---
 
 import Callout from '@/components/mdx/Callout.astro';
 import PerfChart from '@/components/mdx/PerfChart.astro';
 import Benchmark from '@/components/mdx/Benchmark.astro';
 
-The prefill phase processes the entire prompt in parallel, dominating latency for short generations. Optimizing prefill is critical for interactive applications.
+When you type a long prompt into ChatGPT and wait for the first token to appear, you are waiting for the prefill phase. This phase processes the entire prompt through every layer of the transformer before a single output token can be generated. For a 4096-token prompt on Llama 70B, prefill alone can take over a second on a single A100 GPU. Understanding why prefill behaves the way it does -- and how to optimize it -- is essential for building responsive inference systems.
 
-## Prefill Phase Overview
+This article examines prefill from first principles: its computational profile, why it is fundamentally different from decode, and the techniques that modern serving systems use to reduce time-to-first-token (TTFT) without sacrificing decode throughput.
 
-Prefill processes all prompt tokens simultaneously:
+## Prefill vs Decode: Two Fundamentally Different Workloads
+
+The transformer inference pipeline has two phases, and they have almost opposite computational characteristics. Conflating them leads to poor optimization decisions.
+
+**Prefill** processes the entire prompt at once. If the prompt has $L$ tokens, the model performs attention and feed-forward computations over all $L$ tokens simultaneously in a single forward pass. The result is the KV cache for all prompt tokens and the logits for the next token.
+
+**Decode** generates tokens one at a time. Each step processes exactly one new token, appending it to the KV cache, and producing logits for the next token.
+
+The critical distinction is **arithmetic intensity** -- the ratio of compute (FLOPs) to memory traffic (bytes moved). This ratio determines whether a workload is compute-bound or memory-bandwidth-bound.
 
 ```python
-def prefill_phase(model, prompt_tokens):
-    """
-    Prefill: process entire prompt in parallel
-    """
-    # Forward pass through all layers
-    hidden_states = model.embedding(prompt_tokens)
-    
-    for layer in model.layers:
-        # Attention: all tokens attend to all tokens
-        hidden_states = layer.attention(hidden_states, kv_cache=None)
-        hidden_states = layer.ffn(hidden_states)
-    
-    return hidden_states
+# Prefill: large matrix multiplications (compute-bound)
+# Q, K, V shapes: [batch=1, seq_len=4096, d_model=8192]
+# Attention scores: [4096, 4096] -- large GEMM
+# FFN: [4096, 8192] x [8192, 28672] -- large GEMM
+
+# Decode: thin matrix-vector products (memory-bound)
+# Q, K, V shapes: [batch=1, seq_len=1, d_model=8192]
+# Attention scores: [1, seq_len] -- dot product against full KV cache
+# FFN: [1, 8192] x [8192, 28672] -- matrix-vector product
 ```
 
-**Time complexity**: O(n^2d) where n is prompt length, d is model dimension
+During prefill, the GEMMs are large enough to saturate the GPU's tensor cores. An A100's tensor cores deliver 312 TFLOPS (FP16), and a single prefill forward pass on a 70B model with $L = 4096$ generates enough FLOPs to keep them busy. During decode, the same weight matrices are loaded from HBM but multiplied against a single vector -- the tensor cores are starved, and performance is gated by how fast you can stream weights from memory.
 
-## Performance Analysis
+<Callout type="info" title="The Roofline Perspective">
+  On an A100 (312 TFLOPS, 2 TB/s HBM bandwidth), the crossover arithmetic intensity is $312 \times 10^{12} / (2 \times 10^{12}) = 156$ FLOPs/byte. Prefill GEMMs with large $L$ easily exceed this. Decode with batch size 1 sits at roughly 1-2 FLOPs/byte -- deep in the memory-bound regime.
+</Callout>
 
-Prefill time scales quadratically with prompt length:
+This difference has profound implications for optimization strategy:
+
+| Property | Prefill | Decode |
+|---|---|---|
+| Tokens processed per step | $L$ (entire prompt) | 1 |
+| Dominant operation | Large GEMMs | Matrix-vector products |
+| Bottleneck | Compute (tensor cores) | Memory bandwidth (HBM) |
+| Arithmetic intensity | High ($\gg 100$ FLOPs/byte) | Low ($\sim 1$-$2$ FLOPs/byte) |
+| Scaling with model size | Near linear in FLOPs | Near linear in parameter bytes |
+| Primary optimization target | Reduce FLOPs, parallelize compute | Increase batch size, reduce memory traffic |
+
+## Prefill Computational Profile
+
+Let us quantify the FLOPs involved in prefill for a single layer of a transformer. Consider a model with hidden dimension $D$, number of attention heads $H$, head dimension $d = D / H$, and FFN intermediate dimension $D_{ff}$ (typically $4D$ or $8D / 3$ for SwiGLU).
+
+### Attention FLOPs
+
+For a prompt of length $L$:
+
+1. **QKV projection**: Three linear projections from $D$ to $D$. FLOPs: $3 \times 2 L D^2 = 6 L D^2$
+2. **Attention scores** ($QK^T$): For each head, multiply $[L, d]$ by $[d, L]$. FLOPs per head: $2 L^2 d$. Total across $H$ heads: $2 L^2 d H = 2 L^2 D$
+3. **Attention output** ($\text{softmax}(QK^T)V$): Same shape. FLOPs: $2 L^2 D$
+4. **Output projection**: Linear from $D$ to $D$. FLOPs: $2 L D^2$
+
+Total attention FLOPs per layer: $8 L D^2 + 4 L^2 D$
+
+### FFN FLOPs
+
+For a standard two-layer FFN with intermediate dimension $D_{ff}$:
+
+1. **Up projection**: $[L, D] \times [D, D_{ff}]$. FLOPs: $2 L D \cdot D_{ff}$
+2. **Down projection**: $[L, D_{ff}] \times [D_{ff}, D]$. FLOPs: $2 L D \cdot D_{ff}$
+
+Total FFN FLOPs per layer: $4 L D \cdot D_{ff}$
+
+For SwiGLU (used in Llama), there is an additional gate projection, making it $6 L D \cdot D_{ff}$ with $D_{ff} = 8D/3$, which simplifies to $16 L D^2$.
+
+### When Does Attention Dominate?
+
+The attention-specific term is $4 L^2 D$ (the $QK^T$ and softmax-V multiplications). The rest scales as $O(L D^2)$. Attention dominates when:
+
+$$4 L^2 D \gg c \cdot L D^2$$
+
+which simplifies to $L \gg c \cdot D / 4$. For Llama 70B ($D = 8192$), with the constant factor from FFN included, attention starts dominating around $L \approx 4000$-$8000$ tokens.
 
 <Benchmark
-  title="Prefill Time vs Prompt Length"
-  columns={["Prompt Length", "Time (ms)", "Tokens/ms", "Memory (MB)"]}
+  title="FLOPs Breakdown per Layer: Llama 70B (D=8192, Dff=28672)"
+  columns={["Prompt Length (L)", "Attention QKV+O (TFLOPs)", "Attention Scores (TFLOPs)", "FFN (TFLOPs)", "Attention % of Total"]}
   rows={[
-    { values: ["128", "12.4", "10.3", "2.1"], highlight: false },
-    { values: ["512", "45.2", "11.3", "8.4"], highlight: false },
-    { values: ["1024", "178.3", "5.7", "33.6"], highlight: true },
-    { values: ["2048", "712.8", "2.9", "134.2"], highlight: false },
+    { values: ["256", "0.028", "0.001", "0.060", "32%"], highlight: false },
+    { values: ["1024", "0.110", "0.017", "0.240", "35%"], highlight: false },
+    { values: ["4096", "0.440", "0.275", "0.960", "43%"], highlight: true },
+    { values: ["8192", "0.879", "1.100", "1.920", "51%"], highlight: true },
+    { values: ["16384", "1.759", "4.400", "3.840", "62%"], highlight: true },
+    { values: ["32768", "3.518", "17.600", "7.680", "73%"], highlight: false },
   ]}
 />
 
 <PerfChart
-  title="Prefill Performance Scaling"
+  title="Attention vs FFN FLOPs Scaling (Llama 70B, per layer)"
   type="line"
   chartData={{
-    labels: ["128", "512", "1024", "2048"],
+    labels: ["256", "1024", "4096", "8192", "16384", "32768"],
     series: [
       {
-        label: "Time (ms)",
-        data: [12.4, 45.2, 178.3, 712.8],
+        label: "Attention FLOPs (TFLOPs)",
+        data: [0.029, 0.127, 0.715, 1.979, 6.159, 21.118],
         borderColor: "#ef4444",
       },
       {
-        label: "Throughput (tokens/ms)",
-        data: [10.3, 11.3, 5.7, 2.9],
+        label: "FFN FLOPs (TFLOPs)",
+        data: [0.060, 0.240, 0.960, 1.920, 3.840, 7.680],
         borderColor: "#3b82f6",
       }
     ]
   }}
 />
 
-## Parallel Attention Optimization
+At $L = 32768$ (a typical "long context" scenario), attention consumes nearly 3x the FLOPs of the FFN. This is why long-context prefill optimization focuses heavily on attention.
 
-Optimize attention computation:
+### Arithmetic Intensity of Prefill GEMMs
 
-```python
-def optimized_attention(Q, K, V, mask=None):
-    """
-    Optimized attention with better memory access
-    """
-    batch_size, seq_len, d_model = Q.size()
-    d_k = Q.size(-1)
-    
-    # Chunked computation to reduce memory
-    chunk_size = 64
-    output = torch.zeros_like(Q)
-    
-    for i in range(0, seq_len, chunk_size):
-        Q_chunk = Q[:, i:i+chunk_size, :]
-        
-        # Compute attention scores in chunks
-        scores_chunk = torch.matmul(Q_chunk, K.transpose(-2, -1))
-        scores_chunk = scores_chunk / math.sqrt(d_k)
-        
-        if mask is not None:
-            scores_chunk = scores_chunk.masked_fill(mask[:, i:i+chunk_size, :] == 0, -1e9)
-        
-        attn_chunk = F.softmax(scores_chunk, dim=-1)
-        output_chunk = torch.matmul(attn_chunk, V)
-        
-        output[:, i:i+chunk_size, :] = output_chunk
-    
-    return output
-```
+Consider the FFN up-projection: $[L, D] \times [D, D_{ff}]$. FLOPs = $2 L D \cdot D_{ff}$. Bytes loaded = $2(L D + D \cdot D_{ff} + L \cdot D_{ff})$ (in FP16, 2 bytes per element). For $L = 4096$, $D = 8192$, $D_{ff} = 28672$:
 
-**Memory reduction**: O(n^2) -> O(nxchunk_size)
+- FLOPs: $2 \times 4096 \times 8192 \times 28672 \approx 1.93 \times 10^{12}$
+- Bytes: $2 \times (4096 \times 8192 + 8192 \times 28672 + 4096 \times 28672) \approx 1.0 \times 10^9$
+- Arithmetic intensity: $\sim 1930$ FLOPs/byte
 
-## Flash Attention Implementation
+This vastly exceeds the A100's crossover point of 156 FLOPs/byte. Prefill is deep in the compute-bound regime.
 
-Flash Attention optimizes memory access:
+<Callout type="warning" title="Arithmetic Intensity Caveat">
+  The attention score computation $QK^T$ has lower arithmetic intensity than the FFN projections because the output matrix $[L, L]$ is large relative to the input. For very long sequences with small $D$, this can push attention toward memory-bound territory -- which is exactly the regime where FlashAttention provides the most benefit.
+</Callout>
 
-```python
-def flash_attention(Q, K, V, block_size=64):
-    """
-    Flash Attention: tiled attention computation
-    """
-    batch_size, seq_len, d_model = Q.size()
-    output = torch.zeros_like(Q)
-    
-    # Process in blocks
-    for i in range(0, seq_len, block_size):
-        Q_block = Q[:, i:i+block_size, :]
-        output_block = torch.zeros_like(Q_block)
-        max_vals = torch.full((batch_size, block_size), float('-inf'))
-        sum_vals = torch.zeros_like(max_vals)
-        
-        for j in range(0, seq_len, block_size):
-            K_block = K[:, j:j+block_size, :]
-            V_block = V[:, j:j+block_size, :]
-            
-            # Compute attention for block
-            scores = torch.matmul(Q_block, K_block.transpose(-2, -1))
-            scores = scores / math.sqrt(d_model)
-            
-            # Online softmax (numerically stable)
-            max_new = torch.max(max_vals, scores.max(dim=-1, keepdim=True)[0])
-            exp_scores = torch.exp(scores - max_new)
-            sum_new = sum_vals * torch.exp(max_vals - max_new) + exp_scores.sum(dim=-1, keepdim=True)
-            
-            # Update output
-            output_block = output_block * (sum_vals / sum_new).unsqueeze(-1) * torch.exp((max_vals - max_new).unsqueeze(-1))
-            output_block = output_block + torch.matmul(exp_scores, V_block) / sum_new.unsqueeze(-1)
-            
-            max_vals = max_new.squeeze(-1)
-            sum_vals = sum_new.squeeze(-1)
-        
-        output[:, i:i+block_size, :] = output_block
-    
-    return output
-```
+## Prefill Latency: The TTFT Problem
 
-**Memory**: O(n^2) -> O(nxblock_size)
+Time-to-first-token (TTFT) is the wall-clock time from when a request arrives to when the first output token is produced. It is dominated by prefill time. For interactive applications -- chatbots, code assistants, search -- TTFT directly affects perceived responsiveness. Users notice delays above 200-500ms.
 
-## Batch Prefill Optimization
-
-Process multiple prompts in batch:
-
-```python
-def batch_prefill(model, prompts, max_length=2048):
-    """
-    Batch prefill with padding optimization
-    """
-    # Group by length to minimize padding
-    prompts_by_length = {}
-    for prompt in prompts:
-        length = len(prompt)
-        if length not in prompts_by_length:
-            prompts_by_length[length] = []
-        prompts_by_length[length].append(prompt)
-    
-    results = []
-    for length, prompt_group in prompts_by_length.items():
-        # Batch same-length prompts (no padding needed)
-        batch_tokens = torch.tensor(prompt_group)
-        
-        # Prefill batch
-        outputs = model.prefill(batch_tokens)
-        results.extend(outputs)
-    
-    return results
-```
-
-**Padding reduction**: 40-60% less padding vs random batching
-
-## Memory Optimization
-
-Optimize memory usage during prefill:
-
-```python
-def memory_efficient_prefill(model, prompt_tokens):
-    """
-    Prefill with gradient checkpointing
-    """
-    # Store activations only at checkpoints
-    checkpoint_interval = 4
-    
-    hidden_states = model.embedding(prompt_tokens)
-    
-    for i, layer in enumerate(model.layers):
-        if i % checkpoint_interval == 0:
-            # Save checkpoint
-            checkpoint = hidden_states.detach()
-        
-        hidden_states = layer.attention(hidden_states, kv_cache=None)
-        hidden_states = layer.ffn(hidden_states)
-        
-        if i % checkpoint_interval == checkpoint_interval - 1:
-            # Can recompute from checkpoint if needed
-            pass
-    
-    return hidden_states
-```
-
-**Memory reduction**: 30-50% with gradient checkpointing
-
-## Performance Comparison
+For Llama 70B on a single A100 (80GB), approximate prefill times:
 
 <Benchmark
-  title="Prefill Optimization Comparison (seq_len=1024)"
-  columns={["Method", "Time (ms)", "Memory (GB)", "Speedup"]}
+  title="Prefill Latency: Llama 70B on 1x A100-80GB (FP16)"
+  columns={["Prompt Length", "Prefill Time (ms)", "TTFT (ms)", "Prefill TFLOPs"]}
   rows={[
-    { values: ["Standard", "178.3", "33.6", "1.0x"], highlight: false },
-    { values: ["Chunked", "142.6", "8.4", "1.25x"], highlight: true },
-    { values: ["Flash Attention", "98.4", "4.2", "1.81x"], highlight: true },
-    { values: ["Batch Optimized", "156.2", "28.1", "1.14x"], highlight: false },
+    { values: ["128", "45", "52", "1.7"], highlight: false },
+    { values: ["512", "120", "130", "6.8"], highlight: false },
+    { values: ["1024", "210", "225", "13.7"], highlight: false },
+    { values: ["2048", "390", "410", "27.7"], highlight: true },
+    { values: ["4096", "780", "810", "57.5"], highlight: true },
+    { values: ["8192", "1800", "1850", "125"], highlight: false },
+    { values: ["32768", "12500", "12600", "920"], highlight: false },
   ]}
 />
 
-## Conclusion
+A 32K-token prompt takes over 12 seconds just for prefill. During that time, the GPU is exclusively occupied -- no decode steps for any other request can proceed. This is the head-of-line blocking problem.
 
-Prefill optimization requires:
+## Chunked Prefill: Breaking the Head-of-Line Block
 
-1. **Memory optimization**: Reduce O(n^2) memory usage
-2. **Parallel computation**: Maximize GPU utilization
-3. **Batch processing**: Group similar-length prompts
-4. **Flash Attention**: Optimize memory access patterns
-5. **Chunked processing**: Process in blocks
+Long prefills monopolize the GPU. If you are serving hundreds of concurrent users and one sends a 32K-token prompt, every other user's decode latency (time-between-tokens, TBT) spikes because the GPU cannot interleave decode steps during a monolithic prefill.
 
-Key strategies:
-- Use Flash Attention for memory efficiency
-- Batch similar-length prompts
-- Optimize attention computation
-- Reduce memory footprint
-- Maximize parallelization
+**Chunked prefill** solves this by splitting a long prompt into smaller chunks and processing one chunk per scheduling iteration, interleaved with decode steps from other requests.
 
-Optimize prefill to minimize latency for interactive applications.
+### How Chunked Prefill Works
+
+Instead of processing all $L$ tokens in one forward pass, break them into chunks of size $C$:
+
+```python
+class ChunkedPrefillScheduler:
+    def __init__(self, chunk_size=512, max_batch_tokens=4096):
+        self.chunk_size = chunk_size
+        self.max_batch_tokens = max_batch_tokens
+
+    def schedule_iteration(self, prefill_queue, decode_queue):
+        """Schedule one iteration: mix prefill chunks with decode tokens."""
+        batch = []
+        token_budget = self.max_batch_tokens
+
+        # First, include all pending decode requests (1 token each)
+        for req in decode_queue:
+            if token_budget >= 1:
+                batch.append(ScheduleUnit(req, num_tokens=1, is_prefill=False))
+                token_budget -= 1
+
+        # Fill remaining budget with prefill chunks
+        for req in prefill_queue:
+            remaining = req.prompt_length - req.tokens_prefilled
+            chunk = min(remaining, self.chunk_size, token_budget)
+            if chunk > 0:
+                batch.append(ScheduleUnit(req, num_tokens=chunk, is_prefill=True))
+                token_budget -= chunk
+                req.tokens_prefilled += chunk
+
+        return batch
+```
+
+Each iteration processes at most `max_batch_tokens` tokens total. Decode requests contribute 1 token each and are always prioritized. The remaining token budget is allocated to prefill chunks.
+
+### Choosing Chunk Size
+
+The chunk size $C$ controls the trade-off between TTFT and TBT:
+
+- **Small chunks** (128-256 tokens): Minimal impact on decode latency, but prefill takes many iterations to complete, increasing TTFT.
+- **Large chunks** (2048-4096 tokens): Prefill completes faster (lower TTFT), but each iteration takes longer, increasing TBT for decode requests.
+
+The Sarathi-Serve paper provides a principled analysis. They observe that the optimal chunk size depends on the model, hardware, and the decode batch size. Their key insight: the prefill chunk should be sized so that the iteration time remains within the "decode latency SLO" -- typically 50-100ms per token.
+
+<Benchmark
+  title="Chunk Size Trade-offs: Llama 70B on A100 (200 concurrent users)"
+  columns={["Chunk Size", "Median TTFT (ms)", "P99 TBT (ms)", "Throughput (tok/s)", "GPU Util %"]}
+  rows={[
+    { values: ["No chunking", "1200", "1180", "3200", "72%"], highlight: false },
+    { values: ["256", "1800", "28", "3050", "88%"], highlight: false },
+    { values: ["512", "1400", "35", "3180", "91%"], highlight: true },
+    { values: ["1024", "1250", "52", "3250", "93%"], highlight: true },
+    { values: ["2048", "1180", "85", "3280", "94%"], highlight: false },
+    { values: ["4096", "1150", "142", "3300", "95%"], highlight: false },
+  ]}
+/>
+
+<PerfChart
+  title="TTFT vs TBT Trade-off by Chunk Size"
+  type="line"
+  chartData={{
+    labels: ["256", "512", "1024", "2048", "4096"],
+    series: [
+      {
+        label: "Median TTFT (ms)",
+        data: [1800, 1400, 1250, 1180, 1150],
+        borderColor: "#ef4444",
+      },
+      {
+        label: "P99 TBT (ms)",
+        data: [28, 35, 52, 85, 142],
+        borderColor: "#3b82f6",
+      }
+    ]
+  }}
+/>
+
+A chunk size of 512-1024 often provides the best balance. The TTFT penalty over no chunking is modest (10-20%), while TBT improves dramatically (from 1180ms down to 35-52ms).
+
+<Callout type="info" title="Chunked Prefill in Production">
+  vLLM enables chunked prefill via `--enable-chunked-prefill` with a configurable `--max-num-batched-tokens`. Sarathi-Serve extends this with a decode-priority scheduler that dynamically adjusts chunk sizes based on load. TensorRT-LLM supports "inflight batching" which achieves a similar effect.
+</Callout>
+
+### The Attention Computation Across Chunks
+
+A subtlety: when processing chunk $i$ of a prefill, the attention computation must attend to all previously-prefilled tokens (chunks $0$ through $i-1$), not just the current chunk. This means the KV cache from earlier chunks must be available, and the attention FLOPs for chunk $i$ are $O(C \times (i \cdot C))$, not just $O(C^2)$.
+
+```python
+def chunked_prefill_attention(query_chunk, kv_cache_so_far, new_keys, new_values):
+    """
+    Attention for a prefill chunk that must attend to all prior chunks.
+
+    query_chunk: [chunk_size, d_model] -- current chunk's queries
+    kv_cache_so_far: accumulated K,V from previous chunks
+    new_keys, new_values: K,V for current chunk
+    """
+    # Concatenate prior KV cache with current chunk
+    all_keys = torch.cat([kv_cache_so_far.keys, new_keys], dim=0)
+    all_values = torch.cat([kv_cache_so_far.values, new_values], dim=0)
+
+    # Attention: [chunk_size, total_prefilled + chunk_size]
+    # This is a rectangular attention, not square
+    scores = torch.matmul(query_chunk, all_keys.transpose(-2, -1))
+    scores = scores / math.sqrt(d_head)
+
+    # Causal mask: each query can attend to keys at positions <= its own
+    scores = apply_causal_mask(scores, offset=kv_cache_so_far.length)
+
+    attn_weights = F.softmax(scores, dim=-1)
+    output = torch.matmul(attn_weights, all_values)
+
+    # Update KV cache
+    kv_cache_so_far.append(new_keys, new_values)
+
+    return output
+```
+
+The total FLOPs across all chunks sum to the same as a monolithic prefill -- chunking does not add extra computation. But it does add scheduling overhead and may reduce GPU utilization per iteration if the chunks are too small to saturate the tensor cores.
+
+## FlashAttention in Prefill
+
+The attention mechanism computes $\text{softmax}(QK^T / \sqrt{d}) V$. The naive implementation materializes the full $[L, L]$ attention matrix in HBM, consuming $O(L^2)$ memory and generating $O(L^2)$ bytes of HBM traffic.
+
+FlashAttention eliminates this by tiling the computation. Instead of materializing the full attention matrix, it processes blocks of $Q$, $K$, $V$ in SRAM (shared memory), computing partial softmax results and combining them using the online softmax trick.
+
+### Why Prefill Benefits More Than Decode
+
+FlashAttention's benefit is proportional to how much HBM traffic it eliminates. During prefill with prompt length $L$:
+
+- **Standard attention HBM traffic**: $O(L^2)$ for the attention matrix (read and write)
+- **FlashAttention HBM traffic**: $O(L^2 d / M)$ where $M$ is SRAM size, which simplifies to approximately $O(L)$ for typical $M$ values
+
+For $L = 4096$, this is a massive reduction. During decode, the attention "matrix" is $[1, L]$ -- already small. FlashAttention still helps decode (it avoids materializing intermediate results), but the relative improvement is much smaller.
+
+```python
+# Simplified FlashAttention algorithm for prefill
+def flash_attention_prefill(Q, K, V, block_size_q=128, block_size_kv=256):
+    """
+    FlashAttention: tiled computation avoiding O(L^2) materialization.
+    Q, K, V: [L, d] -- full prompt tensors
+    """
+    L, d = Q.shape
+    output = torch.zeros_like(Q)
+
+    for i in range(0, L, block_size_q):
+        q_block = Q[i:i+block_size_q]          # Load Q block to SRAM
+        o_block = torch.zeros_like(q_block)     # Accumulator in SRAM
+        m_block = torch.full((block_size_q,), float('-inf'))  # Row maxima
+        l_block = torch.zeros(block_size_q)     # Row sums
+
+        for j in range(0, L, block_size_kv):
+            k_block = K[j:j+block_size_kv]      # Load K block to SRAM
+            v_block = V[j:j+block_size_kv]      # Load V block to SRAM
+
+            # Compute attention scores in SRAM -- never written to HBM
+            s_block = torch.matmul(q_block, k_block.T) / math.sqrt(d)
+
+            # Apply causal mask
+            s_block = apply_causal_mask(s_block, q_offset=i, k_offset=j)
+
+            # Online softmax update
+            m_new = torch.max(m_block, s_block.max(dim=-1).values)
+            exp_s = torch.exp(s_block - m_new.unsqueeze(-1))
+            l_new = l_block * torch.exp(m_block - m_new) + exp_s.sum(dim=-1)
+
+            # Rescale previous output and add new contribution
+            o_block = o_block * (l_block / l_new).unsqueeze(-1) * \
+                      torch.exp((m_block - m_new)).unsqueeze(-1)
+            o_block = o_block + torch.matmul(exp_s, v_block) / l_new.unsqueeze(-1)
+
+            m_block = m_new
+            l_block = l_new
+
+        output[i:i+block_size_q] = o_block  # Write final result to HBM
+
+    return output
+```
+
+The key insight: the $[block\_size\_q, block\_size\_kv]$ attention score matrix lives entirely in SRAM and is never written to HBM. This eliminates the dominant memory bottleneck for long-sequence prefill.
+
+### FlashAttention Speedup for Prefill
+
+<Benchmark
+  title="FlashAttention vs Standard Attention: Prefill on A100 (Llama 70B, FP16)"
+  columns={["Prompt Length", "Standard (ms)", "FlashAttention (ms)", "Speedup", "Peak Memory Saved"]}
+  rows={[
+    { values: ["512", "42", "28", "1.5x", "0.5 GB"], highlight: false },
+    { values: ["1024", "125", "52", "2.4x", "2.0 GB"], highlight: false },
+    { values: ["2048", "410", "138", "3.0x", "8.0 GB"], highlight: true },
+    { values: ["4096", "1520", "420", "3.6x", "32 GB"], highlight: true },
+    { values: ["8192", "5800", "1250", "4.6x", "128 GB"], highlight: true },
+    { values: ["16384", "OOM", "4200", "N/A", "N/A"], highlight: false },
+  ]}
+/>
+
+<PerfChart
+  title="FlashAttention Speedup vs Prompt Length"
+  type="line"
+  chartData={{
+    labels: ["512", "1024", "2048", "4096", "8192"],
+    series: [
+      {
+        label: "Standard Attention (ms)",
+        data: [42, 125, 410, 1520, 5800],
+        borderColor: "#ef4444",
+      },
+      {
+        label: "FlashAttention (ms)",
+        data: [28, 52, 138, 420, 1250],
+        borderColor: "#22c55e",
+      }
+    ]
+  }}
+/>
+
+At 8192 tokens, FlashAttention delivers a 4.6x speedup. At 16384 tokens, standard attention causes an out-of-memory error on an 80GB A100 (the $[16384, 16384]$ attention matrices across 80 heads require over 160 GB), while FlashAttention completes comfortably.
+
+<Callout type="info" title="FlashAttention Versions">
+  FlashAttention-2 improved on the original by better work partitioning across warps and reducing non-matmul FLOPs. FlashAttention-3 (Hopper architecture) exploits hardware features like TMA (tensor memory accelerator) and warp specialization for an additional 1.5-1.8x speedup on H100 GPUs.
+</Callout>
+
+### FlashAttention and Chunked Prefill Interaction
+
+FlashAttention and chunked prefill are complementary. Chunked prefill reduces the effective sequence length per iteration (from $L$ to $C$), which reduces the attention FLOPs per iteration. FlashAttention reduces the HBM traffic for whatever attention computation remains. When combined:
+
+- Each prefill chunk of size $C$ processes attention using FlashAttention kernels
+- The KV cache from previous chunks is accessed efficiently through FlashAttention's block-wise iteration
+- Memory overhead per iteration is $O(C)$ instead of $O(L^2)$
+
+## Tensor Parallelism for Prefill Latency
+
+When a single GPU cannot deliver acceptable TTFT, spread the model across $N$ GPUs using tensor parallelism (TP). Each GPU processes $1/N$ of each layer's computation, then synchronizes via all-reduce.
+
+### How Tensor Parallelism Splits Prefill
+
+For each transformer layer, tensor parallelism splits the weight matrices column-wise (for the first linear layer) and row-wise (for the second):
+
+```python
+# Tensor-parallel attention on GPU rank `rank` out of `world_size` GPUs
+class TPAttention:
+    def __init__(self, d_model, n_heads, rank, world_size):
+        # Each GPU handles n_heads / world_size attention heads
+        self.local_heads = n_heads // world_size
+        self.local_dim = self.local_heads * (d_model // n_heads)
+
+        # Each GPU holds a shard of QKV and output projections
+        self.wq = nn.Linear(d_model, self.local_dim, bias=False)  # Column-parallel
+        self.wk = nn.Linear(d_model, self.local_dim, bias=False)
+        self.wv = nn.Linear(d_model, self.local_dim, bias=False)
+        self.wo = nn.Linear(self.local_dim, d_model, bias=False)  # Row-parallel
+
+    def forward(self, x):
+        # x: [L, d_model] -- full hidden states (replicated across GPUs)
+        q = self.wq(x)  # [L, local_dim] -- only this GPU's heads
+        k = self.wk(x)
+        v = self.wv(x)
+
+        # Local attention -- only on this GPU's heads
+        attn_output = flash_attention(q, k, v)  # [L, local_dim]
+
+        # Row-parallel output projection
+        output = self.wo(attn_output)  # [L, d_model] -- partial result
+
+        # All-reduce to sum partial results across GPUs
+        dist.all_reduce(output, op=dist.ReduceOp.SUM)
+
+        return output
+```
+
+### Communication Cost
+
+Each transformer layer requires **2 all-reduce operations** in the standard Megatron-LM scheme: one after attention, one after FFN. For $N$ GPUs connected via NVLink:
+
+- All-reduce of tensor $[L, D]$ in FP16: $2 \times (N-1)/N \times L \times D \times 2$ bytes
+- For $L = 4096$, $D = 8192$, $N = 8$: each all-reduce moves approximately $2 \times 7/8 \times 4096 \times 8192 \times 2 \approx 117$ MB
+- On NVLink (600 GB/s bidirectional on A100): approximately 0.2ms per all-reduce
+- For 80 layers: $80 \times 2 \times 0.2 = 32$ ms total communication overhead
+
+The communication overhead is small relative to the compute savings: splitting across 8 GPUs reduces compute per GPU by 8x, while adding only 32ms of communication.
+
+<Benchmark
+  title="Tensor Parallelism Scaling: Llama 70B Prefill (L=4096, FP16)"
+  columns={["TP Degree", "Prefill Time (ms)", "Speedup", "Communication Overhead (ms)", "GPU Utilization"]}
+  rows={[
+    { values: ["1 GPU", "780", "1.0x", "0", "89%"], highlight: false },
+    { values: ["2 GPUs", "410", "1.9x", "12", "85%"], highlight: false },
+    { values: ["4 GPUs", "215", "3.6x", "22", "80%"], highlight: true },
+    { values: ["8 GPUs", "120", "6.5x", "35", "73%"], highlight: true },
+  ]}
+/>
+
+<PerfChart
+  title="Prefill Latency Scaling with Tensor Parallelism"
+  type="line"
+  chartData={{
+    labels: ["1 GPU", "2 GPUs", "4 GPUs", "8 GPUs"],
+    series: [
+      {
+        label: "Prefill Time (ms)",
+        data: [780, 410, 215, 120],
+        borderColor: "#ef4444",
+      },
+      {
+        label: "Ideal Linear Scaling (ms)",
+        data: [780, 390, 195, 97.5],
+        borderColor: "#94a3b8",
+      }
+    ]
+  }}
+/>
+
+Scaling efficiency drops from 95% at TP=2 to 81% at TP=8 due to communication overhead and reduced per-GPU utilization. For TTFT-sensitive applications, TP=4 often provides the best cost-efficiency point.
+
+<Callout type="warning" title="TP vs PP for Prefill">
+  Pipeline parallelism (PP) is poorly suited for prefill latency reduction. PP adds pipeline bubble overhead proportional to the number of stages, and prefill is a single forward pass (no microbatching benefit). TP reduces latency of each layer; PP only helps throughput. For TTFT optimization, always prefer TP.
+</Callout>
+
+## Prefix Caching: Reusing Shared Computation
+
+Many LLM applications share a common system prompt across requests. A customer support chatbot might prepend 2000 tokens of instructions and few-shot examples to every user query. Without prefix caching, every request redundantly computes the KV cache for this shared prefix.
+
+### The Opportunity
+
+If 100 requests per second share a 2000-token system prompt, you are redundantly computing $100 \times \text{prefill}(2000)$ per second. With prefix caching, you compute it once and reuse the KV cache.
+
+Savings per request:
+- Avoided FLOPs: For Llama 70B, prefilling 2000 tokens costs approximately 50 TFLOPs. At 100 req/s, that is 5 PFLOPs/s saved.
+- Avoided TTFT: The shared prefix portion of TTFT drops from ~200ms to ~0ms (just a memory copy or reference).
+
+### RadixAttention (SGLang)
+
+SGLang implements prefix caching using a radix tree (trie) data structure to store KV cache entries:
+
+```python
+class RadixTree:
+    """
+    Trie-based KV cache sharing. Each node corresponds to a token,
+    and stores a pointer to the KV cache block for that position.
+    """
+    def __init__(self):
+        self.root = RadixNode()
+
+    def match_prefix(self, token_ids):
+        """
+        Find the longest prefix of token_ids that exists in the tree.
+        Returns (matched_length, kv_cache_blocks).
+        """
+        node = self.root
+        matched = 0
+        kv_blocks = []
+
+        for token_id in token_ids:
+            if token_id in node.children:
+                node = node.children[token_id]
+                kv_blocks.append(node.kv_block)
+                matched += 1
+            else:
+                break
+
+        return matched, kv_blocks
+
+    def insert(self, token_ids, kv_blocks):
+        """Insert a new sequence's KV cache into the tree."""
+        node = self.root
+        for i, token_id in enumerate(token_ids):
+            if token_id not in node.children:
+                node.children[token_id] = RadixNode(kv_block=kv_blocks[i])
+            node = node.children[token_id]
+```
+
+When a new request arrives, the scheduler queries the radix tree: "What is the longest prefix of this request's tokens that already has a cached KV?" Only the uncached suffix needs prefill.
+
+The radix tree structure naturally handles multiple different prefixes and partial overlaps. If requests A and B share the first 1000 tokens but diverge after that, the tree stores the shared 1000-token KV cache once and branches.
+
+### vLLM Automatic Prefix Caching (APC)
+
+vLLM takes a different approach: hash-based prefix caching. It divides the KV cache into fixed-size blocks (typically 16 tokens per block) and computes a hash of the token content for each block:
+
+```python
+class HashBasedPrefixCache:
+    def __init__(self, block_size=16):
+        self.block_size = block_size
+        self.cache = {}  # hash -> physical_block_id
+
+    def compute_block_hash(self, token_ids, block_idx):
+        """
+        Hash is computed over all tokens up to and including this block,
+        ensuring that identical prefixes produce identical hashes.
+        """
+        prefix_end = (block_idx + 1) * self.block_size
+        prefix_tokens = tuple(token_ids[:prefix_end])
+        return hash(prefix_tokens)
+
+    def allocate_with_prefix_caching(self, token_ids):
+        """Allocate blocks, reusing cached blocks where possible."""
+        num_blocks = (len(token_ids) + self.block_size - 1) // self.block_size
+        physical_blocks = []
+        first_uncached_block = num_blocks  # Assume all cached initially
+
+        for i in range(num_blocks):
+            block_hash = self.compute_block_hash(token_ids, i)
+            if block_hash in self.cache:
+                physical_blocks.append(self.cache[block_hash])
+            else:
+                first_uncached_block = i
+                break
+
+        # Allocate new blocks for uncached suffix
+        for i in range(first_uncached_block, num_blocks):
+            new_block = self.block_manager.allocate()
+            block_hash = self.compute_block_hash(token_ids, i)
+            self.cache[block_hash] = new_block
+            physical_blocks.append(new_block)
+
+        cached_tokens = first_uncached_block * self.block_size
+        return physical_blocks, cached_tokens
+```
+
+The hash-based approach has a key advantage: it does not require explicit management of a tree structure and handles arbitrary sharing patterns automatically. If two requests happen to share any prefix (even without being explicitly marked as using the same system prompt), the cache detects and exploits this.
+
+<Callout type="info" title="Enabling Prefix Caching">
+  In vLLM: `--enable-prefix-caching`. In SGLang, RadixAttention is enabled by default. Both systems use LRU eviction when the cache is full. The cache hit rate depends on the workload -- high for chatbot scenarios (shared system prompts), low for diverse single-turn requests.
+</Callout>
+
+### Prefix Caching Impact
+
+<Benchmark
+  title="Prefix Caching: Llama 70B with 2048-token System Prompt"
+  columns={["Scenario", "TTFT (ms)", "Prefill Tokens", "Cache Hit Rate", "Throughput Gain"]}
+  rows={[
+    { values: ["No caching", "410", "2048 + query", "0%", "1.0x"], highlight: false },
+    { values: ["APC (cold start)", "415", "2048 + query", "0%", "1.0x"], highlight: false },
+    { values: ["APC (warm, same prompt)", "85", "query only", "100%", "2.8x"], highlight: true },
+    { values: ["APC (warm, similar prompt)", "180", "partial + query", "62%", "1.9x"], highlight: true },
+    { values: ["RadixAttention (warm)", "80", "query only", "100%", "2.9x"], highlight: true },
+  ]}
+/>
+
+With a warm cache and a shared 2048-token system prompt, TTFT drops from 410ms to 80-85ms -- a 5x reduction. The throughput improvement comes from freeing GPU compute that would otherwise be spent on redundant prefill.
+
+## Prompt Optimization Techniques
+
+Beyond system-level optimizations, reducing the prompt itself directly improves prefill performance. Every token in the prompt contributes to prefill FLOPs, and for long prompts the relationship is superlinear due to the $O(L^2 D)$ attention term.
+
+### Structured Prompting
+
+Replace verbose natural-language instructions with structured formats:
+
+```
+# Before: 847 tokens
+You are a helpful customer support agent for Acme Corp. When a customer
+asks about their order status, you should look up their order number
+in the system and provide them with the current status. If the order
+is delayed, apologize and offer a 10% discount code. Always be polite
+and professional. Here are some examples of good responses...
+[... 20 few-shot examples ...]
+
+# After: 312 tokens
+Role: Acme Corp support agent
+Rules:
+- Order status: lookup order_number, return status
+- Delayed orders: apologize, offer 10% discount code DELAY10
+- Tone: polite, professional
+[... 3 few-shot examples ...]
+```
+
+This is a 63% reduction in prompt tokens, translating to roughly 63% less FFN compute and approximately 86% less attention compute ($0.37^2 = 0.14$).
+
+### Few-Shot to Zero-Shot Conversion
+
+Few-shot examples are expensive. Each example adds hundreds of tokens to the prompt, and their contribution to the $O(L^2)$ attention term is quadratic. If the model performs adequately with zero-shot or one-shot prompting (often the case for well-tuned instruction-following models), the TTFT savings are significant.
+
+<Benchmark
+  title="Prompt Length Impact on TTFT: Llama 70B on A100"
+  columns={["Prompting Strategy", "Prompt Tokens", "TTFT (ms)", "Relative FLOPs"]}
+  rows={[
+    { values: ["20-shot with verbose instructions", "3800", "720", "1.0x"], highlight: false },
+    { values: ["5-shot with verbose instructions", "1400", "280", "0.26x"], highlight: false },
+    { values: ["5-shot with structured instructions", "800", "165", "0.13x"], highlight: true },
+    { values: ["1-shot with structured instructions", "350", "78", "0.04x"], highlight: true },
+    { values: ["Zero-shot with structured instructions", "180", "48", "0.01x"], highlight: true },
+  ]}
+/>
+
+Going from 20-shot (3800 tokens) to zero-shot with structured prompts (180 tokens) reduces TTFT by 15x. Even if zero-shot quality is slightly lower, the latency improvement often justifies it for real-time applications.
+
+### Prompt Compression
+
+Research systems like LLMLingua and AutoCompressor can compress prompts by 2-10x while preserving most of the information content. The approach typically involves:
+
+1. Using a small model to score token importance
+2. Removing low-importance tokens
+3. Optionally learning "summary tokens" that encode compressed information
+
+For production systems, a simpler approach works well: precompute a compressed version of static prompt components and cache both the compressed text and its KV cache.
+
+### Context Window Management
+
+For retrieval-augmented generation (RAG), the number and length of retrieved passages directly affects prefill cost. Strategies:
+
+- **Truncate passages**: Use only the first $N$ tokens of each passage (information density is usually front-loaded)
+- **Reduce top-k**: Retrieve fewer passages (3 instead of 10)
+- **Hierarchical retrieval**: First retrieve short summaries, then fetch full passages only if needed
+
+Each of these reduces $L$, with quadratic benefits on the attention computation.
+
+## When Prefill Is NOT the Bottleneck
+
+Not every workload is prefill-bound. Understanding when prefill is irrelevant saves you from premature optimization.
+
+### Short Prompts (fewer than 256 tokens)
+
+With a 128-token prompt on Llama 70B, prefill takes approximately 45ms. This is below the perceptual threshold for most users. The decode phase (generating 500 tokens at 50ms each) dominates the total request time by a factor of 500x.
+
+For short-prompt workloads, optimizing decode throughput (larger decode batches, speculative decoding, KV cache quantization) has far more impact than optimizing prefill.
+
+### High Decode-to-Prefill Ratio
+
+If the average output length is much longer than the average input length, the system spends most of its time decoding. Consider a code generation task:
+
+- Input: 200 tokens (function signature + docstring)
+- Output: 2000 tokens (implementation)
+- Prefill time: ~55ms
+- Decode time: ~40,000ms (at 50 tokens/s)
+- Prefill fraction: 0.14%
+
+Optimizing prefill here is essentially meaningless. Focus on decode throughput.
+
+### Streaming Applications
+
+In streaming applications where the user starts reading the output immediately, TTFT matters only for the perceived start of the response. If the output streams at a comfortable reading speed (say, 3-5 tokens per second rendered), even a 500ms TTFT is acceptable because the user cannot read faster than the generation speed anyway.
+
+### Batch Inference Workloads
+
+For offline batch processing (evaluating a dataset, generating synthetic data), individual request latency is irrelevant. Only aggregate throughput matters. In this regime:
+
+- Large monolithic prefills are fine (no real-time users waiting)
+- Chunked prefill adds overhead without benefit
+- The optimization target is maximizing GPU utilization across the batch
+
+<Callout type="warning" title="Profile Before Optimizing">
+  Always profile your actual workload before investing in prefill optimization. Use vLLM's `--collect-detailed-traces` or SGLang's built-in metrics to determine what fraction of GPU time is spent in prefill vs decode. If prefill is less than 20% of total GPU time, optimize decode first.
+</Callout>
+
+## Putting It All Together: A Decision Framework
+
+Given a specific deployment scenario, here is how to decide which prefill optimizations to apply:
+
+**Step 1: Measure your baseline.** Profile TTFT, TBT, and throughput. Determine the prefill-to-decode time ratio.
+
+**Step 2: Enable FlashAttention.** This is a universal win with zero trade-offs. If you are not already using FlashAttention (or FlashDecoding for the decode phase), enable it immediately. Expected improvement: 2-4x on prefill latency for prompts longer than 1024 tokens.
+
+**Step 3: Enable prefix caching.** If your workload has shared prefixes (system prompts, common RAG passages), enable APC in vLLM or use SGLang's RadixAttention. Expected improvement: proportional to the fraction of shared tokens, up to 5x for long shared prefixes.
+
+**Step 4: Choose tensor parallelism degree.** If TTFT still exceeds your SLO after FlashAttention and prefix caching, increase TP. Each doubling of TP roughly halves prefill time (with diminishing returns due to communication overhead). TP=4 is usually the sweet spot for cost efficiency.
+
+**Step 5: Enable chunked prefill.** If you are serving concurrent users and long prefills are causing TBT spikes for decode users, enable chunked prefill. Tune chunk size to balance TTFT and TBT for your latency SLOs.
+
+**Step 6: Optimize prompts.** If prefill is still a bottleneck, reduce prompt length. Convert few-shot to zero-shot, use structured prompts, compress retrieved contexts.
+
+```
+Decision tree:
+
+Is TTFT > SLO?
+├── No → Focus on decode optimization
+└── Yes → Is FlashAttention enabled?
+    ├── No → Enable it (2-4x improvement)
+    └── Yes → Are there shared prefixes?
+        ├── Yes → Enable prefix caching (up to 5x for shared portion)
+        └── No/Still slow → Increase tensor parallelism
+            └── Still slow? → Enable chunked prefill + optimize prompts
+```
+
+## Performance Summary
+
+<Benchmark
+  title="Combined Optimization Impact: Llama 70B, 4096-token Prompt, A100"
+  columns={["Configuration", "TTFT (ms)", "Cumulative Speedup", "Notes"]}
+  rows={[
+    { values: ["Baseline (1 GPU, standard attention)", "1520", "1.0x", "Memory-bound attention"], highlight: false },
+    { values: ["+ FlashAttention", "420", "3.6x", "Eliminates O(L^2) HBM traffic"], highlight: true },
+    { values: ["+ Prefix caching (2K shared prefix)", "180", "8.4x", "Avoids 50% of prefill compute"], highlight: true },
+    { values: ["+ TP=4", "55", "27.6x", "4-way compute split"], highlight: true },
+    { values: ["+ Prompt optimization (2K tokens)", "22", "69x", "Reduced prompt from 4096 to 2048"], highlight: true },
+  ]}
+/>
+
+<PerfChart
+  title="Cumulative TTFT Reduction"
+  type="line"
+  chartData={{
+    labels: ["Baseline", "+FlashAttn", "+PrefixCache", "+TP=4", "+PromptOpt"],
+    series: [
+      {
+        label: "TTFT (ms)",
+        data: [1520, 420, 180, 55, 22],
+        borderColor: "#22c55e",
+      }
+    ]
+  }}
+/>
+
+Starting from a 1520ms TTFT, the combination of FlashAttention, prefix caching, tensor parallelism, and prompt optimization brings it down to 22ms -- a 69x improvement. Each technique addresses a different aspect of the problem: FlashAttention reduces memory traffic, prefix caching eliminates redundant computation, tensor parallelism splits the remaining compute across GPUs, and prompt optimization reduces the work that needs to be done in the first place.
+
+The key takeaway: prefill is compute-bound for long sequences, which makes it fundamentally amenable to parallelization and algorithmic optimization. Unlike decode (where you are fighting memory bandwidth, a hardware constraint), prefill performance can be dramatically improved through software techniques alone. The challenge is choosing the right combination for your specific workload, hardware, and latency requirements.

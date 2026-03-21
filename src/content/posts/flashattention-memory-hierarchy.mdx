@@ -1,12 +1,14 @@
 ---
-title: "FlashAttention Through the Memory Hierarchy Lens"
+title: "FlashAttention: Why Tiling Attention Through the Memory Hierarchy Changes Everything"
 author: "stanley-phoong"
-description: "Analyzing FlashAttention's tiling strategy from an HBM bandwidth perspective. Includes roofline analysis, SRAM utilization measurements, and comparison with standard attention implementations."
-publishDate: 2024-11-13
+description: "A deep systems analysis of FlashAttention — how tiling attention computation to SRAM reduces HBM traffic from O(N²) to O(N), the online softmax trick that makes it possible, and why this single optimization accelerates every modern LLM."
+publishDate: 2025-03-21
 category: llm-inference
-tags: [flashattention, gpu-memory, attention, cuda, roofline]
+tags: [flashattention, gpu-memory, attention, cuda, roofline, optimization]
 difficulty: expert
-readingTime: 28
+readingTime: 35
+featured: true
+draft: false
 ---
 
 import Callout from '@/components/mdx/Callout.astro';
@@ -14,320 +16,345 @@ import MemoryLayout from '@/components/mdx/MemoryLayout.astro';
 import PerfChart from '@/components/mdx/PerfChart.astro';
 import Benchmark from '@/components/mdx/Benchmark.astro';
 
-Standard attention requires O(N²) HBM reads/writes for sequence length N. FlashAttention restructures the algorithm to achieve O(N) HBM access while performing the same computation. This isn't magic—it's careful exploitation of the GPU memory hierarchy.
+Standard attention materializes an $N \times N$ attention matrix in GPU HBM for every head in every layer. For a 4096-token sequence with 32 attention heads across 80 layers, that is over **40 GB** of intermediate data written to and read from HBM — data that's computed, used once, and thrown away. This single bottleneck limits attention throughput to a fraction of what the GPU can deliver.
 
-## The Memory Bandwidth Problem
+FlashAttention eliminates this waste entirely. By restructuring attention as a tiled computation that fits in on-chip SRAM, it reduces HBM traffic from $O(N^2)$ to $O(N)$ while computing the exact same mathematical result. No approximation, no quality loss — just a fundamentally better way to move data through the memory hierarchy.
 
-Consider attention for a single head with sequence length N=4096 and head dimension d=128:
+## The Problem: Attention Is Memory-Bound
 
-**Standard Attention Memory Traffic:**
-```
-Q, K, V load:       3 × N × d × 2 bytes = 3 × 4096 × 128 × 2 = 3.14 MB
-S = QK^T store:     N × N × 2 bytes = 4096 × 4096 × 2 = 33.5 MB
-S load for softmax: N × N × 2 bytes = 33.5 MB  
-P store:            N × N × 2 bytes = 33.5 MB
-P load, V load:     N × N × 2 + N × d × 2 = 34.0 MB
-O store:            N × d × 2 = 1.05 MB
-─────────────────────────────────────────────────────
-Total:              ~139 MB per head
-```
+Standard scaled dot-product attention computes:
 
-For 32 heads: **4.4 GB** of HBM traffic per layer.
+$$\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right) V$$
 
-**FlashAttention Memory Traffic:**
-```
-Q, K, V load:       3 × N × d × 2 bytes = 3.14 MB
-O store:            N × d × 2 = 1.05 MB
-─────────────────────────────────────────────────────
-Total:              ~4.2 MB per head
-```
+For sequence length $N$ and head dimension $d$, this involves:
 
-For 32 heads: **134 MB** of HBM traffic per layer.
+1. **Compute $S = QK^T$**: Read Q and K from HBM ($2Nd$ bytes each), write $S$ to HBM ($N^2$ elements)
+2. **Compute $P = \text{softmax}(S)$**: Read $S$ from HBM, write $P$ to HBM ($N^2$ elements each direction)
+3. **Compute $O = PV$**: Read $P$ and $V$ from HBM, write $O$ to HBM
 
-<PerfChart
-  title="HBM Traffic Comparison (32 heads, seq_len=4096)"
-  unit="MB"
-  data={[
-    { label: "Standard Attention", value: 4450, color: "red" },
-    { label: "FlashAttention", value: 134, color: "green" },
+Total HBM traffic: $O(Nd + N^2)$ bytes. At $N = 4096$ and $d = 128$, the $N^2$ term dominates overwhelmingly.
+
+<Benchmark
+  title="HBM Traffic: Standard Attention (FP16, single head)"
+  columns={["Sequence Length", "QKV Read", "Attention Matrix Read/Write", "Total HBM Traffic", "Ratio (Attn/QKV)"]}
+  rows={[
+    { values: ["512", "0.39 MB", "1.0 MB", "1.4 MB", "2.6x"], highlight: false },
+    { values: ["2048", "1.57 MB", "16 MB", "17.6 MB", "10.2x"], highlight: false },
+    { values: ["4096", "3.15 MB", "64 MB", "67.1 MB", "20.3x"], highlight: true },
+    { values: ["16384", "12.6 MB", "1024 MB", "1036 MB", "81.3x"], highlight: true },
+    { values: ["65536", "50.3 MB", "16384 MB", "16434 MB", "326x"], highlight: false },
   ]}
-  baseline={0}
+  notes="Attention matrix traffic scales as N². At long sequences, it completely dominates QKV traffic."
 />
 
-That's a **33x reduction** in memory traffic.
+The arithmetic intensity of standard attention is approximately:
 
-## GPU Memory Hierarchy Review
+$$\text{AI}_{\text{standard}} = \frac{2N^2 d + 2N^2 d}{2Nd \cdot 3 + 2N^2 \cdot 3} \approx \frac{4N^2 d}{6N^2} = \frac{2d}{3} \approx 85 \text{ FLOP/byte}$$
+
+But this is misleading — the actual bottleneck isn't the compute-to-byte ratio of the algorithm, it's the **memory traffic pattern**. The $N^2$-sized attention matrix is written to HBM and immediately read back. This round-trip through slow memory is pure waste.
+
+<Callout type="perf" title="The Core Insight">
+Standard attention performs $O(N^2 d)$ FLOPs and moves $O(N^2 + Nd)$ bytes through HBM. FlashAttention performs the **same FLOPs** but moves only $O(N^2 d^2 / M)$ bytes, where $M$ is SRAM size. Since $M \gg d^2$, this is effectively $O(Nd)$ — linear in sequence length.
+</Callout>
+
+## FlashAttention: Tiling to SRAM
+
+The key idea: never materialize the full $N \times N$ attention matrix. Instead, compute attention in **tiles** that fit entirely in SRAM (shared memory).
 
 <MemoryLayout
-  title="A100 GPU Memory Hierarchy"
+  title="GPU Memory Hierarchy (A100)"
   regions={[
-    { start: "L0", end: "", name: "Registers", size: "256KB/SM", color: "green", notes: "~19 TB/s bandwidth" },
-    { start: "L1", end: "", name: "Shared Memory / L1", size: "192KB/SM", color: "blue", notes: "~19 TB/s aggregate" },
-    { start: "L2", end: "", name: "L2 Cache", size: "40MB", color: "orange", notes: "~5 TB/s bandwidth" },
-    { start: "HBM", end: "", name: "HBM2e", size: "80GB", color: "red", notes: "2.0 TB/s bandwidth" },
+    { start: "L0", end: "", name: "Registers", size: "256 KB/SM", color: "green", notes: "~19 TB/s, 1 cycle" },
+    { start: "L1", end: "", name: "SRAM (Shared Memory)", size: "192 KB/SM", color: "blue", notes: "~19 TB/s, ~20 cycles" },
+    { start: "L2", end: "", name: "L2 Cache", size: "40 MB", color: "orange", notes: "~5 TB/s, ~200 cycles" },
+    { start: "L3", end: "", name: "HBM2e (Global Memory)", size: "80 GB", color: "red", notes: "2 TB/s, ~400 cycles" },
   ]}
 />
 
-The key insight: **SRAM (registers + shared memory) bandwidth is 10x HBM bandwidth**. FlashAttention restructures attention to maximize SRAM reuse.
+The bandwidth gap between SRAM and HBM is **~10x**. If we can keep the attention computation in SRAM, we avoid the $N^2$ HBM round-trip entirely.
 
-## The Tiling Strategy
+### The Tiling Strategy
 
-FlashAttention divides Q, K, V into blocks that fit in SRAM:
+FlashAttention divides Q into blocks of $B_r$ rows and K, V into blocks of $B_c$ rows. For each block of Q:
 
-```cpp
-// Conceptual tiling (simplified)
-// Block sizes chosen to fit in shared memory
-constexpr int Br = 128;  // Q block rows
-constexpr int Bc = 128;  // K, V block columns
-constexpr int d = 128;   // Head dimension
+1. Load $Q_i$ block from HBM to SRAM (once)
+2. For each K, V block:
+   - Load $K_j$, $V_j$ from HBM to SRAM
+   - Compute $S_{ij} = Q_i K_j^T$ in SRAM (never written to HBM)
+   - Compute local softmax and accumulate $O_i$ in SRAM
+3. Write final $O_i$ to HBM (once)
 
-// SRAM usage per thread block:
-// Q block:  Br × d × 2 bytes = 32 KB
-// K block:  Bc × d × 2 bytes = 32 KB  
-// V block:  Bc × d × 2 bytes = 32 KB
-// O block:  Br × d × 2 bytes = 32 KB
-// S block:  Br × Bc × 2 bytes = 32 KB
-// Total: ~160 KB (fits in 192KB shared memory)
-```
+The critical point: the attention matrix tile $S_{ij}$ of size $B_r \times B_c$ stays entirely in SRAM. It is computed, used for softmax and the attention-value product, then discarded. **No HBM write for the attention matrix at all.**
 
-<Callout type="perf" title="Block Size Selection">
-  Optimal block sizes depend on head dimension and shared memory capacity. For A100 with d=128, Br=Bc=128 achieves ~85% shared memory utilization.
-</Callout>
+### Tile Size Selection
+
+SRAM on A100 is 192 KB per SM (when configured for maximum shared memory). Each tile must fit:
+
+$$B_r \times d + B_c \times d + B_r \times B_c + B_r \times d \leq M$$
+
+For $d = 128$ and FP16 (2 bytes), with $M = 192 \text{ KB}$:
+
+$$B_r \times 256 + B_c \times 256 + B_r \times B_c \times 2 + B_r \times 256 \leq 196608$$
+
+With $B_r = B_c = 128$: $128 \times 256 + 128 \times 256 + 128 \times 128 \times 2 + 128 \times 256 = 32768 + 32768 + 32768 + 32768 = 131072$ bytes = 128 KB. Fits comfortably.
+
+### HBM Traffic Analysis
+
+With tiling, the HBM reads become:
+
+- **Q**: read once = $Nd$ elements = $O(Nd)$
+- **K, V**: each block of K, V is read once per Q block. Total K reads = $(N/B_r) \times N \times d = N^2 d / B_r$. With $B_r = 128$: factor of 128 fewer than naive.
+- **Output O**: write once = $Nd$ elements = $O(Nd)$
+
+Total: $O(N^2 d^2 / M)$ where $M$ is SRAM size. Since $M$ is typically much larger than $d^2$, this approaches $O(Nd)$.
+
+<Benchmark
+  title="HBM Traffic Comparison: Standard vs FlashAttention (FP16, d=128)"
+  columns={["Sequence Length", "Standard Attention", "FlashAttention", "Traffic Reduction"]}
+  rows={[
+    { values: ["512", "1.4 MB", "0.5 MB", "2.8x"], highlight: false },
+    { values: ["2048", "17.6 MB", "2.0 MB", "8.8x"], highlight: false },
+    { values: ["4096", "67.1 MB", "4.0 MB", "16.8x"], highlight: true },
+    { values: ["16384", "1036 MB", "16.0 MB", "64.8x"], highlight: true },
+  ]}
+  notes="FlashAttention traffic scales linearly. Standard attention scales quadratically."
+/>
 
 ## The Online Softmax Trick
 
-Standard softmax requires two passes over S:
-1. Find max: `m = max(S)`
-2. Compute: `softmax(S) = exp(S - m) / sum(exp(S - m))`
+Tiling attention is conceptually simple — the hard part is **softmax**. Standard softmax requires seeing ALL values before computing probabilities:
 
-FlashAttention uses **online softmax** to compute in a single pass:
+$$\text{softmax}(x_i) = \frac{e^{x_i}}{\sum_j e^{x_j}}$$
+
+The denominator requires the full row of attention scores. With tiling, we only see one block of scores at a time. The breakthrough: **online softmax** computes the result incrementally.
+
+### Algorithm
+
+For each row, maintain a running maximum $m$ and running sum $\ell$:
 
 ```python
-# Online softmax accumulation
-def online_softmax_attention_block(Q_block, K_block, V_block, 
-                                    O_prev, l_prev, m_prev):
-    """
-    Process one K,V block while maintaining running softmax statistics.
-    
-    Args:
-        Q_block: [Br, d] query block
-        K_block: [Bc, d] key block  
-        V_block: [Bc, d] value block
-        O_prev: [Br, d] running output accumulator
-        l_prev: [Br] running sum of exponentials
-        m_prev: [Br] running max
-    
-    Returns:
-        O_new, l_new, m_new: Updated accumulators
-    """
-    # Compute attention scores for this block
-    S = Q_block @ K_block.T  # [Br, Bc]
-    
-    # Block-wise max and new global max
-    m_block = S.max(dim=-1)  # [Br]
-    m_new = torch.maximum(m_prev, m_block)
-    
-    # Rescale previous accumulator for new max
-    scale_prev = torch.exp(m_prev - m_new)
-    l_prev_scaled = l_prev * scale_prev
-    O_prev_scaled = O_prev * scale_prev.unsqueeze(-1)
-    
-    # Compute new block contribution
-    P_block = torch.exp(S - m_new.unsqueeze(-1))  # [Br, Bc]
-    l_block = P_block.sum(dim=-1)  # [Br]
-    
-    # Accumulate
-    l_new = l_prev_scaled + l_block
-    O_new = O_prev_scaled + P_block @ V_block
-    
-    return O_new, l_new, m_new
+# Processing tiles left-to-right for one query row
+m_prev = -inf
+ell_prev = 0
+O_prev = zeros(d)
+
+for j in range(num_kv_blocks):
+    # Compute local scores for this tile
+    S_ij = Q_i @ K_j.T / sqrt(d)
+
+    # Update running statistics
+    m_new = max(m_prev, max(S_ij))
+
+    # Rescale previous accumulator to account for new maximum
+    correction = exp(m_prev - m_new)
+    ell_new = correction * ell_prev + sum(exp(S_ij - m_new))
+
+    # Update output: rescale old output + add new contribution
+    P_ij = exp(S_ij - m_new)
+    O_new = correction * O_prev + P_ij @ V_j
+
+    m_prev, ell_prev, O_prev = m_new, ell_new, O_new
 
 # Final normalization
-O_final = O_new / l_new.unsqueeze(-1)
+O = O_prev / ell_prev
 ```
 
-## CUDA Implementation Considerations
+The key insight: when we encounter a new maximum, we can **rescale** the previous accumulator by $e^{m_{\text{prev}} - m_{\text{new}}}$. This is numerically stable (the correction factor is always $\leq 1$) and mathematically exact.
 
-The actual CUDA kernel involves careful register and shared memory management:
+<Callout type="info" title="Why Online Softmax Is Exact">
+The rescaling $e^{m_{\text{old}} - m_{\text{new}}}$ applied to all previous terms is equivalent to computing softmax with the global maximum from the start. No approximation is involved — the final result is bit-identical to standard softmax (up to floating-point associativity).
+</Callout>
 
-```cpp
-template<int Br, int Bc, int d, int WARPS_PER_BLOCK>
-__global__ void flash_attention_forward(
-    const half* __restrict__ Q,
-    const half* __restrict__ K,
-    const half* __restrict__ V,
-    half* __restrict__ O,
-    int N
-) {
-    // Shared memory allocation
-    extern __shared__ char smem[];
-    half* sQ = reinterpret_cast<half*>(smem);
-    half* sK = sQ + Br * d;
-    half* sV = sK + Bc * d;
-    
-    // Per-thread accumulators (in registers)
-    float O_acc[Br / WARPS_PER_BLOCK][d / 32];  // Each thread handles a tile
-    float l_acc[Br / WARPS_PER_BLOCK];           // Running sum
-    float m_acc[Br / WARPS_PER_BLOCK];           // Running max
-    
-    // Initialize accumulators
-    #pragma unroll
-    for (int i = 0; i < Br / WARPS_PER_BLOCK; i++) {
-        m_acc[i] = -INFINITY;
-        l_acc[i] = 0.0f;
-        #pragma unroll
-        for (int j = 0; j < d / 32; j++) {
-            O_acc[i][j] = 0.0f;
-        }
-    }
-    
-    // Load Q block once (reused across all K,V blocks)
-    load_block_async<Br, d>(Q + blockIdx.x * Br * d, sQ, N, d);
-    __syncthreads();
-    
-    // Iterate over K,V blocks
-    for (int kv_block = 0; kv_block < (N + Bc - 1) / Bc; kv_block++) {
-        // Load K, V blocks
-        load_block_async<Bc, d>(K + kv_block * Bc * d, sK, N, d);
-        load_block_async<Bc, d>(V + kv_block * Bc * d, sV, N, d);
-        __syncthreads();
-        
-        // Compute S = Q @ K^T using tensor cores
-        half S_frag[Br / WARPS_PER_BLOCK][Bc / 32];
-        mma_sync(S_frag, sQ, sK);  // Simplified - actual uses wmma/mma
-        
-        // Online softmax update (in registers)
-        #pragma unroll
-        for (int i = 0; i < Br / WARPS_PER_BLOCK; i++) {
-            float row_max = -INFINITY;
-            #pragma unroll
-            for (int j = 0; j < Bc / 32; j++) {
-                row_max = fmaxf(row_max, __half2float(S_frag[i][j]));
-            }
-            row_max = warp_reduce_max(row_max);
-            
-            float new_max = fmaxf(m_acc[i], row_max);
-            float scale = expf(m_acc[i] - new_max);
-            
-            l_acc[i] *= scale;
-            O_acc[i][:] *= scale;  // Conceptual - vectorized in practice
-            
-            // Accumulate this block
-            float row_sum = 0.0f;
-            #pragma unroll
-            for (int j = 0; j < Bc / 32; j++) {
-                float p = expf(__half2float(S_frag[i][j]) - new_max);
-                row_sum += p;
-                // O_acc += p * V - done via mma
-            }
-            l_acc[i] += row_sum;
-            m_acc[i] = new_max;
-        }
-        __syncthreads();
-    }
-    
-    // Final normalization and store
-    #pragma unroll
-    for (int i = 0; i < Br / WARPS_PER_BLOCK; i++) {
-        float inv_l = 1.0f / l_acc[i];
-        #pragma unroll
-        for (int j = 0; j < d / 32; j++) {
-            O_acc[i][j] *= inv_l;
-        }
-    }
-    store_block(O + blockIdx.x * Br * d, O_acc);
-}
+## FlashAttention-2: Better Work Partitioning
+
+FlashAttention-1 achieved the algorithmic breakthrough. FlashAttention-2 (2023) improved the GPU implementation:
+
+### Key FA2 Improvements
+
+1. **Reduced non-matmul FLOPs**: FA1 spent significant time on rescaling, max-finding, and exp computation. FA2 restructured these to minimize non-tensor-core work.
+
+2. **Better parallelism across sequence length**: FA1 parallelized over batch and heads. FA2 additionally parallelizes over the sequence dimension — critical for long sequences where batch × heads is small.
+
+3. **Better warp partitioning**: FA1 split work across warps within a thread block suboptimally. FA2 assigns each warp to compute a portion of the output, reducing shared memory reads/writes between warps.
+
+4. **Forward pass optimization**: Achieved ~73% of theoretical max FLOPS on A100 (up from ~50% in FA1).
+
+<PerfChart
+  title="FlashAttention Achieved TFLOPS (A100, FP16, d=128)"
+  data={[
+    { label: "Standard (cuBLAS)", value: 42, color: "gray", annotation: "Attention matrix in HBM" },
+    { label: "FlashAttention-1", value: 124, color: "orange", annotation: "Tiled, online softmax" },
+    { label: "FlashAttention-2", value: 230, color: "blue", annotation: "Better work partitioning" },
+    { label: "FlashAttention-3", value: 290, color: "green", annotation: "Hopper async + FP8" },
+  ]}
+  unit="TFLOPS"
+  baseline={0}
+/>
+
+## FlashAttention-3: Exploiting Hopper
+
+FlashAttention-3 (2024) targets NVIDIA Hopper architecture (H100) with three hardware-specific optimizations:
+
+### 1. Asynchronous WGMMA (Warp Group Matrix Multiply-Accumulate)
+
+Hopper introduces WGMMA — a 128-thread (4-warp) matrix multiply that executes asynchronously. While one WGMMA computes the current tile's attention scores, another can simultaneously compute the previous tile's output accumulation.
+
 ```
+Timeline (FA3 on Hopper):
+Tile j:   [WGMMA: Q_i @ K_j.T] [softmax] [WGMMA: P_ij @ V_j]
+Tile j+1:                        [WGMMA: Q_i @ K_{j+1}.T] [softmax] [WGMMA: P @ V]
+                                  ^--- overlapped with previous tile's AV compute
+```
+
+### 2. TMA (Tensor Memory Accelerator)
+
+Hopper's TMA hardware loads data from global memory to shared memory without using any CUDA threads. This frees the SM's compute units to do actual work while data loads happen in the background.
+
+In FA3, TMA prefetches the next K, V blocks while the current tile is being computed — fully overlapping memory loads with computation.
+
+### 3. Warp Specialization
+
+FA3 divides warps into **producers** (handle data loading via TMA) and **consumers** (handle computation via WGMMA). This is similar to software pipelining in CPUs but at the warp granularity.
+
+### 4. FP8 Support
+
+Hopper's WGMMA natively supports FP8 (E4M3) matrix multiply. FA3 can operate in FP8 with ~2x throughput over FP16, with per-tile scaling to maintain numerical accuracy.
+
+<Benchmark
+  title="FlashAttention Version Comparison"
+  columns={["Feature", "FA1", "FA2", "FA3"]}
+  rows={[
+    { values: ["Target GPU", "A100 (Ampere)", "A100 (Ampere)", "H100 (Hopper)"], highlight: false },
+    { values: ["Achieved TFLOPS (FP16)", "~124", "~230", "~290"], highlight: true },
+    { values: ["% of Peak", "~40%", "~73%", "~75%"], highlight: true },
+    { values: ["FP8 Support", "No", "No", "Yes (~580 TFLOPS)"], highlight: false },
+    { values: ["Async Data Loading", "No", "No", "Yes (TMA)"], highlight: false },
+    { values: ["Warp Specialization", "No", "No", "Yes"], highlight: false },
+    { values: ["Sequence Parallelism", "No", "Yes", "Yes"], highlight: false },
+  ]}
+/>
+
+## When FlashAttention Is Slower
+
+FlashAttention is not universally faster. There are specific scenarios where standard attention wins:
+
+### Very Short Sequences (N &lt; 256)
+
+For short sequences, the $N^2$ attention matrix is small enough to fit in L2 cache. The tiling overhead (online softmax bookkeeping, tile loop, rescaling) exceeds the HBM savings. cuBLAS-based attention with GEMM fusion can be faster.
+
+### When You Need the Attention Matrix
+
+Some applications require the actual attention weights — interpretability tools, attention visualization, certain architectural modifications. FlashAttention never materializes this matrix. You'd need to run standard attention separately to extract it.
+
+### Very Small Head Dimensions
+
+When $d$ is very small (e.g., $d = 32$), the tiles become tiny, reducing the ratio of compute to overhead. This is rare in modern LLMs (most use $d = 128$).
+
+<Callout type="warning" title="The Backward Pass Is Different">
+FlashAttention's backward pass must recompute the attention matrix from stored Q, K, V and the softmax statistics (running max and sum). This recomputation costs extra FLOPs but saves the HBM traffic of storing the $N^2$ attention matrix for backward. The tradeoff is overwhelmingly positive for long sequences.
+</Callout>
+
+## Integration with GQA/MQA
+
+FlashAttention integrates naturally with grouped-query attention. When using GQA with $G$ KV groups and $H$ query heads ($H/G$ queries share each KV group):
+
+- The K, V blocks are loaded once per group
+- $H/G$ query blocks compute attention against the same K, V
+- Effective bandwidth amplification: the K, V data loaded for one query group is reused by $H/G$ queries
+
+This makes FlashAttention even more efficient with GQA — the KV data reuse within SRAM is amplified.
+
+### torch SDPA Backend Selection
+
+PyTorch's `scaled_dot_product_attention` automatically selects the best backend:
+
+```python
+import torch
+import torch.nn.functional as F
+
+# PyTorch automatically selects FlashAttention when available
+output = F.scaled_dot_product_attention(
+    query, key, value,
+    attn_mask=None,       # Causal masking handled internally
+    is_causal=True,       # Enable causal FlashAttention path
+    scale=1.0 / math.sqrt(d),
+)
+
+# Backend selection priority:
+# 1. FlashAttention (if available and inputs are FP16/BF16 on CUDA)
+# 2. Memory-efficient attention (xformers-based)
+# 3. Standard math attention (fallback)
+```
+
+vLLM and SGLang both use FlashAttention for prefill and memory-efficient paged attention kernels for decode (where the paged KV cache layout requires custom kernels).
 
 ## Roofline Analysis
 
-<Benchmark
-  title="FlashAttention Roofline Position (A100)"
-  columns={["Operation", "Arithmetic Intensity", "Achieved FLOPS", "Bound"]}
-  rows={[
-    { values: ["Standard Attention", "2.8 FLOP/byte", "1.2 TFLOPS", "Memory"], highlight: false },
-    { values: ["FlashAttention", "89 FLOP/byte", "124 TFLOPS", "Compute"], highlight: true },
-    { values: ["FlashAttention-2", "102 FLOP/byte", "156 TFLOPS", "Compute"], highlight: true },
-    { values: ["A100 Peak", "-", "312 TFLOPS", "-"], highlight: false },
+Let's place both standard and flash attention on the roofline for an A100:
+
+- **A100 specs**: 312 TFLOPS FP16, 2 TB/s HBM bandwidth
+- **Ridge point**: $312 / 2 = 156$ FLOP/byte
+
+**Standard attention at N=4096, d=128:**
+- FLOPs: $\sim 2 \times 4096^2 \times 128 \times 2 = 8.6 \times 10^{9}$
+- HBM bytes: $\sim 67 \times 10^6 \times 2 = 1.34 \times 10^8$
+- Arithmetic intensity: $\sim 64$ FLOP/byte — below ridge point, **memory-bound**
+
+**FlashAttention at N=4096, d=128:**
+- FLOPs: same $\sim 8.6 \times 10^{9}$ (identical computation)
+- HBM bytes: $\sim 4 \times 10^6 \times 2 = 8 \times 10^6$
+- Arithmetic intensity: $\sim 1075$ FLOP/byte — well above ridge point, **compute-bound**
+
+<PerfChart
+  title="Operational Intensity: Standard vs Flash Attention (N=4096)"
+  data={[
+    { label: "Standard Attention", value: 64, color: "red", annotation: "Memory-bound" },
+    { label: "FlashAttention", value: 1075, color: "green", annotation: "Compute-bound" },
+    { label: "A100 Ridge Point", value: 156, color: "gray", annotation: "Memory/Compute boundary" },
   ]}
-  notes="FP16, batch=1, heads=32, seq_len=4096, d=128"
+  unit="FLOP/byte"
 />
 
-FlashAttention moves attention from **memory-bound** to **compute-bound** by increasing arithmetic intensity 30x.
+FlashAttention transforms attention from a memory-bound operation into a compute-bound one. This is the fundamental reason it's faster — it moves the kernel to a regime where the GPU can actually use its tensor cores effectively.
 
-## FlashAttention-2 Improvements
+## Wall-Clock Speedups
 
-FlashAttention-2 achieves additional speedup through:
+The theoretical traffic reduction translates directly to real speedups:
 
-1. **Reduced non-matmul FLOPs**: Moved rescaling outside inner loop
-2. **Better parallelism**: Parallelize over sequence length, not just batch
-3. **Improved warp scheduling**: Better occupancy on Ampere/Hopper
+<Benchmark
+  title="End-to-End Speedup: FlashAttention-2 vs Standard (A100, FP16)"
+  columns={["Sequence Length", "Standard (ms)", "FlashAttention-2 (ms)", "Speedup"]}
+  rows={[
+    { values: ["512", "0.8", "0.5", "1.6x"], highlight: false },
+    { values: ["1024", "2.1", "0.9", "2.3x"], highlight: false },
+    { values: ["2048", "7.2", "1.9", "3.8x"], highlight: true },
+    { values: ["4096", "26.4", "4.2", "6.3x"], highlight: true },
+    { values: ["8192", "102.0", "9.8", "10.4x"], highlight: true },
+    { values: ["16384", "OOM", "22.1", "N/A (enables)"], highlight: false },
+  ]}
+  notes="Standard attention OOMs at 16K because the N² attention matrix exceeds GPU memory."
+/>
 
-```python
-# FlashAttention-2 key optimization: delayed rescaling
-# Instead of rescaling O_prev each block, accumulate then rescale once
+At 8K tokens, FlashAttention is over **10x faster**. At 16K+, standard attention simply cannot run at all — FlashAttention doesn't just accelerate attention, it **enables** long-context models.
 
-def flash_attention_2_block(Q_block, K_block, V_block, acc):
-    S = Q_block @ K_block.T
-    m_block = S.max(dim=-1)
-    
-    # Don't rescale yet - just track the scaling factors
-    m_new = torch.maximum(acc.m, m_block)
-    
-    P = torch.exp(S - m_block.unsqueeze(-1))  # Local softmax
-    PV = P @ V_block
-    
-    # Accumulate with deferred scaling
-    acc.O_unscaled += PV * torch.exp(m_block - m_new).unsqueeze(-1)
-    acc.l *= torch.exp(acc.m - m_new)
-    acc.l += P.sum(dim=-1) * torch.exp(m_block - m_new)
-    acc.m = m_new
-    
-    return acc
+## Practical Impact
 
-# Final rescaling (once, after all blocks)
-O_final = acc.O_unscaled / acc.l.unsqueeze(-1)
-```
+FlashAttention is now the default attention implementation in virtually every LLM framework:
 
-## Profiling FlashAttention
+- **PyTorch**: Built into `F.scaled_dot_product_attention`
+- **vLLM**: Uses FA for prefill, custom paged kernels for decode
+- **SGLang**: FA with RadixAttention for prefix caching
+- **TensorRT-LLM**: Custom FA integration with FP8 support
+- **Hugging Face**: Automatic FA2 selection via `attn_implementation="flash_attention_2"`
 
-```bash
-# Measure achieved memory bandwidth
-ncu --set full \
-    --metrics dram__bytes_read.sum,dram__bytes_write.sum,\
-              sm__sass_thread_inst_executed_op_fadd_pred_on.sum,\
-              sm__sass_thread_inst_executed_op_fmul_pred_on.sum \
-    python -c "
-import torch
-from flash_attn import flash_attn_func
-q = torch.randn(1, 4096, 32, 128, device='cuda', dtype=torch.float16)
-k = torch.randn(1, 4096, 32, 128, device='cuda', dtype=torch.float16)
-v = torch.randn(1, 4096, 32, 128, device='cuda', dtype=torch.float16)
-for _ in range(100):
-    o = flash_attn_func(q, k, v)
-torch.cuda.synchronize()
-"
-```
+The impact extends beyond raw speed — by making attention memory-efficient, FlashAttention enabled the jump from 2K to 128K+ context lengths that defines modern LLMs.
 
-Expected results on A100:
-- **HBM Read**: ~134 MB (vs 4.4 GB for standard)
-- **HBM Write**: ~33 MB
-- **Achieved TFLOPS**: 150+ (48% of peak)
-- **SM Occupancy**: 75-85%
-
-## When FlashAttention Isn't Optimal
-
-FlashAttention has overhead for:
-- **Very short sequences** (N &lt; 256): Tiling overhead dominates
-- **Very small batch sizes**: Can't saturate SMs
-- **Non-standard attention patterns**: Requires custom kernels
-
-<Callout type="info" title="Sequence Length Crossover">
-  For N &lt; 512, cuBLAS GEMM-based attention often outperforms FlashAttention due to lower kernel launch overhead and better SM utilization at small problem sizes.
+<Callout type="tip" title="The Lesson Beyond FlashAttention">
+FlashAttention's real contribution isn't a clever algorithm — it's a demonstration that **IO-aware algorithm design** (designing algorithms around the memory hierarchy, not just FLOP counts) can yield order-of-magnitude improvements. The same principle applies to any GPU kernel: minimize HBM traffic, maximize SRAM reuse.
 </Callout>
 
 ## Conclusion
 
-FlashAttention's 33x reduction in HBM traffic comes from a fundamental restructuring of the attention algorithm, not approximation. Understanding this restructuring—and the memory hierarchy constraints that motivate it—is essential for anyone optimizing transformer inference.
+FlashAttention eliminates the $O(N^2)$ HBM bottleneck in attention by tiling the computation to fit in SRAM, using online softmax to process tiles incrementally. The result: same mathematical output, but with $O(N)$ memory traffic instead of $O(N^2)$. On modern GPUs, this translates to 2-10x speedups for typical sequence lengths and enables context lengths that were previously impossible.
 
-The key insight generalizes: **Any O(N²) intermediate tensor that can be computed on-the-fly should be.** This principle applies beyond attention to any algorithm with large intermediate materialization.
+The evolution from FA1 (algorithmic breakthrough) to FA2 (GPU implementation optimization) to FA3 (Hopper hardware exploitation) shows how a single insight — respect the memory hierarchy — compounds across hardware generations. Every modern LLM serving system uses FlashAttention, making it arguably the most impactful single optimization in the transformer era.

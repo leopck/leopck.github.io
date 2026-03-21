@@ -1,219 +1,777 @@
 ---
-title: "GPU Tensor Core Optimization: Maximizing Performance with Mixed-Precision Operations"
+title: "GPU Tensor Core Programming: From Volta WMMA to Hopper WGMMA"
 author: "stanley-phoong"
-description: "Advanced techniques for optimizing Tensor Core usage on NVIDIA GPUs, achieving peak performance with FP16 and INT8 matrix operations."
-publishDate: 2019-12-03
+description: "A deep dive into tensor core architecture across three GPU generations, covering WMMA, MMA PTX, WGMMA, supported precisions, structured sparsity, CUTLASS, and practical optimization strategies."
+publishDate: 2025-03-21
 category: gpu-programming
-tags: [gpu, tensor-cores, cuda, optimization, performance, mixed-precision]
+tags: [gpu, tensor-cores, cuda, optimization, performance, mixed-precision, cutlass, hopper]
 difficulty: expert
-readingTime: 23
+readingTime: 35
 ---
 
 import Callout from '@/components/mdx/Callout.astro';
 import PerfChart from '@/components/mdx/PerfChart.astro';
 import Benchmark from '@/components/mdx/Benchmark.astro';
 
-Tensor Cores provide massive performance improvements for matrix operations. Optimizing Tensor Core usage is essential for achieving peak GPU performance.
+Modern deep learning is, at its mathematical core, an enormous pile of matrix multiplications. Every fully-connected layer, every attention head, every convolution (when lowered via im2col or implicit GEMM) reduces to General Matrix Multiply (GEMM). When a single training step of GPT-class models executes trillions of multiply-accumulate operations, the throughput of matrix math becomes the single most important factor determining how long you wait for a model to converge. Tensor cores exist because general-purpose CUDA cores, designed to execute scalar floating-point instructions one per thread per cycle, are fundamentally inefficient at the one thing deep learning needs most: $D = A \times B + C$ over large matrices.
 
-## Tensor Core Architecture
+This article traces the evolution of tensor cores from Volta through Ampere to Hopper, explains the programming interfaces at every level of abstraction, catalogs every supported precision, and discusses when tensor cores help -- and when they do not.
 
-Tensor Cores perform specialized matrix operations:
+## Why Tensor Cores Exist
+
+Consider how a naive CUDA core GEMM works. Each thread computes one element of the output matrix by iterating over the K dimension, performing one FMA (fused multiply-add) per cycle. A streaming multiprocessor (SM) with 64 FP32 CUDA cores running at 1.5 GHz delivers roughly $64 \times 2 \times 1.5 \times 10^9 = 192$ GFLOPS of FP32 throughput. Scale that across 108 SMs on an A100 and you get approximately 19.5 TFLOPS of FP32. Respectable, but nowhere near enough for modern workloads.
+
+Tensor cores take a radically different approach. Instead of one scalar FMA per thread per cycle, a single tensor core instruction performs a small matrix multiply-accumulate across all 32 threads of a warp simultaneously. On Volta, one `HMMA` instruction computes a $4 \times 4 \times 4$ matrix FMA in a single cycle. Because the hardware knows it is doing a structured matrix operation rather than independent scalar ops, it can share operands across threads, reduce register file pressure through implicit data reuse, and pipeline the multiply-accumulate chain internally.
+
+The throughput difference is staggering:
 
 <Benchmark
-  title="Tensor Core Specifications (NVIDIA V100)"
-  columns={["Operation", "Precision", "Throughput", "Speedup"]}
+  title="Peak Throughput: Tensor Cores vs CUDA Cores"
+  columns={["GPU", "CUDA Core FP32", "Tensor Core FP16", "Tensor Core INT8", "Ratio (FP16/FP32)"]}
   rows={[
-    { values: ["FP32 GEMM", "FP32", "15.7 TFLOPS", "1.0x"], highlight: false },
-    { values: ["Tensor Core", "FP16", "125 TFLOPS", "8x"], highlight: true },
-    { values: ["Tensor Core", "INT8", "250 TOPS", "16x"], highlight: true },
-    { values: ["Tensor Core", "INT4", "500 TOPS", "32x"], highlight: false },
+    { values: ["V100 (Volta)", "15.7 TFLOPS", "125 TFLOPS", "—", "~8x"], highlight: false },
+    { values: ["A100 (Ampere)", "19.5 TFLOPS", "312 TFLOPS", "624 TOPS", "~16x"], highlight: true },
+    { values: ["H100 (Hopper)", "67 TFLOPS*", "989 TFLOPS", "1979 TOPS", "~15x"], highlight: true },
   ]}
 />
 
-## WMMA API Usage
+<Callout type="info" title="FP32 on H100">
+  The H100 FP32 number of 67 TFLOPS includes the Hopper FP32 throughput boost from doubled FP32 pipelines. Even with this improvement, tensor cores still deliver roughly 15x higher throughput for half-precision GEMM.
+</Callout>
 
-Using WMMA (Warp Matrix Multiply Accumulate) API:
+These numbers make the engineering motivation obvious. If 90%+ of your compute is matrix math, and tensor cores deliver 10-16x higher throughput for that math, then failing to use tensor cores means leaving the vast majority of your GPU's capability on the table.
+
+## The Evolution: Volta to Ampere to Hopper
+
+### Volta (SM 7.0): The Beginning
+
+Volta introduced the first-generation tensor core in 2017. Each SM contained 8 tensor cores, and each tensor core could perform a $4 \times 4 \times 4$ FP16 matrix FMA per cycle, producing FP16 or FP32 accumulation results. At the warp level, the WMMA (Warp Matrix Multiply-Accumulate) API exposed $16 \times 16 \times 16$ tile operations, where each warp cooperatively loaded matrix fragments, executed the MMA, and stored the results.
+
+Key Volta tensor core characteristics:
+- **Supported precisions**: FP16 input, FP16 or FP32 accumulation
+- **Warp tile sizes**: $16 \times 16 \times 16$, $32 \times 8 \times 16$, $8 \times 32 \times 16$
+- **Peak throughput**: 125 TFLOPS FP16 on V100
+- **Programming model**: WMMA C++ API, `HMMA` PTX instructions
+
+### Turing (SM 7.5): Integer Tensor Cores
+
+Turing (2018) added INT8 and INT4 tensor core operations for inference workloads, plus INT1 (binary) for experimental use cases. The FP16 throughput matched Volta clock-for-clock, but the integer paths opened the door to quantized inference at 2-4x higher throughput than FP16.
+
+### Ampere (SM 8.0): The Big Leap
+
+Ampere (2020) brought transformative improvements:
+
+- **TF32 (TensorFloat-32)**: A new 19-bit format (8-bit exponent, 10-bit mantissa, 1-bit sign) that provides FP32-range with reduced precision. TF32 tensor core ops accept FP32 inputs and internally round to TF32, meaning existing FP32 code can benefit from tensor cores with zero code changes when using cuBLAS.
+- **BF16 (BFloat16)**: 16-bit format with FP32-range exponent (8 bits) and reduced mantissa (7 bits). Preferred for training because the wider dynamic range reduces overflow/underflow compared to FP16.
+- **Doubled FP16/BF16 throughput**: The A100 achieves 312 TFLOPS FP16, up from 125 on V100.
+- **Structured sparsity**: Hardware-accelerated 2:4 sparsity doubles effective throughput for sparse matrices.
+- **Fine-grained MMA**: New `mma` PTX instructions with more flexible tile shapes.
+
+### Hopper (SM 9.0): Warp-Group MMA and TMA
+
+Hopper (2022) introduced the most radical architectural shift since Volta:
+
+- **WGMMA (Warp Group Matrix Multiply-Accumulate)**: Operations span 128 threads (4 warps = 1 warp group) instead of 32 threads. Larger tiles ($64 \times 256 \times 16$ and beyond) amortize overhead and improve data reuse.
+- **TMA (Tensor Memory Accelerator)**: A dedicated hardware unit that asynchronously copies multi-dimensional tensors from global memory to shared memory (and back) without consuming SM compute resources. TMA understands tensor shapes and strides natively.
+- **FP8 (E4M3 and E5M2)**: 8-bit floating point for both training and inference. E4M3 (4-bit exponent, 3-bit mantissa) is used for forward passes; E5M2 (5-bit exponent, 2-bit mantissa) for gradients.
+- **Asynchronous execution**: WGMMA operations are asynchronous — the warp group issues the MMA and continues executing other instructions. A `wgmma.wait_group` barrier synchronizes when results are needed.
+
+<PerfChart
+  title="Tensor Core Peak FP16 Throughput Across Generations"
+  type="bar"
+  chartData={{
+    labels: ["V100 (Volta)", "T4 (Turing)", "A100 (Ampere)", "H100 (Hopper)"],
+    series: [
+      {
+        label: "FP16 Tensor TFLOPS",
+        data: [125, 65, 312, 989],
+        borderColor: "#10b981",
+      }
+    ]
+  }}
+/>
+
+## How Tensor Cores Work: The Mechanics
+
+At the hardware level, a tensor core is a fixed-function matrix multiply-accumulate unit. When a warp executes a tensor core instruction, all 32 threads collectively provide the input operands (matrix fragments stored in their registers) and receive the output fragments back into their registers. No single thread holds an entire matrix tile — the tile is distributed across the warp.
+
+### The Fragment Model
+
+Consider the canonical $16 \times 16 \times 16$ FP16 operation: $D_{16 \times 16} = A_{16 \times 16} \times B_{16 \times 16} + C_{16 \times 16}$.
+
+Each matrix is decomposed into **fragments** — each thread in the warp holds a small number of elements from each matrix. For a $16 \times 16$ FP16 matrix A in row-major layout, each of the 32 threads holds 8 elements (since $16 \times 16 = 256$ elements total, and $256 / 32 = 8$ elements per thread). The exact mapping of which thread holds which element is architecture-specific and intentionally opaque in the WMMA API — you load and store fragments through API calls, and the hardware handles the distribution.
+
+The mathematical operation at the instruction level proceeds as:
+
+$$D = A \times B + C$$
+
+where all four matrices are distributed across the warp's register file. The tensor core hardware reads the fragment registers, performs the full $16 \times 16 \times 16$ multiply-accumulate internally (which involves $16 \times 16 \times 16 = 4096$ FMA operations), and writes the result fragments back to registers.
+
+<Callout type="tip" title="Why Fragments Are Opaque">
+  NVIDIA deliberately does not document the exact thread-to-element mapping for WMMA fragments. This allows them to change the mapping between GPU generations for better performance. If you need deterministic mapping (for example, to apply per-element operations to fragments), use the lower-level MMA PTX instructions where the mapping is defined in the PTX ISA specification.
+</Callout>
+
+## The WMMA API: High-Level Tensor Core Programming
+
+The WMMA (Warp Matrix Multiply-Accumulate) API, available via `#include <mma.h>`, is the most accessible way to program tensor cores. It provides four core operations:
+
+1. **`wmma::fill_fragment`** — Initialize a fragment to a scalar value
+2. **`wmma::load_matrix_sync`** — Load a matrix tile from memory into a fragment
+3. **`wmma::mma_sync`** — Perform the matrix multiply-accumulate
+4. **`wmma::store_matrix_sync`** — Store a fragment back to memory
+
+### A Complete WMMA GEMM Kernel
+
+The following kernel computes $C = A \times B$ for arbitrary-sized matrices using $16 \times 16 \times 16$ FP16 tensor core tiles, accumulating in FP32 for numerical stability:
 
 ```cpp
 #include <mma.h>
-
 using namespace nvcuda;
 
-__global__ void tensor_core_gemm(half *A, half *B, half *C, int M, int N, int K) {
+// Tile dimensions for tensor core operations
+const int WMMA_M = 16;
+const int WMMA_N = 16;
+const int WMMA_K = 16;
+
+__global__ void wmma_gemm(half *A, half *B, float *C,
+                          int M, int N, int K) {
+    // Each warp computes one 16x16 output tile
+    int warpM = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
+    int warpN = blockIdx.y;
+
+    // Bounds check
+    if (warpM * WMMA_M >= M || warpN * WMMA_N >= N) return;
+
     // Declare fragments
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
-    wmma::fragment<wmma::accumulator, 16, 16, 16, half> c_frag;
-    
-    // Initialize accumulator
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K,
+                   half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K,
+                   half, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K,
+                   float> c_frag;
+
+    // Initialize accumulator to zero
     wmma::fill_fragment(c_frag, 0.0f);
-    
-    // Load matrix tiles
-    wmma::load_matrix_sync(a_frag, A + threadIdx.y * 16, 16);
-    wmma::load_matrix_sync(b_frag, B + threadIdx.x, 16);
-    
-    // Matrix multiply-accumulate
-    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-    
-    // Store result
-    wmma::store_matrix_sync(C + threadIdx.y * 16 + threadIdx.x, c_frag, 16, wmma::mem_row_major);
+
+    // Loop over K dimension in steps of WMMA_K
+    for (int k = 0; k < K; k += WMMA_K) {
+        int aRow = warpM * WMMA_M;
+        int aCol = k;
+        int bRow = k;
+        int bCol = warpN * WMMA_N;
+
+        // Load 16x16 tiles from A and B
+        // Leading dimension (stride) is K for A, N for B
+        wmma::load_matrix_sync(a_frag, A + aRow * K + aCol, K);
+        wmma::load_matrix_sync(b_frag, B + bRow * N + bCol, N);
+
+        // Tensor core MMA: c_frag += a_frag * b_frag
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
+
+    // Store the 16x16 result tile to C
+    int cRow = warpM * WMMA_M;
+    int cCol = warpN * WMMA_N;
+    wmma::store_matrix_sync(C + cRow * N + cCol, c_frag,
+                            N, wmma::mem_row_major);
 }
 ```
 
-## Performance Optimization
+### Fragment Sizes and Supported Configurations
 
-Tensor Core performance characteristics:
+The WMMA API supports several tile configurations depending on the data type:
+
+<Benchmark
+  title="WMMA Fragment Configurations"
+  columns={["Input Type", "Accumulator", "M x N x K", "Min Architecture"]}
+  rows={[
+    { values: ["FP16", "FP16", "16x16x16", "SM 7.0 (Volta)"], highlight: false },
+    { values: ["FP16", "FP32", "16x16x16", "SM 7.0 (Volta)"], highlight: true },
+    { values: ["FP16", "FP32", "32x8x16", "SM 7.0 (Volta)"], highlight: false },
+    { values: ["FP16", "FP32", "8x32x16", "SM 7.0 (Volta)"], highlight: false },
+    { values: ["BF16", "FP32", "16x16x16", "SM 8.0 (Ampere)"], highlight: true },
+    { values: ["TF32", "FP32", "16x16x8", "SM 8.0 (Ampere)"], highlight: true },
+    { values: ["INT8", "INT32", "16x16x16", "SM 7.2 (Turing)"], highlight: false },
+    { values: ["INT4", "INT32", "8x8x32", "SM 7.5 (Turing)"], highlight: false },
+    { values: ["INT1 (binary)", "INT32", "8x8x128", "SM 7.5 (Turing)"], highlight: false },
+    { values: ["FP64", "FP64", "8x8x4", "SM 8.0 (Ampere)"], highlight: false },
+  ]}
+/>
+
+<Callout type="warning" title="Alignment and Padding">
+  Matrix dimensions passed to WMMA loads must be multiples of the tile size (typically 16). If your actual matrix dimensions are not multiples of 16, you must pad them. The leading dimension (stride) must also be a multiple of 16 bytes, which for FP16 means the stride must be a multiple of 8 elements (since each `half` is 2 bytes, and $8 \times 2 = 16$ bytes).
+</Callout>
+
+### Shared Memory Staging for High Performance
+
+The basic WMMA kernel above loads directly from global memory, which is bandwidth-limited. A production-quality kernel stages data through shared memory to maximize data reuse:
+
+```cpp
+__global__ void wmma_gemm_shared(half *A, half *B, float *C,
+                                  int M, int N, int K) {
+    // Shared memory tiles for A and B
+    __shared__ half sA[WMMA_M * 2][WMMA_K]; // 2 warps along M
+    __shared__ half sB[WMMA_K][WMMA_N * 2]; // 2 warps along N
+
+    // Identify this warp's tile position
+    int warpId = threadIdx.x / warpSize;
+    int warpRow = warpId / 2;  // 0 or 1
+    int warpCol = warpId % 2;  // 0 or 1
+
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K,
+                   half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K,
+                   half, wmma::row_major> b_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K,
+                   float> c_frag;
+
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    for (int k = 0; k < K; k += WMMA_K) {
+        // Cooperatively load A and B tiles into shared memory
+        // (all threads in block participate)
+        // ... loading code omitted for brevity ...
+        __syncthreads();
+
+        // Each warp loads its fragment from shared memory
+        wmma::load_matrix_sync(a_frag,
+            &sA[warpRow * WMMA_M][0], WMMA_K);
+        wmma::load_matrix_sync(b_frag,
+            &sB[0][warpCol * WMMA_N], WMMA_N * 2);
+
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        __syncthreads();
+    }
+
+    // Store result
+    int cRow = (blockIdx.y * 2 + warpRow) * WMMA_M;
+    int cCol = (blockIdx.x * 2 + warpCol) * WMMA_N;
+    wmma::store_matrix_sync(C + cRow * N + cCol, c_frag,
+                            N, wmma::mem_row_major);
+}
+```
+
+Loading from shared memory is roughly 20-40x faster than global memory, and because multiple warps in the same block share the same K-dimension data, you dramatically reduce global memory bandwidth pressure.
+
+## MMA PTX Instructions: Maximum Control
+
+The WMMA API is convenient but opaque. For maximum performance, CUTLASS and other high-performance libraries use the lower-level **MMA PTX instructions** directly. These provide explicit control over the thread-to-element mapping and expose additional tile sizes not available through WMMA.
+
+### Volta HMMA vs Ampere MMA
+
+On Volta, the PTX instruction is `mma.sync.aligned.m8n8k4.row.col.f16.f16.f16.f16`, operating on $8 \times 8 \times 4$ tiles per instruction. A $16 \times 16 \times 16$ WMMA operation internally decomposes into multiple `HMMA` instructions.
+
+On Ampere, the `mma.sync.aligned` instruction family was expanded significantly:
+
+```
+// Ampere FP16 MMA, 16x8x16 tile
+mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    {d0, d1, d2, d3},        // 4 FP32 output registers
+    {a0, a1, a2, a3},        // 4 FP16x2 input registers (A)
+    {b0, b1},                // 2 FP16x2 input registers (B)
+    {c0, c1, c2, c3};        // 4 FP32 accumulator registers
+```
+
+Each thread provides specific registers, and the thread-to-element mapping is fully documented in the PTX ISA specification. This lets you manipulate individual matrix elements between MMA calls — essential for fused kernels that combine GEMM with activation functions, bias addition, or other pointwise operations.
+
+### CUTLASS Warp-Level MMA
+
+CUTLASS (CUDA Templates for Linear Algebra Subroutines) builds its entire GEMM hierarchy on top of MMA PTX. The CUTLASS warp-level MMA tile sizes are:
+
+<Benchmark
+  title="CUTLASS Warp MMA Tile Sizes"
+  columns={["Architecture", "PTX Instruction", "Warp Tile (M x N x K)", "Instructions per Warp Tile"]}
+  rows={[
+    { values: ["Volta", "mma.m8n8k4", "Up to 64x64x16", "Multiple HMMA"], highlight: false },
+    { values: ["Ampere (FP16)", "mma.m16n8k16", "Up to 64x64x32", "Multiple MMA"], highlight: true },
+    { values: ["Ampere (TF32)", "mma.m16n8k8", "Up to 64x64x16", "Multiple MMA"], highlight: true },
+    { values: ["Ampere (INT8)", "mma.m16n8k32", "Up to 64x64x64", "Multiple MMA"], highlight: false },
+    { values: ["Hopper (FP16)", "wgmma.m64n*k16", "Up to 64x256x16", "Single WGMMA"], highlight: true },
+  ]}
+/>
+
+A typical CUTLASS kernel organizes computation as a three-level tile hierarchy:
+
+1. **Thread block tile**: The portion of the output matrix computed by one thread block (e.g., $128 \times 128$).
+2. **Warp tile**: The portion computed by one warp within the block (e.g., $64 \times 64$).
+3. **Instruction tile**: The portion computed by one MMA instruction (e.g., $16 \times 8 \times 16$).
+
+The warp tile is divided into multiple instruction tiles, and the kernel loops over the K dimension, issuing MMA instructions and accumulating partial results.
+
+### Using Inline PTX for MMA
+
+When you need MMA-level control without writing raw PTX assembly files, you can use inline PTX in CUDA C++:
+
+```cpp
+__device__ void mma_m16n8k16_fp16(
+    float *D, const uint32_t *A, const uint32_t *B, const float *C)
+{
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0, %1, %2, %3}, "       // D registers
+        "{%4, %5, %6, %7}, "       // A registers (4 x FP16x2)
+        "{%8, %9}, "               // B registers (2 x FP16x2)
+        "{%10, %11, %12, %13};\n"  // C registers
+        : "=f"(D[0]), "=f"(D[1]), "=f"(D[2]), "=f"(D[3])
+        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
+          "r"(B[0]), "r"(B[1]),
+          "f"(C[0]), "f"(C[1]), "f"(C[2]), "f"(C[3])
+    );
+}
+```
+
+This gives you the exact same instruction the hardware executes, with full control over register allocation and the ability to interleave MMA with other operations.
+
+## WGMMA: Hopper's Warp-Group Architecture
+
+Hopper's WGMMA represents a fundamental shift in tensor core programming. Instead of 32-thread warps executing synchronous MMA instructions, WGMMA operates on **warp groups** of 128 threads (4 warps) and executes **asynchronously**.
+
+### Why Warp Groups?
+
+Larger tiles mean better arithmetic intensity — more compute per byte loaded from memory. A $64 \times 256 \times 16$ WGMMA tile performs $64 \times 256 \times 16 \times 2 = 524,288$ FLOPs but only needs to load $64 \times 16 + 256 \times 16 = 5,120$ elements. The compute-to-memory ratio is roughly 100 FLOPs per element loaded, compared to about 32 for a $16 \times 16 \times 16$ WMMA tile. This makes it much easier to hide memory latency.
+
+### The TMA (Tensor Memory Accelerator)
+
+Before Hopper, loading data from global memory to shared memory required explicit `cp.async` or plain load/store instructions executed by SM threads. TMA offloads this entirely to a dedicated hardware unit:
+
+```cpp
+// TMA descriptor setup (host side)
+CUtensorMap tensorMap;
+cuTensorMapEncodeTiled(&tensorMap,
+    CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
+    2,                          // 2D tensor
+    globalPtr,                  // base pointer
+    {N, M},                     // global dimensions
+    {N * sizeof(half), sizeof(half)}, // global strides
+    {tileN, tileM},             // box (tile) dimensions
+    {1, 1},                     // element strides
+    CU_TENSOR_MAP_INTERLEAVE_NONE,
+    CU_TENSOR_MAP_SWIZZLE_128B,
+    CU_TENSOR_MAP_L2_PROMOTION_NONE,
+    CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+```
+
+On the device side, a single thread issues a TMA load that fills an entire shared memory tile:
+
+```cpp
+// Only one thread per warp group issues the TMA load
+if (threadIdx.x == 0) {
+    cp_async_bulk_tensor_2d_global_to_shared(
+        &smem_A[stage][0], &tensorMapA, {tileCol, tileRow},
+        barrier);
+}
+// All threads wait on the barrier
+barrier.arrive_and_wait();
+```
+
+The TMA handles address calculation, boundary checking, data format conversion, and swizzling — all in hardware. This frees SM threads to focus entirely on compute.
+
+### Producer-Consumer Warp Specialization
+
+Hopper's most advanced kernels use **warp specialization**: some warps in the thread block act as "producers" that issue TMA loads, while other warps act as "consumers" that execute WGMMA instructions. Communication happens through shared memory barriers.
+
+```
+Thread Block Layout (Hopper warp-specialized GEMM):
+  Warp Group 0 (warps 0-3):   Producer — issues TMA loads
+  Warp Group 1 (warps 4-7):   Consumer — executes WGMMA
+  Warp Group 2 (warps 8-11):  Consumer — executes WGMMA
+
+  Flow:
+  1. Producer issues TMA load for tile K=0 into smem buffer 0
+  2. Producer signals barrier 0
+  3. Consumer 1 waits on barrier 0, executes WGMMA on buffer 0
+  4. Producer issues TMA load for tile K=1 into smem buffer 1
+  5. Consumer 2 waits on barrier 1, executes WGMMA on buffer 1
+  ... (ping-pong continues)
+```
+
+This pattern achieves near-perfect overlap of memory and compute, which is why H100 can sustain close to its peak 989 TFLOPS FP16 on large GEMMs.
+
+### Asynchronous WGMMA Execution
+
+WGMMA instructions are issued asynchronously. The warp group starts the MMA and continues executing subsequent instructions. You must explicitly wait for completion before reading results:
+
+```cpp
+// Issue WGMMA (does not block)
+wgmma_m64n128k16_f16_f16_f32(d_frag, a_desc, b_desc);
+
+// ... do other work (e.g., issue next TMA load) ...
+
+// Wait for the WGMMA to complete
+wgmma_wait_group<0>();  // wait for all outstanding WGMMAs
+```
+
+This asynchronous model is key to Hopper's ability to overlap compute, memory loads, and register-to-shared-memory traffic simultaneously.
+
+## Supported Precisions: A Complete Catalog
+
+Tensor cores have grown from a single precision (FP16) on Volta to a rich set of numeric formats. The choice of precision directly impacts throughput, memory footprint, and numerical accuracy.
+
+<Benchmark
+  title="Tensor Core Precision Support by Architecture"
+  columns={["Precision", "Bits", "Volta (7.0)", "Turing (7.5)", "Ampere (8.0)", "Hopper (9.0)"]}
+  rows={[
+    { values: ["FP16", "16", "Yes", "Yes", "Yes", "Yes"], highlight: true },
+    { values: ["BF16", "16", "No", "No", "Yes", "Yes"], highlight: true },
+    { values: ["TF32", "19", "No", "No", "Yes", "Yes"], highlight: true },
+    { values: ["FP8 E4M3", "8", "No", "No", "No", "Yes"], highlight: true },
+    { values: ["FP8 E5M2", "8", "No", "No", "No", "Yes"], highlight: true },
+    { values: ["FP64", "64", "No", "No", "Yes", "Yes"], highlight: false },
+    { values: ["INT8", "8", "No", "Yes", "Yes", "Yes"], highlight: false },
+    { values: ["INT4", "4", "No", "Yes", "Yes", "Yes"], highlight: false },
+    { values: ["INT1", "1", "No", "Yes", "No*", "No*"], highlight: false },
+  ]}
+/>
+
+### Throughput by Precision (A100)
+
+The throughput scales inversely with the number of bits per element. Narrower types allow more operations per cycle:
 
 <PerfChart
-  title="Tensor Core Performance vs Matrix Size"
-  type="line"
+  title="A100 Tensor Core Throughput by Precision"
+  type="bar"
   chartData={{
-    labels: ["64x64", "128x128", "256x256", "512x512", "1024x1024"],
+    labels: ["FP64", "TF32", "FP16/BF16", "INT8", "INT4"],
     series: [
       {
-        label: "Tensor Core (TFLOPS)",
-        data: [45, 95, 115, 122, 125],
-        borderColor: "#10b981",
-      },
-      {
-        label: "CUDA Core (TFLOPS)",
-        data: [8, 12, 14, 15, 15.7],
+        label: "Peak TFLOPS / TOPS",
+        data: [19.5, 156, 312, 624, 1248],
         borderColor: "#3b82f6",
       }
     ]
   }}
 />
 
-## Memory Alignment Requirements
+### When to Use Each Precision
 
-Tensor Cores require specific memory alignment:
+**FP16 (IEEE 754 half)**: The default choice for mixed-precision training. 5-bit exponent gives a range of roughly $6 \times 10^{-8}$ to $65504$. Requires loss scaling to prevent gradient underflow during training. Accumulate in FP32 for numerical stability.
 
-```cpp
-__global__ void aligned_tensor_core_gemm(half *A, half *B, half *C, int M, int N, int K) {
-    // Ensure 16-byte alignment for matrix A
-    // Ensure 16-byte alignment for matrix B
-    
-    // Load with proper stride
-    int stride_a = (M + 15) & ~15;  // Round up to multiple of 16
-    int stride_b = (K + 15) & ~15;
-    
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
-    wmma::fragment<wmma::accumulator, 16, 16, 16, half> c_frag;
-    
-    wmma::fill_fragment(c_frag, 0.0f);
-    
-    // Load with aligned stride
-    wmma::load_matrix_sync(a_frag, A + blockIdx.y * 16 * stride_a + threadIdx.y * 16, stride_a);
-    wmma::load_matrix_sync(b_frag, B + blockIdx.x * 16 + threadIdx.x * 16 * stride_b, stride_b);
-    
-    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-    
-    wmma::store_matrix_sync(C + blockIdx.y * 16 * N + blockIdx.x * 16 + threadIdx.y * 16 + threadIdx.x, 
-                            c_frag, N, wmma::mem_row_major);
-}
-```
+**BF16 (Brain Float 16)**: Same 8-bit exponent as FP32 (range $\sim 10^{-38}$ to $\sim 3.4 \times 10^{38}$) but only 7 mantissa bits. Because the range matches FP32, loss scaling is typically unnecessary. Preferred for training large language models. Throughput identical to FP16 on tensor cores.
 
-<Callout type="tip" title="Memory Alignment">
-  Tensor Cores require 16-byte alignment and matrix dimensions must be multiples of 16 for optimal performance.
+**TF32 (TensorFloat-32)**: Not actually 32-bit — it uses FP32's 8-bit exponent but only 10 mantissa bits (19 bits total, stored in 32-bit containers). The beauty of TF32 is that it is transparent: cuBLAS automatically uses TF32 tensor cores when you call FP32 GEMM on Ampere+. You get roughly 8x speedup over FP32 CUDA cores with no code changes and acceptable accuracy loss for most deep learning workloads.
+
+**FP8 E4M3**: 4-bit exponent, 3-bit mantissa. Range of $\sim 2^{-9}$ to $448$. Used for forward-pass activations and weights in Hopper FP8 training recipes. Combined with per-tensor or per-channel scaling, achieves accuracy within 0.1% of FP16 for most models.
+
+**FP8 E5M2**: 5-bit exponent, 2-bit mantissa. Wider range ($\sim 2^{-16}$ to $57344$) but coarser precision. Primarily used for gradients during backward pass, where dynamic range matters more than precision.
+
+**INT8**: 8-bit integer with INT32 accumulation. The workhorse of quantized inference. Post-training quantization (PTQ) or quantization-aware training (QAT) maps FP32 weights and activations to INT8 with scaling factors. Frameworks like TensorRT automate this process.
+
+**INT4**: 4-bit integer for aggressive quantization. Requires careful calibration and is typically used only for weights, not activations. Useful for memory-bound inference scenarios where model size must be minimized.
+
+<Callout type="warning" title="Precision vs Accuracy">
+  Higher tensor core throughput from lower precision is only useful if model accuracy is preserved. Always validate your model's quality metrics (perplexity, accuracy, F1, etc.) after changing precision. The general recommendation: use BF16 or FP16 for training, INT8 for inference, and FP8 on Hopper when the tooling supports it.
 </Callout>
 
-## Mixed Precision Patterns
+## CUTLASS and cuBLAS: Libraries for Tensor Core GEMM
 
-Optimal mixed precision usage:
+### cuBLAS: The Easy Path
 
-```cpp
-__global__ void mixed_precision_gemm(float *A_fp32, float *B_fp32, float *C_fp32, int M, int N, int K) {
-    // Convert to FP16 for Tensor Cores
-    __shared__ half A_fp16[16][16];
-    __shared__ half B_fp16[16][16];
-    
-    // Load and convert
-    if (threadIdx.x under 16 && threadIdx.y under 16) {
-        A_fp16[threadIdx.y][threadIdx.x] = __float2half(A_fp32[blockIdx.y * 16 * K + threadIdx.y * K + threadIdx.x]);
-        B_fp16[threadIdx.y][threadIdx.x] = __float2half(B_fp32[threadIdx.y * N + blockIdx.x * 16 + threadIdx.x]);
-    }
-    __syncthreads();
-    
-    // Tensor Core operation (FP16)
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;  // Accumulate in FP32
-    
-    wmma::fill_fragment(c_frag, 0.0f);
-    wmma::load_matrix_sync(a_frag, (half*)A_fp16, 16);
-    wmma::load_matrix_sync(b_frag, (half*)B_fp16, 16);
-    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-    
-    // Store FP32 result
-    wmma::store_matrix_sync(C_fp32 + blockIdx.y * 16 * N + blockIdx.x * 16 + threadIdx.y * 16 + threadIdx.x,
-                            c_frag, N, wmma::mem_row_major);
-}
-```
-
-**Performance**: 8x speedup over FP32 CUDA cores
-
-## INT8 Tensor Cores
-
-Using INT8 for maximum throughput:
+cuBLAS is NVIDIA's hand-optimized BLAS library. For standard GEMM, cuBLAS automatically selects the best kernel for your GPU, matrix size, and data type — including tensor core kernels when applicable.
 
 ```cpp
-__global__ void int8_tensor_core_gemm(int8_t *A, int8_t *B, int32_t *C, 
-                                      float scale_A, float scale_B, float scale_C,
-                                      int M, int N, int K) {
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, int8_t, wmma::row_major> a_frag;
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, int8_t, wmma::col_major> b_frag;
-    wmma::fragment<wmma::accumulator, 16, 16, 16, int32_t> c_frag;
-    
-    wmma::fill_fragment(c_frag, 0);
-    
-    // Load INT8 matrices
-    wmma::load_matrix_sync(a_frag, A + threadIdx.y * 16, 16);
-    wmma::load_matrix_sync(b_frag, B + threadIdx.x, 16);
-    
-    // INT8 matrix multiply (accumulates in INT32)
-    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-    
-    // Scale and convert to output format
-    // Store with proper scaling
-    wmma::store_matrix_sync(C + threadIdx.y * 16 + threadIdx.x, c_frag, 16, wmma::mem_row_major);
-}
+cublasHandle_t handle;
+cublasCreate(&handle);
+
+// Enable tensor core usage (default on Ampere+)
+cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
+
+// FP16 GEMM with FP32 accumulation
+float alpha = 1.0f, beta = 0.0f;
+cublasGemmEx(handle,
+    CUBLAS_OP_N, CUBLAS_OP_N,
+    N, M, K,
+    &alpha,
+    B_fp16, CUDA_R_16F, N,     // B matrix (column-major)
+    A_fp16, CUDA_R_16F, K,     // A matrix
+    &beta,
+    C_fp32, CUDA_R_32F, N,     // C matrix (output in FP32)
+    CUBLAS_COMPUTE_32F,         // compute in FP32
+    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+cublasDestroy(handle);
 ```
 
-**Performance**: 16x speedup over FP32, 2x over FP16
+cuBLAS handles padding, tiling, shared memory staging, software pipelining, and warp scheduling internally. For standard GEMM shapes, cuBLAS typically achieves 85-95% of peak tensor core throughput.
+
+**When to use cuBLAS**: Standard GEMM, batched GEMM, strided batched GEMM. Any case where you need $C = \alpha \cdot A \times B + \beta \cdot C$ and do not need to fuse custom operations.
+
+### CUTLASS: The Custom Path
+
+CUTLASS is a header-only C++ template library that decomposes GEMM into composable building blocks. While cuBLAS is a black box, CUTLASS exposes every level of the tile hierarchy:
+
+```cpp
+#include <cutlass/gemm/device/gemm.h>
+
+// Define the GEMM operation type
+using Gemm = cutlass::gemm::device::Gemm<
+    cutlass::half_t,                // A element type
+    cutlass::layout::RowMajor,      // A layout
+    cutlass::half_t,                // B element type
+    cutlass::layout::ColumnMajor,   // B layout
+    float,                          // C element type
+    cutlass::layout::RowMajor,      // C layout
+    float,                          // accumulator type
+    cutlass::arch::OpClassTensorOp, // use tensor cores
+    cutlass::arch::Sm80,            // target SM 8.0
+    cutlass::gemm::GemmShape<128, 128, 32>,  // thread block tile
+    cutlass::gemm::GemmShape<64, 64, 32>,    // warp tile
+    cutlass::gemm::GemmShape<16, 8, 16>      // MMA instruction tile
+>;
+
+Gemm gemm_op;
+Gemm::Arguments args(
+    {M, N, K},                // problem size
+    {A, K},                   // A tensor ref + stride
+    {B, N},                   // B tensor ref + stride
+    {C, N},                   // source C
+    {D, N},                   // destination D
+    {1.0f, 0.0f}              // alpha, beta
+);
+
+gemm_op(args);
+```
+
+CUTLASS 3.x (for Hopper) uses a new "cute" (CuTe — CUDA Templates) abstraction that replaces the rigid tile shape templates with more flexible tensor and layout descriptions, enabling easier composition of TMA, WGMMA, and warp specialization.
+
+**When to use CUTLASS**:
+- **Fused kernels**: GEMM + bias + activation (epilogue fusion) without writing back intermediate results to global memory
+- **Custom data types**: Novel quantization schemes, block-scaled formats
+- **Unusual layouts**: Non-standard memory layouts, grouped GEMM
+- **Research**: When you need to modify the GEMM algorithm itself
 
 <Benchmark
-  title="Tensor Core Performance Comparison"
-  columns={["Precision", "Throughput", "Speedup vs FP32", "Use Case"]}
+  title="cuBLAS vs CUTLASS: When to Use Which"
+  columns={["Criterion", "cuBLAS", "CUTLASS"]}
   rows={[
-    { values: ["FP32 (CUDA)", "15.7 TFLOPS", "1.0x", "Baseline"], highlight: false },
-    { values: ["FP16 (Tensor)", "125 TFLOPS", "8.0x", "Training/Inference"], highlight: true },
-    { values: ["INT8 (Tensor)", "250 TOPS", "16.0x", "Inference"], highlight: true },
+    { values: ["Setup complexity", "Low (library call)", "High (template instantiation)"], highlight: false },
+    { values: ["GEMM performance", "Excellent (auto-tuned)", "Excellent (manual tuning)"], highlight: false },
+    { values: ["Epilogue fusion", "Limited (alpha*AB + beta*C)", "Arbitrary (custom epilogues)"], highlight: true },
+    { values: ["Custom precisions", "No", "Yes"], highlight: true },
+    { values: ["Compile time", "N/A", "Long (heavy templates)"], highlight: false },
+    { values: ["Hopper WGMMA support", "Yes (internal)", "Yes (CUTLASS 3.x)"], highlight: true },
   ]}
 />
 
-## Optimization Strategies
+## Structured Sparsity on Ampere
 
-1. **Align matrices**: 16-byte alignment, dimensions multiple of 16
-2. **Use FP16**: 8x speedup with minimal quality loss
-3. **Use INT8**: 16x speedup for inference
-4. **Accumulate in FP32**: Better numerical stability
-5. **Tile matrices**: Fit in shared memory
+Ampere introduced hardware-accelerated structured sparsity, a feature that doubles tensor core throughput for matrices that conform to a specific sparsity pattern.
+
+### The 2:4 Sparsity Pattern
+
+In a 2:4 sparse matrix, out of every group of 4 consecutive elements along the K dimension, exactly 2 must be zero. The hardware stores only the 2 non-zero values plus a 2-bit index indicating which positions are non-zero:
+
+```
+Dense:    [1.2, 0.0, 0.0, 3.4, 0.0, 2.1, 5.6, 0.0]
+           ---- group 1 ----   ---- group 2 ----
+
+Sparse:   [1.2, 3.4, 2.1, 5.6]   (non-zero values, 50% of original)
+Metadata: [0, 3, 1, 2]            (2-bit indices per element)
+```
+
+The tensor core hardware reads the compressed values and metadata, reconstructs the sparse matrix on the fly during the MMA operation, and computes the correct dense output. Because only half the values are loaded, the effective throughput doubles:
+
+<PerfChart
+  title="A100 Throughput: Dense vs 2:4 Sparse"
+  type="bar"
+  chartData={{
+    labels: ["FP16 Dense", "FP16 Sparse", "INT8 Dense", "INT8 Sparse"],
+    series: [
+      {
+        label: "Peak TFLOPS / TOPS",
+        data: [312, 624, 624, 1248],
+        borderColor: "#10b981",
+      }
+    ]
+  }}
+/>
+
+### Pruning Models for 2:4 Sparsity
+
+To use structured sparsity in practice, you need to prune your trained model so that its weight matrices conform to the 2:4 pattern. NVIDIA's ASP (Automatic SParsity) library integrates with PyTorch to do this:
+
+```python
+import torch
+from apex.contrib.sparsity import ASP
+
+model = MyModel().cuda()
+optimizer = torch.optim.Adam(model.parameters())
+
+# Initialize ASP — analyzes model and prepares for pruning
+ASP.prune_trained_model(model, optimizer)
+
+# Fine-tune for a few epochs to recover accuracy
+for epoch in range(fine_tune_epochs):
+    train(model, optimizer, train_loader)
+
+# The model now has 2:4 sparse weights
+# Export to TensorRT for sparse inference
+```
+
+The pruning process typically involves:
+
+1. **Train the dense model** to convergence.
+2. **Prune** weights to 2:4 pattern using magnitude-based selection (keep the 2 largest values in each group of 4).
+3. **Fine-tune** the pruned model for 10-30% of the original training schedule to recover accuracy.
+
+In practice, well-tuned 2:4 sparsity achieves less than 1% accuracy degradation on most vision and language models while delivering 2x inference speedup on A100 and later GPUs.
+
+<Callout type="info" title="Sparsity Is Only for Weights">
+  Structured sparsity on Ampere applies to the A matrix (typically weights) in the GEMM. The B matrix (typically activations) remains dense. This means sparsity benefits inference (where weights are fixed) much more than training (where both weights and activations change each step).
+</Callout>
+
+## Performance Characteristics by Matrix Size
+
+Tensor cores are not universally faster than CUDA cores. Their performance depends critically on matrix dimensions, and understanding this relationship is essential for deciding whether tensor cores will help your workload.
+
+<PerfChart
+  title="Tensor Core vs CUDA Core Performance by Matrix Size (A100, FP16)"
+  type="line"
+  chartData={{
+    labels: ["32x32", "64x64", "128x128", "256x256", "512x512", "1024x1024", "2048x2048", "4096x4096"],
+    series: [
+      {
+        label: "Tensor Core (TFLOPS)",
+        data: [5, 28, 95, 180, 250, 290, 305, 310],
+        borderColor: "#10b981",
+      },
+      {
+        label: "CUDA Core FP32 (TFLOPS)",
+        data: [3, 8, 14, 17, 18.5, 19, 19.3, 19.5],
+        borderColor: "#3b82f6",
+      }
+    ]
+  }}
+/>
+
+At $32 \times 32$, tensor cores deliver only a modest speedup because the overhead of distributing fragments, executing the warp-level instruction, and reassembling results dominates. The tiles do not fill the tensor cores efficiently. At $256 \times 256$ and above, tensor cores reach saturation and deliver close to peak throughput.
+
+## When Tensor Cores Do Not Help
+
+Despite the impressive throughput numbers, there are scenarios where tensor cores provide little or no benefit:
+
+### 1. Very Small Matrices
+
+When matrix dimensions are smaller than the tensor core tile size (typically less than $16 \times 16$), the overhead of the WMMA/MMA infrastructure exceeds the compute savings. A $4 \times 4$ matrix multiply is faster on scalar CUDA cores because there is nothing to amortize. Even at $32 \times 32$, the speedup over CUDA cores is modest (roughly 2-3x rather than 10-16x).
+
+### 2. Non-GEMM Operations
+
+Tensor cores are matrix multiply-accumulate units. They cannot accelerate:
+- Element-wise operations (ReLU, sigmoid, layer normalization)
+- Reductions (softmax, sum, mean)
+- Scatter/gather operations
+- Sorting
+- Graph algorithms
+- Convolutions that cannot be expressed as GEMM
+
+While convolutions can almost always be lowered to GEMM (either explicitly via im2col or implicitly), operations like depthwise separable convolution have a very small K dimension per channel, making tensor core utilization poor.
+
+### 3. Irregular Shapes That Don't Tile Well
+
+If your matrix dimensions are prime numbers or not multiples of the tile size, you must pad. For a $17 \times 17$ matrix, you would pad to $32 \times 32$ (next valid tile boundary), wasting roughly 72% of the compute. The tensor core throughput applies to the padded dimensions, not the useful dimensions.
+
+### 4. Memory-Bandwidth-Bound Problems
+
+If your kernel is already limited by memory bandwidth rather than compute, faster arithmetic units do not help. This is the case for:
+- Batch size 1 inference (the weight matrix is loaded from global memory for each input vector)
+- Very tall-and-skinny or short-and-wide GEMMs where one dimension is very small
+- Kernels dominated by data movement rather than FMA
+
+The arithmetic intensity of a GEMM is roughly $\frac{2MNK}{(MK + KN + MN) \times \text{bytes per element}}$. When this ratio falls below the GPU's compute-to-bandwidth ratio (about 140 FLOPs/byte on A100 for FP16), the kernel is bandwidth-bound and faster tensor cores cannot help.
+
+### 5. When Precision Loss Is Unacceptable
+
+Some scientific computing and numerical methods applications require FP64 precision, and while Ampere+ tensor cores do support FP64, the throughput advantage over FP64 CUDA cores is only 2x (not 16x). For applications where even FP32 is insufficient (computational fluid dynamics, molecular dynamics with strict energy conservation), tensor cores may not provide enough precision.
+
+<Callout type="tip" title="Rule of Thumb">
+  Tensor cores help most when: (1) the problem is a GEMM or can be expressed as one, (2) matrix dimensions are at least $128 \times 128$, (3) reduced precision (FP16/BF16/INT8) is acceptable, and (4) the kernel is compute-bound rather than bandwidth-bound.
+</Callout>
+
+## Optimization Strategies: A Practical Checklist
+
+Here is a ranked list of optimizations for maximizing tensor core throughput, ordered by impact:
+
+### 1. Use the Right Library First
+
+Before writing custom tensor core code, try cuBLAS (`cublasGemmEx`) or cuDNN (for convolutions). These libraries represent thousands of engineer-hours of optimization and achieve 85-95% of peak throughput for standard shapes. Only drop to CUTLASS or raw MMA PTX when you need epilogue fusion or non-standard data types.
+
+### 2. Align Matrix Dimensions
+
+Pad M, N, and K to multiples of the largest tensor core tile dimension. For FP16 on Ampere, this means multiples of 16 at minimum, but multiples of 64 or 128 are better because they align with thread block tile sizes used by cuBLAS.
+
+```cpp
+// Pad dimensions to multiples of 128 for optimal A100 performance
+int M_padded = ((M + 127) / 128) * 128;
+int N_padded = ((N + 127) / 128) * 128;
+int K_padded = ((K + 127) / 128) * 128;
+```
+
+### 3. Stage Through Shared Memory with Software Pipelining
+
+Load future tiles into shared memory while the current tile is being processed by tensor cores. Double-buffering (or multi-stage buffering) ensures that memory latency is fully hidden:
+
+```
+Stage 0: Load tile K=0 into smem buffer A
+Stage 1: Load tile K=1 into smem buffer B, compute MMA on buffer A
+Stage 2: Load tile K=2 into smem buffer A, compute MMA on buffer B
+... (continue ping-ponging)
+```
+
+On Ampere, `cp.async` enables asynchronous shared memory loads. On Hopper, TMA handles this entirely in hardware.
+
+### 4. Accumulate in Higher Precision
+
+Always accumulate FP16/BF16 tensor core results in FP32. The accumulator fragment should be FP32 even when inputs are FP16:
+
+```cpp
+// Good: FP16 inputs, FP32 accumulation
+wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+
+// Bad: FP16 accumulation loses precision over many iterations
+wmma::fragment<wmma::accumulator, 16, 16, 16, half> c_frag;
+```
+
+This is especially critical when K is large (thousands or more), as the accumulated rounding error in FP16 can cause significant accuracy loss.
+
+### 5. Maximize Occupancy and Hide Latency
+
+Tensor core instructions have non-trivial latency (8-16 cycles on Volta, fewer on Ampere/Hopper). You need enough warps in flight to keep the tensor cores busy while individual warps wait for their MMA results. Aim for at least 2-4 concurrent warps per SM executing tensor core operations.
+
+### 6. Consider Sparsity (Ampere+)
+
+If your workload involves inference with fixed weights, investigate 2:4 structured sparsity. The pruning-and-finetuning pipeline adds engineering effort but delivers a clean 2x throughput improvement with minimal accuracy loss for most models.
+
+## Putting It All Together: Generation-by-Generation Summary
+
+<Benchmark
+  title="Tensor Core Evolution Summary"
+  columns={["Feature", "Volta (2017)", "Ampere (2020)", "Hopper (2022)"]}
+  rows={[
+    { values: ["Programming Model", "WMMA (32 threads)", "MMA PTX (32 threads)", "WGMMA (128 threads)"], highlight: false },
+    { values: ["Max FP16 TFLOPS", "125 (V100)", "312 (A100)", "989 (H100)"], highlight: true },
+    { values: ["Narrowest Precision", "FP16", "INT4", "FP8 (E4M3)"], highlight: false },
+    { values: ["TF32 Support", "No", "Yes", "Yes"], highlight: true },
+    { values: ["Structured Sparsity", "No", "Yes (2:4)", "Yes (2:4)"], highlight: true },
+    { values: ["Async Execution", "No", "No", "Yes"], highlight: true },
+    { values: ["TMA", "No", "No", "Yes"], highlight: true },
+    { values: ["Warp Specialization", "No", "No", "Yes"], highlight: true },
+    { values: ["Key Library", "CUTLASS 1.x", "CUTLASS 2.x", "CUTLASS 3.x"], highlight: false },
+  ]}
+/>
+
+The trajectory is clear: each generation increases tile sizes, adds narrower precisions for higher throughput, and pushes more complexity into hardware (TMA, async MMA) to free SM threads for other work. The programming model has grown more complex, but the libraries (cuBLAS, CUTLASS, cuDNN) abstract away most of this complexity for standard workloads.
 
 ## Conclusion
 
-Tensor Core optimization provides:
+Tensor cores are the single most important hardware feature for deep learning performance on NVIDIA GPUs. From Volta's introduction of warp-level FP16 matrix multiply at 125 TFLOPS, through Ampere's addition of TF32, BF16, structured sparsity, and 312 TFLOPS FP16, to Hopper's warp-group-level asynchronous WGMMA with TMA and FP8 at 989 TFLOPS — each generation has delivered roughly 2-3x more tensor core throughput while expanding the set of supported precisions.
 
-1. **Massive speedup**: 8-16x over FP32 CUDA cores
-2. **Memory efficiency**: FP16/INT8 reduce memory bandwidth
-3. **Power efficiency**: Lower power per operation
-4. **Hardware acceleration**: Native support on modern GPUs
+The key insights for practitioners:
 
-Key strategies:
-- Use WMMA API for Tensor Core operations
-- Ensure proper memory alignment
-- Choose appropriate precision (FP16/INT8)
-- Accumulate in FP32 for stability
-- Optimize matrix dimensions (multiples of 16)
+1. **Matrix multiply dominates deep learning compute**. If you are not using tensor cores, you are leaving 90%+ of your GPU's capability unused.
+2. **Start with cuBLAS or cuDNN**. These libraries automatically use tensor cores and achieve near-peak throughput for standard operations.
+3. **Use CUTLASS when you need customization**: epilogue fusion, non-standard precisions, grouped GEMM, or novel algorithms.
+4. **Choose precision carefully**: BF16 for training (no loss scaling needed), FP16 with loss scaling as an alternative, INT8 for inference, FP8 on Hopper when tooling supports it.
+5. **Align your dimensions**: Pad matrices to multiples of 128 for best performance. Avoid prime-number dimensions.
+6. **Consider structured sparsity**: For inference workloads on Ampere+, 2:4 sparsity offers a clean 2x speedup with minimal accuracy cost.
+7. **Know when tensor cores do not help**: Small matrices, non-GEMM operations, bandwidth-bound kernels, and precision-critical scientific computing.
 
-Master Tensor Cores to achieve peak GPU performance for matrix operations.
+The trend toward specialized matrix units is not slowing down. Understanding tensor core programming — from the high-level WMMA API through MMA PTX to Hopper's WGMMA — is essential knowledge for anyone working at the intersection of hardware and machine learning performance.

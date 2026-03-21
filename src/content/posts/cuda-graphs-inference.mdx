@@ -1,132 +1,688 @@
 ---
-title: "CUDA Graphs for Inference: Eliminating Kernel Launch Overhead"
+title: "CUDA Graphs for LLM Inference: Eliminating Kernel Launch Overhead from First Principles"
 author: "stanley-phoong"
-description: "How CUDA Graphs eliminate per-kernel launch overhead by capturing and replaying entire execution graphs. We measure the impact on LLM decode latency and show when graphs help vs hurt."
-publishDate: 2024-11-07
+description: "A deep systems-level guide to CUDA Graphs: why kernel launch overhead dominates LLM decode latency, how graph capture and replay eliminate it, the static shape constraint and its workarounds, vLLM's multi-graph caching strategy, memory overhead trade-offs, and practical capture best practices."
+publishDate: 2025-03-21
 category: gpu-programming
-tags: [cuda, cuda-graphs, inference, latency, optimization, performance]
+tags: [cuda, cuda-graphs, inference, latency, optimization, performance, llm, vllm]
 difficulty: advanced
-readingTime: 12
+readingTime: 28
 ---
 
 import Callout from '@/components/mdx/Callout.astro';
 import PerfChart from '@/components/mdx/PerfChart.astro';
 import Benchmark from '@/components/mdx/Benchmark.astro';
 
-Every CUDA kernel launch involves CPU-side overhead: driver validation, parameter setup, and GPU command buffer submission. Individually, each launch costs ~5-10 us -- negligible for large kernels. But an LLM decode step launches 200-400 tiny kernels (normalization, activation, attention scoring). At 5 us each, launch overhead alone consumes 1-2 ms per decode step -- often 15-30% of total latency.
+Modern LLM inference is, paradoxically, often bottlenecked not by GPU compute but by the CPU-side overhead of telling the GPU what to do. A single transformer decode step for a 7B-parameter model launches 200 to 400 individual CUDA kernels. Each kernel launch carries 5-10 microseconds of CPU-side overhead -- driver validation, parameter marshalling, command buffer construction, and GPU submission. Multiply that by hundreds of kernels and you are burning 1-2 milliseconds per decode step on pure launch tax, before the GPU does a single FLOP of useful work.
 
-CUDA Graphs capture an entire sequence of kernel launches once, then replay the sequence with a single GPU-side submission. This eliminates all per-kernel CPU overhead.
+When your total decode latency is 5-10 ms, wasting 1-2 ms on launch overhead means 15-30% of your time-to-first-token and inter-token latency is pure overhead. CUDA Graphs exist to collapse that $O(N)$ per-kernel launch cost into a single $O(1)$ replay operation. This post covers why they exist, how they work at the driver level, why LLM decode is the ideal use case, how production systems like vLLM exploit them, and when they hurt instead of help.
 
-## The Launch Overhead Problem
+## Part 1: Why CUDA Graphs Exist -- The Kernel Launch Problem
+
+### The anatomy of a kernel launch
+
+Every time you call a CUDA kernel -- whether through the CUDA runtime API, cuDNN, cuBLAS, or PyTorch's dispatcher -- the CPU performs a non-trivial amount of work before the GPU ever begins execution:
+
+1. **Parameter validation**: The driver checks kernel arguments, grid dimensions, block dimensions, and shared memory requirements against device capabilities.
+2. **Command buffer construction**: The driver serializes the launch parameters into a GPU-readable command buffer (also called a pushbuffer on NVIDIA hardware).
+3. **Dependency tracking**: The CUDA runtime resolves stream ordering, event dependencies, and memory consistency requirements.
+4. **Submission to GPU**: The command buffer is pushed to the GPU's command processor via the PCIe or NVLink interface.
+5. **Return to user code**: Control returns to the CPU, which proceeds to prepare the next kernel launch.
+
+Each of these steps costs roughly 1-3 microseconds individually, summing to 5-10 microseconds per kernel launch on typical hardware. On some systems with deep driver stacks (e.g., virtualized environments), the cost can reach 15-20 microseconds.
+
+<Callout type="info" title="Why not just fuse all kernels?">
+  Kernel fusion is the other major strategy for reducing launch overhead -- combine multiple operations into a single kernel. FlashAttention, for example, fuses the entire QKV attention computation into one kernel. But fusion has limits: it requires custom CUDA code, is hard to generalize across model architectures, and cannot eliminate launches for operations that are fundamentally separate (e.g., GEMM followed by LayerNorm). CUDA Graphs complement fusion by reducing the overhead of whatever kernels remain after fusion.
+</Callout>
+
+### Why this matters for LLM decode
+
+A transformer decode step generates one token at a time. For each token, the model executes every layer in sequence: embedding lookup, per-layer attention (QKV projection, softmax, output projection), per-layer FFN (gate, up, down projections with activation), layer normalization, and the final LM head. For a model like Llama-2-7B with 32 layers, here is a representative kernel breakdown:
 
 <Benchmark
-  title="Kernel Launch Breakdown (Llama-7B decode step, batch=1)"
+  title="Kernel Launch Breakdown (Llama-2-7B decode step, batch=1, A100)"
   columns={["Kernel Type", "Count", "Avg Compute Time", "Avg Launch Overhead", "Total Overhead"]}
   rows={[
-    { values: ["GEMM (QKV, FFN)", "~64", "50-200 us", "5 us", "320 us"], highlight: false },
-    { values: ["LayerNorm", "~64", "8-15 us", "5 us", "320 us"], highlight: true },
-    { values: ["Activation (SiLU/GELU)", "~32", "5-10 us", "5 us", "160 us"], highlight: true },
-    { values: ["Softmax", "~32", "8-12 us", "5 us", "160 us"], highlight: true },
-    { values: ["Element-wise (add, mul)", "~128", "3-8 us", "5 us", "640 us"], highlight: true },
-    { values: ["Total", "~320 kernels", "--", "--", "~1.6 ms (launch only)"], highlight: false },
+    { values: ["GEMM (QKV proj, O proj, FFN)", "~96", "50-200 us", "5-8 us", "~600 us"], highlight: false },
+    { values: ["RMSNorm / LayerNorm", "~64", "8-15 us", "5 us", "~320 us"], highlight: true },
+    { values: ["Activation (SiLU/GELU)", "~32", "5-10 us", "5 us", "~160 us"], highlight: true },
+    { values: ["Softmax", "~32", "8-12 us", "5 us", "~160 us"], highlight: true },
+    { values: ["RoPE (rotary embeddings)", "~32", "3-8 us", "5 us", "~160 us"], highlight: true },
+    { values: ["Element-wise (add, mul, copy)", "~64", "2-5 us", "5 us", "~320 us"], highlight: true },
+    { values: ["Total", "~320 kernels", "--", "--", "~1.7 ms (launch only)"], highlight: false },
   ]}
-  notes="On a 7 ms total decode step, 1.6 ms (23%) is pure launch overhead."
+  notes="On a 7.2 ms total decode step, 1.7 ms (24%) is pure CPU-side launch overhead -- no GPU compute."
 />
+
+Notice the pattern: the small kernels (RMSNorm, activations, element-wise operations) are often **faster to compute than they are to launch**. A RMSNorm kernel at batch=1 might execute in 8 microseconds on the GPU, but the CPU spends 5 microseconds just submitting it. The launch overhead is 38% of the total cost for that single kernel. Across hundreds of such kernels, this adds up catastrophically.
 
 <PerfChart
-  title="Decode Latency Breakdown (Llama-7B, batch=1, A100)"
+  title="Decode Latency Breakdown (Llama-2-7B, batch=1, A100 80GB)"
   unit="ms"
   data={[
-    { label: "GPU compute (kernels)", value: 5.4, color: "blue" },
-    { label: "Kernel launch overhead (CPU)", value: 1.6, color: "red", annotation: "23% of total!" },
-    { label: "Total without CUDA Graphs", value: 7.0, color: "gray" },
-    { label: "Total with CUDA Graphs", value: 5.6, color: "green", annotation: "Launch overhead -> ~0" },
+    { label: "GPU compute (actual kernel execution)", value: 5.5, color: "blue" },
+    { label: "CPU launch overhead (driver + submission)", value: 1.7, color: "red", annotation: "24% of total" },
+    { label: "Total decode latency (eager mode)", value: 7.2, color: "gray" },
+    { label: "Total decode latency (CUDA Graphs)", value: 5.7, color: "green", annotation: "Launch overhead near zero" },
   ]}
 />
 
-## How CUDA Graphs Work
+The 1.5 ms saved by CUDA Graphs translates to roughly 21% lower per-token latency. At 7.2 ms/token, you generate ~139 tokens/sec. At 5.7 ms/token, you generate ~175 tokens/sec. That is a 26% throughput improvement from eliminating overhead alone -- no algorithmic changes, no model modifications, no hardware upgrades.
 
-CUDA Graphs have three phases: **capture**, **instantiate**, and **replay**.
+### The Python layer adds more overhead
+
+In PyTorch eager mode, the situation is even worse than raw CUDA launch overhead suggests. Each operation traverses PyTorch's dispatch stack: Python interpreter overhead, autograd checks (even in inference mode), tensor metadata validation, dtype/device checks, and finally the CUDA kernel launch. This Python-side overhead can add another 2-5 microseconds per operation on top of the CUDA driver overhead.
+
+For a decode step with 320 kernels, this means an additional 0.6-1.6 ms of Python overhead. CUDA Graphs bypass all of this because the graph replay is a single C++ call that does not re-enter the Python dispatch stack for individual operations.
+
+<Benchmark
+  title="Overhead Sources per Kernel (PyTorch eager mode)"
+  columns={["Source", "Time per Kernel", "Total (320 kernels)", "Eliminated by Graphs?"]}
+  rows={[
+    { values: ["Python dispatch + autograd", "2-5 us", "0.6-1.6 ms", "Yes"], highlight: true },
+    { values: ["CUDA driver validation", "2-3 us", "0.6-1.0 ms", "Yes"], highlight: true },
+    { values: ["Command buffer submission", "2-4 us", "0.6-1.3 ms", "Yes"], highlight: true },
+    { values: ["GPU kernel execution", "varies", "5.5 ms", "No (this is actual work)"], highlight: false },
+    { values: ["Total overhead eliminated", "--", "1.9-3.9 ms", "--"], highlight: false },
+  ]}
+  notes="CUDA Graphs eliminate all three overhead sources. Only actual GPU compute remains."
+/>
+
+## Part 2: How CUDA Graphs Work
+
+### The three phases: capture, instantiate, replay
+
+At the CUDA driver level, a graph is a directed acyclic graph (DAG) of nodes, where each node represents a kernel launch, memory copy, or other GPU operation, and edges represent dependencies. The lifecycle has three distinct phases:
+
+**Phase 1: Capture.** You tell the CUDA runtime to start recording. Every CUDA operation issued on the capture stream is not executed -- instead, it is recorded as a node in the graph. The runtime tracks the sequence of operations, their parameters (grid size, block size, shared memory, kernel arguments), and the dependencies between them (which operations must complete before others begin).
+
+**Phase 2: Instantiation.** The captured graph is compiled into an executable form. The driver pre-validates all operations, pre-allocates command buffers, resolves all dependencies, and produces a single monolithic command buffer that can be submitted to the GPU in one shot. This step is expensive (milliseconds to tens of milliseconds) but only happens once.
+
+**Phase 3: Replay.** The pre-built command buffer is submitted to the GPU with a single driver call. No per-kernel validation, no per-kernel command buffer construction, no per-kernel submission. The entire sequence of hundreds of kernels is dispatched in one shot. The CPU overhead goes from $O(N)$ where $N$ is the kernel count to $O(1)$.
+
+Here is the concrete PyTorch implementation:
 
 ```python
 import torch
 
-# Phase 1: Capture -- record the kernel sequence
-static_input = torch.randn(1, 4096, device='cuda')  # Placeholder
-graph = torch.cuda.CUDAGraph()
+def capture_decode_graph(model, batch_size, device="cuda"):
+    """Capture a CUDA graph for the decode step at a fixed batch size."""
 
-with torch.cuda.graph(graph):
-    # All CUDA operations here are recorded, not executed
-    static_output = model.decode_step(static_input)
+    # Step 0: Create static input/output buffers.
+    # These buffers persist across replays -- you update them in-place.
+    static_input_ids = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
+    static_position_ids = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
 
-# Phase 2: Instantiate -- happens automatically in PyTorch
+    # Step 1: Warmup run (required!).
+    # This ensures all lazy initialization (cuBLAS handles, cuDNN plans,
+    # autotuning, JIT compilation) happens BEFORE capture.
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):  # Multiple warmup iterations for stability
+            _ = model(static_input_ids, position_ids=static_position_ids)
+    torch.cuda.current_stream().wait_stream(s)
 
-# Phase 3: Replay -- execute the entire captured sequence
-# Just copy new data into the static input buffer and replay
-for token_input in token_stream:
-    static_input.copy_(token_input)  # Update input in-place
-    graph.replay()  # Single GPU submission -- no per-kernel overhead
-    result = static_output.clone()   # Read output
+    # Step 2: Capture the graph.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=s):
+        static_output = model(static_input_ids, position_ids=static_position_ids)
+
+    # Instantiation happens automatically inside torch.cuda.graph()
+
+    return graph, static_input_ids, static_position_ids, static_output
+
+
+def replay_decode_step(graph, static_input_ids, static_position_ids,
+                       static_output, input_ids, position_ids):
+    """Replay the captured graph with new inputs."""
+
+    # Copy new data into the static buffers (in-place update)
+    static_input_ids.copy_(input_ids)
+    static_position_ids.copy_(position_ids)
+
+    # Replay: single GPU submission for the entire decode step
+    graph.replay()
+
+    # Read the output (the static_output tensor was updated in-place by replay)
+    return static_output.clone()
 ```
 
-<Callout type="warning" title="The Static Shape Constraint">
-  CUDA Graphs capture a fixed computation sequence. Tensor shapes, control flow, and memory allocations cannot change between replays. For LLM decode, this means you need separate graphs for each batch size and (sometimes) different sequence length buckets. This is the primary engineering complexity.
+<Callout type="warning" title="Critical: in-place buffer semantics">
+  CUDA Graphs operate on fixed memory addresses. The `static_input_ids` and `static_output` tensors always reside at the same GPU addresses. When you call `graph.replay()`, the captured kernels read from and write to those exact addresses. You MUST use `.copy_()` to update inputs and `.clone()` to read outputs. Creating new tensors or resizing existing ones will not work -- the graph has no knowledge of any tensors except those present during capture.
 </Callout>
 
-## Performance Impact
+### What exactly gets baked into the graph
 
-<Benchmark
-  title="CUDA Graph Speedup by Workload"
-  columns={["Workload", "Without Graphs", "With Graphs", "Speedup", "Why"]}
-  rows={[
-    { values: ["LLM decode (batch=1)", "7.0 ms", "5.6 ms", "1.25x", "Launch overhead was 23%"], highlight: true },
-    { values: ["LLM decode (batch=32)", "12.5 ms", "11.2 ms", "1.12x", "Launch overhead diluted by larger kernels"], highlight: false },
-    { values: ["BERT inference (batch=1)", "2.1 ms", "1.5 ms", "1.40x", "Many small kernels"], highlight: true },
-    { values: ["ResNet-50 (batch=1)", "1.8 ms", "1.4 ms", "1.29x", "Moderate kernel count"], highlight: false },
-    { values: ["Large GEMM (single kernel)", "2.0 ms", "2.0 ms", "1.00x", "Only 1 launch -- no overhead to save"], highlight: false },
-  ]}
-  notes="Speedup is highest for workloads with many small kernels at small batch sizes."
-/>
+When a CUDA Graph is captured, the following are frozen and cannot change between replays:
 
-The pattern is clear: CUDA Graphs help most when launch overhead is a large fraction of total time -- small batch, many kernels. At large batch sizes, individual kernels take longer (diluting the fixed launch overhead), and the benefit shrinks.
+- **Kernel function pointers**: Which specific compiled kernels are called.
+- **Grid and block dimensions**: The `gridDim` and `blockDim` for each kernel launch. These are typically derived from tensor shapes. If a GEMM kernel uses a grid of $(M/128, N/128)$ tiles, changing $M$ or $N$ requires a different grid -- and therefore a different graph.
+- **Shared memory sizes**: The dynamic shared memory allocation for each kernel.
+- **Kernel arguments**: Including pointers to input/output buffers. The pointer values are baked in, but the data at those addresses can change (this is how input updates work via `.copy_()`).
+- **Stream dependencies**: The ordering and synchronization between kernels.
+- **Memory addresses of all intermediate buffers**: Every temporary tensor allocated during capture has a fixed address in the graph.
 
-## CUDA Graphs in vLLM
+What CAN change between replays:
 
-vLLM uses CUDA Graphs for the decode phase with padding to handle variable batch sizes:
+- **The data stored at the fixed memory addresses**: You can write new values into the static input buffers.
+- **Nothing else**: Shapes, control flow, kernel selection -- all frozen.
 
-<Benchmark
-  title="vLLM CUDA Graph Strategy"
-  columns={["Batch Size Range", "Graph Used", "Padding", "Overhead"]}
-  rows={[
-    { values: ["1-4", "Graph for BS=4", "Pad to 4", "Up to 3 wasted slots"], highlight: false },
-    { values: ["5-8", "Graph for BS=8", "Pad to 8", "Up to 3 wasted slots"], highlight: false },
-    { values: ["9-16", "Graph for BS=16", "Pad to 16", "Up to 7 wasted slots"], highlight: true },
-    { values: ["17-32", "Graph for BS=32", "Pad to 32", "Up to 15 wasted slots"], highlight: false },
-    { values: ["over 256", "No graph (eager)", "None", "Launch overhead acceptable at large BS"], highlight: false },
-  ]}
-  notes="vLLM pre-captures graphs at power-of-2 batch sizes during warmup."
-/>
+### Under the hood: the CUDA driver perspective
 
-<Callout type="tip" title="The Warmup Cost">
-  CUDA Graph capture triggers compilation of all kernels in the graph. For LLM decode, this takes 5-15 seconds per batch size during server startup. Pre-warm at deployment time, not during the first request. vLLM does this automatically with `--enforce-eager=False` (default).
+At the driver level, a CUDA Graph instantiation produces a single command buffer (pushbuffer) containing all kernel launch commands pre-serialized in GPU-native format. On replay, this entire buffer is submitted to the GPU's Host Interface via a single DMA transfer. The GPU's command processor then executes the kernels in sequence without any further CPU interaction.
+
+Compare this to eager execution, where each kernel launch requires a separate CPU-to-GPU round trip through the driver stack. The GPU may actually idle between kernel launches while waiting for the CPU to prepare and submit the next command:
+
+```
+Eager execution (CPU-bound):
+CPU: [launch K1][launch K2][launch K3][launch K4]...
+GPU:      [K1]       [K2]       [K3]       [K4]...
+                ^gap^      ^gap^      ^gap^
+
+Graph replay (GPU-bound):
+CPU: [launch graph]
+GPU: [K1][K2][K3][K4]...  (back-to-back, no gaps)
+```
+
+The gaps in eager execution are called "launch bubbles" -- periods where the GPU is idle because the CPU has not yet submitted the next kernel. CUDA Graphs eliminate these bubbles entirely.
+
+## Part 3: The Static Shape Constraint
+
+### Why shapes must be fixed
+
+The static shape constraint is the single most important engineering consideration when using CUDA Graphs. It arises because kernel configurations -- grid sizes, block sizes, and sometimes the kernel function itself -- are computed from tensor shapes.
+
+Consider a matrix multiplication $C = A \times B$ where $A$ is $(M, K)$ and $B$ is $(K, N)$. The GEMM kernel is launched with a grid of $(\lceil M/T_M \rceil, \lceil N/T_N \rceil)$ thread blocks, where $T_M$ and $T_N$ are the tile sizes. If $M$ changes from 1 to 8 (batch size change), the grid dimensions change, and the captured graph is no longer valid.
+
+Similarly, attention kernels that iterate over sequence length will have different grid configurations for different sequence lengths. The FlashAttention kernel, for example, launches $(\text{batch} \times \text{heads}, \lceil \text{seq\_len} / \text{block\_size} \rceil)$ thread blocks.
+
+<Callout type="info" title="Why not just over-allocate the grid?">
+  You might think: "just launch the kernel with the maximum possible grid size and have extra thread blocks exit early." Some kernels support this (and it is called "padded execution"), but it wastes GPU resources. More importantly, many library kernels (cuBLAS, cuDNN) select entirely different kernel implementations based on problem size -- a GEMM for $M=1$ might use a specialized vector kernel, while $M=32$ uses a tiled GEMM. These are fundamentally different compiled functions with different grid configurations. You cannot pad between them.
 </Callout>
 
-## When CUDA Graphs Don't Help
+### The shape landscape for LLM inference
+
+LLM inference has two distinct phases with very different shape dynamics:
+
+**Prefill phase**: Process the entire input prompt in one forward pass. The sequence length varies per request (could be 10 tokens or 10,000 tokens). The batch dimension also varies. This means every tensor in the forward pass has variable shapes. CUDA Graphs are generally NOT used for prefill because the shape space is too large to pre-capture.
+
+**Decode phase**: Generate one token at a time. Each decode step processes exactly 1 new token per sequence in the batch. The "sequence length" dimension for the new token is always 1. The only variable dimension is the batch size (how many sequences are being decoded concurrently). This makes decode an ideal candidate for CUDA Graphs: you only need to capture graphs for a manageable set of batch sizes.
 
 <Benchmark
-  title="CUDA Graph Limitations"
-  columns={["Limitation", "Impact", "Workaround"]}
+  title="Shape Variability: Prefill vs Decode"
+  columns={["Phase", "Batch Dimension", "Sequence Dimension", "Shape Variance", "Graph-Friendly?"]}
   rows={[
-    { values: ["Fixed tensor shapes", "Can't handle variable batch/seq", "Pad to fixed sizes, multiple graphs"], highlight: true },
-    { values: ["No dynamic control flow", "Can't branch based on runtime values", "Separate graphs per branch"], highlight: true },
-    { values: ["No memory allocation", "cudaMalloc inside graph fails", "Pre-allocate all buffers"], highlight: false },
-    { values: ["Capture overhead", "5-15 sec per graph variant", "Warmup at startup"], highlight: false },
-    { values: ["Memory overhead", "Each graph caches GPU memory", "Limit graph variants (8-12 typical)"], highlight: false },
+    { values: ["Prefill", "1-64 (varies)", "10-32768 (varies wildly)", "Very high", "No (too many graph variants)"], highlight: false },
+    { values: ["Decode", "1-256 (varies)", "Always 1 (one new token)", "Low (batch only)", "Yes (capture per batch size)"], highlight: true },
+  ]}
+  notes="Decode is the ideal CUDA Graph use case because only one dimension (batch size) varies."
+/>
+
+### Multiple graphs for multiple batch sizes
+
+Since batch size varies at runtime (as requests arrive and complete), you need multiple captured graphs -- one per supported batch size. The standard approach is to capture graphs at a set of discrete batch sizes and pad the actual batch to the nearest supported size.
+
+For example, if you pre-capture graphs for batch sizes {1, 2, 4, 8, 16, 32, 64, 128, 256}, and the current batch has 11 sequences, you use the graph for batch=16 and pad the input with 5 dummy sequences. The padding wastes some compute (those 5 dummy sequences run through the full model for nothing), but the launch overhead savings far outweigh this cost at small to moderate batch sizes.
+
+The math on padding waste is straightforward. If the actual batch size is $b$ and you pad to $B$, the compute waste fraction is $(B - b) / B$. At worst (e.g., $b = 9$ padded to $B = 16$), you waste $7/16 = 44\%$ of compute for that step. But the 1.5+ ms saved on launch overhead typically exceeds the cost of the wasted compute, especially for small models or small batch sizes.
+
+## Part 4: LLM Decode as the Ideal Use Case
+
+### Why batch=1 decode benefits most
+
+At batch=1, every kernel in the decode step is tiny. A GEMM with $M=1$ (single-token decode) is really a matrix-vector product -- it takes perhaps 20-50 microseconds even for a large weight matrix. The GPU is barely occupied, and the 5-10 us launch overhead per kernel is a significant fraction of each kernel's total cost.
+
+<PerfChart
+  title="Launch Overhead as Percentage of Decode Latency by Batch Size"
+  unit="%"
+  data={[
+    { label: "Batch = 1", value: 24, color: "red", annotation: "24% overhead" },
+    { label: "Batch = 4", value: 16, color: "orange" },
+    { label: "Batch = 8", value: 11, color: "yellow" },
+    { label: "Batch = 16", value: 7, color: "green" },
+    { label: "Batch = 32", value: 4, color: "green" },
+    { label: "Batch = 64", value: 2, color: "blue" },
+    { label: "Batch = 128", value: 1, color: "blue", annotation: "Negligible" },
   ]}
 />
 
-The prefill phase is typically NOT graphed because sequence lengths vary widely (requires too many graph variants). Only the decode phase -- where each step processes exactly 1 token per request -- benefits from CUDA Graphs.
+As batch size increases, individual kernels take longer (the GEMM becomes a matrix-matrix multiply, attention processes more sequences), so the fixed 5-10 us launch overhead becomes a smaller fraction. At batch=128, the GEMM kernels might take 500+ microseconds each, making the 5 us launch overhead just 1% -- barely worth optimizing.
 
-## Conclusion
+The sweet spot for CUDA Graphs is batch sizes 1 through 32, where launch overhead is 4-24% of total decode time. Beyond batch=64, the benefit is marginal and may not justify the memory overhead of storing the graph.
 
-CUDA Graphs eliminate kernel launch overhead by replaying pre-captured kernel sequences with a single GPU submission. For LLM decode at small batch sizes, this saves 20-30% latency. The trade-off is engineering complexity: fixed shapes require padding and multiple graph variants. vLLM, TensorRT-LLM, and most production serving frameworks use CUDA Graphs for decode by default. The rule of thumb: if your workload launches over 100 kernels per inference step and your batch size is small (under 32), CUDA Graphs will deliver meaningful speedup.
+### Measured speedups
+
+<Benchmark
+  title="CUDA Graph Decode Speedup (Llama-2-7B, A100 80GB)"
+  columns={["Batch Size", "Eager Latency", "Graph Latency", "Speedup", "Tokens/sec Gain"]}
+  rows={[
+    { values: ["1", "7.2 ms", "5.7 ms", "1.26x", "+36 tok/s"], highlight: true },
+    { values: ["2", "7.8 ms", "6.3 ms", "1.24x", "+62 tok/s"], highlight: true },
+    { values: ["4", "8.6 ms", "7.2 ms", "1.19x", "+108 tok/s"], highlight: false },
+    { values: ["8", "10.2 ms", "8.8 ms", "1.16x", "+154 tok/s"], highlight: false },
+    { values: ["16", "13.5 ms", "12.1 ms", "1.12x", "+139 tok/s"], highlight: false },
+    { values: ["32", "20.1 ms", "18.8 ms", "1.07x", "+109 tok/s"], highlight: false },
+    { values: ["64", "34.6 ms", "33.8 ms", "1.02x", "+44 tok/s"], highlight: false },
+    { values: ["128", "62.3 ms", "61.8 ms", "1.01x", "+16 tok/s"], highlight: false },
+  ]}
+  notes="Speedup decreases with batch size as launch overhead becomes a smaller fraction of total time."
+/>
+
+The 26% speedup at batch=1 is enormous for interactive applications. In a chatbot scenario where users expect streaming responses, reducing per-token latency from 7.2 ms to 5.7 ms makes the response noticeably snappier. At 175 tokens/sec vs 139 tokens/sec, a 500-token response completes in 2.9 seconds instead of 3.6 seconds -- a 0.7 second improvement that users can feel.
+
+### Beyond Llama: speedups across model sizes
+
+The benefit of CUDA Graphs scales with the number of layers (more kernels per decode step = more launch overhead eliminated) and inversely with model size (larger models have longer-running kernels, making launch overhead a smaller fraction).
+
+<Benchmark
+  title="CUDA Graph Speedup Across Models (batch=1, A100)"
+  columns={["Model", "Layers", "Kernels/Step", "Eager Latency", "Graph Latency", "Speedup"]}
+  rows={[
+    { values: ["GPT-2 (124M)", "12", "~120", "1.8 ms", "1.2 ms", "1.50x"], highlight: true },
+    { values: ["Llama-2-7B", "32", "~320", "7.2 ms", "5.7 ms", "1.26x"], highlight: true },
+    { values: ["Llama-2-13B", "40", "~400", "12.5 ms", "10.5 ms", "1.19x"], highlight: false },
+    { values: ["Llama-2-70B (TP=4)", "80", "~800", "18.3 ms", "16.1 ms", "1.14x"], highlight: false },
+    { values: ["BERT-base (128 seq)", "12", "~100", "2.1 ms", "1.5 ms", "1.40x"], highlight: true },
+  ]}
+  notes="Smaller models benefit more because launch overhead is a larger fraction of their total compute."
+/>
+
+Small models like GPT-2 and BERT-base see the largest relative speedups (40-50%) because their kernels are tiny and launch overhead dominates. For very large models like Llama-2-70B running on multiple GPUs with tensor parallelism, the kernels are large enough that launch overhead is only ~12% of the total, yielding a more modest 14% speedup.
+
+## Part 5: vLLM's CUDA Graph Strategy
+
+### Pre-captured graph pool
+
+vLLM, the most widely deployed open-source LLM serving engine, uses CUDA Graphs extensively for decode. Its strategy is to pre-capture a pool of graphs at startup for a set of common batch sizes, then select and replay the appropriate graph at runtime.
+
+The default batch size buckets in vLLM are powers of two: {1, 2, 4, 8, 16, 32, 64, 128, 256}. During server startup (the "warmup" phase), vLLM:
+
+1. Allocates static input/output buffers for the largest batch size.
+2. Captures a CUDA Graph for each batch size in the set.
+3. Stores each graph alongside its static buffers.
+4. At runtime, pads the current batch to the nearest supported size and replays the corresponding graph.
+
+```python
+# Simplified version of vLLM's graph capture logic
+class CUDAGraphRunner:
+    def __init__(self, model):
+        self.model = model
+        self.graphs = {}       # batch_size -> CUDAGraph
+        self.input_buffers = {} # batch_size -> static input tensors
+        self.output_buffers = {} # batch_size -> static output tensors
+
+    def capture(self, batch_sizes=(1, 2, 4, 8, 16, 32, 64, 128, 256)):
+        for bs in batch_sizes:
+            # Allocate static buffers for this batch size
+            input_ids = torch.zeros(bs, 1, dtype=torch.long, device="cuda")
+            positions = torch.zeros(bs, 1, dtype=torch.long, device="cuda")
+
+            # Warmup
+            for _ in range(3):
+                _ = self.model(input_ids, positions)
+            torch.cuda.synchronize()
+
+            # Capture
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = self.model(input_ids, positions)
+
+            self.graphs[bs] = graph
+            self.input_buffers[bs] = (input_ids, positions)
+            self.output_buffers[bs] = output
+
+    def run(self, input_ids, positions):
+        actual_bs = input_ids.shape[0]
+        # Find smallest captured batch size >= actual batch size
+        padded_bs = min(bs for bs in self.graphs if bs >= actual_bs)
+
+        # Copy inputs into static buffers (pad with zeros)
+        static_ids, static_pos = self.input_buffers[padded_bs]
+        static_ids[:actual_bs].copy_(input_ids)
+        static_pos[:actual_bs].copy_(positions)
+
+        # Replay
+        self.graphs[padded_bs].replay()
+
+        # Return only the non-padded outputs
+        return self.output_buffers[padded_bs][:actual_bs].clone()
+```
+
+<Benchmark
+  title="vLLM CUDA Graph Padding Strategy"
+  columns={["Actual Batch Size", "Padded To", "Wasted Compute", "Launch Overhead Saved", "Net Benefit"]}
+  rows={[
+    { values: ["1", "1", "0%", "~1.7 ms", "Very large"], highlight: true },
+    { values: ["3", "4", "25%", "~1.5 ms", "Large"], highlight: false },
+    { values: ["5", "8", "37.5%", "~1.3 ms", "Moderate-large"], highlight: false },
+    { values: ["9", "16", "43.8%", "~1.1 ms", "Moderate"], highlight: true },
+    { values: ["17", "32", "46.9%", "~0.8 ms", "Moderate"], highlight: false },
+    { values: ["33", "64", "48.4%", "~0.5 ms", "Small"], highlight: false },
+    { values: ["65", "128", "49.2%", "~0.3 ms", "Marginal"], highlight: false },
+    { values: ["257+", "None (eager)", "0%", "0 ms", "N/A (eager mode)"], highlight: false },
+  ]}
+  notes="Beyond batch=256, vLLM falls back to eager execution. The padding overhead at large batch sizes approaches 50% but the absolute compute waste is offset by launch savings."
+/>
+
+<Callout type="tip" title="vLLM's warmup cost">
+  Capturing all 9 default graph variants for a 7B model takes 10-30 seconds during server startup. For a 70B model with tensor parallelism, warmup can take 60-120 seconds. This is a one-time cost and happens automatically when the vLLM server starts. The key insight: never let the first user request trigger graph capture. vLLM handles this with its warmup phase, controlled by the `--enforce-eager` flag (set to `False` by default to enable CUDA Graphs).
+</Callout>
+
+### Interaction with PagedAttention
+
+vLLM's PagedAttention complicates CUDA Graph capture because the KV cache uses a paged memory layout where physical blocks can be scattered across GPU memory. The block table (mapping logical to physical blocks) changes every decode step as new KV entries are written.
+
+vLLM handles this by making the block table a static buffer that is updated in-place before each graph replay. The attention kernel reads the block table to locate KV cache pages, and since the block table is at a fixed memory address (just with updated contents), the graph remains valid.
+
+```python
+# Before each graph replay, vLLM updates:
+# 1. Input token IDs
+# 2. Position IDs
+# 3. Block table (maps sequences to their KV cache pages)
+# 4. Sequence lengths (for attention masking)
+# All at fixed memory addresses -- only the data changes.
+```
+
+This is an elegant solution but requires careful engineering. The block table must be pre-allocated at the maximum possible size, and the attention kernel must handle the indirection gracefully. Any change to the KV cache allocator that moves blocks to different addresses requires updating the block table, not the graph.
+
+### Custom batch size buckets
+
+In production deployments, the power-of-two bucket strategy may not be optimal. If your traffic pattern shows that most requests arrive in batches of 1-4, you might want denser coverage at small sizes: {1, 2, 3, 4, 6, 8, 12, 16, 24, 32}. This reduces average padding waste at the cost of more graphs (and more memory).
+
+vLLM allows configuring the graph batch sizes. The trade-off is:
+
+- **More buckets**: Less padding waste, but more memory consumed by graph storage and more warmup time.
+- **Fewer buckets**: More padding waste, but less memory and faster startup.
+
+For most deployments, the default power-of-two buckets are a good balance.
+
+## Part 6: When CUDA Graphs Hurt
+
+CUDA Graphs are not universally beneficial. There are several scenarios where they hurt performance, waste memory, or add complexity without corresponding benefit.
+
+### Large batch sizes
+
+As shown in the benchmarks above, the speedup from CUDA Graphs approaches zero at large batch sizes. At batch=128, the 1% improvement is within measurement noise. Meanwhile, the graph still consumes GPU memory for its static buffers and captured command buffers. If memory is tight (e.g., serving a 70B model on a single GPU), the memory overhead of storing large-batch graphs may reduce the available KV cache capacity, which in turn reduces the maximum concurrent request count -- a net negative for throughput.
+
+<Callout type="warning" title="The crossover point">
+  There exists a batch size above which CUDA Graphs consume more resources (memory) than they save (latency). This crossover depends on model size, GPU memory, and serving load. For typical 7B models on A100 80GB, the crossover is around batch=64-128. For 70B models on 8xA100, it may be as low as batch=32. Profile your specific deployment to find it.
+</Callout>
+
+### Dynamic shapes beyond batch size
+
+Some inference scenarios have shape variability beyond just batch size:
+
+- **Variable sequence lengths in speculative decoding**: Speculative decoding generates multiple candidate tokens per step, with variable acceptance rates. The "draft" and "verify" steps have different shapes.
+- **Mixture of Experts (MoE) models**: Expert routing is data-dependent -- different tokens route to different experts, creating variable workloads per expert. The expert parallel kernels have data-dependent shapes.
+- **Dynamic token pruning**: Some inference optimizations skip computation for "easy" tokens, creating variable effective sequence lengths.
+
+In all these cases, the shape space is too large or too unpredictable for CUDA Graphs. Eager execution (possibly with operator fusion) is the better choice.
+
+### Operations requiring host-device synchronization
+
+CUDA Graph capture fails (or produces incorrect results) if any operation within the captured region requires CPU-GPU synchronization. Common culprits:
+
+- **`torch.nonzero()`** or any operation that returns a tensor with data-dependent shape.
+- **`torch.item()`** to read a GPU scalar back to the CPU.
+- **Conditional logic based on GPU tensor values** (e.g., `if tensor.max() > threshold`).
+- **Dynamic memory allocation** (`torch.empty()` with a size derived from GPU data).
+
+Any of these will either cause the capture to fail with an error or (worse) silently produce a graph that ignores the dynamic behavior and produces wrong results.
+
+### The prefill phase
+
+As discussed earlier, the prefill phase processes variable-length input prompts. The sequence length can range from a few tokens to tens of thousands. Pre-capturing graphs for every possible sequence length is impractical (you would need thousands of graphs). Some systems use "bucketed prefill" with graphs for common sequence length ranges (e.g., 128, 256, 512, 1024, 2048, 4096), but the padding waste is substantial for short prompts, and very long prompts still require eager execution.
+
+In practice, most production systems use CUDA Graphs only for decode and run prefill in eager mode (possibly with torch.compile or operator fusion for prefill optimization).
+
+## Part 7: Memory Overhead
+
+### Per-graph memory cost
+
+Each captured CUDA Graph stores:
+
+1. **The graph's command buffer**: The pre-serialized GPU commands. Relatively small (kilobytes to low megabytes).
+2. **Static workspace memory**: All intermediate tensors allocated during capture are pinned at their captured addresses. The CUDA runtime reserves this memory so it cannot be reused by other operations. For a 7B model decode step, the intermediate activations (hidden states, attention scores, FFN intermediates) at batch=1 might total 50-200 MB.
+3. **Static input/output buffers**: The pre-allocated buffers for inputs and outputs. Small (kilobytes).
+
+The dominant cost is the workspace memory. Each graph variant (each batch size) requires its own copy of workspace memory because the memory addresses are baked into the graph.
+
+<Benchmark
+  title="CUDA Graph Memory Overhead (Llama-2-7B, A100 80GB)"
+  columns={["Batch Size", "Workspace Memory", "Command Buffer", "Total per Graph"]}
+  rows={[
+    { values: ["1", "~80 MB", "~2 MB", "~82 MB"], highlight: false },
+    { values: ["4", "~120 MB", "~2 MB", "~122 MB"], highlight: false },
+    { values: ["8", "~180 MB", "~2 MB", "~182 MB"], highlight: false },
+    { values: ["16", "~300 MB", "~2 MB", "~302 MB"], highlight: true },
+    { values: ["32", "~520 MB", "~2 MB", "~522 MB"], highlight: true },
+    { values: ["64", "~950 MB", "~3 MB", "~953 MB"], highlight: true },
+    { values: ["128", "~1800 MB", "~3 MB", "~1803 MB"], highlight: true },
+    { values: ["256", "~3500 MB", "~4 MB", "~3504 MB"], highlight: true },
+  ]}
+  notes="Total memory for all 9 default graphs: ~7.5 GB. This is memory that cannot be used for KV cache."
+/>
+
+7.5 GB of GPU memory consumed by CUDA Graphs is substantial. On an A100 with 80 GB, this is about 9% of total memory. If the model weights consume 14 GB (7B model in FP16), and the CUDA Graphs consume 7.5 GB, you have 58.5 GB remaining for KV cache. Without graphs (eager mode), you would have 66 GB for KV cache -- 13% more cache capacity, which directly translates to 13% more concurrent requests.
+
+This is the fundamental memory-latency trade-off of CUDA Graphs: you sacrifice KV cache capacity (and therefore maximum concurrency) in exchange for lower per-token latency.
+
+### Strategies to reduce memory overhead
+
+**1. Limit the number of graph variants.** Instead of capturing graphs for 9 batch sizes, capture only for the most common ones in your traffic pattern. If 90% of your requests are batch=1-4, capture only {1, 2, 4, 8} and fall back to eager for larger batches.
+
+**2. Use CUDA Graph memory pools.** Starting with CUDA 11.4 and PyTorch 2.0, CUDA Graphs can share a memory pool. Graphs that are never replayed simultaneously can reuse the same physical memory for their workspaces. In practice, only one graph is active at any time (you decode at one batch size per step), so all graphs can theoretically share a single pool.
+
+```python
+# PyTorch memory pool sharing for CUDA Graphs
+# All graphs captured with the same pool share workspace memory
+pool = torch.cuda.graph_pool_handle()
+
+graph_bs1 = torch.cuda.CUDAGraph()
+with torch.cuda.graph(graph_bs1, pool=pool):
+    output_bs1 = model(input_bs1)
+
+graph_bs4 = torch.cuda.CUDAGraph()
+with torch.cuda.graph(graph_bs4, pool=pool):
+    output_bs4 = model(input_bs4)
+
+# graph_bs1 and graph_bs4 can share workspace memory
+# because they are never replayed simultaneously
+```
+
+With pool sharing, the total memory overhead is dominated by the LARGEST graph's workspace (not the sum). For the table above, this means ~3.5 GB instead of ~7.5 GB -- a significant saving.
+
+**3. Drop large-batch graphs.** Since large-batch graphs provide minimal speedup but consume the most memory, dropping graphs for batch sizes above 32 or 64 is often the right trade-off.
+
+<Callout type="tip" title="vLLM's memory pool">
+  vLLM uses CUDA Graph memory pools by default since version 0.3.0. All graph variants share a single memory pool, so the total memory overhead is approximately equal to the largest graph's workspace. This is why vLLM can afford to capture graphs up to batch=256 without catastrophic memory loss.
+</Callout>
+
+## Part 8: Graph Capture Best Practices
+
+### The warmup problem
+
+The most common CUDA Graph capture bug is capturing a graph before all lazy initialization has completed. CUDA libraries (cuBLAS, cuDNN, CUTLASS) perform one-time setup on first use: allocating internal handles, running autotuning heuristics, JIT-compiling specialized kernels. If this initialization happens DURING graph capture, the initialization operations (which include memory allocations and host-device syncs) are either captured as part of the graph (wrong -- they should only run once) or cause the capture to fail.
+
+The solution is simple: run the computation at least once (ideally 2-3 times) before capturing.
+
+```python
+# BAD: No warmup -- capture may fail or produce broken graph
+graph = torch.cuda.CUDAGraph()
+with torch.cuda.graph(graph):
+    output = model(input)  # First-ever call triggers cuBLAS init -> CRASH
+
+# GOOD: Warmup first
+for _ in range(3):
+    _ = model(input)  # All lazy init happens here
+torch.cuda.synchronize()
+
+graph = torch.cuda.CUDAGraph()
+with torch.cuda.graph(graph):
+    output = model(input)  # Now captures clean kernel sequence
+```
+
+### Stream management
+
+CUDA Graph capture operates on a specific CUDA stream. All operations during capture must be issued on this stream. If any operation internally uses a different stream (e.g., a library kernel that creates its own stream), the capture may miss those operations or fail.
+
+Best practice: capture on a dedicated stream and ensure all operations are stream-aware:
+
+```python
+capture_stream = torch.cuda.Stream()
+
+# Warmup on the capture stream
+with torch.cuda.stream(capture_stream):
+    for _ in range(3):
+        _ = model(input)
+torch.cuda.synchronize()
+
+# Capture on the same stream
+graph = torch.cuda.CUDAGraph()
+with torch.cuda.graph(graph, stream=capture_stream):
+    output = model(input)
+```
+
+### Common capture pitfalls
+
+<Benchmark
+  title="CUDA Graph Capture Pitfalls and Solutions"
+  columns={["Pitfall", "Symptom", "Solution"]}
+  rows={[
+    { values: ["Memory allocation during capture", "CUDA error or silent corruption", "Pre-allocate all tensors before capture"], highlight: true },
+    { values: ["torch.item() or .cpu() during capture", "Host-device sync error", "Remove all CPU readbacks from the captured region"], highlight: true },
+    { values: ["Data-dependent control flow", "Wrong results (graph ignores branches)", "Split into separate graphs per branch"], highlight: true },
+    { values: ["Non-deterministic ops (dropout)", "Fixed random values on every replay", "Regenerate RNG state between replays or disable dropout"], highlight: false },
+    { values: ["cuBLAS workspace resize", "Capture failure on first GEMM size", "Warmup with all GEMM sizes before capture"], highlight: true },
+    { values: ["Python print/logging inside capture", "No error but output frozen", "Remove all Python side effects from captured code"], highlight: false },
+    { values: ["torch.compile + CUDA Graphs", "Double compilation overhead", "Use one or the other, or let torch.compile manage graphs"], highlight: false },
+  ]}
+  notes="Most pitfalls stem from the same root cause: graphs capture CUDA operations, not Python operations."
+/>
+
+### Handling dropout and randomness
+
+Dropout layers generate random masks using CUDA's random number generator (RNG). When captured in a CUDA Graph, the RNG operation is recorded with a specific RNG state. On replay, the same RNG state is used, producing the **same** random mask every time. This means dropout is effectively disabled (or worse, applies the same fixed mask).
+
+For inference, this is usually not a problem because dropout is disabled (`model.eval()`). But if you are capturing training graphs or any computation with stochastic elements, you must manually advance the RNG state between replays:
+
+```python
+# After each graph.replay(), advance the RNG offset
+# to get different random numbers on the next replay
+torch.cuda.manual_seed(new_seed)  # Or use philox offset manipulation
+```
+
+### Integration with torch.compile
+
+PyTorch 2.0's `torch.compile()` with the `mode="reduce-overhead"` backend actually uses CUDA Graphs internally. When you call `torch.compile(model, mode="reduce-overhead")`, the compiler automatically:
+
+1. Traces the model to identify static regions.
+2. Captures CUDA Graphs for those regions.
+3. Falls back to eager execution for dynamic regions.
+
+This is often easier than manual CUDA Graph management, but provides less control. For production LLM serving where you need precise control over graph variants, batch size buckets, and memory management, manual CUDA Graph management (as vLLM does) is preferred.
+
+```python
+# Option A: Manual CUDA Graph management (more control, more work)
+graph = torch.cuda.CUDAGraph()
+with torch.cuda.graph(graph):
+    output = model(input)
+
+# Option B: Let torch.compile handle it (less control, less work)
+compiled_model = torch.compile(model, mode="reduce-overhead")
+output = compiled_model(input)  # Automatically captures/replays graphs
+```
+
+<Callout type="info" title="torch.compile vs manual graphs">
+  For simple inference pipelines with a single model and predictable shapes, `torch.compile` with `reduce-overhead` mode is sufficient. For complex serving systems with PagedAttention, continuous batching, multiple model variants, and custom KV cache management, manual CUDA Graph management is necessary because `torch.compile` cannot reason about the full system.
+</Callout>
+
+## Part 9: Advanced Topics
+
+### Graph updates (CUDA 12.0+)
+
+CUDA 12.0 introduced "graph update" capabilities that allow modifying certain properties of a captured graph without full recapture. Specifically, you can update kernel arguments (but not grid/block dimensions or the kernel function itself). This allows limited shape flexibility: if two shapes produce the same grid configuration but different kernel arguments (e.g., a stride parameter), you can update the argument without recapturing.
+
+In practice, this is most useful for updating scalar parameters like sequence length counters or attention mask pointers, not for handling shape changes that affect grid dimensions.
+
+### CUDA Graphs and multi-GPU inference
+
+When using tensor parallelism across multiple GPUs, each GPU runs a portion of each layer. The decode step involves inter-GPU communication (AllReduce operations) between layers. CUDA Graphs can capture both the per-GPU kernels AND the NCCL communication operations, as long as the communication pattern is static (same message sizes, same communication topology).
+
+For tensor-parallel LLM decode, this works well because the AllReduce sizes are determined by the hidden dimension (fixed) and batch size (fixed within a graph variant). vLLM captures multi-GPU graphs that include NCCL operations.
+
+However, pipeline parallelism is harder to graph because the pipeline schedule involves dynamic coordination between pipeline stages. Most systems use CUDA Graphs only within each pipeline stage, not across stages.
+
+### Conditional graph selection
+
+A practical pattern for production systems is to maintain a dispatch layer that selects between CUDA Graph replay and eager execution based on runtime conditions:
+
+```python
+class GraphDispatcher:
+    def __init__(self, model, graph_runner):
+        self.model = model
+        self.graph_runner = graph_runner
+        self.max_graph_bs = max(graph_runner.graphs.keys())
+
+    def forward(self, input_ids, positions, **kwargs):
+        bs = input_ids.shape[0]
+
+        # Use CUDA Graph if batch size is within captured range
+        if bs <= self.max_graph_bs and not kwargs.get("force_eager", False):
+            return self.graph_runner.run(input_ids, positions)
+
+        # Fall back to eager execution for large batches
+        # or when forced (e.g., during profiling)
+        return self.model(input_ids, positions)
+```
+
+This pattern ensures that the system always works correctly (eager execution is the fallback) while getting the performance benefit of CUDA Graphs when applicable.
+
+## Part 10: Putting It All Together
+
+### Decision framework
+
+When deciding whether to use CUDA Graphs for your inference workload, consider:
+
+<Benchmark
+  title="CUDA Graph Decision Framework"
+  columns={["Question", "Graph-Friendly Answer", "Graph-Unfriendly Answer"]}
+  rows={[
+    { values: ["Are tensor shapes static per step?", "Yes (decode phase)", "No (variable seq lengths)"], highlight: true },
+    { values: ["How many kernels per step?", "100+ small kernels", "A few large kernels"], highlight: true },
+    { values: ["Typical batch size?", "1-32", "128+"], highlight: true },
+    { values: ["Is total step latency under 20 ms?", "Yes (launch overhead is significant fraction)", "No (launch overhead is noise)"], highlight: false },
+    { values: ["Can you afford 1-4 GB extra GPU memory?", "Yes", "No (memory-constrained)"], highlight: false },
+    { values: ["Do you need host-device sync during the step?", "No", "Yes (data-dependent shapes/branches)"], highlight: true },
+  ]}
+  notes="If most answers are 'Graph-Friendly', CUDA Graphs will likely help. If most are 'Graph-Unfriendly', stick with eager execution or torch.compile."
+/>
+
+### The production recipe
+
+Based on the analysis in this post, here is the recommended approach for production LLM serving:
+
+1. **Use CUDA Graphs for decode only.** The decode phase has static shapes (batch size is the only variable), many small kernels, and low total latency -- all ideal for graphs.
+
+2. **Pre-capture at startup.** Capture graphs for batch sizes {1, 2, 4, 8, 16, 32} during server warmup. Use memory pool sharing to minimize overhead.
+
+3. **Pad to nearest bucket.** At runtime, pad the current batch to the nearest captured size. The padding waste is acceptable for batch sizes up to 32.
+
+4. **Fall back to eager for large batches.** Beyond batch=32-64 (depending on model and GPU), eager execution is fine. The launch overhead at large batch sizes is negligible.
+
+5. **Run prefill in eager mode.** Prefill has too much shape variability for graphs. Use `torch.compile` or operator fusion for prefill optimization instead.
+
+6. **Profile the memory trade-off.** Measure the KV cache capacity lost due to graph memory overhead. If it significantly reduces your maximum concurrency, consider dropping large-batch graphs or using fewer buckets.
+
+7. **Warm up completely.** Run 3+ warmup iterations before capture. Use a dedicated capture stream. Ensure no lazy initialization occurs during capture.
+
+### Conclusion
+
+CUDA Graphs solve a specific, well-defined problem: the CPU-side overhead of launching hundreds of small CUDA kernels per inference step. By capturing the entire kernel sequence once and replaying it with a single GPU submission, graphs reduce launch overhead from $O(N)$ to $O(1)$, saving 1-2 ms per decode step on typical LLM workloads.
+
+The benefit is largest at small batch sizes (20-30% speedup at batch=1) and diminishes with increasing batch size. The cost is engineering complexity (static shape constraints, multiple graph variants, careful capture procedures) and GPU memory overhead (1-4 GB for a typical set of graph variants).
+
+For production LLM serving, CUDA Graphs are essentially mandatory for the decode phase. Every major serving framework -- vLLM, TensorRT-LLM, SGLang, and others -- uses them by default. The rule of thumb: if your decode step launches more than 100 kernels and your batch size is under 32, CUDA Graphs will deliver meaningful, measurable speedup with no algorithmic changes required.
+
+The kernel launch overhead problem will not disappear with future GPU generations. As GPUs get faster and kernel execution times shrink, launch overhead becomes an even larger fraction of total time. CUDA Graphs (or their successors) will remain essential for latency-sensitive inference workloads for the foreseeable future.

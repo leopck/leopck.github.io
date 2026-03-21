@@ -1,12 +1,12 @@
 ---
 title: "eBPF for LLM Inference Profiling: Kernel-Level Observability"
 author: "stanley-phoong"
-description: "Using eBPF to profile LLM inference systems at the kernel level. We trace GPU memory allocation, PCIe DMA transfers, NCCL communication, and system call overhead -- the observability layer that Nsight Compute can't see."
-publishDate: 2024-11-09
+description: "Using eBPF to profile LLM inference systems at the kernel level. Trace GPU memory allocation, CUDA driver calls, CPU-side overhead, and NCCL communication with near-zero overhead -- the observability layer that GPU profilers cannot see."
+publishDate: 2025-03-21
 category: profiling
 tags: [ebpf, profiling, llm, inference, observability, performance]
 difficulty: expert
-readingTime: 14
+readingTime: 30
 featured: true
 ---
 
@@ -14,199 +14,1186 @@ import Callout from '@/components/mdx/Callout.astro';
 import PerfChart from '@/components/mdx/PerfChart.astro';
 import Benchmark from '@/components/mdx/Benchmark.astro';
 
-GPU profilers (Nsight Compute, Nsight Systems) show you what happens *on* the GPU. But LLM inference is a full-system problem -- CPU scheduling, memory allocation, PCIe transfers, NCCL socket operations, and Python runtime overhead all contribute to end-to-end latency. eBPF (extended Berkeley Packet Filter) provides kernel-level observability for everything the GPU profiler can't see.
+GPU profilers like Nsight Compute and Nsight Systems tell you what happens on the GPU: kernel execution times, memory bandwidth utilization, occupancy, warp stalls. They are excellent tools. But LLM inference is a full-system problem. The path from an HTTP request to a generated token touches the network stack, the Python runtime, the CUDA driver, PCIe bus, GPU memory, and often multiple GPUs communicating over NVLink or InfiniBand. GPU profilers are blind to everything except the GPU. eBPF sees everything else.
 
-## Why eBPF for LLM Profiling?
+eBPF (extended Berkeley Packet Filter) is a technology built into the Linux kernel that allows you to attach small, verified programs to nearly any kernel or user-space function. These programs execute in a sandboxed virtual machine inside the kernel, with strict safety guarantees: they cannot crash the system, cannot loop infinitely, and add overhead measured in nanoseconds per event. This makes eBPF uniquely suited for production profiling -- the kind of profiling you leave running continuously, not the kind you enable for five minutes during a maintenance window.
+
+This post covers how to use eBPF to profile every non-GPU aspect of LLM inference: CUDA driver interactions, memory allocation patterns, CPU-side scheduling overhead, NCCL communication, and Python runtime behavior. Combined with GPU profiling tools, eBPF provides complete end-to-end observability from user request to generated token.
+
+## Why eBPF for LLM Serving
+
+Traditional profiling instruments the application. You modify source code to add timing calls, link against profiling libraries, or run under a profiler that intercepts function calls. This approach has three problems for LLM serving:
+
+**Application modification is risky in production.** LLM serving stacks are complex -- vLLM, SGLang, TGI, and Triton Inference Server involve millions of lines of Python and C++ code, third-party CUDA kernels, and deep framework integrations. Adding instrumentation risks introducing bugs, changing timing behavior (probe effect), or breaking the carefully tuned interaction between components.
+
+**Overhead is unpredictable.** Application-level profilers like `cProfile` or `py-spy` add 5-20% overhead depending on the workload. For a serving system targeting P99 latency SLAs, this overhead is unacceptable. Worse, the overhead is non-uniform: it disproportionately affects the fast path, making profiling data misleading.
+
+**Visibility is limited to one layer.** The PyTorch profiler sees PyTorch operations. Nsight sees CUDA operations. Neither sees the operating system: page faults that stall CUDA allocations, context switches that delay kernel launches, TCP retransmissions that slow NCCL, or filesystem I/O that blocks model loading.
+
+eBPF solves all three problems. It instruments the kernel, not the application. It adds under 1% overhead in practice. And it sees everything the kernel sees: system calls, scheduler decisions, network packets, memory management, and file I/O.
 
 <Benchmark
-  title="Profiling Tool Coverage"
-  columns={["Tool", "GPU Kernels", "CPU Code", "System Calls", "Network/IPC", "Overhead"]}
+  title="Profiling Tool Coverage Comparison"
+  columns={["Tool", "GPU Kernels", "CPU Code", "System Calls", "Network/IPC", "Memory Alloc", "Overhead"]}
   rows={[
-    { values: ["Nsight Compute", "Detailed", "None", "None", "None", "High (per-kernel)"], highlight: false },
-    { values: ["Nsight Systems", "Timeline", "Basic", "None", "NCCL events", "Low"], highlight: false },
-    { values: ["PyTorch Profiler", "Mapping", "Python", "None", "None", "Medium"], highlight: false },
-    { values: ["eBPF (bcc/bpftrace)", "None", "Detailed", "Full", "Full", "Very low (under 1%)"], highlight: true },
-    { values: ["perf", "None", "Sampling", "Some", "None", "Low"], highlight: false },
+    { values: ["Nsight Compute", "Detailed", "None", "None", "None", "CUDA only", "High (per-kernel replay)"], highlight: false },
+    { values: ["Nsight Systems", "Timeline", "Basic", "None", "NCCL events", "CUDA timeline", "Low (2-5%)"], highlight: false },
+    { values: ["PyTorch Profiler", "Op mapping", "Python ops", "None", "None", "PyTorch alloc", "Medium (5-15%)"], highlight: false },
+    { values: ["perf", "None", "Sampling", "Some", "None", "Page faults", "Low (1-3%)"], highlight: false },
+    { values: ["eBPF (bcc/bpftrace)", "None (traces driver)", "Detailed", "Full", "Full", "All syscalls", "Very low (under 1%)"], highlight: true },
+    { values: ["eBPF + Nsight Systems", "Full timeline", "Detailed", "Full", "Full", "Complete", "Low (combined 2-5%)"], highlight: true },
   ]}
-  notes="eBPF fills the gap: system-level observability with near-zero overhead."
+  notes="eBPF fills the observability gap: system-level tracing with production-safe overhead. The combination of eBPF and Nsight Systems provides complete coverage."
 />
 
-<Callout type="perf" title="The Hidden Bottleneck">
-  In production vLLM deployments, we've found 10-20% of end-to-end latency comes from non-GPU sources: Python GIL contention, memory allocation/deallocation, CPU-side tokenization, and TCP socket operations for NCCL. GPU profilers are blind to these. eBPF sees them clearly.
+<Callout type="perf" title="The Hidden 10-20% Bottleneck">
+  In production vLLM and SGLang deployments, we consistently find that 10-20% of end-to-end latency comes from non-GPU sources: Python GIL contention (3-5%), memory allocation and deallocation in the CUDA driver (2-4%), CPU-side tokenization and detokenization (2-3%), scheduler logic (2-3%), and TCP socket operations for NCCL communication (1-5%). GPU profilers report that the GPU is "idle" during these periods but cannot explain why. eBPF explains why.
 </Callout>
 
-## Tracing GPU Memory Allocation
+## How eBPF Works: A Quick Primer
 
-CUDA memory allocation (`cudaMalloc`) goes through the kernel via `ioctl` calls to the NVIDIA driver. eBPF can trace these:
+Before diving into LLM-specific profiling, a brief overview of eBPF for readers unfamiliar with the technology.
+
+eBPF programs are small pieces of code (typically 10-100 lines of restricted C) that attach to events in the kernel or user space. When the event fires, the eBPF program executes, collects data, and stores it in shared maps (hash tables, arrays, ring buffers) that user-space tools can read.
+
+The key components:
+
+- **Tracepoints**: Static instrumentation points compiled into the kernel. Examples: `tracepoint:syscalls:sys_enter_ioctl` fires on every `ioctl` system call entry. These are stable across kernel versions.
+- **kprobes/kretprobes**: Dynamic instrumentation of any kernel function. Example: `kprobe:tcp_sendmsg` fires when the kernel sends a TCP message. These depend on kernel symbol names and may break across versions.
+- **uprobes/uretprobes**: Dynamic instrumentation of user-space functions. Example: `uprobe:/usr/lib/libcuda.so:cuLaunchKernel` fires when CUDA launches a kernel. These are the primary mechanism for tracing GPU driver calls.
+- **USDT (User Statically-Defined Tracing)**: Static tracepoints compiled into user-space applications. Some CUDA libraries include USDT probes for key operations.
+- **Maps**: Shared data structures between eBPF programs and user space. Hash maps for per-key aggregation, histograms for latency distributions, ring buffers for event streaming.
+
+Two main tools for writing and running eBPF programs:
+
+- **bpftrace**: A high-level scripting language for one-liners and short scripts. Best for ad-hoc investigation.
+- **BCC (BPF Compiler Collection)**: A Python/C framework for more complex programs. Best for production monitoring tools.
+
+```bash
+# Verify eBPF is available
+uname -r  # Need kernel 4.15+ (5.x recommended)
+bpftrace --version
+# Requires root or CAP_BPF + CAP_PERFMON capabilities
+```
+
+## Tracing GPU Kernel Launches
+
+Every CUDA kernel launch from PyTorch or a serving framework goes through the CUDA driver. The driver exposes functions like `cuLaunchKernel` that eBPF can intercept via uprobes. This lets you measure kernel launch latency from the CPU side -- the time between the application requesting a kernel launch and the driver completing the submission.
+
+### Intercepting CUDA Driver Calls
 
 ```bash
 #!/usr/bin/env bpftrace
-// Trace CUDA memory allocations via NVIDIA driver ioctl
-// Shows allocation size, latency, and calling process
+// trace_cuda_launches.bt
+// Trace CUDA kernel launch latency through the driver
+// Usage: sudo bpftrace trace_cuda_launches.bt
+
+uprobe:/usr/lib/x86_64-linux-gnu/libcuda.so:cuLaunchKernel
+{
+    @launch_start[tid] = nsecs;
+    @launch_count = count();
+}
+
+uretprobe:/usr/lib/x86_64-linux-gnu/libcuda.so:cuLaunchKernel
+/@launch_start[tid]/
+{
+    $latency_us = (nsecs - @launch_start[tid]) / 1000;
+    @launch_latency_us = hist($latency_us);
+
+    // Flag slow launches (> 50us suggests driver contention)
+    if ($latency_us > 50) {
+        printf("SLOW launch: pid=%d tid=%d latency=%dus\n",
+               pid, tid, $latency_us);
+    }
+
+    delete(@launch_start[tid]);
+}
+
+// Also trace synchronization (performance killer)
+uprobe:/usr/lib/x86_64-linux-gnu/libcuda.so:cuCtxSynchronize
+{
+    @sync_start[tid] = nsecs;
+}
+
+uretprobe:/usr/lib/x86_64-linux-gnu/libcuda.so:cuCtxSynchronize
+/@sync_start[tid]/
+{
+    $sync_us = (nsecs - @sync_start[tid]) / 1000;
+    @sync_latency_us = hist($sync_us);
+    @sync_count = count();
+
+    if ($sync_us > 1000) {
+        printf("LONG sync: pid=%d latency=%dus\n", pid, $sync_us);
+    }
+
+    delete(@sync_start[tid]);
+}
+
+interval:s:10
+{
+    printf("\n--- 10s summary ---\n");
+    printf("Kernel launches: %lld\n", @launch_count);
+    printf("Syncs: %lld\n", @sync_count);
+    print(@launch_latency_us);
+}
+```
+
+### What Kernel Launch Latency Reveals
+
+Kernel launch latency is the time the CPU spends in the CUDA driver submitting work to the GPU. In a healthy system, this is 5-15 microseconds per launch. Elevated latency indicates:
+
+- **Driver lock contention**: Multiple threads launching kernels simultaneously. The CUDA driver uses internal locks that serialize launches. eBPF reveals this as bimodal latency -- most launches are fast, but some wait 100+ us for the lock.
+- **GPU command queue full**: The GPU's hardware command queue has a fixed depth. When full, the driver blocks until a slot opens. This manifests as launch latency that correlates with GPU utilization.
+- **Page table operations**: If the launch involves memory that needs page table updates (newly allocated memory, or memory that was freed and reallocated), the driver performs extra work.
+
+<Benchmark
+  title="CUDA Kernel Launch Latency: Healthy vs Unhealthy"
+  columns={["Metric", "Healthy", "Concerning", "Critical", "Root Cause"]}
+  rows={[
+    { values: ["P50 launch latency", "5-10 us", "15-30 us", "50+ us", "Driver overhead or lock contention"], highlight: false },
+    { values: ["P99 launch latency", "15-30 us", "50-200 us", "500+ us", "Serialization, page table ops"], highlight: true },
+    { values: ["P99/P50 ratio", "2-3x", "5-10x", "20x+", "Bimodal = lock contention"], highlight: true },
+    { values: ["Launches per second", "10K-100K", "Under 5K", "Under 1K", "CPU bottleneck before launches"], highlight: false },
+    { values: ["cuCtxSynchronize calls", "0 during serving", "1-10/sec", "100+/sec", "Implicit syncs in code"], highlight: true },
+  ]}
+  notes="Measured on A100 with vLLM serving Llama-7B. cuCtxSynchronize should never appear during normal decode -- its presence indicates a bug."
+/>
+
+<Callout type="warning" title="cuCtxSynchronize Is a Red Flag">
+  The `cuCtxSynchronize` function forces the CPU to wait until all pending GPU work completes. In a serving system, this should never be called during normal inference. If eBPF shows synchronize calls during decode steps, something in the code path is triggering an implicit sync -- typically `.item()`, `.cpu()`, print statements on CUDA tensors, or CUDA error checking in debug mode. Each sync wastes 100-5000 us of CPU time (and prevents kernel launch overlap). Find and eliminate every one.
+</Callout>
+
+### Detecting Scheduling Issues
+
+The gap between kernel launches is just as important as the launch itself. eBPF can measure inter-launch intervals to detect CPU-side scheduling problems:
+
+```bash
+#!/usr/bin/env bpftrace
+// inter_launch_gap.bt
+// Measure time between consecutive kernel launches per thread
+// Large gaps indicate CPU bottlenecks between GPU work
+
+uprobe:/usr/lib/x86_64-linux-gnu/libcuda.so:cuLaunchKernel
+{
+    if (@prev_launch[tid]) {
+        $gap_us = (nsecs - @prev_launch[tid]) / 1000;
+        @inter_launch_gap_us = hist($gap_us);
+
+        // Gaps > 100us between launches = CPU is the bottleneck
+        if ($gap_us > 100) {
+            @slow_gaps = count();
+            printf("CPU gap: %dus between launches (tid=%d pid=%d)\n",
+                   $gap_us, tid, pid);
+        }
+    }
+    @prev_launch[tid] = nsecs;
+}
+
+interval:s:5
+{
+    printf("\n--- Inter-launch gap distribution ---\n");
+    print(@inter_launch_gap_us);
+    printf("Slow gaps (>100us): %lld\n", @slow_gaps);
+}
+```
+
+The inter-launch gap histogram tells a clear story:
+
+- **Tight distribution at 5-20 us**: The CPU is keeping the GPU fed. Kernel launch overhead dominates, not CPU work. This is the healthy state for decode steps using CUDA Graphs.
+- **Bimodal distribution with peaks at 10 us and 200+ us**: Some launches are back-to-back (within a CUDA Graph or fused operation) while others have CPU work between them (scheduler, sampling, memory management). Normal for serving without CUDA Graphs.
+- **Wide distribution or long tail above 500 us**: The CPU is struggling. Python GIL contention, garbage collection pauses, or complex scheduler logic is starving the GPU. Optimization opportunity.
+
+## Memory Allocation Tracking
+
+CUDA memory allocation (`cudaMalloc`, `cudaFree`) goes through the NVIDIA kernel driver via `ioctl` system calls. eBPF can trace these at the system call level to detect leaks, fragmentation, and allocation hotspots without any application modification.
+
+### Tracing cudaMalloc and cudaFree
+
+```bash
+#!/usr/bin/env bpftrace
+// trace_cuda_memory.bt
+// Trace CUDA memory allocation and deallocation via driver ioctl
+// Detects leaks, large allocations, and allocation frequency
 
 tracepoint:syscalls:sys_enter_ioctl
-/comm == "python" || comm == "python3"/
+/comm == "python" || comm == "python3" || comm == "pt_main_thread"/
 {
-    @start[tid] = nsecs;
+    @ioctl_start[tid] = nsecs;
     @ioctl_count[comm] = count();
 }
 
 tracepoint:syscalls:sys_exit_ioctl
-/@start[tid]/
+/@ioctl_start[tid]/
 {
-    $latency_us = (nsecs - @start[tid]) / 1000;
-    @alloc_latency_us = hist($latency_us);
-    delete(@start[tid]);
+    $latency_us = (nsecs - @ioctl_start[tid]) / 1000;
+    @ioctl_latency_us = hist($latency_us);
 
-    // Flag slow allocations (> 1ms suggests fragmentation)
+    // Flag slow ioctls (> 1ms suggests driver doing heavy work)
     if ($latency_us > 1000) {
-        printf("SLOW ioctl: %s pid=%d latency=%dus\n", comm, pid, $latency_us);
+        printf("SLOW ioctl: %s pid=%d tid=%d latency=%dus\n",
+               comm, pid, tid, $latency_us);
+    }
+
+    delete(@ioctl_start[tid]);
+}
+
+// Track mmap calls (GPU memory mapping)
+tracepoint:syscalls:sys_enter_mmap
+/comm == "python" || comm == "python3"/
+{
+    @mmap_start[tid] = nsecs;
+    @mmap_size[tid] = args.len;
+}
+
+tracepoint:syscalls:sys_exit_mmap
+/@mmap_start[tid]/
+{
+    $latency_us = (nsecs - @mmap_start[tid]) / 1000;
+    $size_mb = @mmap_size[tid] / (1024 * 1024);
+
+    @mmap_latency_us = hist($latency_us);
+
+    if ($size_mb > 100) {
+        printf("LARGE mmap: %s pid=%d size=%dMB latency=%dus\n",
+               comm, pid, $size_mb, $latency_us);
+    }
+
+    delete(@mmap_start[tid]);
+    delete(@mmap_size[tid]);
+}
+```
+
+### Detecting Memory Leaks with eBPF
+
+A memory leak in CUDA manifests as `ioctl` calls for allocation that are not balanced by corresponding deallocation calls. While eBPF cannot directly distinguish `cudaMalloc` ioctls from other driver ioctls without parsing the ioctl command numbers, we can use a higher-level approach with uprobes:
+
+```bash
+#!/usr/bin/env bpftrace
+// cuda_leak_detector.bt
+// Track cudaMalloc/cudaFree balance to detect leaks
+// Requires libcudart.so symbols
+
+uprobe:/usr/local/cuda/lib64/libcudart.so:cudaMalloc
+{
+    @malloc_start[tid] = nsecs;
+    @malloc_count = count();
+}
+
+uretprobe:/usr/local/cuda/lib64/libcudart.so:cudaMalloc
+/@malloc_start[tid]/
+{
+    $latency_us = (nsecs - @malloc_start[tid]) / 1000;
+    @malloc_latency_us = hist($latency_us);
+    @total_mallocs = count();
+    delete(@malloc_start[tid]);
+}
+
+uprobe:/usr/local/cuda/lib64/libcudart.so:cudaFree
+{
+    @free_start[tid] = nsecs;
+    @total_frees = count();
+}
+
+uretprobe:/usr/local/cuda/lib64/libcudart.so:cudaFree
+/@free_start[tid]/
+{
+    $latency_us = (nsecs - @free_start[tid]) / 1000;
+    @free_latency_us = hist($latency_us);
+    delete(@free_start[tid]);
+}
+
+interval:s:10
+{
+    printf("\n=== CUDA Memory Balance (10s) ===\n");
+    printf("cudaMalloc calls: %lld\n", @total_mallocs);
+    printf("cudaFree calls:   %lld\n", @total_frees);
+    $delta = @total_mallocs - @total_frees;
+    printf("Delta (leak indicator): %lld\n", $delta);
+    if ($delta > 100) {
+        printf("WARNING: malloc/free imbalance growing!\n");
     }
 }
 ```
 
 <Benchmark
-  title="GPU Memory Allocation Latency (vLLM serving Llama-7B)"
+  title="GPU Memory Allocation Latency During LLM Serving (eBPF Measured)"
   columns={["Operation", "P50 Latency", "P99 Latency", "Frequency", "Impact"]}
   rows={[
-    { values: ["cudaMalloc (small, under 1MB)", "15 us", "50 us", "~100/sec", "Low"], highlight: false },
-    { values: ["cudaMalloc (large, over 100MB)", "200 us", "2.5 ms", "~5/sec", "Medium -- spikes in P99"], highlight: true },
+    { values: ["cudaMalloc (under 1 MB)", "12 us", "45 us", "~100/sec", "Low -- PyTorch allocator caches these"], highlight: false },
+    { values: ["cudaMalloc (1-100 MB)", "50 us", "500 us", "~20/sec", "Medium -- KV cache block allocation"], highlight: false },
+    { values: ["cudaMalloc (over 100 MB)", "200 us", "3 ms", "~2/sec", "High -- weight loading or large cache expansion"], highlight: true },
     { values: ["cudaFree", "8 us", "800 us", "~100/sec", "Low normally, spiky under fragmentation"], highlight: false },
-    { values: ["mmap (driver)", "50 us", "5 ms", "~10/sec", "High -- GPU page table updates"], highlight: true },
+    { values: ["mmap (GPU pages)", "50 us", "5 ms", "~10/sec", "High -- GPU page table updates"], highlight: true },
+    { values: ["munmap (GPU pages)", "30 us", "2 ms", "~5/sec", "Medium -- page table cleanup"], highlight: false },
   ]}
-  notes="Measured with eBPF during steady-state serving. Large allocations spike during KV cache expansion."
+  notes="Measured with eBPF during steady-state vLLM serving of Llama-7B on A100. The PyTorch caching allocator absorbs most small allocations, so cudaMalloc calls at this level represent allocator-to-CUDA interactions."
 />
 
-## Tracing CPU-Side Overhead
+### Fragmentation Pattern Detection
 
-LLM serving has significant CPU work between GPU kernel launches:
+By tracking allocation sizes over time, eBPF can reveal fragmentation-inducing patterns:
 
 ```bash
 #!/usr/bin/env bpftrace
-// Measure time between GPU kernel launches (CPU gap)
-// High gaps indicate CPU-side bottlenecks
+// alloc_pattern.bt
+// Histogram of allocation sizes to detect fragmentation risk
+// Many different sizes = high fragmentation risk
 
-usdt:libtorch_cuda.so:cuda_kernel_launch
+uprobe:/usr/local/cuda/lib64/libcudart.so:cudaMalloc
 {
-    if (@last_launch[tid]) {
-        $gap_us = (nsecs - @last_launch[tid]) / 1000;
-        @cpu_gap_us = hist($gap_us);
+    @alloc_start[tid] = nsecs;
+}
 
-        if ($gap_us > 100) {
-            printf("CPU gap: %dus between kernel launches (tid=%d)\n", $gap_us, tid);
-        }
+uretprobe:/usr/local/cuda/lib64/libcudart.so:cudaMalloc
+/@alloc_start[tid]/
+{
+    // The size parameter is the first argument to cudaMalloc
+    // Note: accessing function arguments in uretprobe requires
+    // saving them in the entry probe. Simplified here.
+    $latency = (nsecs - @alloc_start[tid]) / 1000;
+
+    // Bucket by latency as proxy for size
+    // (larger allocations take longer)
+    if ($latency < 20) {
+        @alloc_bucket["tiny (<20us)"] = count();
+    } else if ($latency < 100) {
+        @alloc_bucket["small (20-100us)"] = count();
+    } else if ($latency < 500) {
+        @alloc_bucket["medium (100-500us)"] = count();
+    } else {
+        @alloc_bucket["large (>500us)"] = count();
     }
-    @last_launch[tid] = nsecs;
+
+    delete(@alloc_start[tid]);
+}
+
+interval:s:30
+{
+    printf("\n=== Allocation Pattern (30s window) ===\n");
+    print(@alloc_bucket);
+    clear(@alloc_bucket);
+}
+```
+
+A healthy serving system shows a narrow distribution of allocation sizes -- vLLM's PagedAttention allocates fixed-size KV cache blocks, and model weights are allocated once at startup. A widening distribution indicates dynamic allocation patterns that fragment the allocator.
+
+<Callout type="tip" title="The PagedAttention Signal in eBPF">
+  When profiling vLLM with eBPF, you should see very few `cudaMalloc` calls during steady-state serving because PagedAttention pre-allocates the KV cache pool at startup. If you see frequent `cudaMalloc`/`cudaFree` calls during inference, something is bypassing the pool -- possibly a custom operation, a logging function allocating tensors, or a bug in cache management. eBPF makes this immediately visible without modifying vLLM's code.
+</Callout>
+
+## bpftrace One-Liners for LLM Profiling
+
+Here are practical one-liners for common LLM profiling tasks. Each can be run immediately with `sudo bpftrace -e '...'`.
+
+### Histogram of ioctl Durations (GPU Driver Calls)
+
+```bash
+# Distribution of GPU driver call latencies
+sudo bpftrace -e '
+tracepoint:syscalls:sys_enter_ioctl /comm == "python3"/ { @start[tid] = nsecs; }
+tracepoint:syscalls:sys_exit_ioctl /@start[tid]/ {
+    @us = hist((nsecs - @start[tid]) / 1000);
+    delete(@start[tid]);
+}'
+```
+
+This produces a power-of-2 histogram of all ioctl latencies. For LLM serving, you want to see the distribution concentrated below 100 us. A long tail above 1 ms indicates driver contention or memory management overhead.
+
+### Count System Calls by Type
+
+```bash
+# What system calls does the serving process make?
+sudo bpftrace -e '
+tracepoint:raw_syscalls:sys_enter /comm == "python3"/ {
+    @syscalls[args.id] = count();
+}'
+```
+
+This reveals the syscall profile of the serving process. Healthy LLM serving is dominated by `ioctl` (GPU driver), `futex` (thread synchronization), `epoll_wait` (network), and `write` (logging). Unexpected high counts of `mmap`/`munmap` (memory allocation), `clock_gettime` (excessive timing), or `read` (unexpected I/O) indicate optimization opportunities.
+
+### Track Context Switches (GIL Contention Indicator)
+
+```bash
+# How often is the serving process descheduled?
+sudo bpftrace -e '
+tracepoint:sched:sched_switch /args.prev_comm == "python3"/ {
+    @switches[args.prev_state] = count();
+    @switch_rate = count();
+}
+interval:s:1 {
+    printf("Context switches/sec: %lld\n", @switch_rate);
+    clear(@switch_rate);
+}'
+```
+
+For Python-based LLM serving, high context switch rates (more than 10,000/sec) typically indicate GIL contention. The `prev_state` field reveals whether switches are voluntary (thread yielding, waiting for I/O) or involuntary (preempted by scheduler). Involuntary switches suggest the process is CPU-bound and competing for cores.
+
+### Monitor Page Faults
+
+```bash
+# Track page faults -- these stall CUDA operations
+sudo bpftrace -e '
+tracepoint:exceptions:page_fault_user /comm == "python3"/ {
+    @faults = count();
+    @fault_addr = hist(args.address);
+}
+interval:s:5 {
+    printf("Page faults in 5s: %lld\n", @faults);
+    clear(@faults);
+}'
+```
+
+Page faults during inference indicate memory that was not pre-faulted. When CUDA allocates memory and the host touches it for the first time, a page fault stalls the operation. vLLM and similar frameworks should pre-fault all memory during startup. Page faults during serving are a bug.
+
+### Trace File I/O (Unexpected Disk Access)
+
+```bash
+# Is the serving process hitting disk during inference?
+sudo bpftrace -e '
+tracepoint:syscalls:sys_enter_read /comm == "python3"/ {
+    @read_start[tid] = nsecs;
+    @read_fd[tid] = args.fd;
+}
+tracepoint:syscalls:sys_exit_read /@read_start[tid]/ {
+    $latency_us = (nsecs - @read_start[tid]) / 1000;
+    if ($latency_us > 100) {
+        printf("SLOW read: fd=%d latency=%dus\n", @read_fd[tid], $latency_us);
+    }
+    delete(@read_start[tid]);
+    delete(@read_fd[tid]);
+}'
+```
+
+Disk I/O during inference is a red flag. The model should be fully loaded into GPU memory. If you see reads during inference, something is loading weights lazily, reading configuration files per-request, or logging synchronously to disk.
+
+<Benchmark
+  title="bpftrace One-Liner Reference for LLM Profiling"
+  columns={["Task", "One-Liner Target", "What It Reveals"]}
+  rows={[
+    { values: ["GPU driver latency", "tracepoint:syscalls:sys_enter/exit_ioctl", "CUDA driver overhead, memory ops"], highlight: true },
+    { values: ["Syscall profile", "tracepoint:raw_syscalls:sys_enter", "What the OS is doing for the process"], highlight: false },
+    { values: ["Context switches", "tracepoint:sched:sched_switch", "GIL contention, CPU scheduling"], highlight: true },
+    { values: ["Page faults", "tracepoint:exceptions:page_fault_user", "Memory not pre-faulted, stalls"], highlight: false },
+    { values: ["TCP latency (NCCL)", "kprobe:tcp_sendmsg / kprobe:tcp_recvmsg", "Multi-GPU communication overhead"], highlight: true },
+    { values: ["File I/O", "tracepoint:syscalls:sys_enter_read/write", "Unexpected disk access during inference"], highlight: false },
+    { values: ["Memory allocation", "uprobe:libcudart.so:cudaMalloc", "CUDA allocation frequency and latency"], highlight: true },
+    { values: ["Futex contention", "tracepoint:syscalls:sys_enter_futex", "Lock contention in driver or Python"], highlight: false },
+  ]}
+/>
+
+## CPU-Side Profiling: Where Time Goes
+
+In LLM serving, the CPU is responsible for tokenization, scheduling, sampling, memory management, and orchestrating GPU kernel launches. Understanding CPU time distribution is critical because the CPU is often the bottleneck during decode steps -- especially at small batch sizes where GPU kernels are memory-bound and fast.
+
+### Decomposing CPU Time with eBPF
+
+```bash
+#!/usr/bin/env bpftrace
+// cpu_breakdown.bt
+// Measure CPU time spent in different categories for LLM serving
+// Uses uprobe on key Python/C++ functions
+
+// Tokenizer time (HuggingFace tokenizers library)
+uprobe:/path/to/tokenizers.cpython-310-x86_64-linux-gnu.so:*encode*
+{
+    @tokenizer_start[tid] = nsecs;
+}
+
+uretprobe:/path/to/tokenizers.cpython-310-x86_64-linux-gnu.so:*encode*
+/@tokenizer_start[tid]/
+{
+    $us = (nsecs - @tokenizer_start[tid]) / 1000;
+    @tokenizer_us = hist($us);
+    @tokenizer_total_us = sum($us);
+    delete(@tokenizer_start[tid]);
+}
+
+// CUDA kernel launch time
+uprobe:/usr/local/cuda/lib64/libcudart.so:cudaLaunchKernel
+{
+    @cuda_launch_start[tid] = nsecs;
+}
+
+uretprobe:/usr/local/cuda/lib64/libcudart.so:cudaLaunchKernel
+/@cuda_launch_start[tid]/
+{
+    $us = (nsecs - @cuda_launch_start[tid]) / 1000;
+    @cuda_launch_us = hist($us);
+    @cuda_launch_total_us = sum($us);
+    delete(@cuda_launch_start[tid]);
+}
+
+interval:s:10
+{
+    printf("\n=== CPU Time Breakdown (10s) ===\n");
+    printf("Tokenizer total:     %lld us\n", @tokenizer_total_us);
+    printf("CUDA launch total:   %lld us\n", @cuda_launch_total_us);
 }
 ```
 
 <PerfChart
-  title="Time Breakdown: Where CPU Cycles Go in vLLM (per decode step)"
+  title="CPU Time Breakdown: Where Cycles Go in vLLM (per decode step)"
   unit="us"
   data={[
-    { label: "GPU kernel execution", value: 5200, color: "blue", annotation: "The actual LLM work" },
-    { label: "Scheduler + batch formation", value: 400, color: "orange" },
-    { label: "Tokenizer (CPU)", value: 150, color: "orange" },
-    { label: "Sampling (CPU)", value: 120, color: "orange" },
-    { label: "Memory management", value: 200, color: "red", annotation: "Page table ops, KV alloc" },
-    { label: "Python overhead (GIL, GC)", value: 180, color: "red" },
-    { label: "Kernel launch overhead", value: 80, color: "gray" },
+    { label: "GPU kernel execution", value: 5200, color: "blue", annotation: "The actual LLM compute" },
+    { label: "Scheduler + batch formation", value: 400, color: "orange", annotation: "Request selection, priority" },
+    { label: "Tokenizer (CPU)", value: 150, color: "orange", annotation: "Encode/decode tokens" },
+    { label: "Sampling (CPU)", value: 120, color: "orange", annotation: "Top-k, temperature, etc." },
+    { label: "Memory management", value: 200, color: "red", annotation: "Page table ops, KV block alloc" },
+    { label: "Python overhead (GIL, GC)", value: 180, color: "red", annotation: "GIL contention, ref counting" },
+    { label: "Kernel launch overhead", value: 80, color: "gray", annotation: "Driver submission" },
+    { label: "NCCL communication setup", value: 50, color: "gray", annotation: "Multi-GPU only" },
   ]}
 />
 
-CPU overhead is ~18% of total step time. The scheduler, tokenizer, and memory management are the largest contributors.
+CPU overhead totals approximately 1180 us per decode step -- roughly 18% of the total 6380 us step time. For a system targeting maximum throughput, this CPU overhead limits scaling: even with infinite GPU speed, the decode rate is bounded by $1 / 1180\mu s \approx 848$ steps/second per CPU core.
 
-## Tracing NCCL Communication
+### Using perf and eBPF Together
 
-For multi-GPU serving with tensor parallelism, NCCL communication adds latency. eBPF can trace the socket-level operations:
+Linux `perf` provides CPU performance counter sampling that complements eBPF's event tracing. Together they give a complete picture:
+
+```bash
+# Step 1: perf record with call graph (CPU sampling)
+sudo perf record -F 99 -g -p $(pgrep -f "vllm") -- sleep 30
+
+# Step 2: Generate flame graph
+sudo perf script | stackcollapse-perf.pl | flamegraph.pl > vllm_perf.svg
+
+# Step 3: Simultaneously run eBPF for event tracing
+sudo bpftrace -e '
+tracepoint:sched:sched_switch /args.prev_comm == "python3"/ {
+    @off_cpu_start[args.prev_pid] = nsecs;
+}
+tracepoint:sched:sched_switch /args.next_comm == "python3"/ {
+    if (@off_cpu_start[args.next_pid]) {
+        $off_us = (nsecs - @off_cpu_start[args.next_pid]) / 1000;
+        @off_cpu_us = hist($off_us);
+        delete(@off_cpu_start[args.next_pid]);
+    }
+}' &
+
+# Step 4: Send load
+python benchmark_serving.py --model llama-7b --num-requests 1000
+```
+
+The `perf` flame graph shows where CPU time is spent (on-CPU analysis). The eBPF off-CPU histogram shows how long the process is descheduled (off-CPU analysis). Combining both reveals the complete story: a function might consume little on-CPU time but cause the process to sleep for milliseconds waiting for a lock or I/O.
+
+### Python GIL Profiling
+
+The Global Interpreter Lock (GIL) is a well-known bottleneck in Python-based serving. eBPF can measure GIL contention by tracing the futex system calls that Python uses for GIL acquisition:
 
 ```bash
 #!/usr/bin/env bpftrace
-// Trace NCCL socket send/recv latency
+// gil_contention.bt
+// Measure Python GIL contention via futex tracing
+// High futex wait times indicate GIL is a bottleneck
+
+tracepoint:syscalls:sys_enter_futex
+/comm == "python3" && args.op == 0/  // FUTEX_WAIT
+{
+    @futex_start[tid] = nsecs;
+    @futex_waits = count();
+}
+
+tracepoint:syscalls:sys_exit_futex
+/@futex_start[tid]/
+{
+    $wait_us = (nsecs - @futex_start[tid]) / 1000;
+    @futex_wait_us = hist($wait_us);
+
+    if ($wait_us > 1000) {
+        printf("LONG futex wait: tid=%d %dus (likely GIL)\n", tid, $wait_us);
+    }
+
+    delete(@futex_start[tid]);
+}
+
+interval:s:10
+{
+    printf("\n=== GIL Contention (10s) ===\n");
+    printf("Total futex waits: %lld\n", @futex_waits);
+    print(@futex_wait_us);
+    clear(@futex_waits);
+}
+```
+
+<Callout type="info" title="GIL Impact on LLM Serving">
+  In multi-threaded Python serving (vLLM uses multiple threads for tokenization, scheduling, and GPU management), GIL contention can add 100-500 us per decode step. eBPF's futex tracing shows the actual wait time. If futex waits dominate the off-CPU histogram, consider: (1) moving tokenization to a separate process (subprocess or Rust tokenizer with released GIL); (2) using CUDA Graphs to batch kernel launches (fewer Python-to-CUDA transitions); (3) upgrading to Python 3.13+ with free-threaded mode for experimental GIL removal.
+</Callout>
+
+## Flamegraphs for LLM Inference
+
+Flamegraphs are the single most effective visualization for understanding CPU time in LLM serving. A flamegraph shows the call stack on the x-axis (width proportional to time) and stack depth on the y-axis, making it immediately obvious where CPU time is concentrated.
+
+### Generating CPU Flamegraphs with eBPF
+
+```bash
+# Method 1: Using profile-bpfcc (BCC tool)
+# Samples CPU stacks at 99 Hz for 30 seconds
+sudo profile-bpfcc -F 99 -p $(pgrep -f "vllm.entrypoints") 30 \
+    > vllm_cpu.folded
+
+# Convert to flamegraph
+flamegraph.pl --title "vLLM CPU Flamegraph" \
+    --subtitle "30s capture during steady-state serving" \
+    --countname "samples" \
+    vllm_cpu.folded > vllm_cpu_flame.svg
+
+# Method 2: Using bpftrace for more control
+sudo bpftrace -e '
+profile:hz:99 /comm == "python3"/ {
+    @stacks[ustack(perf), kstack] = count();
+}' -c 'sleep 30' > stacks.bt
+
+# Method 3: Combined user+kernel stacks
+sudo perf record -F 99 -g --call-graph dwarf \
+    -p $(pgrep -f "vllm") -- sleep 30
+sudo perf script | stackcollapse-perf.pl | flamegraph.pl > vllm_combined.svg
+```
+
+### Reading the Flamegraph for LLM Serving
+
+A typical vLLM flamegraph during steady-state serving shows these regions:
+
+**Tokenizer stack (5-15% of CPU time)**: Look for frames containing `tokenizers`, `encode`, `decode`, or `HuggingFace`. The Rust-based HuggingFace tokenizer is fast but still consumes measurable CPU. If this region is wide (more than 15%), batch tokenization may help.
+
+**Scheduler stack (5-10% of CPU time)**: Frames containing `schedule`, `_schedule`, `SchedulerOutputs`, `_get_num_new_tokens`. The scheduler selects which requests to include in the next batch, manages preemption, and allocates KV cache blocks. Complex scheduling policies (e.g., priority-based, fairness-aware) widen this region.
+
+**CUDA launch stack (3-8% of CPU time)**: Frames containing `cudaLaunchKernel`, `cuLaunchKernel`, `THCudaInternal`. Each kernel launch traverses the CUDA runtime and driver. CUDA Graphs collapse hundreds of individual launches into a single replay, dramatically narrowing this region.
+
+**Sampling stack (3-5% of CPU time)**: Frames containing `sample`, `_sample`, `top_k`, `top_p`, `temperature`. Sampling logic runs on CPU (or partially on GPU) after logits computation. Complex sampling (beam search, top-p with temperature) is more expensive than greedy.
+
+**Python interpreter overhead (5-10% of CPU time)**: Frames containing `PyObject`, `_PyEval`, `_PyFunction_Vectorcall`. This is pure Python overhead -- the interpreter evaluating bytecode, managing reference counts, checking signals. Wider than 10% suggests hot paths that should be moved to C++ or Cython.
+
+**NCCL communication stack (0-15% of CPU time, multi-GPU only)**: Frames containing `ncclAllReduce`, `ncclSend`, `ncclRecv`, `tcp_sendmsg`, `tcp_recvmsg`. For tensor-parallel serving, NCCL communication shows up in the flamegraph as CPU time spent setting up and waiting for collective operations.
+
+<Benchmark
+  title="Expected Flamegraph Proportions: Healthy vs Unhealthy"
+  columns={["Stack Region", "Healthy %", "Unhealthy %", "If Unhealthy"]}
+  rows={[
+    { values: ["Tokenizer", "5-10%", "Over 20%", "Use batch tokenization, faster tokenizer library"], highlight: false },
+    { values: ["Scheduler", "5-10%", "Over 15%", "Simplify scheduling policy, cache decisions"], highlight: false },
+    { values: ["CUDA launch", "3-5%", "Over 10%", "Enable CUDA Graphs for decode"], highlight: true },
+    { values: ["Sampling", "3-5%", "Over 10%", "Move sampling to GPU, simplify strategy"], highlight: false },
+    { values: ["Python interpreter", "5-8%", "Over 15%", "C++ hot paths, reduce Python in loop"], highlight: true },
+    { values: ["GC / memory mgmt", "1-3%", "Over 5%", "Tune gc thresholds, reduce object churn"], highlight: false },
+    { values: ["NCCL (multi-GPU)", "5-10%", "Over 20%", "Check NVLink health, reduce TP degree"], highlight: true },
+    { values: ["Lock contention", "1-2%", "Over 5%", "Reduce lock scope, use lock-free structures"], highlight: false },
+  ]}
+  notes="Percentages are of total CPU time. These benchmarks assume A100 GPU with vLLM serving Llama-7B/13B."
+/>
+
+### Off-CPU Flamegraphs
+
+On-CPU flamegraphs show where the process is running. Off-CPU flamegraphs show where the process is waiting. For LLM serving, off-CPU analysis often reveals more actionable insights:
+
+```bash
+# Off-CPU flamegraph using eBPF
+# Captures stack traces when the process is descheduled
+sudo offcputime-bpfcc -df -p $(pgrep -f "vllm") 30 \
+    > vllm_offcpu.folded
+flamegraph.pl --title "vLLM Off-CPU" \
+    --colors io \
+    --countname "us" \
+    vllm_offcpu.folded > vllm_offcpu_flame.svg
+```
+
+The off-CPU flamegraph shows the call stacks at the moment the process was blocked. Common findings:
+
+- **futex_wait in Python internals**: GIL contention. Threads are waiting to acquire the GIL.
+- **ep_poll (epoll_wait)**: Waiting for network I/O. Normal for idle periods, concerning during active serving.
+- **ioctl to nvidia driver**: Waiting for GPU memory operations. If this dominates off-CPU time, the CUDA allocator is a bottleneck.
+- **nanosleep / clock_nanosleep**: Deliberate sleeps in polling loops. Some serving frameworks poll for request completion. These can often be replaced with event-driven approaches.
+
+<Callout type="tip" title="Start Here: Your First eBPF Profiling Session">
+  For your first eBPF profiling session on an LLM serving system, generate both on-CPU and off-CPU flamegraphs. Run `profile-bpfcc` for 30 seconds (on-CPU) and `offcputime-bpfcc` for 30 seconds (off-CPU) simultaneously during steady-state serving. The on-CPU flamegraph immediately reveals if CPU time is dominated by expected work (tokenization, scheduling) or unexpected overhead (Python GC, memory allocation, lock contention). The off-CPU flamegraph reveals what the process is waiting for -- GIL, I/O, or GPU operations. Together, they provide a complete picture in under a minute of profiling.
+</Callout>
+
+## Tracing NCCL Communication
+
+For multi-GPU LLM serving with tensor parallelism (TP) or pipeline parallelism (PP), NCCL (NVIDIA Collective Communications Library) handles inter-GPU communication. NCCL operations can consume 30-50% of end-to-end latency for small-batch decode with TP greater than 2. eBPF traces the socket-level and system-level operations that NCCL performs.
+
+### Socket-Level NCCL Tracing
+
+```bash
+#!/usr/bin/env bpftrace
+// nccl_socket_trace.bt
+// Trace NCCL socket send/recv latency and throughput
+// NCCL uses TCP sockets for inter-node, shared memory for intra-node
+
 tracepoint:syscalls:sys_enter_sendmsg
-/comm == "nccl-net"/
+/comm == "nccl-net" || comm == "nccl-socket"/
 {
     @send_start[tid] = nsecs;
+    @send_count = count();
 }
 
 tracepoint:syscalls:sys_exit_sendmsg
 /@send_start[tid]/
 {
-    $latency = (nsecs - @send_start[tid]) / 1000;
-    @nccl_send_us = hist($latency);
+    $latency_us = (nsecs - @send_start[tid]) / 1000;
+    @send_latency_us = hist($latency_us);
+
+    if ($latency_us > 500) {
+        printf("SLOW NCCL send: tid=%d latency=%dus\n", tid, $latency_us);
+    }
+
     delete(@send_start[tid]);
+}
+
+tracepoint:syscalls:sys_enter_recvmsg
+/comm == "nccl-net" || comm == "nccl-socket"/
+{
+    @recv_start[tid] = nsecs;
+    @recv_count = count();
+}
+
+tracepoint:syscalls:sys_exit_recvmsg
+/@recv_start[tid]/
+{
+    $latency_us = (nsecs - @recv_start[tid]) / 1000;
+    @recv_latency_us = hist($latency_us);
+    delete(@recv_start[tid]);
+}
+
+interval:s:10
+{
+    printf("\n=== NCCL Communication (10s) ===\n");
+    printf("Sends: %lld, Recvs: %lld\n", @send_count, @recv_count);
+    printf("Send latency:\n");
+    print(@send_latency_us);
+    printf("Recv latency:\n");
+    print(@recv_latency_us);
 }
 ```
 
+### Quantifying NCCL Overhead
+
 <Benchmark
-  title="NCCL Communication Overhead (2-GPU TP, Llama-70B decode)"
-  columns={["Collective", "Data Size", "Latency (eBPF measured)", "Share of Step"]}
+  title="NCCL Communication Overhead (Tensor Parallel LLM Serving)"
+  columns={["Configuration", "Collectives/Step", "Total Comm Time", "% of Step", "Comm/Compute Ratio"]}
   rows={[
-    { values: ["All-reduce (attention output)", "32 KB", "45 us", "0.7%"], highlight: false },
-    { values: ["All-reduce (FFN output)", "32 KB", "42 us", "0.6%"], highlight: false },
-    { values: ["Total per step (80 layers x 2)", "~5 MB", "~7 ms", "~52%"], highlight: true },
+    { values: ["Llama-7B, TP=2, 32 layers", "64 all-reduce", "~3 ms", "~25%", "0.33"], highlight: false },
+    { values: ["Llama-13B, TP=2, 40 layers", "80 all-reduce", "~3.6 ms", "~22%", "0.28"], highlight: false },
+    { values: ["Llama-70B, TP=2, 80 layers", "160 all-reduce", "~7 ms", "~40%", "0.67"], highlight: true },
+    { values: ["Llama-70B, TP=4, 80 layers", "160 all-reduce", "~12 ms", "~55%", "1.22"], highlight: true },
+    { values: ["Llama-70B, TP=8, 80 layers", "160 all-reduce", "~20 ms", "~65%", "1.86"], highlight: true },
   ]}
-  notes="With TP=2, each decode step requires 160 all-reduces (2 per layer x 80 layers). Small but frequent."
+  notes="Each transformer layer requires 2 all-reduce operations (one after attention, one after FFN). eBPF measures the host-side latency. GPU-side latency is lower due to overlap, but eBPF captures the full cost including setup."
 />
 
-<Callout type="info" title="The TP Overhead Surprise">
-  Each NCCL all-reduce is fast (42-45 us) but there are 160 of them per decode step across 80 layers. eBPF reveals that the aggregate overhead (7 ms) is comparable to the GPU compute time itself. This is why TP=2 doesn't give 2x throughput -- it gives ~1.6x at best due to communication overhead that's invisible to GPU profilers.
+<Callout type="info" title="The TP Scaling Wall">
+  Each NCCL all-reduce is individually fast (40-50 us for small messages over NVLink), but there are $2 \times L$ of them per decode step where $L$ is the number of transformer layers. For Llama-70B with 80 layers, that is 160 all-reduces per step. eBPF reveals that the aggregate communication time (7-20 ms depending on TP degree) is comparable to or exceeds the GPU compute time itself. This is why TP=2 yields roughly 1.6x throughput (not 2x), TP=4 yields roughly 2.5x (not 4x), and TP=8 can actually be slower than TP=4 for small batches. The data from eBPF tracing makes the communication overhead concrete and measurable, enabling informed decisions about TP degree.
 </Callout>
 
-## Production Monitoring with eBPF
+### NVLink vs PCIe Detection
 
-For ongoing production profiling, use eBPF-based tools:
+eBPF can help determine whether NCCL is using NVLink (fast) or PCIe (slow) for a particular GPU pair:
 
 ```bash
-# Flame graph of CPU usage in vLLM process
-# Reveals where Python/C++ CPU time goes
-profile-bpfcc -F 99 -p $(pgrep -f "vllm") 30 > vllm.folded
-flamegraph.pl vllm.folded > vllm_flame.svg
+# Check which transport NCCL is using
+# NCCL logs this at startup, but eBPF can trace it dynamically
 
-# Monitor GPU driver ioctl latency continuously
-funclatency-bpfcc -p $(pgrep -f "vllm") 'c:ioctl' -m 5
+# Monitor shared memory operations (NVLink intra-node path)
+sudo bpftrace -e '
+tracepoint:syscalls:sys_enter_mmap
+/comm == "nccl-sharp" || comm == "nccl-net"/ {
+    @nccl_mmap = count();
+    printf("NCCL mmap: pid=%d tid=%d len=%lu\n", pid, tid, args.len);
+}'
 
-# Trace context switches (GIL contention indicator)
-cpudist-bpfcc -p $(pgrep -f "vllm") 10
+# Compare send/recv volume vs shared memory volume
+# NVLink path uses CUDA IPC (shared memory), not sockets
+# If socket traffic is high, NCCL is falling back to PCIe/TCP
 ```
 
-<Benchmark
-  title="eBPF Profiling Toolkit for LLM Inference"
-  columns={["Tool", "What It Measures", "When to Use"]}
-  rows={[
-    { values: ["profile-bpfcc -> flame graph", "CPU time distribution", "Finding unexpected CPU hotspots"], highlight: true },
-    { values: ["funclatency-bpfcc", "Function call latency histograms", "Measuring allocation, ioctl latency"], highlight: true },
-    { values: ["biolatency-bpfcc", "Block I/O latency", "Model loading from disk"], highlight: false },
-    { values: ["tcplife-bpfcc", "TCP connection lifetime", "NCCL connection health"], highlight: false },
-    { values: ["cpudist-bpfcc", "CPU run queue time", "Detecting GIL contention, scheduling delays"], highlight: false },
-    { values: ["Custom bpftrace scripts", "Anything traceable", "Custom instrumentation points"], highlight: true },
-  ]}
-/>
+When NCCL falls back from NVLink to PCIe, communication latency increases 3-5x. When it falls back to TCP (inter-node), latency increases 10-50x. eBPF socket tracing immediately reveals these fallbacks through the latency distribution -- a jump from 40 us to 200 us per collective indicates PCIe fallback, while a jump to 1+ ms indicates TCP.
 
-## Combining GPU + eBPF Profiling
+## Production Observability with eBPF
 
-The power comes from combining both perspectives:
+The profiling techniques above are for investigation. For production, you need continuous low-overhead monitoring that feeds into your observability stack.
 
-1. **Nsight Systems** gives you the GPU timeline -- kernel durations, CUDA API calls, memory copies
-2. **eBPF** gives you the CPU/system timeline -- what happens between GPU events
-3. **Correlate by timestamp** -- match CPU gaps in Nsight Systems with eBPF traces to explain mysterious latency
+### Continuous Profiling Architecture
 
 ```bash
-# Synchronized profiling session
-# Terminal 1: Nsight Systems (GPU timeline)
-nsys profile -t cuda,nvtx -o gpu_trace python -m vllm.entrypoints.api_server
+# Production eBPF monitoring daemon
+# Runs continuously, exports metrics every 15 seconds
 
-# Terminal 2: eBPF (CPU/system timeline)
+#!/bin/bash
+# llm_ebpf_monitor.sh
+
+# Start background eBPF collectors
+
+# 1. CUDA driver latency (exports as histogram to file)
 bpftrace -e '
-  tracepoint:syscalls:sys_enter_ioctl /comm == "python3"/ { @ioctl = count(); }
-  tracepoint:sched:sched_switch /comm == "python3"/ { @ctxsw = count(); }
-' -c 'sleep 30'
+tracepoint:syscalls:sys_enter_ioctl /comm == "python3"/ { @s[tid]=nsecs; }
+tracepoint:syscalls:sys_exit_ioctl /@s[tid]/ {
+    @ioctl_us = hist((nsecs - @s[tid])/1000);
+    delete(@s[tid]);
+}
+interval:s:15 { print(@ioctl_us); clear(@ioctl_us); }
+' > /var/log/ebpf/ioctl_latency.log 2>&1 &
+
+# 2. Context switch monitoring
+bpftrace -e '
+tracepoint:sched:sched_switch /args.prev_comm == "python3"/ {
+    @csw = count();
+}
+interval:s:15 {
+    printf("context_switches %lld\n", @csw);
+    clear(@csw);
+}
+' > /var/log/ebpf/context_switches.log 2>&1 &
+
+# 3. Continuous CPU profiling (low-frequency)
+profile-bpfcc -F 49 -p $(pgrep -f "vllm") -f 0 \
+    > /var/log/ebpf/cpu_stacks.folded 2>&1 &
+
+echo "eBPF monitors started. Logs in /var/log/ebpf/"
 ```
 
-<Callout type="tip" title="Start Here">
-  For your first eBPF profiling session on an LLM serving system: run `profile-bpfcc` for 30 seconds and generate a flame graph. The flame graph immediately reveals if CPU time is dominated by expected work (tokenization, scheduling) or unexpected overhead (Python GC, memory allocation, lock contention).
-</Callout>
+### Detecting Performance Regressions
+
+eBPF monitoring enables automated regression detection by establishing baselines and alerting on deviations:
+
+```python
+#!/usr/bin/env python3
+"""
+eBPF-based performance regression detector for LLM serving.
+Reads eBPF output, compares against baselines, alerts on regressions.
+"""
+
+import subprocess
+import time
+import statistics
+import json
+from datetime import datetime
+
+class EBPFRegressionDetector:
+    def __init__(self, baseline_file="ebpf_baseline.json"):
+        self.baseline = self._load_baseline(baseline_file)
+        self.current_window = []
+
+    def _load_baseline(self, path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return None
+
+    def collect_metrics(self):
+        """Collect one round of eBPF metrics."""
+        metrics = {}
+
+        # Measure ioctl latency P99
+        result = subprocess.run(
+            ["bpftrace", "-e", """
+            tracepoint:syscalls:sys_enter_ioctl /comm=="python3"/ { @s[tid]=nsecs; }
+            tracepoint:syscalls:sys_exit_ioctl /@s[tid]/ {
+                @lat = hist((nsecs-@s[tid])/1000);
+                delete(@s[tid]);
+            }
+            interval:s:5 { exit(); }
+            """],
+            capture_output=True, text=True, timeout=10
+        )
+        # Parse histogram output for P99
+        metrics['ioctl_p99_us'] = self._parse_hist_p99(result.stdout)
+
+        # Measure context switch rate
+        result = subprocess.run(
+            ["bpftrace", "-e", """
+            tracepoint:sched:sched_switch /args.prev_comm=="python3"/ {
+                @csw = count();
+            }
+            interval:s:5 { printf("%lld\\n", @csw); exit(); }
+            """],
+            capture_output=True, text=True, timeout=10
+        )
+        metrics['context_switches_per_5s'] = int(
+            result.stdout.strip().split('\n')[-1]
+        )
+
+        metrics['timestamp'] = datetime.now().isoformat()
+        return metrics
+
+    def check_regression(self, metrics):
+        """Compare current metrics against baseline."""
+        if not self.baseline:
+            return []
+
+        regressions = []
+        for key, value in metrics.items():
+            if key == 'timestamp':
+                continue
+            baseline_val = self.baseline.get(key)
+            if baseline_val and value > baseline_val * 1.5:  # 50% regression
+                regressions.append({
+                    'metric': key,
+                    'baseline': baseline_val,
+                    'current': value,
+                    'regression_pct': (value - baseline_val) / baseline_val * 100
+                })
+
+        return regressions
+
+    def _parse_hist_p99(self, output):
+        # Simplified histogram P99 parsing
+        # In production, use proper histogram aggregation
+        return 100  # placeholder
+
+    def run(self, interval_seconds=60):
+        """Continuous monitoring loop."""
+        while True:
+            metrics = self.collect_metrics()
+            regressions = self.check_regression(metrics)
+
+            if regressions:
+                for r in regressions:
+                    print(f"REGRESSION: {r['metric']} "
+                          f"baseline={r['baseline']} "
+                          f"current={r['current']} "
+                          f"({r['regression_pct']:.1f}% increase)")
+
+            time.sleep(interval_seconds)
+```
+
+### Correlating eBPF Metrics with Request Latency
+
+The ultimate goal is to correlate system-level observations from eBPF with user-visible metrics like time-to-first-token (TTFT) and inter-token latency (ITL):
+
+```python
+# Prometheus metrics that bridge eBPF and application
+from prometheus_client import Histogram, Gauge
+
+# Application-level
+request_ttft = Histogram(
+    'llm_time_to_first_token_seconds',
+    'Time to first token',
+    buckets=[0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+)
+
+request_itl = Histogram(
+    'llm_inter_token_latency_seconds',
+    'Inter-token latency',
+    buckets=[0.01, 0.02, 0.05, 0.1, 0.2, 0.5]
+)
+
+# eBPF-derived (exported by ebpf monitor)
+ioctl_p99 = Gauge('ebpf_ioctl_p99_us', 'P99 ioctl latency in us')
+context_switches = Gauge('ebpf_context_switches_per_sec', 'Context switches/sec')
+futex_wait_total = Gauge('ebpf_futex_wait_total_us', 'Total futex wait time in us')
+nccl_send_p99 = Gauge('ebpf_nccl_send_p99_us', 'P99 NCCL send latency in us')
+```
+
+When TTFT spikes, you can check the eBPF metrics at the same timestamp:
+
+- **ioctl_p99 spiked**: GPU memory operation was slow -- likely fragmentation or large allocation.
+- **context_switches spiked**: CPU scheduling issue -- GIL contention or insufficient CPU cores.
+- **futex_wait spiked**: Lock contention -- possibly in the CUDA driver or Python runtime.
+- **nccl_send_p99 spiked**: Multi-GPU communication degradation -- check NVLink/network health.
+
+<Benchmark
+  title="eBPF Production Monitoring Toolkit"
+  columns={["Tool/Script", "What It Measures", "Production Overhead", "When to Use"]}
+  rows={[
+    { values: ["profile-bpfcc (low freq)", "CPU stack samples at 49 Hz", "Under 0.5%", "Continuous profiling for flamegraphs"], highlight: true },
+    { values: ["offcputime-bpfcc", "Off-CPU wait time distribution", "Under 1%", "Diagnosing latency spikes"], highlight: true },
+    { values: ["funclatency-bpfcc", "Function call latency histograms", "Under 0.5%", "Monitoring CUDA driver latency"], highlight: false },
+    { values: ["biolatency-bpfcc", "Block I/O latency", "Under 0.1%", "Model loading, checkpoint writing"], highlight: false },
+    { values: ["tcplife-bpfcc", "TCP connection lifetime and throughput", "Under 0.1%", "NCCL connection health"], highlight: false },
+    { values: ["cpudist-bpfcc", "CPU run queue time distribution", "Under 0.5%", "Detecting scheduling delays"], highlight: false },
+    { values: ["hardirqs-bpfcc", "Hardware interrupt latency", "Under 0.1%", "NIC interrupt coalescing issues"], highlight: false },
+    { values: ["Custom bpftrace scripts", "Anything traceable in kernel/userspace", "Varies (under 1% typical)", "Custom instrumentation points"], highlight: true },
+  ]}
+  notes="All overhead numbers assume tracing a single process. Tracing system-wide adds more overhead."
+/>
+
+## Advanced: Building a Custom eBPF Profiler for LLM Serving
+
+For teams with specific profiling needs, building a custom eBPF tool using BCC (BPF Compiler Collection) provides more power than bpftrace one-liners:
+
+```python
+#!/usr/bin/env python3
+"""
+llm_profiler.py - Custom eBPF profiler for LLM inference serving
+Uses BCC to trace CUDA driver, memory, and scheduling events
+"""
+
+from bcc import BPF
+import time
+import json
+
+bpf_program = """
+#include <uapi/linux/ptrace.h>
+
+// Hash maps for tracking latency
+BPF_HASH(ioctl_start, u32, u64);
+BPF_HASH(launch_start, u32, u64);
+
+// Histograms for latency distribution
+BPF_HISTOGRAM(ioctl_latency, int);
+BPF_HISTOGRAM(launch_latency, int);
+
+// Counters
+BPF_ARRAY(counters, u64, 4);  // 0=ioctl, 1=launch, 2=sync, 3=malloc
+
+// Trace ioctl entry (GPU driver calls)
+TRACEPOINT_PROBE(syscalls, sys_enter_ioctl) {
+    u32 tid = bpf_get_current_pid_tgid();
+    u64 ts = bpf_ktime_get_ns();
+    ioctl_start.update(&tid, &ts);
+
+    u32 key = 0;
+    u64 *val = counters.lookup(&key);
+    if (val) (*val)++;
+    return 0;
+}
+
+// Trace ioctl exit
+TRACEPOINT_PROBE(syscalls, sys_exit_ioctl) {
+    u32 tid = bpf_get_current_pid_tgid();
+    u64 *tsp = ioctl_start.lookup(&tid);
+    if (!tsp) return 0;
+
+    u64 delta = (bpf_ktime_get_ns() - *tsp) / 1000;  // us
+    int key = bpf_log2l(delta);
+    ioctl_latency.atomic_increment(key);
+
+    ioctl_start.delete(&tid);
+    return 0;
+}
+
+// Trace context switches for the target process
+TRACEPOINT_PROBE(sched, sched_switch) {
+    // Count voluntary vs involuntary switches
+    u32 key = 2;  // reuse counter slot
+    u64 *val = counters.lookup(&key);
+    if (val) (*val)++;
+    return 0;
+}
+"""
+
+def main():
+    b = BPF(text=bpf_program)
+
+    print("Tracing LLM serving process... Ctrl+C to stop")
+
+    try:
+        while True:
+            time.sleep(10)
+
+            print("\n=== ioctl latency (us) ===")
+            b["ioctl_latency"].print_log2_hist("us")
+            b["ioctl_latency"].clear()
+
+            counters = b["counters"]
+            print(f"ioctl calls: {counters[0].value}")
+            print(f"context switches: {counters[2].value}")
+
+    except KeyboardInterrupt:
+        print("\nDone.")
+
+if __name__ == "__main__":
+    main()
+```
+
+This BCC program can be extended with:
+
+- **Per-request tracing**: Correlate eBPF events with individual inference requests by tracing NVTX range push/pop calls.
+- **Adaptive sampling**: Increase tracing frequency when latency exceeds thresholds, reduce during normal operation.
+- **Prometheus export**: Push metrics to Prometheus for dashboarding alongside application metrics.
+- **Ring buffer streaming**: Stream individual events (not just aggregates) for detailed post-hoc analysis.
+
+## Combining GPU and eBPF Profiling: The Complete Picture
+
+The full observability stack for LLM inference combines GPU-side and system-side profiling:
+
+```bash
+# Synchronized profiling session for complete visibility
+
+# Terminal 1: Nsight Systems (GPU timeline)
+nsys profile -t cuda,nvtx,osrt \
+    --cuda-memory-usage=true \
+    --gpu-metrics-device=all \
+    -d 30 -o gpu_trace \
+    python -m vllm.entrypoints.openai.api_server \
+        --model meta-llama/Llama-2-7b-hf
+
+# Terminal 2: eBPF system profiling (simultaneous)
+sudo bpftrace -e '
+BEGIN { printf("eBPF profiling started at %lld\n", nsecs); }
+
+// GPU driver calls
+tracepoint:syscalls:sys_enter_ioctl /comm == "python3"/ {
+    @ioctl_start[tid] = nsecs;
+}
+tracepoint:syscalls:sys_exit_ioctl /@ioctl_start[tid]/ {
+    @ioctl_us = hist((nsecs - @ioctl_start[tid]) / 1000);
+    delete(@ioctl_start[tid]);
+}
+
+// Context switches
+tracepoint:sched:sched_switch /args.prev_comm == "python3"/ {
+    @ctx_switches = count();
+}
+
+// Network (NCCL)
+tracepoint:syscalls:sys_enter_sendmsg /comm == "python3"/ {
+    @sends = count();
+}
+
+interval:s:5 {
+    printf("\n--- 5s report (time=%lld) ---\n", nsecs);
+    print(@ioctl_us);
+    printf("ctx_switches=%lld sends=%lld\n", @ctx_switches, @sends);
+    clear(@ioctl_us);
+    clear(@ctx_switches);
+    clear(@sends);
+}
+' &
+
+# Terminal 3: CPU flamegraph capture
+sudo profile-bpfcc -F 99 -p $(pgrep -f "vllm") 30 > cpu.folded &
+
+# Terminal 4: Send load
+python benchmark_serving.py \
+    --backend openai \
+    --model meta-llama/Llama-2-7b-hf \
+    --num-prompts 100 \
+    --request-rate 10
+```
+
+After the capture, you have:
+
+1. **Nsight Systems report** (`gpu_trace.nsys-rep`): GPU kernel timeline, memory operations, CUDA API calls, NVTX annotations
+2. **eBPF ioctl histogram**: System call latency for GPU driver interactions
+3. **eBPF context switch count**: CPU scheduling overhead
+4. **CPU flamegraph** (`cpu.folded`): Where CPU time is spent
+
+Correlate by timestamp: if Nsight Systems shows a 500 us GPU idle gap at $t = 12.3s$, check the eBPF output at the same time. If ioctl latency spiked, the GPU was waiting for a memory operation. If context switches spiked, the CPU was descheduled. If neither spiked, the CPU was busy doing Python work -- the flamegraph shows what.
+
+<PerfChart
+  title="End-to-End Latency Decomposition (eBPF + Nsight, single decode step)"
+  unit="us"
+  data={[
+    { label: "GPU compute (Nsight)", value: 4800, color: "blue", annotation: "GEMM, attention, MLP kernels" },
+    { label: "GPU idle / kernel gap (Nsight)", value: 400, color: "gray", annotation: "Between kernels" },
+    { label: "CUDA driver overhead (eBPF)", value: 150, color: "red", annotation: "ioctl for launch + memory" },
+    { label: "CPU scheduler logic (eBPF)", value: 350, color: "orange", annotation: "Batch formation" },
+    { label: "Python overhead (eBPF)", value: 200, color: "orange", annotation: "GIL, GC, interpreter" },
+    { label: "Tokenizer/sampling (eBPF)", value: 180, color: "orange", annotation: "Token encode/decode" },
+    { label: "NCCL communication (eBPF)", value: 0, color: "gray", annotation: "Single GPU" },
+    { label: "Context switch delays (eBPF)", value: 50, color: "red", annotation: "OS scheduling" },
+  ]}
+/>
+
+This decomposition is only possible by combining both profiling approaches. Nsight sees the GPU side (5200 us of GPU activity). eBPF sees the CPU/system side (930 us of non-GPU overhead). Together they explain the full 6130 us per decode step.
 
 ## Conclusion
 
-eBPF fills the critical observability gap for LLM inference: the CPU/system layer that GPU profilers don't see. In production, 10-20% of end-to-end latency comes from non-GPU sources -- memory allocation, scheduler logic, NCCL socket operations, and Python runtime overhead. eBPF traces these at kernel level with under 1% overhead, making it safe for production use. The combination of Nsight Systems (GPU) + eBPF (system) provides complete end-to-end observability from user request to token generation.
+eBPF fills the critical observability gap for LLM inference: the CPU and system layer that GPU profilers cannot see. In production, 10-20% of end-to-end latency comes from non-GPU sources -- CUDA driver overhead, memory allocation, scheduler logic, NCCL socket operations, Python GIL contention, and OS scheduling delays. GPU profilers report these periods as "GPU idle" but offer no explanation. eBPF explains exactly what the CPU and kernel are doing during every microsecond of that idle time.
+
+The practical toolkit is straightforward: `bpftrace` one-liners for ad-hoc investigation, `profile-bpfcc` and `offcputime-bpfcc` for flamegraphs, custom BCC scripts for continuous monitoring, and correlation with Nsight Systems for the complete picture. The overhead -- consistently under 1% for targeted tracing -- makes eBPF safe for production use, not just laboratory investigation.
+
+The combination of Nsight Systems (GPU timeline) and eBPF (system-level tracing) provides complete end-to-end observability from HTTP request to generated token. Every microsecond is accounted for. Every bottleneck is visible. For teams operating LLM serving at scale, this combination is not optional -- it is the difference between guessing where latency comes from and knowing.

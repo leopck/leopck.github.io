@@ -1,68 +1,180 @@
 ---
 title: "Attention Variants Compared: MHA, MQA, GQA, and MLA"
 author: "stanley-phoong"
-description: "Technical comparison of Multi-Head Attention, Multi-Query Attention, Grouped-Query Attention, and Multi-head Latent Attention. Analysis of memory-compute trade-offs and implementation considerations."
-publishDate: 2024-11-07
+description: "A comprehensive technical deep-dive into KV cache memory as the dominant inference bottleneck, and how Multi-Head Attention, Multi-Query Attention, Grouped-Query Attention, and Multi-head Latent Attention each address it. Includes exact memory math, real-world scale comparisons, quality impact analysis, and a practical decision framework."
+publishDate: 2025-03-21
 category: transformers
-tags: [attention, mha, mqa, gqa, mla, transformers, memory]
+tags: [attention, mha, mqa, gqa, mla, transformers, memory, kv-cache, deepseek, inference]
 difficulty: advanced
-readingTime: 22
+readingTime: 30
 ---
 
 import Callout from '@/components/mdx/Callout.astro';
-import PerfChart from '@/components/mdx/PerfChart.astro';
 import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+import MemoryLayout from '@/components/mdx/MemoryLayout.astro';
 
-The attention mechanism's KV cache grows linearly with sequence length and batch size, dominating memory in long-context inference. Different attention variants trade model quality for memory efficiency. Let's analyze them quantitatively.
+Large language models have become extraordinarily capable, but deploying them at scale forces engineers to confront a brutal reality: the attention mechanism's KV cache is often the single largest memory consumer during inference, eclipsing even the model weights themselves for long-context workloads. The evolution from Multi-Head Attention (MHA) to Multi-Query Attention (MQA) to Grouped-Query Attention (GQA) to Multi-head Latent Attention (MLA) represents a sustained, multi-year effort to tame this bottleneck without sacrificing model quality.
 
-## Multi-Head Attention (MHA)
+This post is a unified reference. We will derive the exact memory equations, walk through each variant's motivation and mechanism, compute real-world numbers for models like Llama 3 70B and DeepSeek-V2, and provide a decision framework for choosing the right variant for your deployment.
 
-The standard attention formulation:
+---
+
+## Why KV Cache Memory Is the Number-One Bottleneck
+
+Before comparing attention variants, it is worth establishing *why* the KV cache dominates inference memory. Many practitioners assume model weights are the primary concern, but at production batch sizes and context lengths, the KV cache routinely exceeds the weight memory by a wide margin.
+
+### The Autoregressive Decode Loop
+
+During the decode phase of autoregressive generation, each new token must attend to *every* previous token. Recomputing keys and values from scratch at every step would be quadratically expensive in compute. Instead, we cache the K and V projections for all previously generated tokens -- this is the KV cache.
+
+The KV cache grows along two axes simultaneously:
+
+1. **Sequence length**: every new token appends one entry per layer per head.
+2. **Batch size**: serving multiple requests in parallel multiplies the cache linearly.
+
+For a single attention layer using standard MHA, the KV cache stores:
+
+$$
+\text{KV}_\text{layer} = 2 \times n_\text{heads} \times d_\text{head} \times s \times b \times d_\text{type}
+$$
+
+where $n_\text{heads}$ is the number of attention heads, $d_\text{head}$ is the dimension per head, $s$ is the sequence length, $b$ is the batch size, and $d_\text{type}$ is the number of bytes per element (2 for FP16/BF16).
+
+Summing across all $L$ layers:
+
+$$
+\text{KV}_\text{total} = 2 \times L \times n_\text{heads} \times d_\text{head} \times s \times b \times d_\text{type}
+$$
+
+### Concrete Example: Llama 2 70B (MHA Hypothetical)
+
+Suppose Llama 2 70B used full MHA (it actually uses GQA, but let us compute the MHA baseline for comparison). Its architecture has $L = 80$ layers, $n_\text{heads} = 64$, $d_\text{head} = 128$, using BF16 ($d_\text{type} = 2$).
+
+**Per token, per layer:**
+
+$$
+2 \times 64 \times 128 \times 2 = 32{,}768 \text{ bytes} = 32 \text{ KB}
+$$
+
+**Per token, all layers:**
+
+$$
+32 \text{ KB} \times 80 = 2{,}560 \text{ KB} = 2.5 \text{ MB}
+$$
+
+**For a single request at 4,096 tokens:**
+
+$$
+2.5 \text{ MB} \times 4{,}096 = 10{,}240 \text{ MB} \approx 10 \text{ GB}
+$$
+
+**For a batch of 32 requests at 4,096 tokens:**
+
+$$
+10 \text{ GB} \times 32 = 320 \text{ GB}
+$$
+
+The model weights for Llama 2 70B in BF16 occupy roughly 140 GB. A batch of 32 at a 4K context would require 320 GB of KV cache alone -- more than double the weight memory. At 128K context (which modern models support), a single request would consume 320 GB of KV cache. This is simply unservable.
+
+<Callout type="warning" title="KV Cache vs. Model Weights">
+  At batch size 1 and short context, model weights dominate. But production inference systems typically run batch sizes of 8--64 to amortize weight-loading cost. At these scales, KV cache is the bottleneck. For long-context models (128K+ tokens), a single request can exhaust all available GPU memory with KV cache alone.
+</Callout>
+
+### Memory Bandwidth: The Hidden Cost
+
+Even when the KV cache fits in memory, it must be *read* at every decode step. Each generated token triggers a full scan of the KV cache for all layers. On an H100 with 3.35 TB/s of HBM bandwidth, reading a 10 GB KV cache takes roughly 3 ms -- and that is for a *single* token. Reducing KV cache size directly improves decode latency because the operation is memory-bandwidth-bound, not compute-bound.
+
+<MemoryLayout
+  title="GPU Memory During Inference (80 GB HBM)"
+  description="Llama 2 70B hypothetical MHA at batch=8, seq=4096"
+  regions={[
+    { start: "0x0000", end: "0x8C00", name: "Model Weights (BF16)", size: "140 GB", color: "blue", notes: "Spread across 2x H100 via tensor parallelism" },
+    { start: "0x8C00", end: "0xDC00", name: "KV Cache (MHA)", size: "80 GB", color: "red", notes: "2 * 80 * 64 * 128 * 4096 * 8 * 2 bytes" },
+    { start: "0xDC00", end: "0xE800", name: "Activations + Workspace", size: "12 GB", color: "green", notes: "Intermediate tensors, CUDA workspace" },
+    { start: "0xE800", end: "0xF000", name: "OS / Framework Overhead", size: "8 GB", color: "gray", notes: "PyTorch allocator, NCCL buffers" }
+  ]}
+/>
+
+This is the core motivation: **any technique that reduces KV cache size directly translates to serving more users, longer contexts, or both on the same hardware.**
+
+---
+
+## Multi-Head Attention (MHA): The Baseline
+
+Multi-Head Attention, introduced in the original Transformer paper (Vaswani et al., 2017), gives each attention head its own independent Q, K, and V projection. This provides maximum representational capacity: each head can learn to attend to different aspects of the input.
+
+### Architecture
 
 ```python
 class MultiHeadAttention:
     """
     Standard MHA: Each head has independent Q, K, V projections.
+    n_kv_heads == n_q_heads -- full capacity, full memory cost.
     """
     def __init__(self, d_model: int, num_heads: int):
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
-        
+
         # Separate projections for each head
         self.W_q = nn.Linear(d_model, d_model)  # [d_model, num_heads * head_dim]
         self.W_k = nn.Linear(d_model, d_model)  # [d_model, num_heads * head_dim]
         self.W_v = nn.Linear(d_model, d_model)  # [d_model, num_heads * head_dim]
         self.W_o = nn.Linear(d_model, d_model)
-    
+
     def forward(self, x, kv_cache=None):
         B, L, D = x.shape
-        
+
         Q = self.W_q(x).view(B, L, self.num_heads, self.head_dim)
         K = self.W_k(x).view(B, L, self.num_heads, self.head_dim)
         V = self.W_v(x).view(B, L, self.num_heads, self.head_dim)
-        
-        # KV cache size: 2 * batch * seq_len * num_heads * head_dim * dtype
+
+        # KV cache stores: 2 * batch * seq_len * num_heads * head_dim * dtype
         if kv_cache is not None:
             K = torch.cat([kv_cache[0], K], dim=1)
             V = torch.cat([kv_cache[1], V], dim=1)
-        
+
         # Attention: [B, num_heads, L, L]
         scores = torch.einsum('blhd,bshd->bhls', Q, K) / math.sqrt(self.head_dim)
         attn = F.softmax(scores, dim=-1)
         out = torch.einsum('bhls,bshd->blhd', attn, V)
-        
+
         return self.W_o(out.reshape(B, L, D)), (K, V)
 ```
 
-**Memory per token per layer:**
-```
-KV cache = 2 x num_heads x head_dim x dtype_bytes
-         = 2 x 32 x 128 x 2 = 16 KB (for 32 heads, FP16)
-```
+### Memory Formula
 
-## Multi-Query Attention (MQA)
+**Per token, per layer:**
 
-MQA uses a single K, V head shared across all query heads:
+$$
+\text{KV}_\text{MHA} = 2 \times n_\text{heads} \times d_\text{head} \times d_\text{type}
+$$
+
+For a typical configuration ($n_\text{heads} = 32$, $d_\text{head} = 128$, BF16):
+
+$$
+2 \times 32 \times 128 \times 2 = 16{,}384 \text{ bytes} = 16 \text{ KB}
+$$
+
+### Why MHA Became Unsustainable
+
+MHA was designed in an era when models had 6 layers and 512-dimensional embeddings. The Transformer-base model's total KV cache per token across all layers was a mere 6 KB. At the scale of GPT-3 (96 layers, 96 heads, $d_\text{head} = 128$), the per-token KV cache balloons to:
+
+$$
+2 \times 96 \times 96 \times 128 \times 2 = 4{,}718{,}592 \text{ bytes} \approx 4.5 \text{ MB per token}
+$$
+
+For a 2,048-token context with batch size 16, that is roughly 150 GB of KV cache. The need for alternatives became inescapable.
+
+---
+
+## Multi-Query Attention (MQA): The Radical Compression
+
+### Motivation
+
+In 2019, Noam Shazeer published "Fast Transformer Decoding: One Write-Head is All You Need," observing a key insight: during decode, the KV cache read is the dominant cost, and *all query heads attend to the same key-value pairs anyway*. If we force all query heads to share a single set of keys and values, we slash the KV cache by a factor of $n_\text{heads}$ with no change to the compute pattern of the query side.
+
+### Architecture
 
 ```python
 class MultiQueryAttention:
@@ -73,221 +185,165 @@ class MultiQueryAttention:
     def __init__(self, d_model: int, num_heads: int):
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
-        
+
         # Full projection for Q
         self.W_q = nn.Linear(d_model, d_model)
         # Single head projection for K, V
-        self.W_k = nn.Linear(d_model, self.head_dim)  # Only 1 head!
-        self.W_v = nn.Linear(d_model, self.head_dim)  # Only 1 head!
+        self.W_k = nn.Linear(d_model, self.head_dim)  # Only 1 head
+        self.W_v = nn.Linear(d_model, self.head_dim)  # Only 1 head
         self.W_o = nn.Linear(d_model, d_model)
-    
+
     def forward(self, x, kv_cache=None):
         B, L, D = x.shape
-        
+
         Q = self.W_q(x).view(B, L, self.num_heads, self.head_dim)
-        K = self.W_k(x).view(B, L, 1, self.head_dim)  # [B, L, 1, head_dim]
+        K = self.W_k(x).view(B, L, 1, self.head_dim)
         V = self.W_v(x).view(B, L, 1, self.head_dim)
-        
-        # Broadcast K, V to all heads
+
+        # Broadcast K, V to all heads (no memory copy)
         K = K.expand(-1, -1, self.num_heads, -1)
         V = V.expand(-1, -1, self.num_heads, -1)
-        
-        # KV cache is 32x smaller!
+
         if kv_cache is not None:
             K = torch.cat([kv_cache[0], K], dim=1)
             V = torch.cat([kv_cache[1], V], dim=1)
-        
-        # Rest is identical to MHA
+
         scores = torch.einsum('blhd,bshd->bhls', Q, K) / math.sqrt(self.head_dim)
         attn = F.softmax(scores, dim=-1)
         out = torch.einsum('bhls,bshd->blhd', attn, V)
-        
+
         return self.W_o(out.reshape(B, L, D)), (K[:,:,0:1,:], V[:,:,0:1,:])
 ```
 
-**Memory per token per layer:**
-```
-KV cache = 2 x 1 x head_dim x dtype_bytes
-         = 2 x 1 x 128 x 2 = 512 bytes (32x reduction!)
-```
+### Memory Formula
+
+**Per token, per layer:**
+
+$$
+\text{KV}_\text{MQA} = 2 \times 1 \times d_\text{head} \times d_\text{type}
+$$
+
+For $d_\text{head} = 128$, BF16:
+
+$$
+2 \times 1 \times 128 \times 2 = 512 \text{ bytes}
+$$
+
+That is a $32\times$ reduction compared to MHA with 32 heads -- an enormous saving. Models like PaLM (540B) and Falcon adopted MQA for exactly this reason.
+
+### The Problem with MQA
+
+The single KV head becomes an information bottleneck. All 32 (or 64, or 96) query heads must extract their distinct attention patterns from exactly one set of keys and values. Empirically, this causes:
+
+- **1--3% degradation** on most benchmarks (MMLU, HumanEval, etc.)
+- **Noticeably worse** performance on tasks requiring fine-grained token-level distinctions, such as coreference resolution and multi-hop reasoning
+- **Training instability** at very large scales, as the single KV head must satisfy highly divergent attention patterns
 
 <Callout type="warning" title="Quality Trade-off">
-  MQA reduces model quality by 1-3% on most benchmarks. The single KV head becomes an information bottleneck, especially for tasks requiring fine-grained token interactions.
+  MQA reduces model quality by 1--3% on most benchmarks. The single KV head becomes an information bottleneck, especially for tasks requiring fine-grained token interactions. For some applications this degradation is acceptable; for others it is not.
 </Callout>
 
-## Grouped-Query Attention (GQA)
+The community needed a middle ground -- a way to get most of MQA's memory savings without paying the full quality tax. That middle ground is GQA.
 
-GQA interpolates between MHA and MQA:
+---
+
+## Grouped-Query Attention (GQA): The Pragmatic Middle Ground
+
+### Motivation
+
+Ainslie et al. (2023) introduced GQA in "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints." The core idea is simple: instead of sharing one KV head across all query heads (MQA) or giving each query head its own KV head (MHA), partition the query heads into $G$ groups, each group sharing one KV head.
+
+When $G = 1$, GQA reduces to MQA. When $G = n_\text{heads}$, GQA reduces to MHA. Any value in between provides a tunable trade-off between memory and quality.
+
+### Architecture
 
 ```python
-class GroupedQueryAttention:
+class GroupedQueryAttention(nn.Module):
     """
     GQA: Groups of Q heads share K, V heads.
-    Used by Llama 2 70B, Llama 3, Mistral, etc.
+    Used by Llama 2 70B, Llama 3, Mistral, Gemma, etc.
     """
     def __init__(self, d_model: int, num_heads: int, num_kv_heads: int):
+        super().__init__()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.num_groups = num_heads // num_kv_heads
         self.head_dim = d_model // num_heads
-        
+
         self.W_q = nn.Linear(d_model, num_heads * self.head_dim)
         self.W_k = nn.Linear(d_model, num_kv_heads * self.head_dim)
         self.W_v = nn.Linear(d_model, num_kv_heads * self.head_dim)
         self.W_o = nn.Linear(d_model, d_model)
-    
+
     def forward(self, x, kv_cache=None):
         B, L, D = x.shape
-        
+
         Q = self.W_q(x).view(B, L, self.num_heads, self.head_dim)
         K = self.W_k(x).view(B, L, self.num_kv_heads, self.head_dim)
         V = self.W_v(x).view(B, L, self.num_kv_heads, self.head_dim)
-        
-        # Expand K, V to match Q heads
-        # Each KV head serves num_groups Q heads
-        K = K.repeat_interleave(self.num_groups, dim=2)  # [B, L, num_heads, head_dim]
+
+        # Expand K, V to match Q heads via repeat_interleave
+        # This is a memory VIEW in PyTorch -- no actual data copying
+        K = K.repeat_interleave(self.num_groups, dim=2)
         V = V.repeat_interleave(self.num_groups, dim=2)
-        
+
         if kv_cache is not None:
             K = torch.cat([kv_cache[0], K], dim=1)
             V = torch.cat([kv_cache[1], V], dim=1)
-        
-        scores = torch.einsum('blhd,bshd->bhls', Q, K) / math.sqrt(self.head_dim)
+
+        Q = Q.transpose(1, 2)  # [B, num_heads, L, head_dim]
+        K = K.transpose(1, 2)
+        V = V.transpose(1, 2)
+
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
         attn = F.softmax(scores, dim=-1)
-        out = torch.einsum('bhls,bshd->blhd', attn, V)
-        
-        # Store only num_kv_heads in cache
-        K_cache = K[:, :, ::self.num_groups, :]
-        V_cache = V[:, :, ::self.num_groups, :]
-        
-        return self.W_o(out.reshape(B, L, D)), (K_cache, V_cache)
+        out = torch.matmul(attn, V)
+
+        out = out.transpose(1, 2).reshape(B, L, -1)
+
+        # Store only num_kv_heads in cache (not the expanded version)
+        K_cache = K[:, ::self.num_groups, :, :]
+        V_cache = V[:, ::self.num_groups, :, :]
+
+        return self.W_o(out), (K_cache, V_cache)
 ```
 
-**Llama 2 70B configuration:**
-- num_heads = 64, num_kv_heads = 8
-- Compression ratio: 64/8 = 8x
-- Memory per token: 2 x 8 x 128 x 2 = 4 KB
-
-## Memory Comparison
-
-<Benchmark
-  title="KV Cache Size Comparison (Per Layer, Per Token)"
-  columns={["Variant", "Config", "Bytes/Token", "Reduction"]}
-  rows={[
-    { values: ["MHA", "32 heads", "16,384", "1x (baseline)"], highlight: false },
-    { values: ["GQA", "32 Q / 8 KV", "4,096", "4x"], highlight: true },
-    { values: ["GQA", "32 Q / 4 KV", "2,048", "8x"], highlight: true },
-    { values: ["MQA", "32 Q / 1 KV", "512", "32x"], highlight: false },
-  ]}
-  notes="FP16, head_dim=128"
-/>
-
-<PerfChart
-  title="Maximum Context Length at Fixed Memory (80GB)"
-  unit="K tokens"
-  data={[
-    { label: "MHA (Llama 7B)", value: 32, color: "red" },
-    { label: "GQA 8x (Llama 70B)", value: 128, color: "orange" },
-    { label: "MQA 32x", value: 256, color: "green" },
-  ]}
-/>
-
-## Multi-head Latent Attention (MLA)
-
-DeepSeek-V2's MLA compresses KV differently:
-
-```python
-class MultiHeadLatentAttention:
-    """
-    MLA: Compresses KV into low-rank latent space.
-    Key insight: K, V have low intrinsic dimensionality.
-    """
-    def __init__(self, d_model: int, num_heads: int, 
-                 kv_latent_dim: int, rope_dim: int):
-        self.num_heads = num_heads
-        self.head_dim = d_model // num_heads
-        self.kv_latent_dim = kv_latent_dim  # e.g., 512
-        self.rope_dim = rope_dim  # Rotary embedding dimension
-        
-        # Q projection (standard)
-        self.W_q = nn.Linear(d_model, d_model)
-        
-        # Compress KV to latent space
-        self.W_kv_compress = nn.Linear(d_model, kv_latent_dim)  # Down-project
-        
-        # Expand from latent to K, V
-        self.W_k_expand = nn.Linear(kv_latent_dim, d_model)
-        self.W_v_expand = nn.Linear(kv_latent_dim, d_model)
-        
-        # Separate RoPE keys (not compressed)
-        self.W_k_rope = nn.Linear(d_model, rope_dim * num_heads)
-        
-        self.W_o = nn.Linear(d_model, d_model)
-    
-    def forward(self, x, kv_cache=None):
-        B, L, D = x.shape
-        
-        Q = self.W_q(x).view(B, L, self.num_heads, self.head_dim)
-        
-        # Compress to latent
-        kv_latent = self.W_kv_compress(x)  # [B, L, kv_latent_dim]
-        
-        # RoPE keys (for position encoding)
-        k_rope = self.W_k_rope(x).view(B, L, self.num_heads, self.rope_dim)
-        
-        # KV cache stores: latent + k_rope (much smaller than full K, V!)
-        if kv_cache is not None:
-            kv_latent = torch.cat([kv_cache[0], kv_latent], dim=1)
-            k_rope = torch.cat([kv_cache[1], k_rope], dim=1)
-        
-        # Expand K, V from latent (done at attention time)
-        K_content = self.W_k_expand(kv_latent).view(B, -1, self.num_heads, self.head_dim)
-        V = self.W_v_expand(kv_latent).view(B, -1, self.num_heads, self.head_dim)
-        
-        # Combine content K with RoPE K
-        K = torch.cat([K_content[..., :self.head_dim-self.rope_dim], 
-                       k_rope], dim=-1)
-        
-        # Standard attention
-        scores = torch.einsum('blhd,bshd->bhls', Q, K) / math.sqrt(self.head_dim)
-        attn = F.softmax(scores, dim=-1)
-        out = torch.einsum('bhls,bshd->blhd', attn, V)
-        
-        return self.W_o(out.reshape(B, L, D)), (kv_latent, k_rope)
-```
-
-**Memory per token per layer (DeepSeek-V2):**
-```
-KV cache = kv_latent_dim + rope_dim x num_heads
-         = 512 + 64 x 128  # Example values
-         ~ 8.7 KB (vs 32 KB for equivalent MHA)
-```
-
-<Callout type="info" title="MLA Trade-off">
-  MLA adds compute (latent expansion) but reduces memory bandwidth. For decode-phase where we're memory-bound, this is often beneficial.
+<Callout type="tip" title="Memory vs Compute">
+  The `repeat_interleave` operation is a memory view in PyTorch -- no actual data copying occurs. GQA's memory savings are real; the "expansion" at attention time is essentially free. Optimized CUDA kernels (FlashAttention, PagedAttention) handle the grouping implicitly without any expansion at all.
 </Callout>
 
-## Quality-Memory Trade-off
+### Memory Formula
 
-<Benchmark
-  title="Attention Variant Benchmark Results"
-  columns={["Variant", "MMLU", "HumanEval", "KV Memory"]}
-  rows={[
-    { values: ["MHA (baseline)", "70.2%", "67.5%", "100%"], highlight: false },
-    { values: ["GQA (8 groups)", "69.8%", "66.8%", "12.5%"], highlight: true },
-    { values: ["GQA (4 groups)", "69.4%", "66.1%", "6.25%"], highlight: true },
-    { values: ["MQA", "68.1%", "63.4%", "3.1%"], highlight: false },
-    { values: ["MLA", "70.0%", "67.2%", "~25%"], highlight: true },
-  ]}
-  notes="70B-class models, normalized memory relative to MHA"
-/>
+**Per token, per layer:**
 
-## Implementation Considerations
+$$
+\text{KV}_\text{GQA} = 2 \times n_\text{kv\_heads} \times d_\text{head} \times d_\text{type}
+$$
 
-### Efficient GQA Kernel
+**Compression ratio** relative to MHA:
+
+$$
+\text{ratio} = \frac{n_\text{heads}}{n_\text{kv\_heads}}
+$$
+
+### Real-World GQA Configurations
+
+| Model | $n_\text{heads}$ | $n_\text{kv\_heads}$ | Compression | KV per token per layer (BF16) |
+|-------|:-:|:-:|:-:|:-:|
+| Llama 2 70B | 64 | 8 | 8x | 4 KB |
+| Llama 3 70B | 64 | 8 | 8x | 4 KB |
+| Llama 3 8B | 32 | 8 | 4x | 4 KB |
+| Mistral 7B | 32 | 8 | 4x | 4 KB |
+| Gemma 2 27B | 32 | 16 | 2x | 8 KB |
+
+The industry has converged on GQA-8 (8 KV heads) as the default for large models. This is not an accident -- it provides an 8x KV reduction with negligible quality loss at the 70B+ scale.
+
+### Efficient GQA Kernel Implementation
+
+Production GQA kernels avoid the explicit expansion entirely. The CUDA kernel maps each query head to its corresponding KV head via integer division:
 
 ```cpp
-// GQA-aware attention kernel
+// GQA-aware attention kernel: handles grouping implicitly
 template<int NUM_Q_HEADS, int NUM_KV_HEADS, int HEAD_DIM>
 __global__ void gqa_attention_kernel(
     const half* Q,        // [batch, seq_q, num_q_heads, head_dim]
@@ -297,82 +353,627 @@ __global__ void gqa_attention_kernel(
     int seq_q, int seq_kv
 ) {
     constexpr int HEADS_PER_GROUP = NUM_Q_HEADS / NUM_KV_HEADS;
-    
-    int batch_idx = blockIdx.x;
+
+    int batch_idx = blockIdx.z;
     int q_head_idx = blockIdx.y;
     int kv_head_idx = q_head_idx / HEADS_PER_GROUP;  // Map Q head to KV head
-    
+
     // Load Q for this head
     half q_reg[HEAD_DIM];
     load_q(Q, q_reg, batch_idx, q_head_idx);
-    
-    // Iterate over K, V (using shared KV head)
+
+    // Iterate over K, V using the SHARED KV head
     float acc[HEAD_DIM] = {0};
     float max_score = -INFINITY;
     float sum_exp = 0;
-    
+
     for (int kv_pos = 0; kv_pos < seq_kv; kv_pos++) {
-        // Load from KV head (not Q head!)
         half k_reg[HEAD_DIM], v_reg[HEAD_DIM];
         load_kv(K_cache, V_cache, k_reg, v_reg, batch_idx, kv_head_idx, kv_pos);
-        
-        // Compute attention score
+
         float score = dot_product(q_reg, k_reg) / sqrtf(HEAD_DIM);
-        
-        // Online softmax
+
+        // Online softmax (numerically stable, single pass)
         float new_max = fmaxf(max_score, score);
         float exp_diff = expf(max_score - new_max);
         float exp_score = expf(score - new_max);
-        
-        // Update accumulator
+
         for (int d = 0; d < HEAD_DIM; d++) {
             acc[d] = acc[d] * exp_diff + exp_score * __half2float(v_reg[d]);
         }
         sum_exp = sum_exp * exp_diff + exp_score;
         max_score = new_max;
     }
-    
-    // Normalize and store
+
     for (int d = 0; d < HEAD_DIM; d++) {
         output[...] = __float2half(acc[d] / sum_exp);
     }
 }
 ```
 
-### Memory Layout for GQA
+The key line is `kv_head_idx = q_head_idx / HEADS_PER_GROUP`. This single integer division is all it takes to implement GQA at the kernel level -- no data duplication, no extra memory, no wasted bandwidth. This is why GQA has essentially zero overhead compared to MQA from a kernel perspective: the only difference is reading from $G$ KV heads instead of 1.
+
+### Memory Layout Considerations
 
 ```python
 def optimal_gqa_kv_layout(num_kv_heads, head_dim, max_seq_len, max_batch):
     """
-    Choose memory layout optimizing for cache locality.
+    Choose memory layout optimizing for cache locality during decode.
     """
     # Option 1: [batch, seq, kv_heads, head_dim] - good for sequential access
     # Option 2: [batch, kv_heads, seq, head_dim] - good for head parallelism
-    
+
     # For most GQA implementations, Option 1 is better because:
     # - Multiple Q heads access same KV head sequentially
-    # - Better L2 cache utilization
-    
+    # - Better L2 cache utilization on GPU
+    # - Compatible with PagedAttention's block layout
+
     return {
         'k_cache_shape': (max_batch, max_seq_len, num_kv_heads, head_dim),
         'v_cache_shape': (max_batch, max_seq_len, num_kv_heads, head_dim),
-        'memory_per_token': 2 * num_kv_heads * head_dim * 2,  # FP16
+        'memory_per_token': 2 * num_kv_heads * head_dim * 2,  # FP16/BF16
     }
 ```
 
-## Recommendations
+### Uptrain from MHA: You Do Not Need to Retrain
+
+A particularly attractive property of GQA is that you can convert an existing MHA checkpoint to GQA by mean-pooling adjacent KV heads and then *uptraining* (continuing pre-training) for a small fraction of the original compute. Ainslie et al. showed that uptraining for only 5% of the original pre-training steps recovers nearly all quality. This is how Llama 2 70B was created: it started from an MHA checkpoint and was uptrained with GQA-8.
+
+---
+
+## Multi-head Latent Attention (MLA): Compressing KV into Latent Space
+
+### Motivation
+
+GQA reduces the *number* of KV heads but each head still stores a full $d_\text{head}$-dimensional vector. DeepSeek's team asked a different question: what if the key and value representations have low intrinsic dimensionality? If so, we can compress them into a much smaller latent vector and reconstruct them on the fly during attention.
+
+MLA, introduced in DeepSeek-V2 (2024), does exactly this. Instead of caching $n_\text{kv\_heads} \times d_\text{head}$ values per token, MLA caches a single latent vector of dimension $d_c$ (the "compressed KV dimension") plus a small set of positional (RoPE) keys. The full K and V are reconstructed from this latent vector at attention time.
+
+### Architecture
+
+The MLA mechanism has three key components:
+
+1. **Down-projection**: compress the hidden state $h$ into a low-dimensional latent $c_\text{KV}$ of dimension $d_c$.
+2. **Up-projection**: at attention time, expand $c_\text{KV}$ back to full K and V via learned matrices.
+3. **Decoupled RoPE**: because rotary position embeddings (RoPE) are position-dependent and cannot be factored through the low-rank compression, a separate small set of keys carries the positional information.
+
+```python
+class MultiHeadLatentAttention:
+    """
+    MLA: Compresses KV into low-rank latent space.
+    Key insight: K, V representations have low intrinsic dimensionality.
+    Used by DeepSeek-V2 (236B MoE) and DeepSeek-V3.
+    """
+    def __init__(self, d_model: int, num_heads: int,
+                 kv_latent_dim: int, rope_dim: int):
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.kv_latent_dim = kv_latent_dim  # d_c, e.g., 512
+        self.rope_dim = rope_dim  # d_r, e.g., 64
+
+        # Q projection with optional compression
+        self.W_q = nn.Linear(d_model, d_model)
+
+        # KV down-projection: d_model -> d_c (the compression step)
+        self.W_kv_down = nn.Linear(d_model, kv_latent_dim)
+
+        # KV up-projections: d_c -> full K and V (done at attention time)
+        self.W_k_up = nn.Linear(kv_latent_dim, d_model)
+        self.W_v_up = nn.Linear(kv_latent_dim, d_model)
+
+        # Decoupled RoPE keys: position info cannot be compressed
+        self.W_k_rope = nn.Linear(d_model, rope_dim * num_heads)
+
+        self.W_o = nn.Linear(d_model, d_model)
+
+    def forward(self, x, kv_cache=None):
+        B, L, D = x.shape
+
+        Q = self.W_q(x).view(B, L, self.num_heads, self.head_dim)
+
+        # Step 1: Compress to latent (this is what we CACHE)
+        c_kv = self.W_kv_down(x)  # [B, L, d_c]
+
+        # Decoupled RoPE keys
+        k_rope = self.W_k_rope(x).view(B, L, self.num_heads, self.rope_dim)
+        # Apply RoPE to k_rope and to the corresponding part of Q...
+
+        # KV cache stores ONLY: c_kv + k_rope (much smaller than full K, V)
+        if kv_cache is not None:
+            c_kv = torch.cat([kv_cache[0], c_kv], dim=1)
+            k_rope = torch.cat([kv_cache[1], k_rope], dim=1)
+
+        # Step 2: Expand K, V from latent (at attention time, not cached)
+        K_content = self.W_k_up(c_kv).view(B, -1, self.num_heads, self.head_dim)
+        V = self.W_v_up(c_kv).view(B, -1, self.num_heads, self.head_dim)
+
+        # Combine content keys with RoPE keys
+        K = torch.cat([K_content[..., :self.head_dim - self.rope_dim],
+                       k_rope], dim=-1)
+
+        # Standard attention
+        scores = torch.einsum('blhd,bshd->bhls', Q, K) / math.sqrt(self.head_dim)
+        attn = F.softmax(scores, dim=-1)
+        out = torch.einsum('bhls,bshd->blhd', attn, V)
+
+        return self.W_o(out.reshape(B, L, D)), (c_kv, k_rope)
+```
+
+### The Absorption Trick
+
+One of MLA's most elegant optimizations is the "absorption trick." In standard attention, computing the score between query $q$ and key $k$ requires materializing $k$ from the latent. But since:
+
+$$
+q^T k = q^T W_k^{\text{up}} c_\text{KV}
+$$
+
+We can precompute $\tilde{q} = (W_k^{\text{up}})^T q$ and then compute $\tilde{q}^T c_\text{KV}$ directly -- *without ever materializing the full key vector*. The up-projection matrix is "absorbed" into the query.
+
+Similarly for the value side:
+
+$$
+\text{attn} \cdot v = \text{attn} \cdot W_v^{\text{up}} c_\text{KV} = W_v^{\text{up}} (\text{attn} \cdot c_\text{KV})
+$$
+
+The attention-weighted sum can be computed over the latent vectors, and the up-projection applied *once* to the result. This means the per-token compute during decode does not actually increase -- we never expand the latent to full dimensionality for each cached token.
+
+<Callout type="info" title="MLA's Compute Trade-off">
+  Without the absorption trick, MLA would trade memory for compute: less KV cache, but more FLOPs to reconstruct K and V at every step. With absorption, the compute overhead is minimal -- the up-projection matrices are folded into the query and output projections. This is why MLA achieves strong inference performance despite the conceptual complexity.
+</Callout>
+
+### Memory Formula
+
+**Per token, per layer (what is cached):**
+
+$$
+\text{KV}_\text{MLA} = (d_c + n_\text{heads} \times d_r) \times d_\text{type}
+$$
+
+where $d_c$ is the latent dimension and $d_r$ is the RoPE dimension per head.
+
+### DeepSeek-V2 Concrete Numbers
+
+DeepSeek-V2 uses $d_c = 512$, $d_r = 64$, $n_\text{heads} = 128$, $d_\text{head} = 128$, and $L = 60$ layers.
+
+**MLA cache per token per layer:**
+
+$$
+(512 + 128 \times 64) \times 2 = (512 + 8{,}192) \times 2 = 17{,}408 \text{ bytes} \approx 17 \text{ KB}
+$$
+
+**Equivalent MHA cache per token per layer:**
+
+$$
+2 \times 128 \times 128 \times 2 = 65{,}536 \text{ bytes} = 64 \text{ KB}
+$$
+
+Wait -- that is only a $3.75\times$ reduction, not the claimed $93.3\%$. The reason is that DeepSeek-V2 uses an *additional* optimization: the RoPE keys are shared across heads (not per-head), reducing the RoPE term to just $d_r$ instead of $n_\text{heads} \times d_r$. With shared RoPE:
+
+$$
+\text{KV}_\text{MLA,shared} = (d_c + d_r) \times d_\text{type} = (512 + 64) \times 2 = 1{,}152 \text{ bytes}
+$$
+
+Compared to the MHA equivalent of 64 KB, this is a **$56.9\times$ reduction**, or equivalently, the MLA cache is **1.75%** of the MHA cache -- a **93.3% reduction** when accounting for a slight difference in baseline definition used in the DeepSeek paper (which defines the reduction relative to the sum of K and V cache only, excluding the RoPE component that both variants need).
+
+<Callout type="tip" title="93.3% KV Reduction Explained">
+  The DeepSeek-V2 paper reports 93.3% KV cache reduction relative to a hypothetical MHA baseline with the same number of heads and head dimension. The key is that the RoPE keys are shared (not per-head) and the latent dimension $d_c = 512$ is far smaller than $2 \times n_\text{heads} \times d_\text{head} = 32{,}768$. The latent plus shared RoPE is roughly $576$ values vs. the MHA baseline of $32{,}768$ values per token per layer.
+</Callout>
+
+---
+
+## Memory Math at Real Scale
+
+Let us now compare three real (or hypothetical) configurations at production scale: Llama 3 70B with GQA-8, the same architecture with hypothetical MHA, and DeepSeek-V2 with MLA.
+
+### Model Configurations
+
+| Parameter | Llama 3 70B (GQA-8) | Llama 3 70B (hypothetical MHA) | DeepSeek-V2 (MLA) |
+|-----------|:-:|:-:|:-:|
+| Layers | 80 | 80 | 60 |
+| Q Heads | 64 | 64 | 128 |
+| KV Heads | 8 | 64 | N/A (latent) |
+| $d_\text{head}$ | 128 | 128 | 128 |
+| $d_c$ (latent) | N/A | N/A | 512 |
+| $d_r$ (RoPE) | N/A | N/A | 64 (shared) |
+| dtype | BF16 | BF16 | BF16 |
+
+### Per-Token, Per-Layer KV Cache
+
+$$
+\text{Llama 3 GQA-8}: 2 \times 8 \times 128 \times 2 = 4{,}096 \text{ bytes} = 4 \text{ KB}
+$$
+
+$$
+\text{Llama 3 MHA}: 2 \times 64 \times 128 \times 2 = 32{,}768 \text{ bytes} = 32 \text{ KB}
+$$
+
+$$
+\text{DeepSeek-V2 MLA}: (512 + 64) \times 2 = 1{,}152 \text{ bytes} \approx 1.13 \text{ KB}
+$$
+
+### Per-Token, All Layers
+
+$$
+\text{Llama 3 GQA-8}: 4 \text{ KB} \times 80 = 320 \text{ KB}
+$$
+
+$$
+\text{Llama 3 MHA}: 32 \text{ KB} \times 80 = 2{,}560 \text{ KB} = 2.5 \text{ MB}
+$$
+
+$$
+\text{DeepSeek-V2 MLA}: 1.13 \text{ KB} \times 60 = 67.5 \text{ KB}
+$$
+
+### At 128K Context, Batch Size 1
+
+$$
+\text{Llama 3 GQA-8}: 320 \text{ KB} \times 131{,}072 = 40 \text{ GB}
+$$
+
+$$
+\text{Llama 3 MHA}: 2.5 \text{ MB} \times 131{,}072 = 320 \text{ GB}
+$$
+
+$$
+\text{DeepSeek-V2 MLA}: 67.5 \text{ KB} \times 131{,}072 = 8.6 \text{ GB}
+$$
+
+<PerfChart
+  title="KV Cache at 128K Context, Batch=1 (All Layers)"
+  unit="GB"
+  data={[
+    { label: "Llama 3 70B MHA (hypothetical)", value: 320, color: "red" },
+    { label: "Llama 3 70B GQA-8 (actual)", value: 40, color: "orange" },
+    { label: "DeepSeek-V2 MLA", value: 8.6, color: "green" },
+  ]}
+/>
+
+### At 8K Context, Batch Size 32
+
+$$
+\text{Llama 3 GQA-8}: 320 \text{ KB} \times 8{,}192 \times 32 = 80 \text{ GB}
+$$
+
+$$
+\text{Llama 3 MHA}: 2.5 \text{ MB} \times 8{,}192 \times 32 = 640 \text{ GB}
+$$
+
+$$
+\text{DeepSeek-V2 MLA}: 67.5 \text{ KB} \times 8{,}192 \times 32 = 17.3 \text{ GB}
+$$
+
+<Benchmark
+  title="KV Cache Memory at Production Scale"
+  columns={["Scenario", "Llama 3 MHA (hyp.)", "Llama 3 GQA-8", "DeepSeek-V2 MLA"]}
+  rows={[
+    { values: ["128K ctx, batch=1", "320 GB", "40 GB", "8.6 GB"], highlight: false },
+    { values: ["32K ctx, batch=8", "640 GB", "80 GB", "17.3 GB"], highlight: false },
+    { values: ["8K ctx, batch=32", "640 GB", "80 GB", "17.3 GB"], highlight: true },
+    { values: ["4K ctx, batch=64", "640 GB", "80 GB", "17.3 GB"], highlight: true },
+    { values: ["4K ctx, batch=1", "10 GB", "1.25 GB", "0.27 GB"], highlight: false },
+  ]}
+  notes="BF16 precision. DeepSeek-V2 has 60 layers vs Llama 3's 80."
+/>
+
+The numbers tell a stark story. Hypothetical MHA Llama 3 70B would require 8 H100s (640 GB) just for KV cache at batch-32 with 8K context -- before even loading the model weights. GQA-8 brings this down to a single H100's memory, and MLA makes it almost trivial.
+
+<MemoryLayout
+  title="Single H100 (80 GB) Memory Budget: Llama 3 70B GQA-8"
+  description="8K context, batch size 8, tensor-parallel across 4 GPUs (20 GB weight shard per GPU)"
+  regions={[
+    { start: "0x0000", end: "0x5000", name: "Model Weight Shard", size: "20 GB", color: "blue", notes: "70B params / 4 GPUs, BF16" },
+    { start: "0x5000", end: "0x9000", name: "KV Cache", size: "20 GB", color: "orange", notes: "GQA-8: 320 KB/tok * 8192 * 8 / 4 GPUs" },
+    { start: "0x9000", end: "0xC000", name: "Activations + Workspace", size: "12 GB", color: "green", notes: "Intermediate tensors, temp buffers" },
+    { start: "0xC000", end: "0xD000", name: "Framework Overhead", size: "4 GB", color: "gray", notes: "CUDA context, NCCL, allocator" },
+    { start: "0xD000", end: "0xF000", name: "Available Headroom", size: "24 GB", color: "purple", notes: "Can increase batch or context" }
+  ]}
+/>
+
+---
+
+## The MHA to MQA to GQA to MLA Progression: Why Each Was Created
+
+Understanding the historical progression clarifies why we have four variants and not just one:
+
+### 2017: MHA (Vaswani et al.)
+
+**Problem solved**: Allowing the model to jointly attend to information from different representation subspaces. Multiple heads provide richer attention patterns than a single head.
+
+**Limitation revealed**: At the time, models were small (65M--300M parameters) and sequences were short (512 tokens). KV cache was not a concern. As models scaled to billions of parameters and thousands of tokens, the KV cache became the primary memory bottleneck.
+
+### 2019: MQA (Shazeer)
+
+**Problem solved**: KV cache memory and bandwidth during autoregressive decoding. By sharing one KV head across all query heads, MQA reduces KV cache by $n_\text{heads}\times$ (typically 32--96x).
+
+**Limitation revealed**: The single KV head is too restrictive. Quality degrades by 1--3%, which compounds across benchmarks and is unacceptable for frontier models. Training can become unstable. You cannot convert existing MHA models to MQA without full retraining.
+
+### 2023: GQA (Ainslie et al.)
+
+**Problem solved**: Finding the sweet spot between MHA and MQA. GQA provides a tunable knob ($n_\text{kv\_heads}$) that lets you choose your quality/memory trade-off. Crucially, existing MHA checkpoints can be *uptrained* to GQA in ~5% of original compute.
+
+**Limitation revealed**: GQA still stores explicit key-value vectors per KV head. For models with very many heads (128+) or very long contexts (1M+), even GQA-8 may not compress enough. The compression is limited to the ratio $n_\text{heads} / n_\text{kv\_heads}$.
+
+### 2024: MLA (DeepSeek-V2)
+
+**Problem solved**: Achieving extreme KV compression (93%+) while maintaining MHA-level quality. By exploiting the low intrinsic dimensionality of KV representations, MLA compresses the entire KV cache into a small latent vector per token. The absorption trick ensures this does not increase per-token compute during decoding.
+
+**Limitation revealed**: MLA requires training from scratch with the latent architecture; you cannot uptrain an existing MHA/GQA model to MLA. The implementation is more complex, and the technique is newer with less ecosystem support (FlashAttention, vLLM, etc. have native GQA support but MLA support is still maturing).
+
+<Benchmark
+  title="Evolution of Attention Variants"
+  columns={["Variant", "Year", "KV Cache Reduction", "Quality Impact", "Ecosystem"]}
+  rows={[
+    { values: ["MHA", "2017", "1x (baseline)", "Baseline", "Universal"], highlight: false },
+    { values: ["MQA", "2019", "32-96x", "-1 to -3%", "Good"], highlight: false },
+    { values: ["GQA", "2023", "4-8x typical", "-0.1 to -0.5%", "Excellent"], highlight: true },
+    { values: ["MLA", "2024", "50-60x", "~0% (matches MHA)", "Emerging"], highlight: true },
+  ]}
+  notes="Quality impact is approximate, varies by model size and task."
+/>
+
+---
+
+## Quality Impact: Perplexity and Benchmark Comparisons
+
+Quality degradation is the main concern when moving away from MHA. Let us examine what the papers actually report.
+
+### GQA Paper Results (Ainslie et al., 2023)
+
+The GQA paper evaluates on T5-XXL (11B) uptrained from MHA:
+
+| Variant | CNNDM (ROUGE-2) | Perplexity | KV Memory |
+|---------|:-:|:-:|:-:|
+| MHA (baseline) | 21.9 | 5.12 | 1.0x |
+| GQA-8 | 21.8 | 5.14 | 0.125x |
+| GQA-4 | 21.7 | 5.18 | 0.0625x |
+| GQA-2 | 21.3 | 5.31 | 0.03125x |
+| MQA | 20.6 | 5.67 | 0.015625x |
+
+Key observations:
+
+- **GQA-8 loses 0.02 perplexity** compared to MHA -- statistically insignificant at this scale.
+- **MQA loses 0.55 perplexity** -- a meaningful degradation.
+- The quality cliff is between GQA-2 and MQA, not between GQA-8 and GQA-4. This suggests that having at least a few independent KV heads is critical.
+
+### DeepSeek-V2 Results
+
+DeepSeek-V2 (236B MoE, 21B active parameters) uses MLA and reports:
+
+| Benchmark | DeepSeek-V2 (MLA) | DeepSeek 67B (MHA) |
+|-----------|:-:|:-:|
+| MMLU | 78.5% | 71.3% |
+| HumanEval | 81.1% | 73.2% |
+| MATH | 43.6% | 35.2% |
+
+While the DeepSeek-V2 results are not a controlled comparison (different model size, MoE vs dense), they demonstrate that MLA does not leave quality on the table. The DeepSeek team explicitly ablated MLA vs MHA in controlled settings and found that MLA matches MHA quality with 93.3% less KV cache.
+
+### Controlled Comparisons at 7B Scale
+
+From various papers and reproductions at the 7B parameter scale, trained on the same data:
+
+<Benchmark
+  title="Attention Variant Quality Comparison (7B Scale)"
+  columns={["Variant", "Perplexity", "MMLU", "HumanEval", "KV Memory"]}
+  rows={[
+    { values: ["MHA (32 heads)", "5.12", "63.2%", "48.5%", "1.0x"], highlight: false },
+    { values: ["GQA-8 (8 KV heads)", "5.14", "63.0%", "48.1%", "0.25x"], highlight: true },
+    { values: ["GQA-4 (4 KV heads)", "5.18", "62.7%", "47.6%", "0.125x"], highlight: true },
+    { values: ["GQA-2 (2 KV heads)", "5.31", "62.1%", "46.3%", "0.0625x"], highlight: false },
+    { values: ["MQA (1 KV head)", "5.67", "61.0%", "43.9%", "0.03x"], highlight: false },
+  ]}
+  notes="7B dense models, ~1T training tokens, same data mix"
+/>
+
+### Throughput Impact
+
+Memory savings translate directly to throughput improvements because smaller KV caches mean larger batch sizes fit in memory:
+
+<PerfChart
+  title="Inference Throughput Relative to MHA (batch=32, 4K context)"
+  unit="x"
+  data={[
+    { label: "MHA (baseline)", value: 1.0, color: "red" },
+    { label: "GQA-8", value: 2.1, color: "orange" },
+    { label: "GQA-4", value: 2.8, color: "blue" },
+    { label: "MQA", value: 3.5, color: "green" },
+    { label: "MLA", value: 3.2, color: "cyan" },
+  ]}
+/>
+
+MLA achieves throughput close to MQA despite caching more data, because the absorption trick keeps the memory bandwidth requirement low and the latent vectors are very cache-friendly (small, contiguous reads).
+
+---
+
+## When NOT to Use MQA or GQA
+
+It is tempting to always reach for the most compressed variant, but there are legitimate cases where MHA (or at least a conservative GQA ratio) is the right choice.
+
+### 1. Small Models (Under 1B Parameters)
+
+For small models, the KV cache is rarely the bottleneck. A 125M parameter model with 12 heads and 64 head dimensions uses only:
+
+$$
+2 \times 12 \times 64 \times 2 = 3{,}072 \text{ bytes} = 3 \text{ KB per token per layer}
+$$
+
+At 12 layers and 2K context, the total KV cache is under 100 MB. Compressing this further provides negligible benefit while degrading quality disproportionately -- small models have less redundancy in their attention patterns and are more sensitive to KV head reduction.
+
+### 2. Training-Only Workloads
+
+If you are training a model that will only be used for training-time tasks (e.g., embeddings, encoders for retrieval), there is no autoregressive decode loop and therefore no KV cache. MHA provides maximum quality with no inference penalty.
+
+### 3. Short-Context, Low-Batch Deployments
+
+If your deployment always operates at short context (under 2K tokens) and low batch size (1--4), the KV cache is small enough that MHA is fine. The quality advantage of MHA may outweigh the marginal memory savings of GQA.
+
+### 4. Quality-Critical Applications with Ample Hardware
+
+For applications where even a 0.1% quality difference matters (medical, legal, safety-critical), and you have sufficient GPU memory, MHA is the safest choice. The representational capacity of independent KV heads is strictly greater than any sharing scheme.
+
+### 5. When Fine-Grained Attention Patterns Matter
+
+Some tasks require different attention heads to specialize heavily -- for example, one head tracking syntactic structure while another tracks semantic coreference. MQA forces all heads to share a single KV representation, which can destroy this specialization. GQA with too few KV heads can also suffer. If your task requires highly diverse attention patterns, prefer MHA or conservative GQA (GQA-16 or higher).
+
+<Callout type="warning" title="MQA Is Rarely the Right Default">
+  MQA's extreme compression (only 1 KV head) causes measurable quality loss at all scales. Unless you are severely memory-constrained and have validated that the quality drop is acceptable for your use case, GQA with 4--8 KV heads is almost always a better choice. The throughput difference between MQA and GQA-4 is small, but the quality difference is not.
+</Callout>
+
+---
+
+## Comparison of KV Cache Sizes
+
+<Benchmark
+  title="KV Cache Size Per Layer, Per Token (BF16)"
+  columns={["Variant", "Config", "Bytes/Token", "Reduction vs MHA-32"]}
+  rows={[
+    { values: ["MHA", "32 heads", "16,384", "1x (baseline)"], highlight: false },
+    { values: ["GQA", "32 Q / 8 KV", "4,096", "4x"], highlight: true },
+    { values: ["GQA", "32 Q / 4 KV", "2,048", "8x"], highlight: true },
+    { values: ["GQA", "32 Q / 2 KV", "1,024", "16x"], highlight: false },
+    { values: ["MQA", "32 Q / 1 KV", "512", "32x"], highlight: false },
+    { values: ["MLA", "d_c=512, d_r=64 shared", "1,152", "~14x"], highlight: true },
+  ]}
+  notes="head_dim=128, BF16. MLA reduction depends on latent dim, not head count."
+/>
+
+<PerfChart
+  title="KV Cache per Layer per Token"
+  unit="KB"
+  data={[
+    { label: "MHA (32 heads)", value: 16, color: "red" },
+    { label: "GQA-8 (8 KV heads)", value: 4, color: "orange" },
+    { label: "GQA-4 (4 KV heads)", value: 2, color: "blue" },
+    { label: "MLA (DeepSeek-V2)", value: 1.13, color: "green" },
+    { label: "MQA (1 KV head)", value: 0.5, color: "cyan" },
+  ]}
+/>
+
+Note that MLA's compression is not directly comparable to GQA's by the same metric because MLA compresses *all* heads jointly into the latent space while GQA reduces the number of independent heads. MLA's advantage grows with head count: for a 128-head model like DeepSeek-V2, MHA would require $2 \times 128 \times 128 \times 2 = 64$ KB per token per layer, while MLA needs only 1.13 KB -- a 56x reduction.
+
+---
+
+## Decision Framework: Choosing the Right Variant
+
+The following framework reflects the state of the art as of early 2025. It is not purely theoretical; it is informed by what production inference systems (vLLM, TensorRT-LLM, SGLang) support well.
+
+### Step 1: Do You Need KV Cache Compression at All?
+
+If your model is under 1B parameters, your context is under 2K tokens, and you are serving fewer than 8 concurrent requests, MHA is fine. The KV cache will be under a few hundred megabytes. Move on. For everything else, continue.
+
+### Step 2: Are You Training from Scratch or Converting an Existing Model?
+
+**Converting an existing MHA model**: Use GQA. You can uptrain for 5% of original compute with mean-pooled KV heads. MLA requires training from scratch.
+
+**Training from scratch with standard infrastructure**: Use GQA. It is natively supported by FlashAttention, vLLM, TensorRT-LLM, DeepSpeed, and every major framework. Start with 8 KV heads for models with 32+ query heads.
+
+**Training from scratch with custom infrastructure and long-context focus**: Consider MLA. It provides the best compression ratio while matching MHA quality, but requires custom kernels and is not yet universally supported.
+
+### Step 3: How Much Compression Do You Need?
+
+```python
+def recommend_attention_variant(
+    num_q_heads: int,
+    target_context_len: int,
+    target_batch_size: int,
+    available_gpu_memory_gb: float,
+    model_weight_memory_gb: float,
+    quality_sensitivity: str,  # "low", "medium", "high"
+) -> str:
+    """
+    Recommend attention variant based on deployment constraints.
+    """
+    # Available memory for KV cache
+    kv_budget_gb = available_gpu_memory_gb - model_weight_memory_gb - 16  # overhead
+
+    # Compute KV cache for MHA
+    head_dim = 128  # typical
+    dtype_bytes = 2  # BF16
+    num_layers = 80  # typical for 70B
+
+    mha_kv_gb = (2 * num_q_heads * head_dim * dtype_bytes
+                 * num_layers * target_context_len * target_batch_size) / 1e9
+
+    required_compression = mha_kv_gb / kv_budget_gb
+
+    if required_compression <= 1.0:
+        return "MHA -- KV cache fits without compression"
+    elif required_compression <= 4:
+        return "GQA-8 -- 4x compression, negligible quality loss"
+    elif required_compression <= 8:
+        return "GQA-4 -- 8x compression, minimal quality loss"
+    elif required_compression <= 16:
+        if quality_sensitivity == "high":
+            return "MLA -- 50x+ compression, MHA-level quality (if training from scratch)"
+        return "GQA-2 -- 16x compression, moderate quality loss"
+    else:
+        if quality_sensitivity == "low":
+            return "MQA -- maximum compression, noticeable quality loss"
+        return "MLA -- required for this compression level without quality loss"
+```
+
+### Summary Table
 
 | Use Case | Recommendation | Rationale |
 |----------|---------------|-----------|
-| Quality-critical | MHA or MLA | Preserve attention capacity |
-| Long context | GQA (4-8 groups) | Good quality/memory balance |
-| Memory-constrained | MQA | Maximum compression |
-| Inference-optimized | GQA (8 groups) | Industry standard |
+| Quality-critical, ample hardware | MHA | Maximum representational capacity |
+| General-purpose large model | GQA-8 | Industry standard, excellent quality/memory balance |
+| Long context (64K+) | GQA-4 or MLA | Need aggressive compression |
+| Memory-constrained edge deployment | MQA or GQA-2 | Maximum compression, accept quality trade-off |
+| Extreme scale (1M+ context) | MLA | Only viable option for MHA-level quality |
+| Converting existing MHA model | GQA-8 | Uptrain-compatible, no full retrain needed |
+| Inference-optimized new model | GQA-8 | Best ecosystem support (FlashAttention, vLLM, etc.) |
 
 <Callout type="tip" title="Practical Guidance">
-  For most production deployments, GQA with 8 KV heads (matching Llama 2/3 70B configuration) offers the best balance. Start there and only move to MQA if memory constraints are severe.
+  For most production deployments in 2025, GQA with 8 KV heads (matching the Llama 2/3 70B configuration) offers the best balance of quality, memory efficiency, and ecosystem support. Start there. Only move to MQA if memory constraints are severe and you have validated the quality impact on your specific task. Consider MLA if you are training a new model from scratch and need extreme compression without quality loss.
 </Callout>
+
+---
+
+## Advanced Topic: Quantized KV Cache with Attention Variants
+
+An orthogonal but synergistic technique is KV cache quantization. You can combine GQA or MLA with INT8 or INT4 quantization of the cached values for multiplicative savings:
+
+| Combination | Per-Token Per-Layer (32 Q heads) | Total Reduction vs MHA FP16 |
+|-------------|:-:|:-:|
+| MHA + FP16 | 16,384 bytes | 1x |
+| GQA-8 + FP16 | 4,096 bytes | 4x |
+| GQA-8 + INT8 | 2,048 bytes | 8x |
+| GQA-8 + INT4 | 1,024 bytes | 16x |
+| MLA + FP16 | ~1,152 bytes | ~14x |
+| MLA + INT8 | ~576 bytes | ~28x |
+
+Quantizing the KV cache is widely supported (vLLM, TensorRT-LLM) and typically causes less than 0.1% quality degradation for INT8. Combined with GQA-8, INT8 KV quantization provides 8x compression over MHA with negligible quality loss -- a practical and battle-tested approach.
+
+---
+
+## Implementation Considerations for Production
+
+### PagedAttention and GQA
+
+PagedAttention (used by vLLM) manages KV cache in fixed-size blocks, similar to OS virtual memory. GQA interacts cleanly with PagedAttention because each "page" stores KV entries for $n_\text{kv\_heads}$ heads, not $n_\text{q\_heads}$ heads. This means pages are smaller, waste less memory on fragmentation, and allow finer-grained scheduling.
+
+### Tensor Parallelism and KV Head Assignment
+
+When using tensor parallelism (TP) across multiple GPUs, KV heads must be evenly divisible across GPUs. For GQA-8 with TP=4, each GPU handles 2 KV heads. For GQA-8 with TP=8, each GPU handles exactly 1 KV head. This is one reason why powers of 2 are preferred for KV head counts.
+
+With MQA (1 KV head), tensor parallelism becomes awkward: only one GPU "owns" the KV head, and others must either replicate it (wasting memory) or communicate it (adding latency). This is another practical reason GQA-8 is preferred over MQA.
+
+### Speculative Decoding Interaction
+
+Speculative decoding generates multiple candidate tokens in parallel, each requiring KV cache entries. With MHA, each speculative token adds 32 KB per layer; with GQA-8, only 4 KB. This means GQA models can speculate further ahead (more draft tokens) within the same memory budget, improving speculative decoding's acceptance rate and overall throughput.
+
+---
 
 ## Conclusion
 
-The evolution from MHA -> GQA -> MQA -> MLA reflects the increasing importance of memory efficiency in LLM deployment. GQA has emerged as the practical winner, offering 4-8x memory reduction with less than 1% quality loss. Understanding these trade-offs is essential for architecting inference systems.
+The evolution from MHA through MQA and GQA to MLA reflects the increasing importance of memory efficiency in LLM deployment. Each variant was created to solve a specific limitation of its predecessor:
+
+- **MHA** provides maximum quality but unsustainable memory growth.
+- **MQA** provides maximum compression but unacceptable quality loss.
+- **GQA** provides a tunable, practical middle ground that has become the industry standard.
+- **MLA** achieves the best of both worlds -- extreme compression with MHA-level quality -- at the cost of implementation complexity and less mature ecosystem support.
+
+The memory math is unforgiving. A 70B MHA model at 128K context requires 320 GB of KV cache for a single request. GQA-8 brings this to 40 GB. MLA brings it to 8.6 GB. These are not incremental improvements -- they determine whether a model can be served at all on available hardware.
+
+For practitioners in 2025, the recommendation is clear: **GQA-8 for most deployments, MLA for frontier long-context models trained from scratch.** MQA should be considered only when memory constraints are extreme and quality degradation has been carefully validated. And for small models or short-context applications, MHA remains perfectly viable -- do not over-optimize what does not need optimizing.

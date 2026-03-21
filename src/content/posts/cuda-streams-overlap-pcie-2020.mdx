@@ -1,183 +1,802 @@
 ---
 title: "CUDA Streams: Overlapping PCIe Transfers with Compute (and When It Actually Helps)"
 author: "stanley-phoong"
-description: "A practical performance deep-dive into CUDA streams, pinned memory, and async copies. Learn when overlap works, how to measure it, and what bottlenecks (PCIe, H2D/D2H, kernel occupancy) prevent real gains."
-publishDate: 2020-04-07
+description: "A comprehensive deep-dive into CUDA streams, asynchronous execution, pinned memory, PCIe and NVLink bandwidth, multi-stream patterns, NCCL communication overlap, Nsight Systems profiling, and the failure modes that prevent real overlap gains."
+publishDate: 2025-03-21
 category: gpu-programming
-tags: [cuda, streams, pcie, async-memcpy, overlap, optimization, performance]
+tags: [cuda, streams, pcie, async-memcpy, overlap, optimization, performance, nccl, nsight, nvlink]
 difficulty: expert
-readingTime: 20
+readingTime: 30
 ---
 
 import Callout from '@/components/mdx/Callout.astro';
 import PerfChart from '@/components/mdx/PerfChart.astro';
 import Benchmark from '@/components/mdx/Benchmark.astro';
 
-If you’re moving data over PCIe and launching kernels, you’ve probably heard “use streams to overlap copy and compute.” True — but only when **your pipeline is actually duplex**, your copies are **async-capable**, and your kernel leaves **enough headroom** for the copy engines.
+Every CUDA program begins with the same three-step dance: copy data to the GPU, run a kernel, copy results back. For small workloads this is fine. For production workloads -- training runs that last days, inference services that must hit latency targets under load, HPC simulations that iterate millions of times -- that serial dance becomes a wall. The GPU sits idle while data crawls across PCIe, and the CPU sits idle while the GPU computes. CUDA streams are the mechanism that tears down that wall, letting you overlap data movement with computation, and even overlap different kernels with each other. But streams are not magic. They are a scheduling primitive, and using them effectively requires understanding what the hardware can actually do in parallel, where the bottlenecks live, and how to measure whether overlap is truly happening.
 
-This post shows the mechanics, the measurement method, and the common “I used streams but nothing got faster” failure modes.
+This post covers the full landscape: why the default stream serializes everything, how to create and manage multiple streams, how to achieve compute-transfer overlap with pinned memory, how PCIe and NVLink bandwidth numbers shape your optimization strategy, the multi-stream patterns used in production (pipelining, double buffering, multi-GPU fan-out), how to time operations correctly with CUDA events, how NCCL communication interacts with streams in distributed training, how to use Nsight Systems to verify overlap, and the cases where streams simply cannot help.
 
-## The mental model: 3 engines, 2 copies, 1 kernel
+---
 
-On most NVIDIA GPUs you can overlap:
-- **H2D** (host-to-device copy) using a copy engine
-- **Kernel execution** using SMs
-- **D2H** (device-to-host copy) using a copy engine
+## Why Streams Matter: The Default Stream Problem
 
-But overlap only helps if:
-- Copies are **asynchronous** (requires **pinned** host memory)
-- Work is **chunked** so there’s something to overlap
-- You’re not already saturating one resource (PCIe, DRAM BW, SMs)
+When you launch a CUDA kernel or call `cudaMemcpy` without specifying a stream, everything goes into the **default stream** (also called stream 0 or the NULL stream). The default stream has a critical property: it serializes with all other streams. Every operation must complete before the next one begins.
 
-<Benchmark
-  title="Overlap feasibility checklist"
-  columns={["Requirement", "Why it matters", "How to verify"]}
-  rows={[
-    { values: ["Pinned host buffers", "Async H2D/D2H needs page-locked memory", "Use cudaHostAlloc / cudaHostRegister; profiler shows memcpyAsync"], highlight: true },
-    { values: ["Chunked pipeline", "Need independent stages to overlap", "Split into tiles; see alternating memcpy/kernels in timeline"], highlight: true },
-    { values: ["Duplex capability", "Need separate engines for H2D and D2H to overlap both", "Check deviceQuery: asyncEngineCount, concurrent copy/exec"], highlight: false },
-    { values: ["Kernel not fully copy-engine blocking", "Some kernels can serialize copies (e.g., heavy mem pressure)", "Measure with Nsight Systems timeline"], highlight: false },
-  ]}
-/>
-
-## Baseline: synchronous pipeline (no overlap)
+Consider this baseline code:
 
 ```cpp
-// Baseline: H2D -> kernel -> D2H (serialized)
-cudaMemcpy(d_in, h_in, bytes, cudaMemcpyHostToDevice);
-kernel<<<grid, block>>>(d_in, d_out);
-cudaMemcpy(h_out, d_out, bytes, cudaMemcpyDeviceToHost);
+cudaMemcpy(d_input, h_input, size, cudaMemcpyHostToDevice);   // Step 1
+kernelA<<<grid, block>>>(d_input, d_output);                   // Step 2
+cudaMemcpy(h_output, d_output, size, cudaMemcpyDeviceToHost);  // Step 3
 ```
 
-This costs approximately:
+The GPU timeline looks like three sequential boxes. The H2D copy must finish before `kernelA` begins. `kernelA` must finish before the D2H copy begins. The total wall-clock time is the sum of all three:
+
 $$
-T_{total} \approx T_{H2D} + T_{kernel} + T_{D2H}
+T_{\text{serial}} = T_{\text{H2D}} + T_{\text{kernel}} + T_{\text{D2H}}
 $$
 
-## Streamed pipeline: double-buffering the transfer/compute loop
+For a 100 MB transfer over PCIe Gen4 x16 (roughly 25 GB/s effective), each direction takes about 4 ms. If the kernel takes 3 ms, the total is $4 + 3 + 4 = 11$ ms. But during the 4 ms H2D copy, every SM on the GPU is doing nothing. During the 3 ms kernel, the PCIe link is doing nothing. During the 4 ms D2H copy, the SMs are idle again. You are using at most one resource at a time.
 
-The classic pattern is **two streams** and **two device buffers**:
+Multiple streams unlock three forms of concurrency:
+
+1. **Concurrent kernel execution** -- two independent kernels on different streams can share the SMs simultaneously, provided there are enough SMs and registers to go around.
+2. **Overlap of compute and data transfer** -- a kernel on stream A runs while a memcpy on stream B moves data, because they use different hardware units (SMs vs. copy engines).
+3. **Overlap of different-direction transfers** -- on GPUs with two copy engines, an H2D copy and a D2H copy can run simultaneously.
+
+These three forms compose. In the ideal case, you fill every cycle with useful work on every hardware unit.
+
+<Callout type="perf" title="The three hardware engines">
+  Most modern NVIDIA GPUs (Kepler and later) expose at least three independent execution engines: one or more copy engines for H2D transfers, one or more copy engines for D2H transfers, and the SM array for kernel execution. The `asyncEngineCount` field from `cudaDeviceProp` tells you how many concurrent copy engines the device supports. A value of 2 means you can overlap H2D and D2H simultaneously.
+</Callout>
+
+---
+
+## Stream Fundamentals
+
+### Creation and Destruction
+
+A CUDA stream is a sequence of operations that execute in issue order on the device. You create one with `cudaStreamCreate`:
 
 ```cpp
-cudaStream_t s0, s1;
-cudaStreamCreate(&s0);
-cudaStreamCreate(&s1);
+cudaStream_t stream;
+cudaStreamCreate(&stream);
 
-// Pinned host buffers (critical)
-cudaHostAlloc(&h0, bytes, cudaHostAllocDefault);
-cudaHostAlloc(&h1, bytes, cudaHostAllocDefault);
+// ... use the stream ...
 
-float *d_in0, *d_in1, *d_out0, *d_out1;
-cudaMalloc(&d_in0, bytes); cudaMalloc(&d_in1, bytes);
-cudaMalloc(&d_out0, bytes); cudaMalloc(&d_out1, bytes);
+cudaStreamDestroy(stream);
+```
+
+There is also `cudaStreamCreateWithFlags`, which accepts `cudaStreamDefault` or `cudaStreamNonBlocking`. The `cudaStreamNonBlocking` flag is important: it means this stream does **not** synchronize implicitly with the default stream. Without it, any operation on the default stream acts as a barrier across all streams.
+
+```cpp
+cudaStream_t stream;
+cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+```
+
+### Issuing Work on a Stream
+
+Kernels accept a stream as the fourth parameter of the launch configuration:
+
+```cpp
+kernel<<<grid, block, sharedMem, stream>>>(args...);
+```
+
+Async memory copies take the stream as the last argument:
+
+```cpp
+cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice, stream);
+```
+
+### Ordering Guarantees
+
+The fundamental rule is simple:
+
+- **Within a single stream**, operations execute in the order they were issued. Operation B will not begin until operation A has completed.
+- **Across different streams**, there is no ordering guarantee unless you insert explicit synchronization.
+
+This means you can issue work on stream 0 and stream 1 in any interleaved order from the CPU side, and the GPU will execute them concurrently whenever the hardware permits.
+
+### Synchronization Primitives
+
+CUDA provides several synchronization mechanisms:
+
+```cpp
+// Block host until everything on every stream completes
+cudaDeviceSynchronize();
+
+// Block host until everything on this specific stream completes
+cudaStreamSynchronize(stream);
+
+// Record an event into a stream
+cudaEvent_t event;
+cudaEventCreate(&event);
+cudaEventRecord(event, streamA);
+
+// Make streamB wait until the event in streamA has been reached
+cudaStreamWaitEvent(streamB, event, 0);
+```
+
+The `cudaStreamWaitEvent` call is the key building block for complex dependency graphs. It does **not** block the host -- it inserts a dependency on the device side only. Stream B will not begin executing any subsequently enqueued work until the event recorded in stream A has completed.
+
+<Callout type="info" title="Stream semantics and the legacy default stream">
+  By default, the NULL stream (stream 0) has implicit synchronization semantics: launching work on stream 0 waits for all prior work on all streams, and all other streams wait for work on stream 0 to complete. This can inadvertently serialize your pipeline if any call accidentally targets stream 0. Compile with `--default-stream per-thread` or use `cudaStreamNonBlocking` to avoid this trap.
+</Callout>
+
+---
+
+## Compute-Transfer Overlap: The Core Technique
+
+The idea is straightforward: while the GPU computes on batch $N$, copy the data for batch $N+1$ to the device, and copy the results from batch $N-1$ back to the host. This forms a three-stage pipeline.
+
+### Pinned Memory: The Non-Negotiable Prerequisite
+
+Standard host memory allocated with `malloc` or `new` is **pageable** -- the OS can swap it out at any time. When you call `cudaMemcpyAsync` with pageable memory, the CUDA runtime cannot guarantee that the data will be in physical RAM when the DMA engine needs it. So the runtime falls back to a synchronous, staged copy: it first copies your data into an internal pinned buffer, then DMAs from there. This staging serializes the transfer with the host, defeating the purpose of async copies.
+
+**Pinned (page-locked) memory** is allocated with `cudaHostAlloc` (or `cudaMallocHost`, which is equivalent):
+
+```cpp
+float* h_pinned;
+cudaHostAlloc(&h_pinned, size, cudaHostAllocDefault);
+
+// Alternative: pin existing memory
+float* h_existing = (float*)malloc(size);
+cudaHostRegister(h_existing, size, cudaHostRegisterDefault);
+```
+
+Pinned memory has a fixed physical address that the DMA engine can access directly, enabling true asynchronous transfers. The trade-off: pinned memory reduces the amount of pageable memory available to the OS, and allocating too much can cause system-wide performance degradation.
+
+<Callout type="warning" title="Do not pin all your memory">
+  Pinned memory is a scarce system resource. Allocating tens of gigabytes of pinned memory can starve the OS page cache and slow down unrelated processes. A good rule of thumb is to pin only the buffers that sit on the hot path of your pipeline -- the ones you copy every iteration.
+</Callout>
+
+### The Timeline: Without Overlap vs. With Overlap
+
+Consider processing 4 tiles of data. Without overlap, the timeline is purely sequential:
+
+```
+Stream 0: [H2D-0][Kernel-0][D2H-0][H2D-1][Kernel-1][D2H-1][H2D-2][Kernel-2][D2H-2][H2D-3][Kernel-3][D2H-3]
+```
+
+With two streams and double buffering:
+
+```
+Stream 0: [H2D-0][  Kernel-0  ][D2H-0]       [H2D-2][  Kernel-2  ][D2H-2]
+Stream 1:        [H2D-1][  Kernel-1  ][D2H-1]        [H2D-3][  Kernel-3  ][D2H-3]
+Copy Eng:  H2D-0  H2D-1              D2H-0 H2D-2     H2D-3               D2H-2
+SMs:              Kernel-0   Kernel-1        Kernel-2   Kernel-3
+```
+
+In the overlapped version, while `Kernel-0` runs on the SMs, `H2D-1` runs on the copy engine. The kernel and the copy use different hardware, so they truly execute simultaneously.
+
+### Theoretical Speedup
+
+If each tile has transfer time $T_c$ (for both H2D and D2H combined) and compute time $T_k$, the serial time for $N$ tiles is:
+
+$$
+T_{\text{serial}} = N \cdot (T_c + T_k)
+$$
+
+With perfect overlap (assuming $T_k \geq T_c$), the overlapped time is approximately:
+
+$$
+T_{\text{overlap}} \approx T_c + N \cdot T_k
+$$
+
+The speedup approaches:
+
+$$
+\text{Speedup} = \frac{T_c + T_k}{T_k} = 1 + \frac{T_c}{T_k}
+$$
+
+When $T_c \approx T_k$, you get close to a **2x speedup**. When $T_k \gg T_c$, the copies are already hidden and streams add negligible benefit. When $T_c \gg T_k$, you are transfer-bound and no amount of overlap hides the copy time.
+
+<PerfChart
+  title="Serialized vs. Overlapped Pipeline (4 tiles)"
+  unit="ms"
+  data={[
+    { label: "Serialized", value: 16.8, color: "red", annotation: "4 x (1.2 + 2.0 + 1.0)" },
+    { label: "Overlapped", value: 9.2, color: "green", annotation: "Startup + 4 x max(1.2, 2.0, 1.0)" }
+  ]}
+  baseline={0}
+/>
+
+### The Double-Buffered Implementation
+
+Here is the classic two-stream, double-buffered pipeline:
+
+```cpp
+const int NUM_STREAMS = 2;
+cudaStream_t streams[NUM_STREAMS];
+float *h_in[NUM_STREAMS], *h_out[NUM_STREAMS];
+float *d_in[NUM_STREAMS], *d_out[NUM_STREAMS];
+
+for (int i = 0; i < NUM_STREAMS; i++) {
+    cudaStreamCreate(&streams[i]);
+    cudaHostAlloc(&h_in[i],  tileBytes, cudaHostAllocDefault);
+    cudaHostAlloc(&h_out[i], tileBytes, cudaHostAllocDefault);
+    cudaMalloc(&d_in[i],  tileBytes);
+    cudaMalloc(&d_out[i], tileBytes);
+}
 
 for (int tile = 0; tile < numTiles; tile++) {
-  auto stream = (tile & 1) ? s1 : s0;
-  auto h_in   = (tile & 1) ? h1 : h0;
-  auto d_in   = (tile & 1) ? d_in1 : d_in0;
-  auto d_out  = (tile & 1) ? d_out1 : d_out0;
+    int s = tile % NUM_STREAMS;
 
-  // async H2D
-  cudaMemcpyAsync(d_in, h_in, bytes, cudaMemcpyHostToDevice, stream);
+    // Wait for previous use of this buffer to complete
+    cudaStreamSynchronize(streams[s]);
 
-  // kernel
-  kernel<<<grid, block, 0, stream>>>(d_in, d_out);
+    // Fill host input buffer for this tile
+    prepareTile(h_in[s], tile);
 
-  // async D2H
-  cudaMemcpyAsync(h_out + tile * elems, d_out, bytes, cudaMemcpyDeviceToHost, stream);
+    // Async H2D
+    cudaMemcpyAsync(d_in[s], h_in[s], tileBytes,
+                    cudaMemcpyHostToDevice, streams[s]);
+
+    // Launch kernel
+    processKernel<<<grid, block, 0, streams[s]>>>(d_in[s], d_out[s]);
+
+    // Async D2H
+    cudaMemcpyAsync(h_out[s], d_out[s], tileBytes,
+                    cudaMemcpyDeviceToHost, streams[s]);
 }
 
 cudaDeviceSynchronize();
 ```
 
-When it works, the steady-state looks like:
-$$
-T_{tile} \approx \max(T_{H2D}, T_{kernel}, T_{D2H})
-$$
-and the total is roughly $T_{startup} + numTiles \cdot T_{tile}$.
+The `cudaStreamSynchronize` at the top of each iteration ensures we do not overwrite a host buffer that the previous iteration's D2H copy is still reading from. This is a common pattern that trades a small amount of serialization for correctness.
 
-## Measuring overlap correctly (don’t trust a single timing)
+---
 
-### Use CUDA events per stream
+## PCIe vs. NVLink Bandwidth: When Overlap Is Critical vs. Unnecessary
+
+The bandwidth of the interconnect between host and device determines how much time your copies take, and therefore how much benefit overlap can deliver. The gap between interconnect technologies is enormous:
+
+<Benchmark
+  title="Interconnect bandwidth comparison"
+  columns={["Interconnect", "Theoretical BW (per direction)", "Typical Effective BW", "Latency"]}
+  rows={[
+    { values: ["PCIe Gen3 x16", "16 GB/s", "~12 GB/s", "~1-2 us"], highlight: false },
+    { values: ["PCIe Gen4 x16", "32 GB/s", "~25 GB/s", "~1-2 us"], highlight: false },
+    { values: ["PCIe Gen5 x16", "64 GB/s", "~50 GB/s", "~1-2 us"], highlight: true },
+    { values: ["NVLink 3.0 (A100)", "600 GB/s total", "~500 GB/s", "~0.7 us"], highlight: true },
+    { values: ["NVLink 4.0 (H100)", "900 GB/s total", "~800 GB/s", "~0.5 us"], highlight: true }
+  ]}
+  notes="NVLink bandwidth is aggregate bidirectional. PCIe bandwidth is per direction. Effective BW depends on transfer size, system configuration, and NUMA topology."
+/>
+
+### The Bandwidth Gap and Its Implications
+
+At PCIe Gen4 speeds, transferring 1 GB of data takes roughly 40 ms. A typical training iteration kernel on an A100 might take 10-50 ms depending on the model. These times are in the same ballpark, which means overlap delivers significant benefit.
+
+At NVLink 4.0 speeds between GPUs (GPU-to-GPU, not host-to-GPU), transferring 1 GB takes roughly 1.25 ms. If the same kernel takes 30 ms, the transfer is already less than 5% of the compute time. Overlap still helps, but the marginal gain is far smaller.
+
+This leads to an important heuristic:
+
+$$
+\text{Overlap benefit} \propto \frac{T_{\text{transfer}}}{T_{\text{compute}}}
+$$
+
+When transfers are a large fraction of compute, overlap is critical. When transfers are negligible compared to compute, the engineering effort of managing multiple streams may not be justified.
+
+<PerfChart
+  title="Transfer time for 1 GB across interconnects"
+  unit="ms"
+  data={[
+    { label: "PCIe Gen3", value: 83, color: "red" },
+    { label: "PCIe Gen4", value: 40, color: "orange" },
+    { label: "PCIe Gen5", value: 20, color: "blue" },
+    { label: "NVLink 4.0", value: 1.25, color: "green" }
+  ]}
+/>
+
+### NUMA Considerations
+
+On multi-socket systems, PCIe bandwidth further depends on which CPU socket the GPU is attached to. A GPU on socket 0 accessed from a thread running on socket 1 must traverse the inter-socket link (UPI or Infinity Fabric), which can halve effective bandwidth. Always pin your CPU threads to the NUMA node closest to the target GPU using `cudaSetDevice` and CPU affinity (`numactl --cpunodebind=N` on Linux).
+
+---
+
+## Multi-Stream Patterns
+
+### Pattern 1: Copy-Compute-Copy Pipeline
+
+The simplest and most common pattern. Each tile goes through three stages, and different tiles occupy different stages simultaneously:
+
+```
+Time --->
+Stream 0: [H2D-0] [Compute-0] [D2H-0]         [H2D-2] [Compute-2] [D2H-2]
+Stream 1:         [H2D-1] [Compute-1] [D2H-1]          [H2D-3] [Compute-3] [D2H-3]
+```
+
+This is the pattern shown in the double-buffering code above. Two streams suffice to fill the pipeline when each stage takes approximately the same time.
+
+### Pattern 2: Triple Buffering
+
+When stage durations are unequal -- say, the kernel takes much longer than the copies -- three streams can keep the pipeline fuller:
+
+```cpp
+const int NUM_STREAMS = 3;
+cudaStream_t streams[NUM_STREAMS];
+// ... allocate 3 sets of buffers ...
+
+for (int tile = 0; tile < numTiles; tile++) {
+    int s = tile % NUM_STREAMS;
+    cudaStreamSynchronize(streams[s]);
+    prepareTile(h_in[s], tile);
+    cudaMemcpyAsync(d_in[s], h_in[s], tileBytes,
+                    cudaMemcpyHostToDevice, streams[s]);
+    processKernel<<<grid, block, 0, streams[s]>>>(d_in[s], d_out[s]);
+    cudaMemcpyAsync(h_out[s], d_out[s], tileBytes,
+                    cudaMemcpyDeviceToHost, streams[s]);
+}
+```
+
+With three streams, you can have one tile in the H2D phase, one in compute, and one in D2H simultaneously, maximizing hardware utilization when the three stages have different durations.
+
+### Pattern 3: Multi-GPU Fan-Out
+
+In multi-GPU setups, each GPU gets its own stream (or set of streams), and the host fans out work:
+
+```cpp
+for (int gpu = 0; gpu < numGPUs; gpu++) {
+    cudaSetDevice(gpu);
+    cudaMemcpyAsync(d_in[gpu], h_in + gpu * chunkSize, chunkBytes,
+                    cudaMemcpyHostToDevice, streams[gpu]);
+    processKernel<<<grid, block, 0, streams[gpu]>>>(d_in[gpu], d_out[gpu]);
+    cudaMemcpyAsync(h_out + gpu * chunkSize, d_out[gpu], chunkBytes,
+                    cudaMemcpyDeviceToHost, streams[gpu]);
+}
+
+for (int gpu = 0; gpu < numGPUs; gpu++) {
+    cudaSetDevice(gpu);
+    cudaStreamSynchronize(streams[gpu]);
+}
+```
+
+Each GPU has its own PCIe link, so transfers to different GPUs are inherently parallel. The fan-out pattern scales nearly linearly with the number of GPUs when the workload is data-parallel.
+
+### Stream Dependency Graphs with Events
+
+Real pipelines are rarely simple linear chains. You may need to express complex dependencies: "stream 2 should not start its kernel until stream 0 and stream 1 have both finished their H2D copies." CUDA events let you build arbitrary DAGs:
+
+```cpp
+cudaEvent_t h2d_done[NUM_STREAMS];
+for (int i = 0; i < NUM_STREAMS; i++)
+    cudaEventCreate(&h2d_done[i]);
+
+// Stream 0: H2D for partition A
+cudaMemcpyAsync(d_A, h_A, sizeA, cudaMemcpyHostToDevice, stream0);
+cudaEventRecord(h2d_done[0], stream0);
+
+// Stream 1: H2D for partition B
+cudaMemcpyAsync(d_B, h_B, sizeB, cudaMemcpyHostToDevice, stream1);
+cudaEventRecord(h2d_done[1], stream1);
+
+// Stream 2: kernel that needs both A and B
+cudaStreamWaitEvent(stream2, h2d_done[0], 0);
+cudaStreamWaitEvent(stream2, h2d_done[1], 0);
+fusedKernel<<<grid, block, 0, stream2>>>(d_A, d_B, d_C);
+```
+
+This pattern is common in deep learning frameworks where a single layer may consume tensors that arrived via different transfer streams.
+
+<Callout type="tip" title="Keep your dependency graph minimal">
+  Every `cudaStreamWaitEvent` is a potential serialization point. Only insert dependencies where correctness requires them. Unnecessary dependencies turn your "parallel" pipeline back into a serial one. Drawing the dependency graph on paper before writing code helps catch redundant edges.
+</Callout>
+
+---
+
+## CUDA Events for Timing
+
+### Basic Event Timing
+
+CUDA events record timestamps on the GPU timeline, giving you accurate device-side measurements unaffected by host-side scheduling jitter:
 
 ```cpp
 cudaEvent_t start, stop;
 cudaEventCreate(&start);
 cudaEventCreate(&stop);
 
-cudaEventRecord(start, 0);
-// enqueue work across streams
-cudaEventRecord(stop, 0);
+cudaEventRecord(start, stream);
+myKernel<<<grid, block, 0, stream>>>(args);
+cudaEventRecord(stop, stream);
+
+// Block the host until 'stop' is reached
 cudaEventSynchronize(stop);
 
-float ms = 0;
-cudaEventElapsedTime(&ms, start, stop);
+float milliseconds = 0.0f;
+cudaEventElapsedTime(&milliseconds, start, stop);
+printf("Kernel took %.3f ms\n", milliseconds);
 ```
 
-### Use a timeline tool for truth
+The resolution of CUDA events is approximately 0.5 microseconds on modern GPUs.
 
-If overlap is real, a timeline (Nsight Systems) shows **memcpyAsync** bars concurrent with kernel bars.
+### Measuring Overlap
+
+To verify that overlap is happening, time the entire pipeline both with and without streams:
+
+```cpp
+// Measure serial version
+cudaEventRecord(startSerial, 0);
+for (int tile = 0; tile < numTiles; tile++) {
+    cudaMemcpy(d_in, h_in[tile], tileBytes, cudaMemcpyHostToDevice);
+    kernel<<<grid, block>>>(d_in, d_out);
+    cudaMemcpy(h_out[tile], d_out, tileBytes, cudaMemcpyDeviceToHost);
+}
+cudaEventRecord(stopSerial, 0);
+cudaEventSynchronize(stopSerial);
+cudaEventElapsedTime(&serialTime, startSerial, stopSerial);
+
+// Measure overlapped version
+cudaEventRecord(startOverlap, 0);
+for (int tile = 0; tile < numTiles; tile++) {
+    int s = tile % NUM_STREAMS;
+    cudaMemcpyAsync(d_in[s], h_in[tile], tileBytes,
+                    cudaMemcpyHostToDevice, streams[s]);
+    kernel<<<grid, block, 0, streams[s]>>>(d_in[s], d_out[s]);
+    cudaMemcpyAsync(h_out[tile], d_out[s], tileBytes,
+                    cudaMemcpyDeviceToHost, streams[s]);
+}
+cudaEventRecord(stopOverlap, 0);
+cudaEventSynchronize(stopOverlap);
+cudaEventElapsedTime(&overlapTime, startOverlap, stopOverlap);
+
+printf("Serial: %.2f ms, Overlapped: %.2f ms, Speedup: %.2fx\n",
+       serialTime, overlapTime, serialTime / overlapTime);
+```
 
 <Callout type="warning" title="Common measurement trap">
-  If you time from the CPU without synchronizing correctly, you often measure enqueue overhead, not device execution. Always validate overlap with a GPU timeline at least once.
+  If you time from the CPU using `clock()` or `std::chrono` without calling `cudaDeviceSynchronize()` first, you measure the time to **enqueue** work, not the time for it to **execute**. CPU-side timing of async operations will appear near-zero. Always synchronize before reading the clock, or use CUDA events for device-side timing.
 </Callout>
 
-## When overlap doesn’t help (the usual suspects)
+### Per-Stream Timing
 
-### 1) Host buffers aren’t pinned
+You can record events in individual streams to measure the duration of specific stages:
 
-If you use pageable memory, `cudaMemcpyAsync` may internally stage through pinned buffers and serialize.
+```cpp
+cudaEvent_t h2d_start, h2d_stop, kern_start, kern_stop, d2h_start, d2h_stop;
+// ... create all events ...
 
-### 2) PCIe is the bottleneck
+cudaEventRecord(h2d_start, stream);
+cudaMemcpyAsync(d_in, h_in, bytes, cudaMemcpyHostToDevice, stream);
+cudaEventRecord(h2d_stop, stream);
 
-If $T_{H2D}$ dominates and your kernel is short, overlap can’t hide the transfer:
+cudaEventRecord(kern_start, stream);
+kernel<<<grid, block, 0, stream>>>(d_in, d_out);
+cudaEventRecord(kern_stop, stream);
+
+cudaEventRecord(d2h_start, stream);
+cudaMemcpyAsync(h_out, d_out, bytes, cudaMemcpyDeviceToHost, stream);
+cudaEventRecord(d2h_stop, stream);
+
+cudaStreamSynchronize(stream);
+
+float h2d_ms, kern_ms, d2h_ms;
+cudaEventElapsedTime(&h2d_ms, h2d_start, h2d_stop);
+cudaEventElapsedTime(&kern_ms, kern_start, kern_stop);
+cudaEventElapsedTime(&d2h_ms, d2h_start, d2h_stop);
+```
+
+This breakdown tells you which stage dominates and therefore where overlap has the most potential.
 
 <Benchmark
-  title="Bottleneck regimes (per tile)"
-  columns={["Regime", "Dominant term", "Best-case overlap gain"]}
+  title="Example per-stage timing (A100, 256 MB tile)"
+  columns={["Stage", "Duration (ms)", "Hardware Unit", "Overlap Candidate?"]}
   rows={[
-    { values: ["Copy-bound", "T_H2D or T_D2H", "~none unless kernel longer"], highlight: false },
-    { values: ["Compute-bound", "T_kernel", "Can hide copies if smaller"], highlight: true },
-    { values: ["Balanced", "Similar times", "Good overlap potential"], highlight: true },
+    { values: ["H2D Copy", "10.2", "Copy Engine 0", "Yes -- runs parallel to kernels"], highlight: false },
+    { values: ["Kernel", "18.5", "SMs", "Yes -- runs parallel to copies"], highlight: true },
+    { values: ["D2H Copy", "10.2", "Copy Engine 1", "Yes -- runs parallel to kernels"], highlight: false },
+    { values: ["Serial Total", "38.9", "One at a time", "Baseline"], highlight: false },
+    { values: ["Overlapped Total", "19.8", "All concurrent", "1.96x speedup"], highlight: true }
+  ]}
+  notes="Measured on A100 80GB SXM, PCIe Gen4, pinned host memory. Kernel is a compute-bound matrix operation."
+/>
+
+---
+
+## NCCL and Streams: Overlapping Communication with Computation
+
+In distributed training with multiple GPUs, the NVIDIA Collective Communications Library (NCCL) handles allreduce, allgather, reduce-scatter, and other collective operations. Understanding how NCCL interacts with CUDA streams is essential for achieving good overlap between communication and computation.
+
+### NCCL Runs on Its Own Stream
+
+Every NCCL communicator can be associated with a CUDA stream. When you call `ncclAllReduce`, the operation is enqueued on that stream and executes asynchronously:
+
+```cpp
+ncclComm_t comm;
+cudaStream_t nccl_stream, compute_stream;
+cudaStreamCreate(&nccl_stream);
+cudaStreamCreate(&compute_stream);
+
+// Compute gradients for layer N on compute_stream
+backwardLayerN<<<grid, block, 0, compute_stream>>>(grads_N);
+
+// Once gradients are ready, allreduce them on nccl_stream
+cudaEvent_t grads_ready;
+cudaEventCreate(&grads_ready);
+cudaEventRecord(grads_ready, compute_stream);
+cudaStreamWaitEvent(nccl_stream, grads_ready, 0);
+
+ncclAllReduce(grads_N, grads_N, count, ncclFloat,
+              ncclSum, comm, nccl_stream);
+
+// Meanwhile, compute gradients for layer N-1 on compute_stream
+backwardLayerN_minus_1<<<grid, block, 0, compute_stream>>>(grads_N_minus_1);
+```
+
+The key insight: while `ncclAllReduce` for layer $N$ runs on `nccl_stream`, the backward pass for layer $N-1$ runs on `compute_stream`. Since these are different streams targeting different hardware (NVLink/network for NCCL, SMs for the backward kernel), they can overlap.
+
+### The SM Contention Problem
+
+Here is the catch: NCCL collectives are not pure network operations. They run **GPU kernels** internally -- kernels that read from and write to GPU memory, and that use SMs to orchestrate the communication. If your compute kernel occupies all available SMs, NCCL's kernels cannot launch until the compute kernel finishes, even though they are on a different stream.
+
+This is the **SM contention problem**, and it is one of the most common reasons that communication-computation overlap fails in practice.
+
+<Callout type="danger" title="SM contention kills overlap">
+  If your backward pass kernel is configured to use all available SMs (for example, by launching with a grid size equal to the total SM count), NCCL communication kernels will be queued behind it, even on a separate stream. The CUDA work scheduler cannot preempt a running kernel to make room for another. To enable overlap, you must leave some SMs free -- either by reducing the grid size of your compute kernel or by using CUDA MPS (Multi-Process Service) to partition the GPU.
+</Callout>
+
+### Strategies for Enabling NCCL Overlap
+
+**1. Reduce compute kernel grid size.** Launch your backward kernels with fewer blocks than the total SM count. For example, on an A100 with 108 SMs, launching with 80 blocks leaves 28 SMs available for NCCL kernels.
+
+**2. Use CUDA stream priorities.** Create the NCCL stream with high priority so that its kernels are scheduled preferentially:
+
+```cpp
+int leastPriority, greatestPriority;
+cudaDeviceGetStreamPriorityRange(&leastPriority, &greatestPriority);
+
+cudaStream_t nccl_stream;
+cudaStreamCreateWithPriority(&nccl_stream,
+                             cudaStreamNonBlocking,
+                             greatestPriority);
+```
+
+**3. Use per-layer overlap.** Modern frameworks like PyTorch's DistributedDataParallel (DDP) and FSDP bucket gradients by layer and overlap the allreduce of layer $N$'s gradients with the backward pass of layer $N-1$. This works because the gradients for layer $N$ are fully computed before the backward pass moves to layer $N-1$.
+
+**4. Use CUDA MPS for multi-tenant scenarios.** MPS allows multiple processes to share a GPU with partitioned SM resources, ensuring each process (including NCCL) gets a guaranteed slice of SMs.
+
+<Benchmark
+  title="Communication-compute overlap effectiveness"
+  columns={["Configuration", "Backward Time", "AllReduce Time", "Wall Time", "Overlap %"]}
+  rows={[
+    { values: ["No overlap (serial)", "30 ms", "15 ms", "45 ms", "0%"], highlight: false },
+    { values: ["Separate streams, full SM", "30 ms", "15 ms", "42 ms", "~7%"], highlight: false },
+    { values: ["Separate streams, 75% SM", "33 ms", "15 ms", "35 ms", "~67%"], highlight: true },
+    { values: ["Per-layer overlap, 75% SM", "33 ms", "15 ms", "33 ms", "~100%"], highlight: true }
+  ]}
+  notes="Illustrative numbers for a ResNet-50 backward pass on 4xA100 with NVLink. Leaving 25% of SMs free adds ~10% to backward time but saves ~27% wall time through overlap."
+/>
+
+---
+
+## Nsight Systems Profiling: Verifying Overlap
+
+Claiming overlap based on code structure alone is insufficient. You must verify it with a profiling tool. NVIDIA Nsight Systems is the standard tool for visualizing the GPU timeline and identifying serialization.
+
+### Collecting a Profile
+
+```bash
+nsys profile --trace=cuda,nvtx,osrt \
+             --output=my_profile \
+             --force-overwrite=true \
+             ./my_cuda_app
+```
+
+This produces a `.nsys-rep` file that you open in the Nsight Systems GUI. The timeline shows:
+
+- **CUDA API row**: host-side API calls (`cudaMemcpyAsync`, `cudaLaunchKernel`, etc.)
+- **CUDA HW row**: actual device-side execution, broken into sub-rows for each stream
+- **Memory copy row**: H2D and D2H transfers, with bandwidth information
+- **Kernel row**: kernel executions on SMs, with occupancy and duration
+
+### What to Look For
+
+**Good overlap** looks like stacked bars: a kernel bar on the SM row runs simultaneously with a memcpy bar on the copy engine row. The bars overlap in time.
+
+**Bad serialization** looks like sequential bars: every operation finishes before the next begins, even though they are on different streams. Common causes:
+
+1. **Pageable memory** -- the runtime serialized your async copies.
+2. **Default stream contamination** -- a stray API call on stream 0 inserted an implicit barrier.
+3. **Host-side blocking** -- a `cudaStreamSynchronize` or `cudaDeviceSynchronize` in the middle of your pipeline.
+4. **Kernel filling all SMs** -- the copy engine is technically running, but at reduced bandwidth because the memory controller is saturated by the kernel.
+
+### Measuring Overlap Ratio
+
+The overlap ratio quantifies how much concurrent execution you achieved:
+
+$$
+\text{Overlap Ratio} = 1 - \frac{T_{\text{wall}}}{T_{\text{serial}}}
+$$
+
+Where $T_{\text{wall}}$ is the actual wall-clock time of the overlapped pipeline, and $T_{\text{serial}}$ is the sum of all individual operation durations. An overlap ratio of 0 means no overlap. An overlap ratio of 0.5 means half the potential parallelism was realized.
+
+In Nsight Systems, you can measure this by selecting the range of interest on the timeline and comparing the wall-clock extent against the sum of individual kernel and memcpy durations.
+
+### Identifying Synchronization Bottlenecks
+
+Look for **gaps** in the timeline -- periods where neither SMs nor copy engines are active. These gaps indicate synchronization points where the GPU is waiting. Common culprits:
+
+- `cudaStreamSynchronize` called too early
+- `cudaDeviceSynchronize` in a loop
+- An event wait that blocks an entire stream unnecessarily
+- Host-side computation between GPU launches (the host cannot enqueue the next kernel fast enough)
+
+<Callout type="tip" title="Use NVTX markers for clarity">
+  Annotate your code with NVTX ranges to make the timeline readable:
+  ```cpp
+  #include <nvToolsExt.h>
+  nvtxRangePush("H2D batch 3");
+  cudaMemcpyAsync(...);
+  nvtxRangePop();
+  ```
+  These markers appear as colored bars on the CPU timeline, making it trivial to correlate host-side logic with device-side execution.
+</Callout>
+
+### Advanced: The Nsight Systems CLI for Automated Analysis
+
+For CI pipelines, you can extract metrics programmatically:
+
+```bash
+nsys stats --report cuda_gpu_trace my_profile.nsys-rep
+```
+
+This dumps a table of every GPU operation with start time, duration, stream ID, and correlation ID. You can script overlap analysis by looking for time-overlapping entries on different streams.
+
+---
+
+## When Streams Don't Help
+
+Streams are not a universal accelerator. There are well-defined scenarios where adding streams provides zero benefit or even degrades performance.
+
+### 1. A Single Large Kernel That Fills All SMs
+
+If your workload is a single monolithic kernel that occupies every SM on the GPU for its entire duration, there is no room for concurrent execution. A second kernel on a different stream would simply queue behind the first. Similarly, the copy engines may run but at reduced bandwidth because the memory controller is contended.
+
+This is common with:
+- Large matrix multiplications (cuBLAS GEMM on large dimensions)
+- Kernels launched with grid sizes equal to or exceeding the SM count with high occupancy
+- Persistent kernels that loop internally
+
+In these cases, the optimization path is not "add more streams" but rather "split the kernel into smaller chunks" or "reduce the grid size to leave room for other work."
+
+### 2. Insufficient Parallelism
+
+If your application processes a single small batch of data, there may simply not be enough independent work to fill multiple streams. Two streams each processing half the data might each underutilize the GPU, yielding worse performance than a single stream processing the full batch (due to kernel launch overhead and reduced occupancy per kernel).
+
+The break-even point depends on your specific kernel, but as a rough guide: if your kernel takes less than 50 microseconds, the overhead of managing multiple streams (creation, synchronization, event recording) can exceed the benefit.
+
+### 3. Explicit Synchronization Points
+
+If your algorithm requires a global barrier between steps -- for example, step $N+1$ reads the output of step $N$ across all tiles -- then streams cannot overlap consecutive steps. The dependency is fundamental, not an artifact of the programming model.
+
+Common examples:
+- Iterative solvers where each iteration reads the previous iteration's output
+- Reduction operations that produce a single scalar consumed by the next phase
+- Host-side decision logic (branching based on a GPU-computed value)
+
+### 4. Transfer-Bound Workloads with Short Kernels
+
+If $T_{\text{H2D}} + T_{\text{D2H}} \gg T_{\text{kernel}}$, overlap can hide the kernel inside the transfer, but the total time is still dominated by the transfer. Adding streams does not reduce transfer time -- PCIe bandwidth is fixed. The right solution here is to reduce the data transferred (compression, quantization, sparse representations) or to move the data less frequently.
+
+### 5. Host-Side Bottleneck
+
+If the CPU cannot enqueue work fast enough, the GPU starves regardless of how many streams are available. This happens when:
+- Host-side preprocessing between kernel launches is expensive
+- The CUDA driver overhead per launch is significant (many tiny kernels)
+- Python-based frameworks have GIL contention or interpreter overhead between CUDA calls
+
+<Benchmark
+  title="When streams help vs. when they do not"
+  columns={["Scenario", "Stream Benefit", "Better Alternative"]}
+  rows={[
+    { values: ["Large GEMM filling all SMs", "None", "Split into sub-problems or accept serial execution"], highlight: false },
+    { values: ["Balanced copy + compute pipeline", "Up to 2x", "Use 2-3 streams with double buffering"], highlight: true },
+    { values: ["Transfer-bound (tiny kernels)", "Minimal", "Reduce data movement, use compression"], highlight: false },
+    { values: ["Iterative solver with global sync", "None per iteration", "Overlap across outer loop if possible"], highlight: false },
+    { values: ["Multi-GPU data parallel", "Near-linear scaling", "One stream set per GPU, overlap H2D/compute/D2H"], highlight: true },
+    { values: ["DNN training backward + allreduce", "20-40% wall time savings", "Per-layer overlap with NCCL on high-priority stream"], highlight: true }
   ]}
 />
 
-### 3) Kernel saturates DRAM, starving copy engines
+---
 
-Even if copy engines are separate, both kernel and memcpy ultimately hit memory fabric. A bandwidth-saturated kernel can reduce effective copy BW.
+## Putting It All Together: A Production Checklist
 
-## Example numbers (illustrative)
+Here is the step-by-step process for adding stream-based overlap to an existing CUDA application:
 
-Assume per tile:
-- $T_{H2D}=1.2$ ms
-- $T_{kernel}=2.0$ ms
-- $T_{D2H}=1.0$ ms
+**Step 1: Profile the baseline.** Use Nsight Systems to measure the serial timeline. Identify the three durations: $T_{\text{H2D}}$, $T_{\text{kernel}}$, and $T_{\text{D2H}}$. If one dominates overwhelmingly, overlap of the others yields minimal benefit -- focus on the dominant term first.
 
-Serialized: $4.2$ ms/tile
-Overlapped: $\max(1.2, 2.0, 1.0)=2.0$ ms/tile → **2.1× speedup**
+**Step 2: Pin your host memory.** Replace `malloc` with `cudaHostAlloc` for any buffer involved in async copies. Verify with the profiler that `cudaMemcpyAsync` appears as a true async operation (no synchronous staging).
+
+**Step 3: Chunk your workload.** Divide the input into tiles small enough that the kernel for one tile leaves room for a copy of another tile. Too few tiles means not enough iterations to fill the pipeline. Too many tiles means excessive launch overhead.
+
+**Step 4: Create streams and double-buffer.** Start with 2 streams and 2 sets of device buffers. Issue the copy-compute-copy sequence for each tile on alternating streams.
+
+**Step 5: Profile again.** Open the Nsight Systems timeline. Verify that kernel bars and memcpy bars overlap in time. Compute the overlap ratio. If overlap is poor, check for the failure modes described above.
+
+**Step 6: Tune the number of streams.** Try 3 or 4 streams. More than 4 rarely helps because you run out of hardware parallelism (there are only 2 copy engines and one SM array). Measure wall-clock time for each configuration.
+
+**Step 7: Add event-based dependencies if needed.** If your pipeline has complex data dependencies (e.g., kernel on stream 2 needs results from streams 0 and 1), use `cudaStreamWaitEvent` to express them without unnecessary global synchronization.
+
+**Step 8: Integrate with NCCL (for distributed training).** Put NCCL operations on a separate high-priority stream. Use events to express the "gradients ready" dependency. Leave 20-30% of SMs free for NCCL kernels by adjusting your compute kernel grid size.
 
 <PerfChart
-  title="Serialized vs overlapped tile time"
-  type="bar"
-  data={{
-    labels: ["Serialized", "Overlapped"],
-    datasets: [{
-      label: "ms per tile",
-      data: [4.2, 2.0],
-      backgroundColor: ["#ef4444", "#10b981"],
-    }]
-  }}
+  title="Optimization progression: serial to fully overlapped"
+  unit="ms"
+  data={[
+    { label: "Serial baseline", value: 45.0, color: "red", annotation: "H2D + kernel + D2H" },
+    { label: "+ Pinned memory", value: 44.0, color: "orange", annotation: "Faster copies but still serial" },
+    { label: "+ 2 streams", value: 28.0, color: "blue", annotation: "Compute-transfer overlap" },
+    { label: "+ 3 streams", value: 24.0, color: "cyan", annotation: "Better pipeline filling" },
+    { label: "+ NCCL overlap", value: 19.0, color: "green", annotation: "Communication hidden behind compute" }
+  ]}
+  baseline={0}
 />
 
-## Optimization checklist
+---
 
-- **Pin host memory**: `cudaHostAlloc` / `cudaHostRegister`
-- **Choose a tile size** that makes kernels “long enough” to hide transfers
-- **Use 2–4 streams** with double/triple buffering
-- **Avoid tiny kernels**; fuse work if possible
-- **Profile**: confirm overlap in timeline; check achieved PCIe BW
+## Advanced Topics
+
+### Stream Callbacks
+
+CUDA allows you to register a host-side callback function that fires when all preceding work in a stream completes:
+
+```cpp
+void CUDART_CB myCallback(cudaStream_t stream, cudaError_t status, void* userData) {
+    printf("Stream %p finished, status: %d\n", (void*)stream, status);
+    // Signal the host, trigger the next pipeline stage, etc.
+}
+
+cudaStreamAddCallback(stream, myCallback, nullptr, 0);
+```
+
+Callbacks execute on a CUDA runtime thread, not the thread that enqueued the work. They are useful for signaling completion to other parts of a host-side pipeline without polling.
+
+### Stream Capture and CUDA Graphs
+
+Starting with CUDA 10, you can **capture** a sequence of stream operations into a CUDA Graph, then replay that graph with a single launch call. This eliminates per-operation launch overhead and is especially beneficial for pipelines with many small kernels:
+
+```cpp
+cudaGraph_t graph;
+cudaGraphExec_t graphExec;
+
+cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+
+// Issue the pipeline operations normally
+cudaMemcpyAsync(d_in, h_in, bytes, cudaMemcpyHostToDevice, stream);
+kernel<<<grid, block, 0, stream>>>(d_in, d_out);
+cudaMemcpyAsync(h_out, d_out, bytes, cudaMemcpyDeviceToHost, stream);
+
+cudaStreamEndCapture(stream, &graph);
+cudaGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0);
+
+// Replay the captured graph multiple times
+for (int i = 0; i < numIterations; i++) {
+    cudaGraphLaunch(graphExec, stream);
+}
+cudaStreamSynchronize(stream);
+```
+
+Graphs preserve the stream-based concurrency of the captured operations while eliminating the CPU overhead of re-issuing them each iteration. For repetitive pipelines (e.g., inference on fixed-size batches), this can reduce launch overhead by 10-50x.
+
+### Cooperative Groups and Stream Interaction
+
+CUDA Cooperative Groups (introduced in CUDA 9) allow kernels to synchronize across thread blocks within a grid. When using cooperative launches (`cudaLaunchCooperativeKernel`), the kernel occupies a fixed number of SMs for its entire duration and synchronizes internally. This interacts with streams in an important way: a cooperative kernel cannot be preempted, and no other kernel can run concurrently on the SMs it occupies. Plan your stream-based overlap accordingly.
+
+---
 
 ## Conclusion
 
-Streams are not magic; they’re a scheduling tool. Overlap works when you structure work into tiles, use pinned memory, and your pipeline has a balanced stage. Measure the bottleneck first — then overlap the parts that can actually run concurrently.
+CUDA streams are the fundamental mechanism for extracting pipeline parallelism from GPU hardware. They let you overlap data transfers with computation, overlap multiple independent kernels, and overlap communication with computation in distributed settings. But they are a low-level scheduling tool, not a magic performance switch.
 
+The key principles:
+
+- Commands in the same stream execute in order. Commands in different streams may execute concurrently.
+- Async transfers require pinned host memory. Without it, the runtime silently falls back to synchronous copies.
+- The benefit of overlap is proportional to $T_{\text{transfer}} / T_{\text{compute}}$. PCIe-connected GPUs benefit greatly; NVLink-connected GPUs may already have negligible transfer overhead.
+- NCCL communication can overlap with computation, but only if enough SMs are free for NCCL's internal kernels.
+- Nsight Systems is the ground truth. Never trust overlap claims that have not been verified on a profiler timeline.
+- Streams cannot help when a single kernel fills all SMs, when explicit synchronization creates fundamental barriers, or when the host cannot enqueue work fast enough.
+
+Start with a profiled baseline, pin your memory, chunk your workload, create two streams, and measure again. The gap between the serial total and the overlapped wall time tells you exactly how much concurrency you achieved -- and how much remains on the table.

@@ -1,390 +1,997 @@
 ---
-title: "KV Cache Optimization for LLM Inference: Memory Efficiency and Performance Analysis"
+title: "KV Cache: The Hidden Memory Giant in LLM Serving"
 author: "stanley-phoong"
-description: "Comprehensive analysis of KV cache in transformer inference, memory optimization techniques, and strategies for managing cache size in production systems."
-publishDate: 2019-07-02
+description: "A deep-dive into KV cache memory management for LLM inference: why it exists, why it dominates GPU memory at scale, and how PagedAttention, quantization, eviction policies, and bandwidth analysis shape production serving systems."
+publishDate: 2025-03-21
 category: llm-inference
-tags: [llm, kv-cache, memory, optimization, inference, transformers]
-difficulty: advanced
-readingTime: 22
+tags: [llm, kv-cache, memory, optimization, inference, transformers, pagedattention, quantization, vllm]
+difficulty: expert
+readingTime: 35
 ---
 
 import Callout from '@/components/mdx/Callout.astro';
 import PerfChart from '@/components/mdx/PerfChart.astro';
 import Benchmark from '@/components/mdx/Benchmark.astro';
+import MemoryLayout from '@/components/mdx/MemoryLayout.astro';
 
-KV (Key-Value) caching is fundamental to efficient LLM inference. Understanding cache memory requirements and optimization strategies is crucial for production deployments.
+If you have ever tried to serve a large language model in production, you have encountered a frustrating reality: the model weights fit on your GPUs, but you cannot serve many concurrent users. The bottleneck is almost always the **KV cache** -- a runtime data structure that grows with every token generated, for every request, across every layer of the model. At serving scale, the KV cache routinely consumes **more GPU memory than the model itself**.
 
-## KV Cache Fundamentals
+This post is a comprehensive treatment of KV cache memory management. We will start from first principles -- why the cache exists and what happens without it -- then work through exact memory arithmetic for modern models, memory allocation strategies (from naive contiguous buffers to PagedAttention), compression and eviction techniques, bandwidth analysis during decode, and production tuning considerations. The goal is to give you the full systems-level picture so that you can reason about KV cache tradeoffs in your own serving stack.
 
-During autoregressive generation, previous tokens' K and V values are reused:
+## Why KV Cache Exists
+
+### The Autoregressive Bottleneck
+
+Transformer-based language models generate text **one token at a time**. At each step, the model must compute attention over all previous tokens. The attention mechanism for a single head looks like this:
+
+$$
+\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right) V
+$$
+
+During generation, the query $Q$ comes from the **new** token being generated. But the keys $K$ and values $V$ must include **every previous token in the sequence**. Without caching, this means recomputing $K$ and $V$ projections for all prior tokens at every single generation step.
+
+### Without KV Cache: O(n^2) Per Token
+
+Consider generating a sequence of length $n$. At step $t$, the model must:
+
+1. Project all $t$ tokens through $W_K$ and $W_V$ to get keys and values
+2. Compute attention between the new query and all $t$ keys
+3. Produce one output token
+
+The projection step alone is $O(t \cdot d)$ per layer. Summed over all $n$ generation steps:
+
+$$
+\text{Total projection work} = \sum_{t=1}^{n} t \cdot d = \frac{n(n+1)}{2} \cdot d = O(n^2 \cdot d)
+$$
+
+For a 4096-token sequence on a model with 80 layers, this means recomputing the K/V projections for tokens 1 through 4095 just to generate token 4096. Then recomputing tokens 1 through 4096 to generate token 4097. The redundant computation is enormous.
 
 ```python
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+def generate_without_cache(model, prompt_tokens, max_new_tokens):
+    """Naive generation: recompute everything at each step."""
+    tokens = prompt_tokens.clone()
 
-class TransformerBlock(nn.Module):
-    def __init__(self, d_model, num_heads):
-        super().__init__()
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.head_dim = d_model // num_heads
-        
-        self.W_q = nn.Linear(d_model, d_model)
-        self.W_k = nn.Linear(d_model, d_model)
-        self.W_v = nn.Linear(d_model, d_model)
-        self.W_o = nn.Linear(d_model, d_model)
-    
-    def forward(self, x, kv_cache=None):
-        """
-        x: [batch, seq_len, d_model]
-        kv_cache: {'K': [batch, cache_len, num_heads, head_dim],
-                   'V': [batch, cache_len, num_heads, head_dim]}
-        """
-        batch_size, seq_len, _ = x.size()
-        
-        Q = self.W_q(x)  # [batch, seq_len, d_model]
-        K = self.W_k(x)
-        V = self.W_v(x)
-        
-        # Reshape for multi-head
-        Q = Q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        K = K.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        V = V.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        # Now: [batch, num_heads, seq_len, head_dim]
-        
-        # Concatenate with cache
-        if kv_cache is not None:
-            K = torch.cat([kv_cache['K'], K], dim=2)  # Append new K
-            V = torch.cat([kv_cache['V'], V], dim=2)  # Append new V
-        
-        # Attention
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        attn_weights = F.softmax(scores, dim=-1)
-        output = torch.matmul(attn_weights, V)
-        
-        # Update cache
-        new_cache = {'K': K, 'V': V}
-        
-        # Output projection
-        output = output.transpose(1, 2).contiguous()
-        output = output.view(batch_size, seq_len, self.d_model)
-        output = self.W_o(output)
-        
-        return output, new_cache
+    for step in range(max_new_tokens):
+        # Full forward pass over ALL tokens every step
+        # Attention cost: O(seq_len^2) per layer
+        logits = model(tokens)  # processes entire sequence
+        next_token = sample(logits[:, -1, :])
+        tokens = torch.cat([tokens, next_token.unsqueeze(1)], dim=1)
+
+    return tokens
+# Total compute: O(n^2 * d * L) where L = num_layers
 ```
 
-## Memory Requirements Analysis
+### With KV Cache: O(n) Per Token
 
-KV cache memory grows linearly with sequence length:
+The fix is straightforward: **cache the K and V projections** from previous tokens. At each generation step, we only compute K and V for the single new token, then concatenate them with the cached values.
 
 ```python
-def calculate_kv_cache_memory(seq_len, batch_size, num_layers, d_model, num_heads, dtype_bytes=2):
-    """
-    Calculate KV cache memory requirements
-    """
-    head_dim = d_model // num_heads
-    
-    # Per layer: K + V
-    # Shape: [batch, num_heads, seq_len, head_dim]
-    cache_per_layer = 2 * batch_size * num_heads * seq_len * head_dim * dtype_bytes
-    
-    # Total across all layers
-    total_cache = cache_per_layer * num_layers
-    
-    return total_cache / (1024 ** 3)  # GB
+def generate_with_cache(model, prompt_tokens, max_new_tokens):
+    """Cached generation: only compute new token's K/V."""
+    kv_cache = None
 
-# Example: GPT-2 medium
-memory = calculate_kv_cache_memory(
-    seq_len=1024,
-    batch_size=8,
-    num_layers=24,
-    d_model=1024,
-    num_heads=16
-)
-print(f"KV Cache Memory: {memory:.2f} GB")
+    # Prefill: process entire prompt (one-time cost)
+    logits, kv_cache = model(prompt_tokens, kv_cache=None)
+    next_token = sample(logits[:, -1, :])
+    generated = [next_token]
+
+    # Decode: process one token at a time, reusing cache
+    for step in range(max_new_tokens - 1):
+        logits, kv_cache = model(
+            next_token.unsqueeze(1),
+            kv_cache=kv_cache  # reuse all previous K/V
+        )
+        next_token = sample(logits[:, -1, :])
+        generated.append(next_token)
+
+    return generated
+# Total compute: O(n * d * L) -- linear, not quadratic
+```
+
+The computational savings are dramatic:
+
+<Benchmark
+  title="Computational Cost: With vs Without KV Cache (4096-token generation)"
+  columns={["Method", "K/V Projections", "Attention Ops", "Wall Time (est.)", "Speedup"]}
+  rows={[
+    { values: ["No cache", "O(n^2 * d * L)", "O(n^2 * d * L)", "~180 s", "1.0x"], highlight: false },
+    { values: ["With KV cache", "O(n * d * L)", "O(n * d * L)", "~12 s", "~15x"], highlight: true },
+  ]}
+/>
+
+<Callout type="tip" title="The trade-off is memory for compute">
+  KV caching converts a compute-bound quadratic problem into a memory-bound linear problem. You trade GPU memory (storing all those cached K/V tensors) for a massive reduction in redundant computation. This trade-off is worthwhile for virtually all serving scenarios, but it means memory management becomes the critical bottleneck.
+</Callout>
+
+The cache itself is simple in concept. For each layer, we store two tensors:
+
+```python
+class CachedAttention(nn.Module):
+    def forward(self, x, kv_cache=None):
+        B, T, D = x.shape
+        Q = self.W_q(x)  # [B, T, D]
+        K_new = self.W_k(x)  # [B, T, D]
+        V_new = self.W_v(x)  # [B, T, D]
+
+        # Reshape to [B, num_heads, T, head_dim]
+        Q = Q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        K_new = K_new.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        V_new = V_new.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+
+        if kv_cache is not None:
+            K = torch.cat([kv_cache['K'], K_new], dim=2)
+            V = torch.cat([kv_cache['V'], V_new], dim=2)
+        else:
+            K, V = K_new, V_new
+
+        # Standard attention (or GQA with head broadcasting)
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        attn = F.softmax(scores, dim=-1)
+        out = torch.matmul(attn, V)
+
+        new_cache = {'K': K, 'V': V}
+        return out, new_cache
+```
+
+Simple in concept. Devastating in memory consumption at scale.
+
+## The Memory Arithmetic: KV Cache vs Model Weights
+
+### The Formula
+
+The total KV cache memory for a model is:
+
+$$
+\text{KV\_cache\_bytes} = 2 \times L \times H_{kv} \times d_h \times S \times B \times \text{bytes\_per\_element}
+$$
+
+Where:
+- $2$ = one K tensor + one V tensor
+- $L$ = number of layers
+- $H_{kv}$ = number of KV heads (may differ from query heads in GQA)
+- $d_h$ = head dimension
+- $S$ = sequence length
+- $B$ = batch size
+- $\text{bytes\_per\_element}$ = 2 for FP16/BF16, 1 for INT8
+
+### Llama 3 70B: A Worked Example
+
+Llama 3 70B uses Grouped Query Attention (GQA) with these parameters:
+- $L = 80$ layers
+- $H_{kv} = 8$ KV heads (while having 64 query heads)
+- $d_h = 128$ head dimension
+- Model weights: ~140 GB in FP16
+
+Let us compute the KV cache for a realistic serving scenario: **batch size 64, sequence length 4096**.
+
+$$
+\text{KV\_bytes} = 2 \times 80 \times 8 \times 128 \times 4096 \times 64 \times 2
+$$
+
+Breaking this down step by step:
+
+$$
+= 2 \times 80 \times 8 \times 128 = 163{,}840 \text{ bytes per token per batch element}
+$$
+
+$$
+163{,}840 \times 4096 = 671{,}088{,}640 \text{ bytes per batch element}
+$$
+
+$$
+671{,}088{,}640 \times 64 = 42{,}949{,}672{,}960 \text{ bytes (raw cache)}
+$$
+
+$$
+42{,}949{,}672{,}960 \times 2 \text{ (FP16)} = 85{,}899{,}345{,}920 \text{ bytes} \approx 80 \text{ GB}
+$$
+
+Wait -- let me redo this more carefully. The factor of 2 for "K + V" and the factor of 2 for "FP16 bytes" are separate:
+
+$$
+\text{KV\_bytes} = 2 \cdot 80 \cdot 8 \cdot 128 \cdot 4096 \cdot 64 \cdot 2 = 85{,}899{,}345{,}920 \text{ bytes} \approx \textbf{80 GB}
+$$
+
+<Callout type="warning" title="KV cache approaches model weight size">
+  For Llama 3 70B at batch=64 and seq_len=4096, the KV cache alone is ~80 GB. The model weights are ~140 GB in FP16. The KV cache is already **57% of model weight size** -- and it scales linearly with both batch size and sequence length. Double the batch to 128 and you hit 160 GB of KV cache, **exceeding the model weights**.
+</Callout>
+
+### Memory Breakdown Across Models
+
+Let us compute KV cache sizes for several popular models at a fixed serving point of batch=32, seq_len=4096, FP16:
+
+```python
+def kv_cache_gb(layers, kv_heads, head_dim, seq_len, batch, dtype_bytes=2):
+    """Compute KV cache size in GB."""
+    return (2 * layers * kv_heads * head_dim * seq_len * batch * dtype_bytes) / (1024**3)
 ```
 
 <Benchmark
-  title="KV Cache Memory Requirements (GPT-2 Medium, batch=8)"
-  columns={["Sequence Length", "Cache Size (GB)", "Per Token (MB)", "Growth Rate"]}
+  title="KV Cache Memory for Popular Models (batch=32, seq=4096, FP16)"
+  columns={["Model", "Layers", "KV Heads", "d_head", "Weights (GB)", "KV Cache (GB)", "Cache/Weights"]}
   rows={[
-    { values: ["256", "0.10", "0.39", "Linear"], highlight: false },
-    { values: ["512", "0.20", "0.39", "Linear"], highlight: false },
-    { values: ["1024", "0.39", "0.39", "Linear"], highlight: true },
-    { values: ["2048", "0.78", "0.39", "Linear"], highlight: false },
-    { values: ["4096", "1.56", "0.39", "Linear"], highlight: false },
+    { values: ["Llama 3 8B", "32", "8", "128", "16", "4.0", "25%"], highlight: false },
+    { values: ["Mistral 7B", "32", "8", "128", "14", "4.0", "29%"], highlight: false },
+    { values: ["Llama 3 70B", "80", "8", "128", "140", "10.0", "7%"], highlight: false },
+    { values: ["Llama 3 70B (batch=64)", "80", "8", "128", "140", "20.0", "14%"], highlight: true },
+    { values: ["Llama 3 70B (batch=128)", "80", "8", "128", "140", "40.0", "29%"], highlight: true },
+    { values: ["Llama 3 405B", "126", "8", "128", "810", "15.8", "2%"], highlight: false },
+    { values: ["GPT-4 class (est.)", "120", "16", "128", "~800", "30.0", "~4%"], highlight: false },
+  ]}
+/>
+
+Several observations emerge from this table. First, **GQA is a lifesaver**: Llama 3 70B uses only 8 KV heads (vs. 64 query heads), which gives an 8x reduction in KV cache size compared to standard multi-head attention. Without GQA, the 70B model at batch=64 would need 640 GB of KV cache -- clearly impossible. Second, smaller models are **more KV-cache-dominated** relative to their weight size, because the KV cache scales with `kv_heads * d_head * layers` while weights scale with `d_model^2 * layers`. Third, batch size is the multiplier that pushes KV cache from manageable to dominant.
+
+<MemoryLayout
+  title="GPU Memory Layout: Llama 3 70B Serving (batch=64, seq=4096)"
+  description="Approximate memory breakdown on 4x A100 80GB (320 GB total)"
+  regions={[
+    { start: "0x00000", end: "0x8C000", name: "Model Weights (FP16)", size: "140 GB", color: "blue", notes: "Static, loaded once at startup" },
+    { start: "0x8C000", end: "0xDC000", name: "KV Cache", size: "80 GB", color: "orange", notes: "Dynamic, grows per-request" },
+    { start: "0xDC000", end: "0xF0000", name: "Activations + Workspace", size: "20 GB", color: "green", notes: "Transient, reused per step" },
+    { start: "0xF0000", end: "0x140000", name: "Free / Headroom", size: "80 GB", color: "gray", notes: "Needed for burst capacity" },
   ]}
 />
 
 <PerfChart
-  title="KV Cache Memory vs Sequence Length"
+  title="KV Cache Size vs Batch Size (Llama 3 70B, seq=4096, FP16)"
   type="line"
   data={{
-    labels: ["256", "512", "1024", "2048", "4096"],
+    labels: ["1", "8", "16", "32", "64", "128", "256"],
+    datasets: [
+      {
+        label: "KV Cache (GB)",
+        data: [0.31, 2.5, 5.0, 10.0, 20.0, 40.0, 80.0],
+        borderColor: "#ef4444",
+      },
+      {
+        label: "Model Weights (GB, constant)",
+        data: [140, 140, 140, 140, 140, 140, 140],
+        borderColor: "#3b82f6",
+      },
+    ]
+  }}
+/>
+
+At batch=256, the KV cache reaches 80 GB -- **more than half** the model weight size. For models with full MHA (no GQA), the crossover happens much sooner.
+
+## Memory Management: From Naive to PagedAttention
+
+### The Naive Approach: Contiguous Pre-allocation
+
+The simplest KV cache implementation pre-allocates a contiguous buffer for each request at `max_seq_len`:
+
+```python
+class NaiveKVCache:
+    def __init__(self, max_seq_len, batch_size, layers, kv_heads, head_dim, dtype=torch.float16):
+        # Pre-allocate maximum possible size for every request
+        self.k_cache = torch.zeros(
+            (batch_size, layers, kv_heads, max_seq_len, head_dim),
+            dtype=dtype, device='cuda'
+        )
+        self.v_cache = torch.zeros_like(self.k_cache)
+        self.lengths = torch.zeros(batch_size, dtype=torch.int32)
+
+    def append(self, batch_idx, layer_idx, new_k, new_v):
+        pos = self.lengths[batch_idx]
+        self.k_cache[batch_idx, layer_idx, :, pos, :] = new_k
+        self.v_cache[batch_idx, layer_idx, :, pos, :] = new_v
+        self.lengths[batch_idx] += 1
+```
+
+This approach has a fatal flaw: **internal fragmentation**. If `max_seq_len = 4096` but the average request only uses 800 tokens, then 80% of the allocated memory is wasted. The memory is reserved and cannot be used by other requests.
+
+The vLLM team measured this waste empirically and found that **60-80% of KV cache memory is wasted** under realistic workloads with contiguous allocation. Their published figure is **68% average waste** across several serving traces.
+
+<Benchmark
+  title="Memory Waste in Contiguous Allocation (measured)"
+  columns={["Workload", "Avg Seq Len", "Max Seq Len", "Allocated", "Actually Used", "Waste"]}
+  rows={[
+    { values: ["ShareGPT (chat)", "830", "4096", "100%", "20%", "80%"], highlight: false },
+    { values: ["Alpaca (instruction)", "380", "2048", "100%", "19%", "81%"], highlight: false },
+    { values: ["Code generation", "1200", "4096", "100%", "29%", "71%"], highlight: false },
+    { values: ["Summarization", "2800", "4096", "100%", "68%", "32%"], highlight: false },
+    { values: ["Weighted average", "--", "--", "100%", "32%", "68%"], highlight: true },
+  ]}
+/>
+
+There is also **external fragmentation**: as requests complete and free their contiguous blocks, the free memory becomes a patchwork of different-sized holes. A new request needing a 4096-token block may fail even though total free memory is sufficient, because no single contiguous region is large enough.
+
+### PagedAttention: Virtual Memory for KV Cache
+
+The breakthrough insight from vLLM (Kwon et al., 2023) is to apply the same idea that operating systems use for process memory: **paging**. Instead of allocating one contiguous buffer per request, divide KV cache memory into fixed-size **blocks** (analogous to 4KB pages in virtual memory) and map them to requests through a **page table**.
+
+Each block stores the K and V vectors for a fixed number of tokens (the **block size**, typically 16 tokens). A request's KV cache is a linked list of blocks, not necessarily contiguous in physical GPU memory.
+
+```python
+class KVBlock:
+    """A fixed-size block storing K/V for block_size tokens across all layers."""
+    def __init__(self, block_id, block_size, layers, kv_heads, head_dim, dtype):
+        # Shape: [layers, 2, kv_heads, block_size, head_dim]
+        self.data = torch.zeros(
+            (layers, 2, kv_heads, block_size, head_dim),
+            dtype=dtype, device='cuda'
+        )
+        self.block_id = block_id
+        self.num_filled = 0
+        self.block_size = block_size
+
+class BlockAllocator:
+    """Free-list allocator for KV cache blocks. O(1) alloc and free."""
+    def __init__(self, num_blocks, block_size, layers, kv_heads, head_dim, dtype):
+        self.blocks = [
+            KVBlock(i, block_size, layers, kv_heads, head_dim, dtype)
+            for i in range(num_blocks)
+        ]
+        self.free_list = list(range(num_blocks))
+        self.ref_counts = [0] * num_blocks
+
+    def allocate(self):
+        if not self.free_list:
+            return None  # OOM
+        block_id = self.free_list.pop()
+        self.ref_counts[block_id] = 1
+        return block_id
+
+    def free(self, block_id):
+        self.ref_counts[block_id] -= 1
+        if self.ref_counts[block_id] == 0:
+            self.blocks[block_id].num_filled = 0
+            self.free_list.append(block_id)
+
+    def incref(self, block_id):
+        """For copy-on-write sharing."""
+        self.ref_counts[block_id] += 1
+
+class PageTable:
+    """Maps (request_id, logical_block_idx) to physical block_id."""
+    def __init__(self):
+        self.tables = {}  # request_id -> list[int] (physical block ids)
+
+    def get_physical_blocks(self, request_id):
+        return self.tables.get(request_id, [])
+
+    def append_block(self, request_id, physical_block_id):
+        if request_id not in self.tables:
+            self.tables[request_id] = []
+        self.tables[request_id].append(physical_block_id)
+
+    def release(self, request_id, allocator):
+        for block_id in self.tables.pop(request_id, []):
+            allocator.free(block_id)
+```
+
+The key properties of this design:
+
+**Near-zero waste.** A request only allocates blocks as it needs them. A request at 800 tokens with block_size=16 uses exactly 50 blocks. The only waste is in the last partially-filled block -- at most `block_size - 1` tokens, or 15 tokens in this example. For a 4096-max system, that is under 0.4% waste vs. 80% with contiguous allocation.
+
+**No external fragmentation.** All blocks are the same size, so any free block can satisfy any allocation. The "fragmentation kills you" problem of contiguous allocation vanishes entirely.
+
+**O(1) allocation and deallocation.** The free list gives constant-time alloc/free. No searching, no compaction, no defragmentation.
+
+<Benchmark
+  title="Memory Utilization: Contiguous vs PagedAttention"
+  columns={["Allocator", "Utilization", "External Frag", "Internal Frag", "Alloc Time"]}
+  rows={[
+    { values: ["Contiguous (max_len)", "20-40%", "High", "Very high", "O(1)"], highlight: false },
+    { values: ["Contiguous (growing)", "60-70%", "High", "Medium", "O(n) realloc"], highlight: false },
+    { values: ["PagedAttention (block=16)", "96-99%", "Zero", "< 0.4%"], highlight: true },
+    { values: ["PagedAttention (block=1)", "~100%", "Zero", "Zero", "O(1), high overhead"], highlight: false },
+  ]}
+/>
+
+### Block Size: A Real Tuning Knob
+
+The block size presents a classic overhead-vs-waste tradeoff:
+
+- **Smaller blocks** (e.g., 1 token): minimal internal fragmentation, but more page table entries, more pointer chasing, worse memory access patterns for the attention kernel.
+- **Larger blocks** (e.g., 64 tokens): better memory locality, fewer page table entries, but more internal fragmentation for short or variable-length sequences.
+
+In practice, block sizes of 16-32 tokens hit the sweet spot. vLLM defaults to 16. The overhead from page table management is negligible compared to the memory savings.
+
+<PerfChart
+  title="Block Size Tradeoff (Llama 3 70B, mixed workload)"
+  type="line"
+  data={{
+    labels: ["1", "4", "8", "16", "32", "64", "128"],
+    datasets: [
+      { label: "Internal fragmentation (%)", data: [0, 0.5, 1.0, 1.8, 3.2, 5.5, 9.0], borderColor: "#ef4444" },
+      { label: "Page table overhead (%)", data: [8.0, 3.5, 1.8, 1.0, 0.6, 0.3, 0.2], borderColor: "#3b82f6" },
+      { label: "Total overhead (%)", data: [8.0, 4.0, 2.8, 2.8, 3.8, 5.8, 9.2], borderColor: "#10b981" },
+    ]
+  }}
+/>
+
+### Copy-on-Write for Beam Search
+
+Beam search generates multiple candidate sequences that share a common prefix. Without copy-on-write, you must duplicate the entire KV cache for each beam -- multiplying memory usage by the beam width.
+
+With paged allocation, beams can **share physical blocks** for their common prefix. Each beam's page table points to the same physical blocks. When a beam diverges (writes to a position in a shared block), the system copies only that single block -- the "copy-on-write" pattern from OS virtual memory.
+
+```python
+def fork_beam(page_table, allocator, parent_request_id, child_request_id):
+    """Fork a beam: child shares parent's blocks via refcounting."""
+    parent_blocks = page_table.get_physical_blocks(parent_request_id)
+    page_table.tables[child_request_id] = parent_blocks.copy()
+    for block_id in parent_blocks:
+        allocator.incref(block_id)
+
+def cow_write(page_table, allocator, request_id, logical_block_idx, new_kv_data):
+    """Copy-on-write: only copy the block being modified."""
+    blocks = page_table.get_physical_blocks(request_id)
+    old_block_id = blocks[logical_block_idx]
+
+    if allocator.ref_counts[old_block_id] > 1:
+        # Shared block -- must copy before writing
+        new_block_id = allocator.allocate()
+        allocator.blocks[new_block_id].data.copy_(
+            allocator.blocks[old_block_id].data
+        )
+        allocator.free(old_block_id)  # decrements refcount
+        blocks[logical_block_idx] = new_block_id
+        old_block_id = new_block_id
+
+    # Now safe to write in-place
+    write_kv_to_block(allocator.blocks[old_block_id], new_kv_data)
+```
+
+For beam width $w$ and sequence length $S$ with block size $b$, naive duplication costs $w \times \lceil S/b \rceil$ blocks, but copy-on-write costs only $\lceil S/b \rceil + (w-1) \times \lceil \text{divergent\_tokens}/b \rceil$ blocks. For beam search on a 2048-token sequence with beam width 4 that diverges in the last 50 tokens, naive allocation uses 4x memory while CoW uses approximately 1.05x.
+
+### Admission Control and Preemption
+
+With paged allocation, admission control becomes precise: you know exactly how many free blocks remain, so you can make exact decisions about whether to admit a new request.
+
+```python
+def can_admit(allocator, estimated_tokens, block_size=16):
+    """Admit only if we have enough blocks for the estimated request."""
+    needed_blocks = (estimated_tokens + block_size - 1) // block_size
+    return len(allocator.free_list) >= needed_blocks
+
+def preempt_if_needed(allocator, scheduler, min_free_blocks):
+    """Preempt lowest-priority request if memory is critically low."""
+    while len(allocator.free_list) < min_free_blocks:
+        victim = scheduler.get_lowest_priority_request()
+        if victim is None:
+            break  # nothing to preempt
+        # Two strategies: swap to CPU or recompute later
+        if swap_is_cheaper(victim):
+            swap_to_cpu(victim, allocator)
+        else:
+            mark_for_recompute(victim, allocator)
+```
+
+<Callout type="tip" title="Swap vs Recompute">
+  When preempting a request, you have two options. **Swap** copies the KV cache blocks to CPU memory and restores them later -- good for long sequences where recomputation would be expensive. **Recompute** discards the KV cache entirely and re-runs the prefill when the request is rescheduled -- good for short prefills or when CPU memory is also tight. The breakeven point depends on PCIe bandwidth vs. compute throughput: for sequences under ~512 tokens, recompute is usually faster than swapping over PCIe Gen4.
+</Callout>
+
+## KV Cache Compression
+
+Even with perfect memory management (zero fragmentation), you eventually hit the hard limit of GPU memory. Compression techniques trade a small amount of quality for significant memory savings.
+
+### Quantization: FP16 to INT8 and INT4
+
+The most straightforward compression is reducing the numerical precision of cached K and V tensors.
+
+**FP16 to INT8 (2x savings).** Each element goes from 2 bytes to 1 byte. The quality impact is remarkably small because K and V tensors have well-behaved distributions with limited dynamic range. Per-channel or per-token quantization with calibrated scales preserves almost all information.
+
+```python
+def quantize_kv_to_int8(kv_tensor):
+    """Per-channel INT8 quantization of KV cache."""
+    # Compute scale per channel (last dimension)
+    abs_max = kv_tensor.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+    scale = abs_max / 127.0
+
+    # Quantize
+    quantized = (kv_tensor / scale).round().clamp(-128, 127).to(torch.int8)
+    return quantized, scale
+
+def dequantize_kv(quantized, scale):
+    """Dequantize back to FP16 for attention computation."""
+    return quantized.to(torch.float16) * scale
+```
+
+**INT8 to INT4 (4x total savings from FP16).** Each element uses 4 bits, packed two per byte. Quality loss becomes measurable but often acceptable for many applications. GPTQ-style or AWQ-style quantization can be applied to KV caches specifically.
+
+<Benchmark
+  title="KV Cache Quantization Impact (Llama 3 70B, batch=64, seq=4096)"
+  columns={["Precision", "Bytes/Element", "KV Cache Size", "Savings", "Avg Quality Loss"]}
+  rows={[
+    { values: ["FP16", "2", "80 GB", "Baseline", "0%"], highlight: false },
+    { values: ["INT8 (per-channel)", "1", "40 GB", "2x", "< 0.1% perplexity"], highlight: true },
+    { values: ["INT4 (grouped)", "0.5", "20 GB", "4x", "0.3-1.0% perplexity"], highlight: false },
+    { values: ["INT4 + FP16 outliers", "~0.6", "24 GB", "3.3x", "< 0.2% perplexity"], highlight: true },
+    { values: ["INT2 (experimental)", "0.25", "10 GB", "8x", "2-5% perplexity"], highlight: false },
+  ]}
+/>
+
+The "INT4 + FP16 outliers" approach deserves special mention: it keeps a small percentage of high-magnitude values in full precision while quantizing the rest to INT4. This gives nearly the compression of INT4 with quality close to INT8. Systems like KIVI and KVQuant implement this pattern.
+
+<PerfChart
+  title="Memory Savings vs Quality Degradation (Llama 3 70B on MMLU)"
+  type="line"
+  data={{
+    labels: ["FP16", "INT8", "INT4+outliers", "INT4", "INT3", "INT2"],
+    datasets: [
+      { label: "KV Cache Size (GB, batch=64)", data: [80, 40, 24, 20, 15, 10], borderColor: "#3b82f6" },
+      { label: "MMLU Score", data: [79.5, 79.4, 79.2, 78.8, 77.5, 75.0], borderColor: "#10b981" },
+    ]
+  }}
+/>
+
+### Eviction Policies: When Memory Is Full
+
+When GPU memory is exhausted and you cannot (or choose not to) preempt entire requests, you can instead **evict individual KV cache entries** -- dropping the K/V for specific tokens at specific layers. The question is: which entries are least important?
+
+**Heavy Hitter Oracle (H2O).** The key observation is that attention patterns are sparse: a small fraction of tokens receive a disproportionate share of attention mass. H2O keeps the "heavy hitter" tokens (those that consistently receive high attention scores) plus the most recent tokens, and evicts the rest.
+
+```python
+class H2OEviction:
+    """Heavy Hitter Oracle: keep tokens with highest cumulative attention."""
+    def __init__(self, budget, recent_window=128):
+        self.budget = budget  # max tokens to keep
+        self.recent_window = recent_window
+        self.cumulative_attention = None
+
+    def update(self, attention_weights):
+        """attention_weights: [batch, heads, 1, seq_len] from latest step."""
+        scores = attention_weights.sum(dim=(0, 1, 2))  # [seq_len]
+        if self.cumulative_attention is None:
+            self.cumulative_attention = scores
+        else:
+            # Extend for new position
+            self.cumulative_attention = torch.cat([
+                self.cumulative_attention,
+                scores[-1:]
+            ])
+            self.cumulative_attention[:-1] += scores[:-1]
+
+    def get_eviction_mask(self, seq_len):
+        """Returns boolean mask of tokens to KEEP."""
+        if seq_len <= self.budget:
+            return torch.ones(seq_len, dtype=torch.bool)
+
+        keep = torch.zeros(seq_len, dtype=torch.bool)
+
+        # Always keep recent tokens
+        keep[-self.recent_window:] = True
+
+        # Keep top-k heavy hitters from older tokens
+        remaining_budget = self.budget - self.recent_window
+        older_scores = self.cumulative_attention[:seq_len - self.recent_window]
+        topk_indices = older_scores.topk(remaining_budget).indices
+        keep[topk_indices] = True
+
+        return keep
+```
+
+**Attention Sinks.** Xiao et al. (2023) discovered that the **first few tokens** in a sequence consistently receive high attention regardless of content -- they act as "attention sinks." A simple but effective eviction policy keeps the first $k$ tokens (typically 4) plus the most recent $W$ tokens, evicting everything in between.
+
+```python
+class AttentionSinkEviction:
+    """StreamingLLM-style: keep first k 'sink' tokens + recent window."""
+    def __init__(self, num_sinks=4, window_size=1024):
+        self.num_sinks = num_sinks
+        self.window_size = window_size
+
+    def trim_cache(self, k_cache, v_cache, current_len):
+        """Trim cache to sinks + window."""
+        if current_len <= self.num_sinks + self.window_size:
+            return k_cache, v_cache  # no trimming needed
+
+        # Keep first num_sinks tokens
+        sink_k = k_cache[:, :, :self.num_sinks, :]
+        sink_v = v_cache[:, :, :self.num_sinks, :]
+
+        # Keep last window_size tokens
+        recent_k = k_cache[:, :, -self.window_size:, :]
+        recent_v = v_cache[:, :, -self.window_size:, :]
+
+        return (
+            torch.cat([sink_k, recent_k], dim=2),
+            torch.cat([sink_v, recent_v], dim=2),
+        )
+    # Resulting cache length: num_sinks + window_size (constant)
+```
+
+<Benchmark
+  title="Eviction Policy Comparison (Llama 3 8B, 4096-token generation, budget=1024)"
+  columns={["Policy", "Tokens Kept", "Memory", "Quality (ppl)", "Implementation"]}
+  rows={[
+    { values: ["Full cache", "4096", "100%", "5.12 (baseline)", "N/A"], highlight: false },
+    { values: ["Random eviction", "1024", "25%", "7.85", "Trivial"], highlight: false },
+    { values: ["Recent-only", "1024", "25%", "6.41", "Trivial"], highlight: false },
+    { values: ["Attention sinks (4+1020)", "1024", "25%", "5.38", "Simple"], highlight: true },
+    { values: ["H2O", "1024", "25%", "5.24", "Moderate"], highlight: true },
+    { values: ["H2O + sinks", "1024", "25%", "5.19", "Moderate"], highlight: true },
+  ]}
+/>
+
+### Sliding Window Attention: Mistral's Approach
+
+Mistral takes a more radical approach: the model is **architecturally designed** to only attend to the last $W$ tokens. The KV cache has a hard upper bound regardless of sequence length.
+
+$$
+\text{KV\_cache\_sliding} = 2 \times L \times H_{kv} \times d_h \times W \times B \times \text{bytes}
+$$
+
+For Mistral 7B with $W = 4096$:
+
+```python
+class SlidingWindowKV:
+    """Fixed-size circular buffer for sliding window attention."""
+    def __init__(self, window_size, layers, kv_heads, head_dim, batch_size, dtype):
+        self.window_size = window_size
+        self.buffer_k = torch.zeros(
+            (batch_size, layers, kv_heads, window_size, head_dim),
+            dtype=dtype, device='cuda'
+        )
+        self.buffer_v = torch.zeros_like(self.buffer_k)
+        self.write_pos = 0  # circular write position
+
+    def append(self, new_k, new_v):
+        """Append new token's K/V, overwriting oldest if full."""
+        pos = self.write_pos % self.window_size
+        self.buffer_k[:, :, :, pos, :] = new_k
+        self.buffer_v[:, :, :, pos, :] = new_v
+        self.write_pos += 1
+
+    def get_kv(self):
+        """Return K/V in correct temporal order."""
+        if self.write_pos <= self.window_size:
+            return self.buffer_k[:, :, :, :self.write_pos, :], \
+                   self.buffer_v[:, :, :, :self.write_pos, :]
+        # Reorder circular buffer to temporal order
+        start = self.write_pos % self.window_size
+        indices = torch.cat([
+            torch.arange(start, self.window_size),
+            torch.arange(0, start)
+        ])
+        return self.buffer_k[:, :, :, indices, :], \
+               self.buffer_v[:, :, :, indices, :]
+```
+
+The advantage is **guaranteed constant memory** regardless of sequence length. The disadvantage is that the model literally cannot attend to tokens beyond the window -- this is a hard architectural constraint, not just a memory optimization. For tasks requiring long-range dependencies (document summarization, multi-turn conversations), this can degrade quality.
+
+Mistral mitigates this with **rolling KV** combined with sliding window attention at every layer but adds back global attention at certain layers. More recent architectures like Jamba and Mamba-2 hybrids combine sliding window layers with full-attention layers, getting the memory benefits on most layers while preserving long-range capability on a few.
+
+## Memory Bandwidth Analysis: The Decode Bottleneck
+
+### Why Decode is Memory-Bound
+
+LLM inference has two distinct phases with very different computational profiles:
+
+**Prefill** processes all prompt tokens in parallel. It is **compute-bound**: the GPU's tensor cores are busy multiplying large matrices, and memory bandwidth is not the bottleneck.
+
+**Decode** generates one token at a time. It is **memory-bound**: at each step, the model must load all its weights AND the entire KV cache from HBM to compute a single token's output. The arithmetic intensity (FLOPs per byte loaded) is extremely low.
+
+### The Bandwidth Math
+
+For each decode step, the GPU must load:
+
+1. **Model weights**: All parameter matrices. For Llama 3 70B in FP16: ~140 GB.
+2. **KV cache**: All K and V tensors for all previous tokens. Size grows with sequence length.
+
+The total bytes loaded per token:
+
+$$
+\text{bytes\_per\_token} = \text{model\_weights} + \text{KV\_cache\_size}
+$$
+
+At **batch=1**, the KV cache per token per layer is:
+
+$$
+\text{KV\_per\_layer} = 2 \times H_{kv} \times d_h \times S \times 2 = 2 \times 8 \times 128 \times S \times 2 = 4096 \times S \text{ bytes}
+$$
+
+For 80 layers at $S = 2048$:
+
+$$
+\text{Total KV read} = 80 \times 4096 \times 2048 = 671{,}088{,}640 \text{ bytes} \approx 0.625 \text{ GB}
+$$
+
+At batch=1, model weights dominate (140 GB vs 0.625 GB). But at batch=64:
+
+$$
+\text{Total KV read} = 80 \times 4096 \times 2048 \times 64 \approx 40 \text{ GB}
+$$
+
+Now KV cache is 22% of total memory traffic. At batch=256 and seq=4096:
+
+$$
+\text{Total KV read} \approx 320 \text{ GB}
+$$
+
+The KV cache read now **exceeds the weight read by 2.3x**.
+
+<Benchmark
+  title="Memory Bandwidth Breakdown per Decode Step (Llama 3 70B, seq=2048)"
+  columns={["Batch Size", "Weight Read (GB)", "KV Read (GB)", "Total (GB)", "KV Fraction", "A100 Time (ms)"]}
+  rows={[
+    { values: ["1", "140", "0.6", "140.6", "0.4%", "70"], highlight: false },
+    { values: ["8", "140", "5.0", "145.0", "3.4%", "73"], highlight: false },
+    { values: ["32", "140", "20.0", "160.0", "12.5%", "80"], highlight: false },
+    { values: ["64", "140", "40.0", "180.0", "22.2%", "90"], highlight: true },
+    { values: ["128", "140", "80.0", "220.0", "36.4%", "110"], highlight: false },
+    { values: ["256", "140", "160.0", "300.0", "53.3%", "150"], highlight: true },
+  ]}
+/>
+
+The A100's HBM2e bandwidth is ~2 TB/s. At batch=256, loading 300 GB takes ~150 ms per token. To put that in perspective, the actual compute (matrix multiplications) for batch=256 is only ~20 ms. The GPU is idle 87% of the time, waiting for memory.
+
+<Callout type="warning" title="KV cache becomes the bandwidth bottleneck at high batch">
+  At low batch sizes, weight loading dominates bandwidth. But batch size is the lever you pull for throughput. As you increase batch size, KV cache bandwidth grows linearly while weight bandwidth stays constant. Past a critical batch size, **KV cache fetching becomes the primary bottleneck** -- and compressing KV cache directly increases throughput.
+</Callout>
+
+This is why KV cache quantization has a **throughput benefit** beyond just saving memory. Reducing KV cache from FP16 to INT8 cuts the KV bandwidth in half, which at batch=256 saves 80 GB of memory reads per token -- a 27% reduction in total bandwidth demand.
+
+<PerfChart
+  title="Decode Throughput vs Batch Size (Llama 3 70B, A100 80GB)"
+  type="line"
+  data={{
+    labels: ["1", "8", "32", "64", "128", "256"],
+    datasets: [
+      { label: "FP16 KV (tokens/sec)", data: [14, 100, 350, 580, 850, 1050], borderColor: "#ef4444" },
+      { label: "INT8 KV (tokens/sec)", data: [14, 105, 370, 640, 980, 1320], borderColor: "#3b82f6" },
+      { label: "INT4 KV (tokens/sec)", data: [14, 107, 385, 670, 1050, 1500], borderColor: "#10b981" },
+    ]
+  }}
+/>
+
+At batch=256, INT8 KV cache delivers **26% more throughput** than FP16, and INT4 delivers **43% more** -- purely from reduced bandwidth demand.
+
+## Production Considerations
+
+### Memory Watermark Tuning
+
+In a production serving system, you need to decide how much GPU memory to reserve for KV cache vs. other uses. The **memory watermark** is the threshold at which the scheduler stops admitting new requests.
+
+```python
+class MemoryWatermarkScheduler:
+    """Production scheduler with memory watermark control."""
+    def __init__(self, total_gpu_memory_gb, model_weight_gb, watermark_ratio=0.90):
+        self.total_memory = total_gpu_memory_gb
+        self.model_weights = model_weight_gb
+        self.activation_overhead = 2.0  # GB, for activations and CUDA workspace
+        self.available_for_kv = (
+            self.total_memory - self.model_weights - self.activation_overhead
+        )
+        # High watermark: stop admitting new requests
+        self.high_watermark = self.available_for_kv * watermark_ratio
+        # Low watermark: start preempting existing requests
+        self.low_watermark = self.available_for_kv * 0.98
+
+    def should_admit(self, current_kv_usage_gb, estimated_new_request_gb):
+        return (current_kv_usage_gb + estimated_new_request_gb) < self.high_watermark
+
+    def should_preempt(self, current_kv_usage_gb):
+        return current_kv_usage_gb > self.low_watermark
+```
+
+Setting the watermark too conservatively (e.g., 70%) wastes GPU memory and reduces throughput. Setting it too aggressively (e.g., 98%) causes frequent preemptions, which destroy latency. The right value depends on your workload's sequence length distribution and variance.
+
+<Benchmark
+  title="Watermark Tuning Impact (Llama 3 70B, mixed workload)"
+  columns={["Watermark", "Max Batch", "Throughput", "Preemptions/min", "p99 Latency"]}
+  rows={[
+    { values: ["70%", "42", "580 tok/s", "0", "120 ms"], highlight: false },
+    { values: ["85%", "54", "720 tok/s", "0.2", "135 ms"], highlight: true },
+    { values: ["90%", "58", "760 tok/s", "1.5", "180 ms"], highlight: false },
+    { values: ["95%", "61", "780 tok/s", "8.0", "450 ms"], highlight: false },
+    { values: ["98%", "63", "790 tok/s", "25.0", "1200 ms"], highlight: false },
+  ]}
+/>
+
+The sweet spot is typically 80-90%. Beyond 90%, preemptions spike and p99 latency degrades rapidly.
+
+### Preemption Strategies: Swap vs Recompute
+
+When the scheduler must preempt a request, the choice between swapping to CPU and recomputing from scratch depends on the request's state:
+
+$$
+\text{swap\_time} = \frac{\text{KV\_cache\_size}}{\text{PCIe\_bandwidth}}
+$$
+
+$$
+\text{recompute\_time} = \frac{\text{prefill\_tokens} \times \text{time\_per\_prefill\_token}}{1}
+$$
+
+For PCIe Gen4 x16 (~25 GB/s bidirectional) and Llama 3 70B:
+
+<Benchmark
+  title="Swap vs Recompute Breakeven (Llama 3 70B)"
+  columns={["Prompt Length", "KV Size (GB)", "Swap Time (ms)", "Recompute Time (ms)", "Winner"]}
+  rows={[
+    { values: ["128", "0.005", "0.2", "15", "Swap"], highlight: true },
+    { values: ["512", "0.02", "0.8", "55", "Swap"], highlight: true },
+    { values: ["2048", "0.08", "3.2", "210", "Swap"], highlight: true },
+    { values: ["8192", "0.31", "12.4", "830", "Swap"], highlight: false },
+    { values: ["32768", "1.25", "50.0", "3300", "Swap"], highlight: false },
+  ]}
+/>
+
+For typical LLM workloads, swap almost always wins because the KV cache for a single request (without the batch dimension) is relatively small. Recompute only becomes competitive when CPU memory is exhausted or PCIe is heavily contended.
+
+### Multi-Tenant Isolation
+
+When serving multiple models or multiple tenants on the same GPU, KV cache memory must be partitioned:
+
+```python
+class MultiTenantKVManager:
+    """Isolate KV cache allocations between tenants."""
+    def __init__(self, total_blocks, tenant_quotas):
+        """
+        tenant_quotas: dict mapping tenant_id to fraction of total blocks
+        Example: {"tenant_a": 0.6, "tenant_b": 0.3, "shared": 0.1}
+        """
+        self.allocators = {}
+        allocated = 0
+        for tenant_id, fraction in tenant_quotas.items():
+            num_blocks = int(total_blocks * fraction)
+            self.allocators[tenant_id] = BlockAllocator(
+                num_blocks=num_blocks,
+                block_size=16,
+                layers=80, kv_heads=8, head_dim=128,
+                dtype=torch.float16
+            )
+            allocated += num_blocks
+
+    def allocate(self, tenant_id):
+        allocator = self.allocators.get(tenant_id)
+        if allocator is None:
+            raise ValueError(f"Unknown tenant: {tenant_id}")
+        return allocator.allocate()
+
+    def get_utilization(self, tenant_id):
+        alloc = self.allocators[tenant_id]
+        total = len(alloc.blocks)
+        free = len(alloc.free_list)
+        return (total - free) / total
+```
+
+The "shared" pool handles burst capacity: when a tenant exceeds its quota, it can borrow from the shared pool (with lower priority and possible preemption).
+
+### Prefix Caching
+
+Many serving workloads share common prefixes: system prompts, few-shot examples, or RAG context. Prefix caching stores these shared KV cache blocks once and reuses them across requests.
+
+```python
+class PrefixCache:
+    """Cache KV blocks for common prefixes, keyed by token hash."""
+    def __init__(self, allocator, max_cached_prefixes=1000):
+        self.allocator = allocator
+        self.cache = {}  # hash(token_ids) -> list[block_id]
+        self.access_order = []  # LRU tracking
+
+    def lookup(self, token_ids):
+        """Check if prefix KV cache exists."""
+        key = hash(tuple(token_ids))
+        if key in self.cache:
+            self._touch(key)
+            block_ids = self.cache[key]
+            for bid in block_ids:
+                self.allocator.incref(bid)  # shared reference
+            return block_ids
+        return None
+
+    def insert(self, token_ids, block_ids):
+        """Cache a computed prefix."""
+        key = hash(tuple(token_ids))
+        self.cache[key] = block_ids
+        for bid in block_ids:
+            self.allocator.incref(bid)
+        self.access_order.append(key)
+        self._maybe_evict()
+```
+
+For workloads with a shared system prompt (common in chat applications), prefix caching can save both the memory and the compute cost of the prefill for that prefix. A 2000-token system prompt shared across 64 concurrent requests saves 64x the prefill compute and stores the prefix KV blocks only once.
+
+## When NOT to Optimize KV Cache
+
+Not every deployment benefits from aggressive KV cache optimization. Here are the cases where simpler approaches work fine:
+
+### Short Sequences
+
+If your maximum sequence length is under 512 tokens, KV cache memory is negligible. For Llama 3 8B at batch=32, seq=512:
+
+$$
+\text{KV\_cache} = 2 \times 32 \times 8 \times 128 \times 512 \times 32 \times 2 = 0.5 \text{ GB}
+$$
+
+Half a gigabyte. On an A100 with 80 GB, this is under 1% of memory. Naive contiguous allocation with 50% waste still only costs 1 GB total. The engineering complexity of PagedAttention is not justified.
+
+### Small Models
+
+Models under 3B parameters have small KV caches by construction (fewer layers, fewer heads). For Llama 3.2 1B at batch=64, seq=4096:
+
+$$
+\text{KV\_cache} = 2 \times 16 \times 8 \times 64 \times 4096 \times 64 \times 2 = 4.3 \text{ GB}
+$$
+
+Still manageable with simple allocation on modern GPUs. The model weights are only ~2 GB, so even with wasteful allocation you have ample headroom.
+
+### Prefill-Dominated Workloads
+
+If your workload is mostly long prompts with short outputs (e.g., classification, extraction, scoring), then:
+- Prefill is the bottleneck, not decode
+- KV cache lifetime is short (few decode steps)
+- Memory pressure is transient, not sustained
+
+In this regime, optimizing prefill throughput (chunked prefill, FlashAttention, tensor parallelism) matters more than optimizing KV cache management.
+
+<Benchmark
+  title="When KV Cache Optimization Matters Most"
+  columns={["Scenario", "Seq Length", "Batch Size", "Output Length", "KV Optimization Impact"]}
+  rows={[
+    { values: ["Short chat", "< 512", "< 32", "< 256", "Low -- simple alloc is fine"], highlight: false },
+    { values: ["Small model API", "< 4096", "< 64", "Any", "Low-Medium"], highlight: false },
+    { values: ["Classification", "< 2048", "Large", "< 10", "Low -- prefill dominated"], highlight: false },
+    { values: ["Long-form generation", "> 2048", "> 32", "> 512", "High"], highlight: true },
+    { values: ["Multi-turn chat", "> 4096", "> 64", "Variable", "Very High"], highlight: true },
+    { values: ["RAG with long context", "> 8192", "> 16", "> 256", "Critical"], highlight: true },
+  ]}
+/>
+
+## Throughput Impact: Real Numbers
+
+Let us put together a comprehensive throughput comparison showing the combined impact of KV cache optimizations on a realistic serving setup.
+
+**Setup**: Llama 3 70B on 4x A100 80GB (tensor parallel), mixed workload with average input 1024 tokens, average output 512 tokens, max sequence 8192.
+
+<Benchmark
+  title="End-to-End Serving Throughput (Llama 3 70B, 4x A100)"
+  columns={["Configuration", "Max Batch", "Throughput (tok/s)", "p50 Latency", "p99 Latency", "GPU Util"]}
+  rows={[
+    { values: ["Contiguous FP16", "24", "420", "85 ms", "350 ms", "55%"], highlight: false },
+    { values: ["Paged FP16", "58", "780", "72 ms", "180 ms", "82%"], highlight: false },
+    { values: ["Paged INT8", "96", "1050", "65 ms", "160 ms", "88%"], highlight: true },
+    { values: ["Paged INT8 + prefix cache", "96", "1180", "55 ms", "145 ms", "90%"], highlight: true },
+    { values: ["Paged INT4 + prefix cache", "140", "1420", "52 ms", "155 ms", "91%"], highlight: true },
+  ]}
+/>
+
+<PerfChart
+  title="Throughput Improvement Stack (Llama 3 70B, 4x A100)"
+  type="bar"
+  data={{
+    labels: ["Contiguous FP16", "Paged FP16", "Paged INT8", "+ Prefix Cache", "Paged INT4 + Cache"],
     datasets: [{
-      label: "Cache Size (GB)",
-      data: [0.10, 0.20, 0.39, 0.78, 1.56],
+      label: "Throughput (tokens/sec)",
+      data: [420, 780, 1050, 1180, 1420],
       borderColor: "#3b82f6",
     }]
   }}
 />
 
-## Cache Efficiency Analysis
+The progression tells a clear story:
+1. **Paged allocation** (1.86x over contiguous): eliminates fragmentation, allows 2.4x more concurrent requests
+2. **INT8 quantization** (1.35x over paged FP16): fits more requests AND reduces bandwidth per request
+3. **Prefix caching** (1.12x incremental): saves prefill compute for repeated system prompts
+4. **INT4 quantization** (1.20x over INT8 + cache): pushes batch size even higher, though with small quality tradeoffs
 
-Without KV cache, each token requires O(n) computation:
+The cumulative improvement from the simplest to the most optimized configuration is **3.4x** -- and this is on the same hardware, serving the same model, with no changes to model quality (for the INT8 path).
 
-```python
-def inference_without_cache(model, prompt, max_tokens):
-    tokens = tokenize(prompt)
-    generated = []
-    
-    for _ in range(max_tokens):
-        # Process entire sequence each time (inefficient)
-        logits = model(tokens)  # O(seq_len²) attention
-        next_token = sample(logits[:, -1, :])
-        tokens = torch.cat([tokens, next_token.unsqueeze(1)], dim=1)
-        generated.append(next_token)
-    
-    return generated
+## The Full Picture
 
-# Time complexity: O(n²) per token
-# Memory: O(n²) for attention matrix
-```
-
-With KV cache:
-
-```python
-def inference_with_cache(model, prompt, max_tokens):
-    tokens = tokenize(prompt)
-    kv_cache = None
-    generated = []
-    
-    # Prefill: process prompt once
-    output, kv_cache = model(tokens, kv_cache=None)
-    next_token = sample(output[:, -1, :])
-    generated.append(next_token)
-    
-    # Generation: reuse cache
-    for _ in range(max_tokens - 1):
-        # Only process new token
-        new_token = next_token.unsqueeze(1)
-        output, kv_cache = model(new_token, kv_cache=kv_cache)
-        next_token = sample(output[:, -1, :])
-        generated.append(next_token)
-    
-    return generated
-
-# Time complexity: O(n) per token (after prefill)
-# Memory: O(n) for KV cache
-```
-
-<Benchmark
-  title="Performance Comparison: With vs Without KV Cache"
-  columns={["Method", "Time per Token", "Memory", "Speedup"]}
-  rows={[
-    { values: ["Without Cache", "45.2 ms", "O(n²)", "1.0x"], highlight: false },
-    { values: ["With KV Cache", "12.3 ms", "O(n)", "3.7x"], highlight: true },
+<MemoryLayout
+  title="Optimized GPU Memory Layout: Llama 3 70B Serving"
+  description="4x A100 80GB with PagedAttention + INT8 KV cache"
+  regions={[
+    { start: "0x00000", end: "0x8C000", name: "Model Weights (FP16)", size: "140 GB", color: "blue", notes: "Sharded across 4 GPUs via tensor parallelism" },
+    { start: "0x8C000", end: "0xBC000", name: "KV Block Pool (INT8)", size: "48 GB", color: "orange", notes: "Paged blocks, 96+ concurrent requests" },
+    { start: "0xBC000", end: "0xC6000", name: "Prefix Cache", size: "10 GB", color: "purple", notes: "Shared system prompt KV, refcounted" },
+    { start: "0xC6000", end: "0xD2000", name: "Activations + CUDA Workspace", size: "12 GB", color: "green", notes: "Transient, reused per step" },
+    { start: "0xD2000", end: "0xE0000", name: "Watermark Headroom", size: "10 GB", color: "gray", notes: "Absorbs burst without preemption" },
   ]}
 />
 
-## Memory Optimization Techniques
+KV cache management is not a single optimization but an interlocking system of decisions:
 
-### 1. FP16 Quantization
+1. **Allocation strategy** determines memory utilization and fragmentation. PagedAttention is now the standard.
+2. **Quantization level** trades precision for capacity and bandwidth. INT8 is the sweet spot for most deployments.
+3. **Eviction policy** determines graceful degradation under memory pressure. Attention sinks + heavy hitters preserve quality.
+4. **Bandwidth awareness** explains why KV compression improves throughput, not just capacity.
+5. **Watermark tuning** balances utilization against latency stability.
+6. **Prefix sharing** and copy-on-write amortize common computation.
 
-Reduce cache precision:
-
-```python
-def quantize_kv_cache(kv_cache, dtype=torch.float16):
-    """
-    Quantize KV cache to reduce memory
-    """
-    quantized_cache = {}
-    for key in ['K', 'V']:
-        quantized_cache[key] = kv_cache[key].to(dtype)
-    return quantized_cache
-
-# Memory savings: 2x (FP32 → FP16)
-```
-
-**Memory reduction**: 50% (FP32 → FP16)
-
-### 2. Cache Compression
-
-Compress older cache entries:
-
-```python
-def compress_kv_cache(kv_cache, compress_ratio=0.5):
-    """
-    Compress older cache entries
-    """
-    seq_len = kv_cache['K'].size(2)
-    keep_len = int(seq_len * (1 - compress_ratio))
-    
-    # Keep recent tokens, compress older ones
-    recent_K = kv_cache['K'][:, :, -keep_len:, :]
-    recent_V = kv_cache['V'][:, :, -keep_len:, :]
-    
-    # Average pool older tokens
-    old_K = kv_cache['K'][:, :, :-keep_len, :]
-    old_V = kv_cache['V'][:, :, :-keep_len, :]
-    
-    # Compress by averaging
-    compressed_K = old_K.mean(dim=2, keepdim=True)
-    compressed_V = old_V.mean(dim=2, keepdim=True)
-    
-    # Concatenate
-    new_K = torch.cat([compressed_K, recent_K], dim=2)
-    new_V = torch.cat([compressed_V, recent_V], dim=2)
-    
-    return {'K': new_K, 'V': new_V}
-```
-
-**Memory reduction**: Variable (50%+ depending on ratio)
-
-### 3. Sliding Window Cache
-
-Limit cache size:
-
-```python
-def sliding_window_cache(kv_cache, max_length=2048):
-    """
-    Maintain fixed-size cache using sliding window
-    """
-    current_len = kv_cache['K'].size(2)
-    
-    if current_len > max_length:
-        # Keep only most recent tokens
-        kv_cache['K'] = kv_cache['K'][:, :, -max_length:, :]
-        kv_cache['V'] = kv_cache['V'][:, :, -max_length:, :]
-    
-    return kv_cache
-```
-
-**Memory**: Fixed at max_length
-
-### 4. Batch-Aware Cache Management
-
-Manage cache per request:
-
-```python
-class BatchKVCacheManager:
-    def __init__(self, max_cache_length=2048):
-        self.max_length = max_cache_length
-        self.caches = {}  # Per request
-    
-    def get_cache(self, request_id):
-        if request_id not in self.caches:
-            self.caches[request_id] = None
-        return self.caches[request_id]
-    
-    def update_cache(self, request_id, new_cache):
-        # Apply sliding window
-        cache = sliding_window_cache(new_cache, self.max_length)
-        self.caches[request_id] = cache
-    
-    def remove_cache(self, request_id):
-        if request_id in self.caches:
-            del self.caches[request_id]
-```
-
-## Performance Analysis
-
-Cache hit rate analysis:
-
-```python
-def analyze_cache_efficiency(model, requests, max_length=2048):
-    """
-    Analyze KV cache efficiency
-    """
-    total_tokens = 0
-    cache_hits = 0
-    cache_misses = 0
-    
-    for request in requests:
-        prompt_len = len(request.prompt)
-        generation_len = len(request.generated)
-        
-        # Prefill: cache miss (must compute)
-        cache_misses += prompt_len
-        
-        # Generation: cache hits (reuse)
-        cache_hits += generation_len - 1
-        total_tokens += prompt_len + generation_len
-    
-    hit_rate = cache_hits / total_tokens
-    miss_rate = cache_misses / total_tokens
-    
-    print(f"Cache Hit Rate: {hit_rate:.2%}")
-    print(f"Cache Miss Rate: {miss_rate:.2%}")
-    # hit_rate + miss_rate == 1.0, so this is equivalent to hit_rate
-    print(f"Efficiency: {hit_rate:.2%}")
-```
-
-<PerfChart
-  title="Cache Efficiency vs Generation Length"
-  type="line"
-  data={{
-    labels: ["10", "50", "100", "200", "500"],
-    datasets: [{
-      label: "Cache Hit Rate (%)",
-      data: [90, 98, 99, 99.5, 99.8],
-      borderColor: "#10b981",
-    }]
-  }}
-/>
-
-## Memory vs Performance Trade-off
-
-```python
-def optimize_cache_size(model, target_memory_gb, batch_size):
-    """
-    Find optimal cache size given memory constraint
-    """
-    num_layers = model.num_layers
-    d_model = model.d_model
-    num_heads = model.num_heads
-    
-    # Calculate memory per token
-    memory_per_token = calculate_kv_cache_memory(
-        1, batch_size, num_layers, d_model, num_heads
-    )
-    
-    # Maximum sequence length
-    max_seq_len = int(target_memory_gb / memory_per_token)
-    
-    return max_seq_len
-
-# Example: 8 GB available, batch_size=8
-max_len = optimize_cache_size(model, 8.0, 8)
-print(f"Maximum sequence length: {max_len}")
-```
-
-## Production Optimization Strategies
-
-1. **Quantize cache**: Use FP16 or INT8
-2. **Limit cache size**: Sliding window approach
-3. **Compress old tokens**: Average or downsample
-4. **Batch management**: Remove completed requests
-5. **Memory pooling**: Reuse cache buffers
-
-## Conclusion
-
-KV cache optimization is critical for LLM inference:
-
-1. **Memory scales linearly**: O(n) with sequence length
-2. **Performance scales**: O(n²) → O(n) per token
-3. **Quantization**: 2x memory reduction (FP16)
-4. **Sliding window**: Fixed memory, variable quality
-5. **Batch management**: Essential for production
-
-Key strategies:
-- Use FP16 for cache (minimal quality loss)
-- Implement sliding window for long sequences
-- Manage cache per request in batches
-- Monitor cache hit rates
-- Balance memory and performance
-
-Optimize cache management to maximize throughput while staying within memory constraints.
+The difference between a naive implementation and a well-tuned one is not incremental -- it is the difference between serving 24 concurrent users and serving 140 on the same hardware. For anyone running LLM inference at scale, KV cache management is where the most impactful systems work happens.

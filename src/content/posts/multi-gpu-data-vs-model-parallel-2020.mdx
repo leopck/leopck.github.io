@@ -1,149 +1,870 @@
 ---
-title: "Multi-GPU Performance: Data Parallel vs Model Parallel for Transformer Inference"
+title: "The Definitive Guide to Distributed Parallelism: Data, Tensor, Pipeline, Expert, and Sequence Parallelism for Large-Scale Training"
 author: "stanley-phoong"
-description: "A performance comparison of data parallel and model parallel strategies for transformer inference. We quantify communication costs (all-reduce, all-gather), memory savings, and when each strategy actually improves throughput."
-publishDate: 2020-08-05
-category: gpu-programming
-tags: [multi-gpu, data-parallel, model-parallel, transformer, inference, allreduce, optimization]
+description: "A comprehensive deep-dive into every parallelism strategy used in modern distributed deep learning — DDP, ZeRO/FSDP, Megatron-style tensor parallelism, pipeline parallelism, expert parallelism, context/sequence parallelism, and how to combine them for 3D/4D/5D parallel training at scale."
+publishDate: 2025-03-21
+category: distributed-training
+tags: [multi-gpu, data-parallel, model-parallel, tensor-parallelism, pipeline-parallelism, expert-parallelism, fsdp, zero, megatron, distributed-training, deepseek, llama]
 difficulty: expert
-readingTime: 21
+readingTime: 40
 ---
 
 import Callout from '@/components/mdx/Callout.astro';
 import PerfChart from '@/components/mdx/PerfChart.astro';
 import Benchmark from '@/components/mdx/Benchmark.astro';
+import MemoryLayout from '@/components/mdx/MemoryLayout.astro';
 
-Throwing more GPUs at a transformer doesn’t automatically give you higher throughput. Whether **data parallel** or **model parallel** helps depends on:
-- batch size
-- sequence length
-- interconnect bandwidth/latency
-- memory headroom
+Modern large language models do not fit on a single GPU. Llama 3 70B in FP16 requires roughly 140 GB of memory just for its parameters — and a single A100 has 80 GB. A 405B model needs over 800 GB. Training is even worse: optimizer states, gradients, and activations can multiply the memory footprint by 4-16x. You **must** distribute the work across multiple GPUs.
 
-This post models the main costs and shows when each strategy makes sense for *inference* (not training).
+But *how* you split the work matters enormously. A naive approach can leave most GPUs idle, drown the interconnect in communication, or introduce latency-killing pipeline bubbles. This guide covers every major parallelism strategy used in production today — from the simplest (data parallelism) to the most exotic (expert parallelism, bidirectional pipelines) — and shows you how to combine them for large-scale training runs across thousands of GPUs.
 
-## Data parallel for inference: mostly useless unless you batch
+## Why Parallelism Is Unavoidable
 
-Data parallel (DP) = each GPU has a full copy of the model, processes different batches.
-
-For pure inference:
-- there is **no gradient all-reduce**
-- communication is limited to request routing and maybe periodic weight sync
-
-If your batch size is already 1 per GPU (per request), DP only helps if:
-- you have **many independent requests**
-- your serving stack can **feed each GPU efficiently**
+Let us start with the arithmetic that forces our hand.
 
 <Benchmark
-  title="Data parallel inference scenarios"
-  columns={["Scenario", "Batch", "DP helpful?", "Why?"]}
+  title="Memory Requirements for Modern LLMs (FP16 Parameters Only)"
+  columns={["Model", "Parameters", "FP16 Weight Memory", "A100 80GB GPUs Needed (weights only)"]}
   rows={[
-    { values: ["Single long-running request", "1", "No", "One GPU mostly busy, others idle"], highlight: false },
-    { values: ["Many small requests", "1 per GPU", "Yes", "More aggregate capacity"], highlight: true },
-    { values: ["Already batch=8 on 1 GPU", "8", "Sometimes", "If memory-bound, more GPUs help"], highlight: false },
+    { values: ["Llama 3 8B", "8B", "16 GB", "1"], highlight: false },
+    { values: ["Llama 3 70B", "70B", "140 GB", "2"], highlight: true },
+    { values: ["Llama 3 405B", "405B", "810 GB", "11"], highlight: true },
+    { values: ["GPT-4 (estimated)", "~1.8T MoE", "~3.6 TB", "45+"], highlight: false },
+    { values: ["DeepSeek V3", "671B MoE (37B active)", "~1.3 TB", "17+"], highlight: true },
+  ]}
+  notes="This is parameters only. Training adds optimizer states (2x for Adam), gradients (1x), and activations (variable). A 70B model at FP16 needs ~1 TB total during training."
+/>
+
+For training, the memory multiplier is brutal. With Adam optimizer in mixed precision, each parameter costs:
+
+- 2 bytes for the FP16 parameter
+- 2 bytes for the FP16 gradient
+- 4 bytes for the FP32 master weight (for numerical stability)
+- 4 bytes for the FP32 first moment (Adam)
+- 4 bytes for the FP32 second moment (Adam)
+
+That is 16 bytes per parameter. A 70B model needs **1.12 TB** just for parameters + optimizer + gradients — before a single activation is stored. This is 14 A100s worth of memory, minimum.
+
+<Callout type="warning" title="The Memory Wall">
+  A single GPU cannot hold a 70B model for training. Even for inference, FP16 weights alone exceed one A100's capacity. Parallelism is not optional — it is a hard requirement imposed by physics and economics.
+</Callout>
+
+The question is never "should I parallelize?" but rather "which combination of parallelism strategies minimizes total training time while fitting within my hardware constraints?"
+
+## Data Parallelism: The Foundation
+
+Data parallelism is the simplest and most widely used strategy. The idea: replicate the entire model on every GPU, split the training data into shards, and have each GPU process a different mini-batch. After computing gradients locally, GPUs synchronize gradients so every replica takes the same optimizer step.
+
+### Distributed Data Parallel (DDP)
+
+PyTorch's `DistributedDataParallel` (DDP) is the workhorse of data parallelism. Each GPU (each "rank") holds a complete copy of the model and processes a different portion of the mini-batch.
+
+The training loop looks like:
+
+1. Each GPU receives a different mini-batch of data
+2. Each GPU runs forward pass independently
+3. Each GPU computes gradients independently
+4. **All-reduce** across all GPUs to average the gradients
+5. Each GPU applies the same optimizer step (parameters stay in sync)
+
+The critical communication primitive is **all-reduce**: every GPU contributes its gradient tensor, and every GPU receives the sum (or average) of all contributions. Conceptually, each GPU sends $M$ bytes and receives $M$ bytes, where $M$ is the size of the model's gradients.
+
+In practice, all-reduce is implemented as a **ring all-reduce** or **tree all-reduce** that requires each GPU to send and receive $2M \cdot \frac{N-1}{N}$ bytes total (where $N$ is the number of GPUs). For large $N$, this approaches $2M$ — the volume is independent of GPU count.
+
+<MemoryLayout
+  title="DDP Memory Layout per GPU"
+  description="Every GPU holds a full copy of everything. N GPUs = N copies of the model."
+  layout={[
+    {
+      name: "FP16 Parameters (full copy)",
+      power: "2 bytes x num_params",
+      state: "Identical across all GPUs — redundant",
+      color: "#3b82f6"
+    },
+    {
+      name: "FP16 Gradients (full copy)",
+      power: "2 bytes x num_params",
+      state: "Computed locally, then all-reduced",
+      color: "#ef4444"
+    },
+    {
+      name: "FP32 Optimizer States (full copy)",
+      power: "12 bytes x num_params (Adam: master weights + m + v)",
+      state: "Identical across all GPUs — massively redundant",
+      color: "#f59e0b"
+    },
+    {
+      name: "Activations",
+      power: "Varies with batch size and sequence length",
+      state: "Unique per GPU (different data shards)",
+      color: "#8b5cf6"
+    }
   ]}
 />
 
-## Model parallel: tensor / pipeline / sequence
+The problem with DDP is obvious from the memory layout: every GPU holds a **complete copy** of all parameters, gradients, and optimizer states. With $N$ GPUs, you have $N$ redundant copies of the optimizer states alone. For a 70B model, that is $N \times 840\text{ GB}$ of optimizer state across the cluster — an enormous waste.
 
-For large models that **don’t fit** on one GPU, you split the model:
-- **Tensor parallel**: split matrices across GPUs (all-reduce heavy)
-- **Pipeline parallel**: split layers across GPUs (bubble / pipeline balance)
-- **Sequence parallel**: split sequence dimension (all-gather heavy)
+<Callout type="info" title="DDP Communication Pattern">
+  DDP uses **all-reduce** for gradient synchronization. The total communication volume per step is approximately $2M$ bytes (where $M$ is gradient size), independent of the number of GPUs. DDP overlaps communication with backward computation by bucketing gradients and launching all-reduce as soon as each bucket is ready.
+</Callout>
 
-Each comes with a communication tax.
+DDP works well when the model fits on a single GPU. You get near-linear throughput scaling because the only overhead is gradient all-reduce, which overlaps with computation. But for models that exceed single-GPU memory, DDP is impossible — you cannot even load the model.
 
-## Tensor parallel cost model
+### ZeRO: Eliminating Redundancy
 
-For linear layers of shape $[B, H] \times [H, 4H]$ (FFN), split H across $N$ GPUs:
+The **Zero Redundancy Optimizer** (ZeRO), introduced by Microsoft DeepSpeed, attacks the memory redundancy in DDP. The key insight: if every GPU holds identical optimizer states, gradients, and parameters, why not **partition** them across GPUs so each GPU holds only $1/N$ of the total?
 
-Each GPU holds a shard of weights and computes a partial output; you all-reduce to combine.
+ZeRO comes in three stages, each eliminating more redundancy:
 
-Let:
-- $C_{comp}$ = compute time per shard
-- $C_{comm}$ = all-reduce time (latency + bandwidth term)
+**ZeRO Stage 1 (ZeRO-1): Partition Optimizer States**
 
-Per step:
+Instead of every GPU holding all of Adam's $m$ and $v$ tensors, each GPU is responsible for $1/N$ of the optimizer states. After all-reduce of gradients, each GPU updates only its assigned parameter partition using its local optimizer states.
+
+Memory per GPU for a model with $P$ parameters:
+
 $$
-T_{TP} \approx C_{comp} + C_{comm}
+\text{ZeRO-1 memory} = 2P + 2P + \frac{12P}{N} = 4P + \frac{12P}{N} \text{ bytes}
 $$
 
-If:
+For $N=64$ GPUs and a 70B model: $4 \times 70\text{B} + \frac{12 \times 70\text{B}}{64} = 280\text{ GB} + 13.1\text{ GB} = 293\text{ GB}$. Still too large for one GPU, but the optimizer state dropped from 840 GB to 13.1 GB per GPU.
+
+**ZeRO Stage 2 (ZeRO-2): Partition Gradients + Optimizer States**
+
+Each GPU holds only $1/N$ of the gradients in addition to $1/N$ of the optimizer states. Instead of all-reduce (which leaves a full gradient copy on every GPU), ZeRO-2 uses **reduce-scatter**: each GPU receives only the gradient shard it is responsible for.
+
 $$
-C_{comp}/N \gg C_{comm}
+\text{ZeRO-2 memory} = 2P + \frac{2P}{N} + \frac{12P}{N} = 2P + \frac{14P}{N} \text{ bytes}
 $$
-then you win (speedup close to N). If communication dominates, you lose.
+
+For $N=64$ and 70B: $140\text{ GB} + 15.3\text{ GB} = 155\text{ GB}$. Getting closer but still does not fit on one A100.
+
+**ZeRO Stage 3 (ZeRO-3): Partition Everything**
+
+The parameters themselves are also partitioned. Each GPU holds only $1/N$ of the parameters, gradients, and optimizer states. When a layer needs the full parameter tensor for forward or backward computation, it performs an **all-gather** to collect all shards, computes, and then discards the non-local shards.
+
+$$
+\text{ZeRO-3 memory} = \frac{2P}{N} + \frac{2P}{N} + \frac{12P}{N} = \frac{16P}{N} \text{ bytes}
+$$
+
+For $N=64$ and 70B: $\frac{16 \times 70\text{B}}{64} = 17.5\text{ GB}$ per GPU. Now it fits comfortably on an A100.
+
+<Benchmark
+  title="ZeRO Memory Savings per GPU (70B Model, FP16 + Adam, N=64 GPUs)"
+  columns={["Strategy", "Params (GB)", "Gradients (GB)", "Optimizer (GB)", "Total (GB)", "Fits on A100 80GB?"]}
+  rows={[
+    { values: ["DDP (no ZeRO)", "140", "140", "840", "1120", "No"], highlight: false },
+    { values: ["ZeRO-1", "140", "140", "13.1", "293", "No"], highlight: false },
+    { values: ["ZeRO-2", "140", "2.2", "13.1", "155", "No"], highlight: false },
+    { values: ["ZeRO-3", "2.2", "2.2", "13.1", "17.5", "Yes"], highlight: true },
+  ]}
+  notes="Excludes activation memory, which depends on batch size, sequence length, and activation checkpointing. ZeRO-3 numbers are approximate — the all-gathered parameters are transiently in memory during forward/backward."
+/>
+
+<Callout type="perf" title="ZeRO Communication Trade-offs">
+  ZeRO-1 has the same communication volume as DDP (one all-reduce per step). ZeRO-2 replaces all-reduce with reduce-scatter (half the volume: $M$ instead of $2M$). ZeRO-3 adds all-gather operations for forward and backward passes, roughly tripling total communication volume compared to DDP. The memory savings come at a communication cost.
+</Callout>
+
+### FSDP: PyTorch's Native ZeRO-3
+
+**Fully Sharded Data Parallelism** (FSDP) is PyTorch's native implementation of ZeRO-3. The semantics are identical: parameters are sharded across GPUs, all-gathered on demand for computation, and discarded after use.
+
+FSDP's communication pattern per training step:
+
+1. **Forward pass**: For each layer, **all-gather** parameter shards from all GPUs, compute the forward pass, then discard non-local shards
+2. **Backward pass**: For each layer, **all-gather** parameters again (or recompute via activation checkpointing), compute gradients, then **reduce-scatter** to distribute gradient shards
+3. **Optimizer step**: Each GPU updates only its local parameter shard using its local gradient shard and optimizer states
+
+The communication primitives:
+- **All-gather**: Each GPU broadcasts its shard; every GPU receives the full tensor. Volume per GPU: $M \cdot \frac{N-1}{N}$ sent, $M \cdot \frac{N-1}{N}$ received.
+- **Reduce-scatter**: Each GPU sends partial gradients; each receives its reduced shard. Volume per GPU: $M \cdot \frac{N-1}{N}$ sent, $\frac{M}{N}$ received.
+
+Total communication volume per step for FSDP/ZeRO-3 is approximately $3M$ — about 1.5x that of DDP's $2M$ all-reduce. The trade-off is dramatically lower memory usage.
 
 <PerfChart
-  title="Tensor parallel speedup vs interconnect"
+  title="Communication Volume Comparison (Normalized to DDP)"
   type="line"
   data={{
-    labels: ["1", "2", "4", "8"],
+    labels: ["DDP", "ZeRO-1", "ZeRO-2", "ZeRO-3 / FSDP"],
     datasets: [
-      { label: "NVLink (high BW)", data: [1.0, 1.8, 3.2, 5.5], borderColor: "#10b981" },
-      { label: "PCIe only", data: [1.0, 1.5, 2.1, 2.4], borderColor: "#ef4444" },
+      { label: "Communication Volume (relative)", data: [1.0, 1.0, 0.5, 1.5], borderColor: "#3b82f6" },
+      { label: "Memory Usage (relative)", data: [1.0, 0.26, 0.14, 0.016], borderColor: "#10b981" },
     ]
   }}
 />
 
-## Pipeline parallel cost model
+### When to Use DDP vs. FSDP/ZeRO
 
-Split layers into $N$ stages:
-- each stage processes part of the model
-- you pass activations along the pipeline
+- **Model fits on one GPU**: Use DDP. It has the lowest communication overhead and simplest implementation.
+- **Model does not fit on one GPU**: Use FSDP/ZeRO-3. The extra communication is unavoidable.
+- **Model barely fits, but optimizer states blow memory**: Use ZeRO-1 or ZeRO-2 for a middle ground.
 
-Pipeline bubbles reduce efficiency for small numbers of microbatches.
+## Tensor Parallelism: Splitting Layers Across GPUs
 
-Effective speedup:
+Data parallelism replicates the model and splits data. Tensor parallelism does the opposite at the matrix level: it splits individual weight matrices across GPUs, so each GPU computes a portion of every layer's output.
+
+### The Megatron-LM Column/Row Strategy
+
+The breakthrough insight from the Megatron-LM paper is that you can split the two linear layers in a transformer's FFN block in a complementary way that minimizes communication.
+
+A standard transformer FFN block computes:
+
 $$
-\text{Speedup} \approx \frac{N}{1 + \text{bubble\_fraction}}
+\text{FFN}(x) = W_{\text{down}} \cdot \sigma(W_{\text{up}} \cdot x)
 $$
 
-For inference with **batch=1**, bubble fraction is huge unless you accumulate multiple tokens in flight.
+where $W_{\text{up}} \in \mathbb{R}^{H \times 4H}$ and $W_{\text{down}} \in \mathbb{R}^{4H \times H}$ (with $H$ being the hidden dimension).
 
-<Callout type="warning" title="Pipeline parallel is batch-hungry">
-  For low-batch, pipeline parallel often hurts latency because bubbles dominate, and you still pay activation transfer costs.
-</Callout>
+Megatron-LM splits this across $N$ GPUs as follows:
 
-## Sequence parallel cost model
+**First linear (column-parallel)**: Split $W_{\text{up}}$ along its output dimension (columns). Each GPU $i$ holds $W_{\text{up}}^{(i)} \in \mathbb{R}^{H \times 4H/N}$ and computes:
 
-Split sequence dimension across GPUs (e.g., attention heads see shard of sequence). Requires all-gather at some points.
+$$
+Y_i = x \cdot W_{\text{up}}^{(i)} \quad \text{(no communication needed)}
+$$
 
-Helps when:
-- sequence length is very large
-- single-GPU memory is the limiting factor
+**Activation function**: Apply $\sigma$ (SiLU/GeLU) element-wise on each GPU's local $Y_i$. Since the activation is element-wise, no communication is needed.
 
-But all-gather latency can hurt single-token step time.
+**Second linear (row-parallel)**: Split $W_{\text{down}}$ along its input dimension (rows). Each GPU $i$ holds $W_{\text{down}}^{(i)} \in \mathbb{R}^{4H/N \times H}$ and computes:
 
-## Comparative summary (inference-focused)
+$$
+Z_i = \sigma(Y_i) \cdot W_{\text{down}}^{(i)}
+$$
 
-<Benchmark
-  title="Multi-GPU strategies for inference"
-  columns={["Strategy", "When it helps", "Main cost", "Good for"]}
-  rows={[
-    { values: ["Data parallel", "Many independent requests", "None (if no sync)", "Throughput scaling"], highlight: true },
-    { values: ["Tensor parallel", "Model too big, high-BW link", "All-reduces", "Large models with NVLink"], highlight: true },
-    { values: ["Pipeline parallel", "High batch, long sequences", "Pipeline bubbles + activations", "Offline / batch inference"], highlight: false },
-    { values: ["Sequence parallel", "Very long context", "All-gathers", "Long-context models"], highlight: false },
+Now $Z_i$ is a partial sum — each GPU has computed part of the final output. An **all-reduce** sums these partials:
+
+$$
+Z = \sum_{i=1}^{N} Z_i = \text{all\_reduce}(Z_i)
+$$
+
+<MemoryLayout
+  title="Megatron-LM Column/Row Parallel Strategy"
+  description="FFN split: first linear is column-parallel (split output dim), second is row-parallel (split input dim)"
+  layout={[
+    {
+      name: "Column-Parallel Linear (FFN Up-Project)",
+      power: "Weight split along output dimension: W = [W_1 | W_2 | ... | W_N]",
+      state: "Each GPU computes Y_i = X @ W_i (no communication needed!)",
+      color: "#3b82f6"
+    },
+    {
+      name: "Activation (SiLU/GELU)",
+      power: "Applied locally on each GPU's partition",
+      state: "No communication — element-wise on local data",
+      color: "#10b981"
+    },
+    {
+      name: "Row-Parallel Linear (FFN Down-Project)",
+      power: "Weight split along input dimension: W = [W_1; W_2; ... ; W_N]",
+      state: "Each GPU computes Z_i = Y_i @ W_i, then ALL-REDUCE to sum partials",
+      color: "#ef4444"
+    }
   ]}
 />
 
-## Practical guidance
+<Callout type="perf" title="Why This Split Pattern?">
+  Column-parallel followed by row-parallel means the activation function is computed on already-partitioned data — no all-reduce needed between the two linears. The only synchronization point is after the row-parallel matmul, where partial sums from each GPU are combined via all-reduce. This halves the number of all-reduces compared to a naive split where you would need to gather outputs after every linear layer.
+</Callout>
 
-- If your model **fits on one GPU**:
-  - scale **out** with data parallel for *throughput*
-  - keep each GPU running as independently as possible
-- If your model **does not fit**:
-  - prefer **tensor parallel on NVLink-class** systems
-  - combine with **paged KV cache** and efficient attention
-- For low-latency single-request scenarios:
-  - minimize cross-GPU traffic; a **single fast GPU** often beats many slow ones
+### Attention Head Partitioning
 
-## Conclusion
+For multi-head attention, tensor parallelism splits attention heads across GPUs. Each GPU handles $\text{num\_heads}/N$ query heads and the corresponding KV heads.
 
-Multi-GPU inference is not a free lunch:
-- data parallel helps when you have **concurrency**
-- model parallel helps when you have **memory pressure** and **fast links**
-- both can hurt p99 latency if communication is not carefully modeled
+<Benchmark
+  title="Attention Head Distribution (Llama 3 70B: 64 Q heads, 8 KV heads)"
+  columns={["TP Degree", "Q Heads per GPU", "KV Heads per GPU", "Notes"]}
+  rows={[
+    { values: ["TP=1", "64", "8", "All heads on one GPU"], highlight: false },
+    { values: ["TP=2", "32", "4", "Clean split"], highlight: true },
+    { values: ["TP=4", "16", "2", "Clean split"], highlight: true },
+    { values: ["TP=8", "8", "1", "Minimum: 1 KV head per GPU"], highlight: true },
+  ]}
+  notes="KV heads must divide evenly into TP degree. Llama 3 70B with 8 KV heads supports TP up to 8. Beyond that, KV heads must be replicated."
+/>
 
-Before you shard the model, measure per-token compute and estimate communication time with realistic interconnect numbers — then choose the least-painful strategy for your latency/throughput budget.
+After the attention output projection (which is also split as a row-parallel linear), another all-reduce combines the partial results. So each transformer layer requires **2 all-reduce operations** in the forward pass:
 
+1. One after the attention output projection
+2. One after the FFN down-projection
+
+And correspondingly, **2 all-reduce operations** in the backward pass, for a total of **4 all-reduces per layer per training step**.
+
+### Communication Cost Analysis
+
+<Benchmark
+  title="TP Communication per Transformer Layer (Llama 3 70B, FP16)"
+  columns={["Component", "All-Reduces per Direction", "Data per All-Reduce", "Total per Layer"]}
+  rows={[
+    { values: ["Attention output projection", "1", "B x L x 8192 x 2 bytes", "B x L x 16 KB"], highlight: false },
+    { values: ["FFN down-projection", "1", "B x L x 8192 x 2 bytes", "B x L x 16 KB"], highlight: false },
+    { values: ["Total per layer (forward)", "2", "--", "B x L x 32 KB"], highlight: true },
+    { values: ["Total per model (80 layers, forward + backward)", "320", "--", "B x L x 5 MB"], highlight: true },
+  ]}
+  notes="B=batch, L=seq_len. At B=32, L=1 (decode): 160 KB per layer, 12.8 MB total per step."
+/>
+
+The real question is: how long do these all-reduces take relative to the compute?
+
+For **decode** (L=1, B=32): 12.8 MB total communication per step. On NVLink at 600 GB/s (H100), this is about 21 microseconds — utterly negligible compared to the milliseconds of compute.
+
+For **prefill** (L=2048, B=4): roughly 1.3 GB total. On NVLink 4.0: about 2 ms. On PCIe Gen4 at 32 GB/s: about 40 ms. **This is why tensor parallelism requires NVLink.**
+
+<PerfChart
+  title="TP All-Reduce Overhead by Interconnect (Llama 3 70B, Prefill 2048 Tokens)"
+  unit="ms"
+  data={[
+    { label: "NVLink 4.0 (H100, 900 GB/s)", value: 1.4, color: "green", annotation: "Negligible" },
+    { label: "NVLink 3.0 (A100, 600 GB/s)", value: 2.1, color: "green", annotation: "Acceptable" },
+    { label: "PCIe Gen5 (64 GB/s)", value: 10, color: "orange", annotation: "Noticeable" },
+    { label: "PCIe Gen4 (32 GB/s)", value: 20, color: "red", annotation: "Bottleneck" },
+  ]}
+/>
+
+### TP Scaling Efficiency
+
+<Benchmark
+  title="Tensor Parallelism Scaling (Llama 3 70B, A100 NVLink)"
+  columns={["TP Degree", "Memory per GPU", "Throughput (tok/s)", "Scaling Efficiency", "Notes"]}
+  rows={[
+    { values: ["TP=1", "140+ GB (does not fit)", "--", "--", "Requires model parallelism"], highlight: false },
+    { values: ["TP=2", "~75 GB", "680", "Baseline", "Fits on 80 GB A100"], highlight: true },
+    { values: ["TP=4", "~40 GB", "1250", "92%", "Good scaling"], highlight: true },
+    { values: ["TP=8", "~22 GB", "2200", "81%", "Communication starts to matter"], highlight: false },
+  ]}
+  notes="Beyond TP=8, efficiency drops sharply. Each GPU does less compute but communication volume per all-reduce stays constant."
+/>
+
+The practical limit for tensor parallelism is **TP=8** — which conveniently matches the number of GPUs connected by NVLink within a single node (DGX A100 or DGX H100). Going beyond TP=8 would require crossing the node boundary, where bandwidth drops from 600+ GB/s (NVLink) to 50-100 GB/s (InfiniBand), making TP communication a severe bottleneck.
+
+<Callout type="warning" title="NVLink Is Non-Negotiable for TP">
+  At PCIe bandwidths (~50 GB/s), tensor parallel communication can easily consume 30-50% of total step time for large prefills. NVLink at 600-900 GB/s brings this down to 2-5%. If you do not have NVLink, do not use tensor parallelism beyond TP=2 — prefer pipeline parallelism instead.
+</Callout>
+
+### Implementation Pattern
+
+```python
+# Simplified Megatron-LM style TP for FFN
+class TensorParallelFFN(nn.Module):
+    def __init__(self, d_model, d_ff, tp_rank, tp_world):
+        super().__init__()
+        # Column-parallel: split output dim
+        self.up_proj = nn.Linear(d_model, d_ff // tp_world, bias=False)
+        # Row-parallel: split input dim
+        self.down_proj = nn.Linear(d_ff // tp_world, d_model, bias=False)
+        self.tp_world = tp_world
+
+    def forward(self, x):
+        h = F.silu(self.up_proj(x))     # Local compute, no comm
+        out = self.down_proj(h)           # Local partial result
+        dist.all_reduce(out)              # Sum partials across TP group
+        return out
+```
+
+<PerfChart
+  title="Time Breakdown: TP=4 Llama 3 70B Decode Step (A100 NVLink)"
+  unit="ms"
+  data={[
+    { label: "Local GEMM compute", value: 3.8, color: "blue" },
+    { label: "All-reduce communication", value: 0.6, color: "orange" },
+    { label: "Other (norm, activation, sampling)", value: 0.4, color: "gray" },
+    { label: "Total", value: 4.8, color: "green", annotation: "87% compute efficiency" },
+  ]}
+/>
+
+## Pipeline Parallelism: Splitting Layers in Sequence
+
+Pipeline parallelism (PP) takes a different approach: instead of splitting individual layers, it assigns **entire groups of layers** to different GPUs. GPU 0 gets layers 0-19, GPU 1 gets layers 20-39, GPU 2 gets layers 40-59, GPU 3 gets layers 60-79, and so on.
+
+The appeal is that inter-stage communication is just passing activation tensors at the boundary — a point-to-point send/receive, not a collective all-reduce. This makes PP much more tolerant of lower-bandwidth interconnects like InfiniBand or even ethernet, making it the natural choice for **inter-node** parallelism.
+
+### The Bubble Problem
+
+The fundamental challenge with pipeline parallelism is **pipeline bubbles**. In a naive implementation:
+
+1. GPU 0 computes forward pass for micro-batch 1
+2. GPU 0 sends activations to GPU 1; GPU 0 is now **idle**
+3. GPU 1 computes forward on those activations; GPU 0 is still idle
+4. ... and so on through the pipeline
+5. The backward pass propagates back in reverse
+
+With $P$ pipeline stages and $M$ micro-batches, the bubble fraction (the fraction of time GPUs are idle) is:
+
+$$
+\text{bubble\_fraction} = \frac{P - 1}{M + P - 1}
+$$
+
+For $P=4$ stages and $M=1$ micro-batch, the bubble fraction is $3/4 = 75\%$ — three out of four GPUs are idle at any given time. This is catastrophic.
+
+<PerfChart
+  title="Pipeline Bubble Fraction vs. Number of Micro-batches (P=4 Stages)"
+  type="line"
+  data={{
+    labels: ["1", "2", "4", "8", "16", "32", "64"],
+    datasets: [
+      { label: "Bubble fraction", data: [0.75, 0.60, 0.43, 0.27, 0.16, 0.09, 0.05], borderColor: "#ef4444" },
+    ]
+  }}
+/>
+
+The solution is to split the mini-batch into many **micro-batches** and pipeline them through the stages. With enough micro-batches, the bubbles become a small fraction of total time.
+
+### 1F1B Schedule
+
+The **1F1B (one-forward-one-backward)** schedule, used in PipeDream and Megatron-LM, interleaves forward and backward passes of different micro-batches to reduce memory and improve efficiency.
+
+The schedule works as follows:
+
+1. **Warmup phase**: Each stage performs forward passes for a sufficient number of micro-batches to fill the pipeline
+2. **Steady state**: Each stage alternates — one forward pass, one backward pass (1F1B)
+3. **Cooldown phase**: Remaining backward passes drain the pipeline
+
+The advantage of 1F1B over the naive "all-forward-then-all-backward" approach: it limits the number of in-flight micro-batches, so each GPU only needs to store activations for $P$ micro-batches (not $M$), dramatically reducing activation memory.
+
+The bubble fraction with 1F1B is still:
+
+$$
+\text{bubble\_fraction} = \frac{P - 1}{M}
+$$
+
+(where $M$ is the total number of micro-batches). To keep bubbles below 5%, you need $M \geq 20(P-1)$. For $P=4$, that means $M \geq 60$ micro-batches — which requires a very large global batch size.
+
+### Interleaved Pipeline (Megatron-LM v2)
+
+Megatron-LM introduced an **interleaved pipeline** schedule where each GPU holds multiple non-contiguous groups of layers (called virtual stages). Instead of GPU 0 holding layers 0-19 contiguously, it might hold layers 0-4 and layers 40-44.
+
+With $V$ virtual stages per GPU, the bubble fraction becomes:
+
+$$
+\text{bubble\_fraction} = \frac{P - 1}{V \cdot M}
+$$
+
+Doubling $V$ halves the bubble. The trade-off: more pipeline stages means more inter-stage communication (more activation transfers).
+
+<Benchmark
+  title="Pipeline Bubble Fraction for Different Schedules (P=4, M=16)"
+  columns={["Schedule", "Virtual Stages", "Bubble Fraction", "Inter-stage Comms per Step"]}
+  rows={[
+    { values: ["Naive (all-forward-all-backward)", "1", "18.8%", "Low"], highlight: false },
+    { values: ["1F1B", "1", "18.8%", "Low"], highlight: false },
+    { values: ["Interleaved (V=2)", "2", "9.4%", "2x baseline"], highlight: true },
+    { values: ["Interleaved (V=4)", "4", "4.7%", "4x baseline"], highlight: true },
+  ]}
+  notes="Interleaved schedules trade communication for less bubble. The extra communication is point-to-point and can often be overlapped."
+/>
+
+### DualPipe: Bidirectional Pipeline (DeepSeek V3)
+
+DeepSeek V3 introduced **DualPipe**, a bidirectional pipeline schedule that processes micro-batches from **both ends** of the pipeline simultaneously. One stream flows forward through stages 0 to $P-1$, while another flows backward from stage $P-1$ to 0.
+
+The key insight: while a forward-flowing micro-batch is in the backward pass on GPU $i$, a backward-flowing micro-batch can be in its forward pass on that same GPU. The computation from both streams fills what would otherwise be bubble time.
+
+DualPipe achieves near-zero bubble fraction without requiring the enormous batch sizes that traditional schedules need. The cost is implementation complexity and the requirement that the model's computation is roughly symmetric across stages.
+
+<Callout type="info" title="Pipeline Parallelism Communication">
+  PP communication is **point-to-point** (send/receive between adjacent stages), not collective. Each inter-stage transfer sends one activation tensor of size $B \times L \times H \times 2$ bytes (for FP16). For Llama 3 70B with $H=8192$, $B=4$, $L=2048$: that is 128 MB per transfer. On InfiniBand at 400 Gb/s (50 GB/s), this takes about 2.5 ms — acceptable if overlapped with computation.
+</Callout>
+
+### When Pipeline Parallelism Wins
+
+PP is the strategy of choice when:
+- You need to scale **beyond a single NVLink domain** (beyond 8 GPUs)
+- Your interconnect bandwidth is moderate (InfiniBand, not NVLink)
+- You can afford large batch sizes (many micro-batches to fill the pipeline)
+- Latency is not the primary concern (bubbles add latency)
+
+PP is a poor choice for:
+- Low-latency inference (bubbles kill time-to-first-token)
+- Small batch sizes (bubble fraction is too high)
+- Within a node where NVLink is available (TP is strictly better intra-node)
+
+## Expert Parallelism: Distributing MoE Experts
+
+Mixture-of-Experts (MoE) models like DeepSeek V3 (671B parameters, 37B active per token) and Mixtral use sparsely-activated expert layers. Each token is routed to a small number of experts (typically 2 out of 64 or more), making compute per token much cheaper than a dense model of the same total size.
+
+Expert parallelism (EP) is the natural parallelism strategy for MoE models: distribute experts across GPUs, so each GPU holds a subset of the total experts.
+
+### How Expert Parallelism Works
+
+1. **Router**: A lightweight gating network decides which experts each token should be sent to
+2. **All-to-all dispatch**: Tokens are sent to the GPUs that hold their assigned experts. This is an **all-to-all** communication pattern — fundamentally different from the all-reduce in TP or the point-to-point in PP
+3. **Expert compute**: Each GPU processes the tokens that were routed to its local experts
+4. **All-to-all combine**: Results are sent back to the originating GPUs
+
+<MemoryLayout
+  title="Expert Parallel Layout (64 Experts, 8 GPUs)"
+  description="Each GPU holds 8 experts. Tokens are dispatched to the correct GPU via all-to-all communication."
+  layout={[
+    {
+      name: "GPU 0: Experts 0-7",
+      power: "Holds weights for 8 experts",
+      state: "Receives tokens routed to experts 0-7 from ALL GPUs",
+      color: "#3b82f6"
+    },
+    {
+      name: "GPU 1: Experts 8-15",
+      power: "Holds weights for 8 experts",
+      state: "Receives tokens routed to experts 8-15 from ALL GPUs",
+      color: "#10b981"
+    },
+    {
+      name: "...",
+      power: "Each GPU holds 8 of 64 experts",
+      state: "Load balancing is critical — uneven routing wastes compute",
+      color: "#8b5cf6"
+    },
+    {
+      name: "GPU 7: Experts 56-63",
+      power: "Holds weights for 8 experts",
+      state: "Receives tokens routed to experts 56-63 from ALL GPUs",
+      color: "#f59e0b"
+    }
+  ]}
+/>
+
+### All-to-All Communication
+
+The all-to-all primitive is the defining characteristic of expert parallelism. Unlike all-reduce (where every GPU contributes and receives the same quantity of data), all-to-all has **non-uniform traffic patterns**: a GPU might send many tokens to one expert GPU and few to another, depending on the router's decisions.
+
+The communication volume depends on the number of tokens, expert assignment, and token hidden dimension. For a sequence of $T$ tokens with hidden dimension $H$, each dispatched to $K$ experts across $N$ GPUs, the total all-to-all volume is approximately:
+
+$$
+\text{All-to-all volume} \approx 2 \times T \times K \times H \times 2 \text{ bytes (dispatch + combine)}
+$$
+
+This is substantial for large batch sizes. DeepSeek V3 uses EP=64 across 64 GPUs, meaning every expert lives on exactly one GPU. The all-to-all communication is distributed across the entire cluster.
+
+### DeepEP: Optimized Expert Communication
+
+DeepSeek developed **DeepEP**, an optimized communication library for MoE expert parallelism. Key innovations include:
+
+- **Hook-based overlap**: Communication is overlapped with computation by hooking into the forward/backward pass
+- **Optimized dispatch/combine kernels**: Custom CUDA kernels that fuse routing decisions with communication setup
+- **Adaptive routing**: Load balancing across experts to prevent communication hotspots
+
+<Callout type="perf" title="Expert Parallelism vs. Tensor Parallelism for MoE">
+  For dense models, TP splits every layer across GPUs. For MoE models, EP is more efficient because only the expert layers need inter-GPU communication — the shared attention layers can use TP within a smaller group. DeepSeek V3 combines EP for expert layers with TP for attention layers.
+</Callout>
+
+### When Expert Parallelism Wins
+
+EP is the right choice when:
+- Your model uses MoE architecture
+- You have enough experts to distribute meaningfully (typically 8+ experts)
+- You can tolerate the all-to-all latency (or overlap it with compute)
+- Load balancing across experts is achievable (via auxiliary loss or routing constraints)
+
+EP is a poor choice for:
+- Dense models (there are no experts to distribute)
+- Very small numbers of experts (the all-to-all overhead is not amortized)
+- Latency-critical inference with small batch sizes (all-to-all has high fixed overhead)
+
+## Context and Sequence Parallelism: Handling Long Sequences
+
+When sequences become very long — 32K, 128K, or even 1M tokens — the memory consumed by attention's KV cache and the quadratic cost of attention computation become bottlenecks that no other parallelism strategy addresses directly.
+
+Context parallelism (CP) and sequence parallelism (SP) split the **sequence dimension** across GPUs.
+
+### Ring Attention
+
+Ring Attention distributes the sequence across GPUs: GPU $i$ holds tokens $[i \cdot L/N, (i+1) \cdot L/N)$ of the sequence. Each GPU computes attention for its local query tokens against the full KV cache.
+
+The trick: the KV cache is passed around in a **ring** topology. At each step:
+
+1. GPU $i$ computes attention between its local queries and the current KV block
+2. GPU $i$ sends its KV block to GPU $(i+1) \mod N$ and receives from GPU $(i-1) \mod N$
+3. Repeat for $N$ steps until every GPU has seen all KV blocks
+
+The key property: KV transfer between adjacent GPUs can be **overlapped** with the attention computation on the current KV block. If the compute is slower than the communication (which it usually is for long sequences), the ring communication is fully hidden.
+
+Memory per GPU:
+
+$$
+\text{KV cache per GPU} = \frac{L}{N} \times 2 \times H \times \text{num\_layers} \times 2 \text{ bytes}
+$$
+
+For a 1M token sequence with $H=8192$, 80 layers, FP16: total KV cache is $\approx 2.6\text{ TB}$. With 8 GPUs: 328 GB per GPU (still needs further sharding or quantization). With 32 GPUs: 82 GB per GPU.
+
+### Ulysses Sequence Parallelism
+
+DeepSpeed Ulysses takes a different approach: it splits the sequence dimension and uses **all-to-all** communication (similar to expert parallelism) to transpose between sequence-parallel and head-parallel views.
+
+The workflow:
+
+1. Split input sequence across GPUs along the sequence dimension
+2. Before attention: all-to-all to redistribute from [sequence-split, all-heads] to [all-sequence, head-split]
+3. Compute attention (now each GPU has all sequence positions but only some heads)
+4. After attention: all-to-all to redistribute back to [sequence-split, all-heads]
+
+Ulysses requires 4 all-to-all operations per transformer layer (2 for forward, 2 for backward), but each all-to-all is smaller than Ring Attention's total communication.
+
+<Benchmark
+  title="Context Parallelism Comparison"
+  columns={["Method", "Communication Pattern", "Communication Volume", "Overlap Potential", "Best For"]}
+  rows={[
+    { values: ["Ring Attention", "Ring of point-to-point KV passes", "~KV cache size per ring step", "High (overlap with attention compute)", "Very long sequences, GQA/MQA models"], highlight: true },
+    { values: ["Ulysses", "All-to-all (sequence <-> head split)", "~4 all-to-all per layer", "Moderate", "Moderate sequences, many heads"], highlight: true },
+    { values: ["Hybrid Ring + Ulysses", "Both", "Varies", "High", "Extremely long sequences"], highlight: false },
+  ]}
+/>
+
+### When to Use Context Parallelism
+
+Context parallelism becomes necessary when:
+
+- Sequence length exceeds **32K tokens** and the KV cache does not fit on a single GPU (even with quantization)
+- You are training on very long documents (128K+) and activation memory for attention is the bottleneck
+- Other parallelism dimensions are already saturated
+
+For most current workloads (sequences under 8K), context parallelism is unnecessary. Standard tensor and data parallelism handle the memory and compute requirements.
+
+<Callout type="info" title="Sequence Parallelism (Megatron) vs. Context Parallelism">
+  Megatron-LM's "sequence parallelism" is different from context parallelism. Megatron SP splits the sequence dimension only for LayerNorm and Dropout operations (which are replicated in TP), converting redundant computation to distributed computation. It uses all-gather and reduce-scatter (not ring or all-to-all). This is a complement to TP, not a separate parallelism axis. Context parallelism (Ring Attention, Ulysses) splits the entire attention computation along the sequence dimension and is a separate parallelism axis.
+</Callout>
+
+## Combining Parallelisms: 3D, 4D, and 5D Parallel Training
+
+No single parallelism strategy is sufficient for training the largest models. Real production training runs combine multiple strategies, each operating at a different granularity and exploiting a different level of the hardware hierarchy.
+
+### The Hardware Hierarchy
+
+Modern GPU clusters have a hierarchy of interconnects with dramatically different bandwidths:
+
+<Benchmark
+  title="Interconnect Bandwidth Hierarchy (H100 DGX Cluster)"
+  columns={["Level", "Connects", "Bandwidth", "Latency", "Best Parallelism"]}
+  rows={[
+    { values: ["Intra-GPU", "SMs within one GPU", "~3 TB/s (HBM)", "~ns", "None needed"], highlight: false },
+    { values: ["Intra-node NVLink", "8 GPUs within a node", "900 GB/s bidirectional", "~1 us", "Tensor Parallelism (TP)"], highlight: true },
+    { values: ["Inter-node InfiniBand", "Nodes in a cluster", "400 Gb/s = 50 GB/s", "~1-5 us", "Pipeline Parallelism (PP)"], highlight: true },
+    { values: ["Inter-rack / multi-hop", "Distant nodes", "400 Gb/s, higher latency", "~5-20 us", "Data Parallelism (DP/FSDP)"], highlight: true },
+  ]}
+/>
+
+The principle: **match parallelism strategy to interconnect bandwidth**.
+
+- **TP** requires the highest bandwidth (all-reduce every layer) → use within NVLink domain
+- **PP** requires moderate bandwidth (point-to-point at stage boundaries) → use across nearby nodes
+- **DP/FSDP** requires the least frequent communication (once per step for gradient sync) → use across the cluster
+- **EP** requires all-to-all (for MoE token dispatch) → typically inter-node, overlapped with compute
+
+### 3D Parallelism (TP + PP + DP)
+
+The classic combination for large dense models:
+
+$$
+\text{Total GPUs} = \text{TP} \times \text{PP} \times \text{DP}
+$$
+
+Example: Training Llama 3 70B on 256 A100 GPUs:
+- **TP=8**: Split each layer across 8 GPUs within a node (NVLink)
+- **PP=4**: Split the 80 layers into 4 pipeline stages across 4 nodes (InfiniBand)
+- **DP=8**: 8 independent pipeline replicas processing different data shards
+
+This gives $8 \times 4 \times 8 = 256$ GPUs. Each GPU holds $1/8$ of each layer's weights (TP), $1/4$ of the total layers (PP), and processes $1/8$ of the global batch (DP).
+
+### 4D/5D Parallelism (Adding EP and CP)
+
+For MoE models and long-context training, additional parallelism axes come into play:
+
+$$
+\text{Total GPUs} = \text{TP} \times \text{PP} \times \text{DP} \times \text{EP} \times \text{CP}
+$$
+
+**DeepSeek V3 training configuration** (2048 H800 GPUs):
+- **EP=64** for expert layers (each of 256 experts distributed across 64 GPUs)
+- **TP=4** for attention layers within a node
+- **PP=16** pipeline stages across nodes
+- **DP=2** for data parallelism
+
+Note that EP and DP can share the same GPU dimension — a GPU that handles data shard $i$ for dense layers handles expert group $j$ for MoE layers. The total GPU count is $\text{EP} \times \text{PP} \times \text{DP}_{\text{effective}} = 64 \times 16 \times 2 = 2048$.
+
+<Benchmark
+  title="Real-World Multi-Dimensional Parallelism Configurations"
+  columns={["Model", "Total GPUs", "TP", "PP", "DP", "EP", "CP"]}
+  rows={[
+    { values: ["Llama 3 70B", "256 A100s", "8", "4", "8", "--", "--"], highlight: false },
+    { values: ["Llama 3 405B", "16384 H100s", "8", "16", "128", "--", "--"], highlight: true },
+    { values: ["DeepSeek V3", "2048 H800s", "4", "16", "2", "64", "--"], highlight: true },
+    { values: ["GPT-4 (estimated)", "~10000+ GPUs", "8", "~64", "~20+", "MoE", "--"], highlight: false },
+    { values: ["Long-context training (128K)", "512 H100s", "8", "4", "4", "--", "4"], highlight: false },
+  ]}
+  notes="Configurations are approximate and may vary by training phase. Many teams adjust parallelism dimensions dynamically."
+/>
+
+### How to Choose: A Decision Process
+
+The order in which you add parallelism dimensions matters. Here is the recommended priority:
+
+**Step 1: Tensor Parallelism first (for latency)**
+
+If the model does not fit on one GPU, start with TP within a single NVLink-connected node. TP=8 for 8-GPU nodes. This gives the lowest latency because all-reduce on NVLink is fast and there are no pipeline bubbles.
+
+**Step 2: Pipeline Parallelism second (for inter-node scaling)**
+
+If TP=8 is not enough (model still too large, or you need more GPUs), add PP across nodes. PP tolerates the lower InfiniBand bandwidth. Choose the number of stages to keep bubble fraction manageable (below 5-10%).
+
+**Step 3: Data Parallelism third (for throughput scaling)**
+
+Once the model fits via TP+PP, scale throughput with DP/FSDP across remaining GPUs. DP communication (gradient sync) happens once per step and can overlap with computation.
+
+**Step 4: Expert Parallelism (for MoE models)**
+
+If using MoE, add EP to distribute experts. EP typically replaces some of the DP dimension for expert layers.
+
+**Step 5: Context Parallelism (for long sequences)**
+
+If training on very long sequences (over 32K), add CP to split the sequence dimension.
+
+<Callout type="perf" title="The Rule of Thumb">
+  TP handles the **model dimension** (each layer is too big). PP handles the **depth dimension** (too many layers). DP handles the **data dimension** (need more throughput). EP handles the **expert dimension** (MoE). CP handles the **sequence dimension** (long context). Each addresses a different bottleneck with a communication pattern suited to a different level of the interconnect hierarchy.
+</Callout>
+
+## Communication Primitives Reference
+
+All parallelism strategies reduce to a small number of collective communication primitives. Understanding these is essential for reasoning about performance.
+
+<Benchmark
+  title="Communication Primitives Used by Each Parallelism Strategy"
+  columns={["Primitive", "Description", "Volume per GPU", "Used By"]}
+  rows={[
+    { values: ["All-reduce", "Sum tensors across all GPUs, result on all GPUs", "~2M (ring)", "DDP gradients, TP layer outputs"], highlight: true },
+    { values: ["All-gather", "Each GPU broadcasts its shard, all GPUs get full tensor", "~M(N-1)/N", "FSDP parameter gathering, Megatron SP"], highlight: true },
+    { values: ["Reduce-scatter", "Sum tensors, each GPU gets 1/N of result", "~M(N-1)/N", "FSDP gradient reduction, Megatron SP"], highlight: true },
+    { values: ["All-to-all", "Each GPU sends different data to each other GPU", "Variable", "Expert parallelism dispatch/combine, Ulysses SP"], highlight: true },
+    { values: ["Point-to-point (send/recv)", "One GPU sends to one other GPU", "One tensor", "Pipeline parallelism stage boundaries, Ring Attention"], highlight: false },
+  ]}
+  notes="All-reduce can be decomposed into reduce-scatter + all-gather. Volume M refers to the tensor size being communicated."
+/>
+
+A useful identity: **all-reduce = reduce-scatter + all-gather**. This is exactly what FSDP exploits — instead of doing an all-reduce and keeping the full gradient (wasteful), it does only the reduce-scatter (keeping $1/N$ of the gradient) for gradient computation, and only the all-gather when the full parameter is needed for forward/backward.
+
+## When Each Parallelism Wins: A Decision Tree
+
+Here is a practical decision tree for choosing parallelism strategies:
+
+**Does the model fit on a single GPU (including optimizer states for training)?**
+- **Yes**: Use **DDP** for throughput scaling. This is the simplest and most efficient option.
+- **No**: Continue below.
+
+**Does the model fit on a single GPU with ZeRO-1 or ZeRO-2 (sharded optimizer)?**
+- **Yes**: Use **ZeRO-1/2** with DDP. You get memory savings with minimal communication overhead.
+- **No**: Continue below.
+
+**Do you have NVLink-connected GPUs (DGX-style node)?**
+- **Yes**: Start with **TP=8** within the NVLink domain. If the model still does not fit, add **PP** across nodes. Fill remaining GPUs with **DP/FSDP**.
+- **No (PCIe only)**: Use **FSDP/ZeRO-3** for sharding. Avoid TP beyond TP=2. Consider **PP** if you have multiple nodes.
+
+**Is the model MoE?**
+- **Yes**: Add **EP** to distribute experts. Combine with TP for attention layers and PP for depth.
+- **No**: Stick with TP + PP + DP.
+
+**Is the sequence length over 32K tokens?**
+- **Yes**: Add **CP** (Ring Attention or Ulysses) to split the sequence dimension.
+- **No**: Standard TP + PP + DP is sufficient.
+
+<Benchmark
+  title="Parallelism Strategy Quick Reference"
+  columns={["Strategy", "When to Use", "Communication Pattern", "Bandwidth Requirement", "Latency Impact"]}
+  rows={[
+    { values: ["DDP", "Model fits on 1 GPU, scale throughput", "All-reduce (1x per step)", "Low", "None"], highlight: true },
+    { values: ["FSDP / ZeRO-3", "Model does not fit, need memory savings", "All-gather + reduce-scatter", "Moderate", "Slight increase"], highlight: true },
+    { values: ["Tensor Parallel", "Layer too large for 1 GPU, have NVLink", "All-reduce (2x per layer)", "Very High (NVLink)", "Low"], highlight: true },
+    { values: ["Pipeline Parallel", "Model too deep, scaling beyond 1 node", "Point-to-point at boundaries", "Moderate", "Bubbles add latency"], highlight: true },
+    { values: ["Expert Parallel", "MoE model, distribute experts", "All-to-all dispatch/combine", "Moderate-High", "All-to-all latency"], highlight: false },
+    { values: ["Context Parallel", "Very long sequences (over 32K)", "Ring or all-to-all", "Moderate", "Depends on overlap"], highlight: false },
+  ]}
+/>
+
+## Practical Considerations
+
+### Activation Checkpointing
+
+Regardless of parallelism strategy, activation checkpointing (gradient checkpointing) is almost always used for large model training. Instead of storing all activations from the forward pass for use in the backward pass, you recompute them. This trades ~33% extra compute for a dramatic reduction in activation memory.
+
+With FSDP + activation checkpointing, the memory per GPU is approximately:
+
+$$
+\text{Memory} \approx \frac{16P}{N} + \text{batch\_activations}
+$$
+
+where the activation memory depends on batch size, sequence length, and how aggressively you checkpoint.
+
+### Mixed Precision
+
+Modern training uses BF16 or FP16 for forward/backward computation and FP32 for optimizer states and master weights. This halves the communication volume for TP all-reduces (since activations are in FP16) and halves the parameter memory. The optimizer states remain in FP32 for numerical stability, which is why ZeRO's optimizer state sharding is so impactful.
+
+### Overlapping Communication and Computation
+
+The key to high GPU utilization is **overlapping** communication with computation:
+
+- **DDP**: Gradient all-reduce is overlapped with backward computation (bucketed all-reduce starts as soon as each gradient bucket is ready)
+- **FSDP**: All-gather for the next layer can be prefetched during the current layer's computation
+- **TP**: All-reduce can partially overlap with subsequent layer norm computation
+- **PP**: Activation transfer to the next stage overlaps with the current stage's remaining computation
+- **EP**: Token dispatch can overlap with attention computation on the dense layers
+
+When communication is fully overlapped with computation, it effectively "disappears" from the critical path. This is why real-world scaling efficiency is often better than what communication volume alone would suggest.
+
+### Fault Tolerance at Scale
+
+With 2048+ GPUs, failures are not rare events — they are expected. A single GPU failure every few hours is normal at this scale. Production training systems need:
+
+- **Checkpointing**: Periodic saves of model state. With FSDP, each GPU saves its local shard (fast), and shards are assembled during recovery.
+- **Elastic training**: The ability to continue training with fewer GPUs (adjusting DP degree) when a node fails, then scale back up when it recovers.
+- **Communication timeout handling**: Detecting and recovering from NCCL communication hangs caused by GPU or network failures.
+
+## Putting It All Together: A Worked Example
+
+Suppose you want to train a 70B dense model on 512 H100 GPUs (64 nodes of 8 GPUs each). Here is how you would configure parallelism:
+
+**Model analysis:**
+- 70B parameters, 80 transformer layers
+- FP16 weights: 140 GB
+- With Adam optimizer (FP32): 16 bytes/param = 1.12 TB total
+- Target: global batch size of 4M tokens (1024 sequences of 4096 tokens)
+
+**Configuration:**
+- **TP=8**: Within each 8-GPU node (NVLink). Each GPU holds $1/8$ of each layer's weights.
+- **PP=4**: Across 4 nodes. 20 layers per stage. Requires ~16 micro-batches to keep bubble below 5%.
+- **DP=16**: 16 independent TP+PP groups, each processing $1/16$ of the global batch.
+
+**Verification:** $8 \times 4 \times 16 = 512$ GPUs. Each GPU's memory:
+- Parameters: $140\text{ GB} / 8\text{ (TP)} / 4\text{ (PP)} = 4.4\text{ GB}$
+- Optimizer states (with ZeRO-1 across DP): $840\text{ GB} / 8 / 4 / 16 = 1.6\text{ GB}$
+- Activations (with checkpointing): ~10-20 GB (depends on micro-batch size and sequence length)
+- Total: ~20-30 GB per GPU — well within H100's 80 GB
+
+**Communication:**
+- TP: 2 all-reduces per layer, 20 layers per stage = 40 all-reduces per step on NVLink (~900 GB/s) — microseconds per step
+- PP: 1 activation transfer per micro-batch at each stage boundary on InfiniBand (50 GB/s) — a few milliseconds, overlapped with compute
+- DP: 1 gradient all-reduce per step across 16 replicas on InfiniBand — overlapped with backward computation
+
+This configuration achieves approximately 40-50% Model FLOPs Utilization (MFU), meaning 40-50% of the theoretical peak FLOPS are used for useful computation. The rest is overhead from communication, memory operations, and pipeline bubbles.
+
+<Callout type="info" title="Model FLOPs Utilization (MFU)">
+  MFU measures what fraction of the GPU's theoretical peak compute is used for model computation (excluding communication, memory copies, etc.). State-of-the-art training runs achieve 40-55% MFU. DeepSeek V3 reportedly achieved ~55% MFU on their 2048-GPU cluster. Higher MFU means less money wasted on idle silicon.
+</Callout>
+
+## Summary
+
+<Benchmark
+  title="Complete Parallelism Strategy Summary"
+  columns={["Dimension", "What It Splits", "Communication", "Where to Use", "Scales To"]}
+  rows={[
+    { values: ["Data (DDP)", "Training data across replicas", "All-reduce gradients", "Everywhere", "1000s of GPUs"], highlight: true },
+    { values: ["Data (FSDP/ZeRO)", "Data + params + optimizer + grads", "All-gather + reduce-scatter", "Everywhere", "1000s of GPUs"], highlight: true },
+    { values: ["Tensor (TP)", "Weight matrices within each layer", "All-reduce per layer", "Intra-node (NVLink)", "8 GPUs per group"], highlight: true },
+    { values: ["Pipeline (PP)", "Layers across pipeline stages", "Point-to-point activations", "Inter-node (InfiniBand)", "16-64 stages"], highlight: true },
+    { values: ["Expert (EP)", "MoE experts across GPUs", "All-to-all dispatch/combine", "Across cluster", "Num experts"], highlight: true },
+    { values: ["Context (CP)", "Sequence dimension", "Ring or all-to-all", "Across nodes", "Sequence length / chunk"], highlight: true },
+  ]}
+/>
+
+The art of distributed training is choosing the right combination of these strategies for your specific model, hardware, and requirements. The general recipe:
+
+1. **TP=8 intra-node** to split layers across NVLink-connected GPUs
+2. **PP across nodes** to handle model depth beyond what TP covers
+3. **DP/FSDP across the cluster** to scale throughput
+4. **EP for MoE models** to distribute experts
+5. **CP for long sequences** when the sequence dimension is the memory bottleneck
+
+Each parallelism dimension addresses a different bottleneck (layer size, model depth, throughput, expert count, sequence length) and maps to a different level of the hardware interconnect hierarchy. Getting this mapping right is the difference between 50% MFU and 20% MFU — the difference between a training run that finishes in weeks and one that takes months.

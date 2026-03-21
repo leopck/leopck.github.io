@@ -1,144 +1,820 @@
 ---
 title: "CUDA Kernel Fusion: Reducing Memory Traffic for Elementwise-Heavy Workloads"
 author: "stanley-phoong"
-description: "A performance-focused guide to kernel fusion for CUDA: when it pays off, how much memory traffic it saves, and the trade-offs in register pressure and occupancy for transformer-style elementwise ops."
-publishDate: 2020-10-24
+description: "A comprehensive deep dive into kernel fusion for CUDA: why it matters, the fusion patterns that exist, how to implement them with Triton and torch.compile, FlashAttention as the ultimate fusion, and practical guidance for measuring and applying fusion in production LLM inference systems."
+publishDate: 2025-03-21
 category: gpu-programming
-tags: [cuda, kernel-fusion, memory-traffic, transformers, optimization, performance]
+tags: [cuda, kernel-fusion, memory-traffic, transformers, optimization, performance, triton, flashattention]
 difficulty: advanced
-readingTime: 19
+readingTime: 30
 ---
 
 import Callout from '@/components/mdx/Callout.astro';
 import PerfChart from '@/components/mdx/PerfChart.astro';
 import Benchmark from '@/components/mdx/Benchmark.astro';
+import CodeCompare from '@/components/mdx/CodeCompare.astro';
 
-In transformer inference, many kernels are short, bandwidth-heavy elementwise operations: bias add, activation, dropout, residual add, layernorm, etc. Launching each as a separate kernel:
-- thrashes L2 and global memory
-- burns launch overhead
+Modern GPU workloads, especially transformer inference, are dominated by memory traffic. The arithmetic intensity of most operations outside of matrix multiplication is so low that the GPU spends the majority of its time waiting for data to arrive from HBM rather than performing computation. Kernel fusion is the single most effective technique for reducing this memory traffic, and understanding it deeply is essential for anyone working on GPU performance.
 
-Kernel fusion addresses this by **reading data once, doing more math, and writing once**.
+This post covers the full landscape of kernel fusion: the two costs it eliminates, the major fusion patterns, practical implementation approaches from manual CUDA to automatic compiler fusion, FlashAttention as the most impactful fusion in deep learning, when fusion hurts rather than helps, and how to measure everything with profiling tools.
 
-## A simple example: bias + GELU + residual
+## The Two Costs Fusion Eliminates
 
-Naive:
+Every time you launch a CUDA kernel, two costs are incurred that have nothing to do with the actual computation you want to perform. Fusion eliminates both.
 
-```c
-__global__ void add_bias(float* x, const float* b, int n) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) x[i] += b[i];
-}
+### Cost 1: Kernel Launch Overhead
 
-__global__ void gelu(float* x, int n) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) {
-    float v = x[i];
-    x[i] = 0.5f * v * (1.0f + erff(v * 0.70710678f));
-  }
-}
+Each CUDA kernel launch involves a round-trip through the CUDA driver. The CPU must package the kernel arguments, submit the launch to the GPU command queue, and the GPU must decode the launch parameters and schedule thread blocks. On modern GPUs (A100, H100), this takes approximately 5-10 microseconds per kernel launch.
 
-__global__ void add_residual(float* x, const float* residual, int n) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) x[i] += residual[i];
-}
-```
+That sounds small, but consider what happens in a single transformer layer during inference. A typical layer involves:
 
-Each kernel:
-- reads x
-- maybe reads another array
-- writes x back
+- QKV projection (GEMM)
+- Bias add
+- Reshape and transpose for multi-head attention
+- QK^T matmul
+- Scale by $1/\sqrt{d_k}$
+- Causal mask application
+- Softmax
+- Dropout (during training)
+- Attention-value matmul
+- Output projection (GEMM)
+- Bias add
+- Residual addition
+- LayerNorm (mean, variance, normalize)
+- Feed-forward GEMM 1
+- Bias add
+- Activation (GELU/SiLU)
+- Feed-forward GEMM 2
+- Bias add
+- Residual addition
+- LayerNorm
 
-Total: **multiple round-trips** to DRAM per element.
+That is roughly 20-30 individual operations. If each launches as a separate kernel at 7 microseconds per launch, that is 140-210 microseconds of pure launch overhead per layer. A 70B parameter model with 80 layers would accumulate 11-17 milliseconds of launch overhead alone, before any actual computation. During decode (where batch sizes are small and kernels are short), this launch overhead can dominate total latency.
 
-Fused:
-
-```cpp
-__global__ void fused_bias_gelu_residual(
-    float* x, const float* b, const float* residual, int n) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) {
-    float v = x[i];
-    v += b[i];                           // bias
-    float g = 0.5f * v * (1.0f + erff(v * 0.70710678f)); // GELU
-    v = g + residual[i];                // residual
-    x[i] = v;                           // single write
-  }
-}
-```
-
-## Memory traffic comparison
-
-Assume sizeof(float) = 4 bytes, arrays length N:
-
-<Benchmark
-  title="Approximate DRAM traffic per element"
-  columns={["Pattern", "Reads", "Writes", "Total bytes"]}
-  rows={[
-    { values: ["Unfused (3 kernels)", "x:3 + b:1 + res:1", "x:3", " (3+1+1+3).4 = 32 bytes"], highlight: false },
-    { values: ["Fused", "x:1 + b:1 + res:1", "x:1", " (1+1+1+1).4 = 16 bytes"], highlight: true },
-  ]}
-/>
-
-Roughly **2x less DRAM traffic** for this toy pattern.
-
-If the kernel is memory-bound, halving bytes can nearly double speed.
-
-<PerfChart
-  title="Speedup vs fusion (memory-bound case, example)"
-  type="bar"
-  chartData={{
-    labels: ["Unfused", "Fused"],
-    series: [{
-      label: "Relative time",
-      data: [1.0, 0.55],
-      backgroundColor: ["#ef4444", "#10b981"],
-    }]
-  }}
-/>
-
-## Trade-offs: register pressure and occupancy
-
-Fusion:
-- increases live values per thread -> more registers
-- might reduce occupancy
-
-If you go too far, you may:
-- spill to local memory (negating benefits)
-- under-occupy and fail to hide latency
-
-<Callout type="warning" title="Don't fuse blindly">
-  Fusion helps when you're **bandwidth-bound** and registers stay under control. If you're already compute-bound or register-limited, more fusion can hurt.
+<Callout type="perf" title="Launch Overhead in Decode">
+  During autoregressive decode with batch size 1, individual elementwise kernels may execute in 2-5 microseconds. When the kernel launch overhead is 5-10 microseconds, you spend more time launching kernels than running them. Fusion turns 10 launches into 1, eliminating this overhead entirely.
 </Callout>
 
-## Transformer-style fusion targets
+### Cost 2: Memory Traffic to HBM
 
-Good fusion candidates:
-- bias + activation
-- dropout + residual add
-- layernorm + residual add (with care)
-- multiple pointwise ops on the same tensor
+This is the far more significant cost. When operations execute as separate kernels, every intermediate result must be written to HBM (High Bandwidth Memory) by one kernel and read back from HBM by the next kernel. HBM, despite its name, is slow relative to the GPU's compute capability. On an A100, HBM bandwidth is approximately 2 TB/s, while the compute throughput for FP16 is 312 TFLOPS. This means that any operation with fewer than ~156 FLOPs per byte transferred is memory-bound.
 
-Less ideal:
-- ops with very different access patterns (e.g., matmul + softmax + dropout)
-- anything that requires drastically different tiling
+Most elementwise operations (bias add, activation functions, dropout, residual connections) perform 1-10 FLOPs per element while transferring 4-8 bytes per element (depending on precision). Their arithmetic intensity is well below 1 FLOP/byte. They are completely memory-bound.
 
-## Measuring impact
+Consider a simple sequence: bias add followed by GELU activation followed by dropout. With three separate kernels:
 
-1. Measure baseline kernel times and memory BW
-2. Fuse obvious elementwise sequences
-3. Re-measure:
-   - bytes moved (from profiler)
-   - kernel time
-   - register count/occupancy (from SASS or `nvcc --ptxas-options=-v`)
+**Kernel 1 (bias add):** Read $x$ from HBM, read $b$ from HBM, write $x + b$ to HBM.
 
-If bytes drop significantly and register count stays reasonable, you win.
+**Kernel 2 (GELU):** Read the result from HBM, compute GELU, write result to HBM.
+
+**Kernel 3 (dropout):** Read the result from HBM, apply mask, write result to HBM.
+
+For $N$ elements in FP16 (2 bytes each), the total HBM traffic is:
+
+$$\text{Unfused} = \underbrace{2N + 2N}_{\text{bias read}} + \underbrace{2N}_{\text{bias write}} + \underbrace{2N}_{\text{GELU read}} + \underbrace{2N}_{\text{GELU write}} + \underbrace{2N}_{\text{dropout read}} + \underbrace{2N}_{\text{dropout write}} = 14N \text{ bytes}$$
+
+We also need to read the bias vector and the dropout mask, but for large $N$ these are negligible relative to the main tensor. The key point is that the intermediate results between kernels are written and then re-read unnecessarily.
+
+With a single fused kernel:
+
+**Fused kernel:** Read $x$ from HBM, read $b$ from HBM, compute bias + GELU + dropout in registers, write final result to HBM.
+
+$$\text{Fused} = \underbrace{2N}_{\text{read } x} + \underbrace{2N}_{\text{read } b} + \underbrace{2N}_{\text{write result}} = 6N \text{ bytes}$$
+
+That is a **2.3x reduction** in HBM traffic. For a memory-bound operation, reducing traffic by 2.3x translates almost directly to a 2.3x speedup.
+
+<Benchmark
+  title="HBM Traffic: Bias + GELU + Dropout (N elements, FP16)"
+  columns={["Pattern", "HBM Reads", "HBM Writes", "Total Traffic", "Relative"]}
+  rows={[
+    { values: ["Unfused (3 kernels)", "8N bytes", "6N bytes", "14N bytes", "2.33x"], highlight: false },
+    { values: ["Fused (1 kernel)", "4N bytes", "2N bytes", "6N bytes", "1.00x"], highlight: true },
+  ]}
+  notes="Assumes FP16 precision (2 bytes/element). Bias vector and dropout mask reads omitted for clarity."
+/>
+
+### The Fundamental Principle
+
+Fusion works because GPU registers and shared memory (SRAM) are orders of magnitude faster than HBM. On an A100:
+
+- **Registers:** ~20 TB/s effective bandwidth per SM, zero additional latency
+- **Shared memory (SRAM):** ~19 TB/s aggregate across all SMs
+- **L2 cache:** ~5 TB/s
+- **HBM:** ~2 TB/s
+
+When you fuse two operations, the intermediate result stays in registers. It never touches HBM. The first operation computes a value into a register, and the second operation reads it from that same register. The cost of the intermediate transfer drops from nanoseconds (HBM round-trip) to effectively zero.
+
+## Fusion Patterns
+
+Not all operations can be fused the same way. The fusion strategy depends on the data access patterns and dependencies between operations.
+
+### Pattern 1: Elementwise Fusion
+
+This is the simplest and most common fusion pattern. When consecutive operations are all elementwise, meaning each output element depends only on the corresponding input element(s), they can trivially be fused into a single kernel. Each thread handles one element and applies all operations in sequence.
+
+Common elementwise fusion targets in transformers:
+
+- **Bias + activation:** $\text{GELU}(x + b)$ or $\text{SiLU}(x + b)$
+- **Bias + activation + dropout:** $\text{dropout}(\text{GELU}(x + b))$
+- **Residual + LayerNorm pre-processing:** $x + \text{residual}$ followed by the start of LayerNorm
+- **Scale + mask + softmax input:** $\frac{QK^T}{\sqrt{d_k}} + \text{mask}$
+
+The implementation is straightforward. Each thread loads its element, applies all operations, and writes the final result:
+
+```cuda
+__global__ void fused_bias_gelu_dropout(
+    half* __restrict__ output,
+    const half* __restrict__ input,
+    const half* __restrict__ bias,
+    const uint8_t* __restrict__ mask,
+    float scale,
+    int n, int hidden_dim) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    float x = __half2float(input[idx]);
+    float b = __half2float(bias[idx % hidden_dim]);
+    float v = x + b;
+    // GELU approximation
+    float gelu = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v)));
+    // Dropout
+    float result = mask[idx] ? gelu * scale : 0.0f;
+    output[idx] = __float2half(result);
+  }
+}
+```
+
+Elementwise fusion typically delivers 2-3x speedup for chains of 2-4 operations. The speedup is proportional to the reduction in HBM round-trips.
+
+### Pattern 2: Reduction Fusion
+
+Reduction operations (sum, max, mean, variance) collect data across a dimension and produce a smaller output. They can be fused with preceding elementwise operations and, critically, with the normalize step that often follows.
+
+**LayerNorm** is the canonical example. It involves three steps:
+
+1. Compute mean: $\mu = \frac{1}{N}\sum_i x_i$ (reduction)
+2. Compute variance: $\sigma^2 = \frac{1}{N}\sum_i (x_i - \mu)^2$ (reduction)
+3. Normalize: $y_i = \frac{x_i - \mu}{\sqrt{\sigma^2 + \epsilon}} \cdot \gamma + \beta$ (elementwise)
+
+A naive implementation launches three kernels. A fused implementation does everything in one kernel using shared memory for the reduction. Threads within a block collaboratively compute the mean and variance, synchronize via `__syncthreads()`, then each thread normalizes its own elements.
+
+```cuda
+__global__ void fused_layernorm(
+    half* __restrict__ output,
+    const half* __restrict__ input,
+    const half* __restrict__ gamma,
+    const half* __restrict__ beta,
+    float epsilon, int hidden_dim) {
+  // Each block handles one row (one token)
+  extern __shared__ float shared[];
+
+  int row = blockIdx.x;
+  const half* row_in = input + row * hidden_dim;
+  half* row_out = output + row * hidden_dim;
+
+  // Step 1: Compute mean
+  float local_sum = 0.0f;
+  for (int i = threadIdx.x; i < hidden_dim; i += blockDim.x) {
+    local_sum += __half2float(row_in[i]);
+  }
+  shared[threadIdx.x] = local_sum;
+  __syncthreads();
+
+  // Block-level reduction for mean
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride)
+      shared[threadIdx.x] += shared[threadIdx.x + stride];
+    __syncthreads();
+  }
+  float mean = shared[0] / hidden_dim;
+  __syncthreads();
+
+  // Step 2: Compute variance
+  float local_var = 0.0f;
+  for (int i = threadIdx.x; i < hidden_dim; i += blockDim.x) {
+    float diff = __half2float(row_in[i]) - mean;
+    local_var += diff * diff;
+  }
+  shared[threadIdx.x] = local_var;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride)
+      shared[threadIdx.x] += shared[threadIdx.x + stride];
+    __syncthreads();
+  }
+  float variance = shared[0] / hidden_dim;
+  float inv_std = rsqrtf(variance + epsilon);
+  __syncthreads();
+
+  // Step 3: Normalize + affine transform
+  for (int i = threadIdx.x; i < hidden_dim; i += blockDim.x) {
+    float x = __half2float(row_in[i]);
+    float normalized = (x - mean) * inv_std;
+    float result = normalized * __half2float(gamma[i]) + __half2float(beta[i]);
+    row_out[i] = __float2half(result);
+  }
+}
+```
+
+The fused version reads the input once and writes the output once. The unfused version would read the input three times (once per kernel) and write intermediates twice. For a hidden dimension of 4096 in FP16, that is the difference between 16 KB and 48 KB of HBM traffic per token.
+
+<Callout type="info" title="Reduction Fusion is Harder">
+  Unlike elementwise fusion, reduction fusion requires thread cooperation via shared memory. This makes it architecture-dependent (block size matters) and harder to auto-generate. Most compiler-based fusion systems handle elementwise fusion well but still rely on hand-written or template-based kernels for reductions like LayerNorm and Softmax.
+</Callout>
+
+### Pattern 3: GEMM Epilogue Fusion
+
+Matrix multiplications (GEMMs) are the most compute-intensive operations in transformers, but they are almost always followed by elementwise operations: bias add, activation function, residual connection. Without fusion, the GEMM writes its output to HBM, and then a separate kernel reads it back to apply the bias and activation.
+
+GEMM epilogue fusion embeds these post-GEMM operations directly into the GEMM kernel. As each output tile of the matrix multiplication is computed in registers, the epilogue applies bias addition, activation, and any other elementwise operations before writing to HBM.
+
+NVIDIA's CUTLASS library supports epilogue fusion natively through its `EpilogueOp` template parameter. You can compose epilogues that include:
+
+- Bias addition (per-column or per-element)
+- Activation functions (ReLU, GELU, SiLU)
+- Residual addition
+- Quantization / dequantization
+- Custom pointwise operations
+
+```cpp
+// CUTLASS epilogue: GEMM + bias + GELU
+using EpilogueOp = cutlass::epilogue::thread::LinearCombinationGELU<
+    ElementOutput,                    // output type
+    128 / cutlass::sizeof_bits<ElementOutput>::value,  // elements per access
+    ElementAccumulator,               // accumulator type
+    ElementCompute                    // compute type
+>;
+```
+
+This is particularly valuable because GEMM outputs can be very large. For a 4096x4096 weight matrix operating on a batch of 128 tokens, the output is $128 \times 4096 = 524{,}288$ elements. In FP16, that is 1 MB written to HBM and then immediately read back just to add a bias vector. Epilogue fusion eliminates this entirely.
+
+<Benchmark
+  title="GEMM + Bias + GELU: Fused vs Unfused (A100, FP16)"
+  columns={["Configuration", "Time (us)", "HBM Traffic", "Speedup"]}
+  rows={[
+    { values: ["GEMM + separate bias + separate GELU", "142", "3x output size", "1.00x"], highlight: false },
+    { values: ["GEMM with fused epilogue", "128", "1x output size", "1.11x"], highlight: true },
+  ]}
+  notes="For large GEMMs the speedup is modest because the GEMM itself is compute-bound. The benefit grows for smaller batch sizes where the epilogue traffic becomes a larger fraction of total time."
+/>
+
+The speedup from epilogue fusion is modest for large, compute-bound GEMMs because the GEMM dominates runtime regardless. But for small batch sizes (like decode in LLM inference), where GEMMs become memory-bound, epilogue fusion matters significantly.
+
+### Pattern 4: Attention Fusion (FlashAttention)
+
+This is by far the most impactful fusion in modern deep learning. Standard multi-head attention computes:
+
+$$\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right) V$$
+
+The naive implementation materializes the full $N \times N$ attention matrix (where $N$ is the sequence length), stores it in HBM, computes softmax over it, then multiplies by $V$. For sequence length $N = 8192$ and $d_k = 128$, the attention matrix alone is $8192 \times 8192 = 67$ million elements. In FP16, that is 128 MB per attention head. With 32 heads, that is 4 GB of intermediate storage that gets written to and read from HBM.
+
+FlashAttention fuses the entire attention computation into a single kernel that never materializes the full attention matrix. Instead, it processes the attention in tiles, keeping partial results in SRAM. I will cover this in detail in a dedicated section below.
+
+## How Fusion Works in Practice
+
+There are multiple ways to achieve fusion, ranging from fully manual to fully automatic. Each makes different trade-offs between development effort, performance, and flexibility.
+
+### Manual CUDA Kernels
+
+Writing a custom CUDA kernel gives you complete control over the fusion strategy. You decide exactly which operations to combine, how to use shared memory, what thread block dimensions to use, and how to handle edge cases.
+
+The bias + GELU + residual kernel shown earlier is a simple example. For more complex fusions like LayerNorm or FlashAttention, manual CUDA involves hundreds to thousands of lines of carefully tuned code. FlashAttention's original CUDA implementation is approximately 2,000 lines.
+
+**Advantages:** Maximum performance, full control over memory hierarchy usage, ability to fuse any combination of operations.
+
+**Disadvantages:** High development cost (days to weeks per kernel), architecture-specific tuning required, difficult to maintain as models evolve.
+
+### Triton: The Middle Ground
+
+OpenAI's Triton is a Python-based language for writing GPU kernels. It provides a programming model that is much higher-level than CUDA while still giving you explicit control over fusion and memory access patterns. A fused kernel that would take 500 lines in CUDA can often be written in 50-100 lines of Triton.
+
+Here is a complete fused bias + GELU kernel in Triton:
+
+```python
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_bias_gelu_kernel(
+    output_ptr, input_ptr, bias_ptr,
+    n_elements, hidden_dim,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    # Load input and bias
+    x = tl.load(input_ptr + offsets, mask=mask)
+    b = tl.load(bias_ptr + (offsets % hidden_dim), mask=mask)
+
+    # Fused bias + GELU
+    v = x + b
+    gelu = 0.5 * v * (1.0 + tl.math.tanh(0.7978845608 * (v + 0.044715 * v * v * v)))
+
+    # Single write to HBM
+    tl.store(output_ptr + offsets, gelu, mask=mask)
+```
+
+Triton handles thread block scheduling, memory coalescing, and register allocation automatically. You just express the computation per program (analogous to a thread block) and Triton's compiler generates the PTX/SASS.
+
+Here is a more complex example: a fused softmax kernel that combines the reduction pattern with elementwise operations:
+
+```python
+@triton.jit
+def fused_softmax_kernel(
+    output_ptr, input_ptr,
+    n_rows, n_cols,
+    input_row_stride, output_row_stride,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_idx = tl.program_id(0)
+    row_start = row_idx * input_row_stride
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < n_cols
+
+    # Load entire row into SRAM
+    row = tl.load(input_ptr + row_start + col_offsets, mask=mask, other=float('-inf'))
+
+    # Compute max for numerical stability (reduction)
+    row_max = tl.max(row, axis=0)
+
+    # Subtract max and exponentiate (elementwise)
+    numerator = tl.exp(row - row_max)
+
+    # Compute sum (reduction)
+    denominator = tl.sum(numerator, axis=0)
+
+    # Normalize (elementwise)
+    softmax_out = numerator / denominator
+
+    # Single write to HBM
+    tl.store(output_ptr + row_idx * output_row_stride + col_offsets, softmax_out, mask=mask)
+```
+
+This kernel reads each row once from HBM and writes the softmax output once. The naive implementation (separate max, subtract, exp, sum, divide) would read and write the row five times.
+
+<Callout type="tip" title="Triton Autotuning">
+  Triton supports `@triton.autotune` to automatically search over block sizes, number of warps, and number of stages. This eliminates much of the manual tuning work that CUDA requires. A single autotuned Triton kernel often matches or exceeds the performance of a hand-tuned CUDA kernel for elementwise and reduction fusions.
+</Callout>
+
+### torch.compile (Inductor Backend)
+
+PyTorch 2.0's `torch.compile` with the Inductor backend provides fully automatic fusion. When you wrap your model with `torch.compile`, PyTorch:
+
+1. **Traces** the computation graph using TorchDynamo (a Python bytecode analyzer)
+2. **Lowers** the graph to a functional IR (FX graph)
+3. **Identifies** fusible subgraphs: contiguous sequences of pointwise and reduction operations
+4. **Generates** Triton kernels for each fused subgraph
+5. **Compiles** the Triton kernels to GPU machine code
+
+For example, if your model has:
+
+```python
+def forward(self, x, residual):
+    x = self.linear(x)           # GEMM - not fused (uses cuBLAS)
+    x = x + self.bias            # elementwise \
+    x = F.gelu(x)                # elementwise  |-- fused into one Triton kernel
+    x = F.dropout(x, p=0.1)     # elementwise /
+    x = x + residual             # elementwise - may be fused with above
+    x = self.layernorm(x)        # reduction - separate fused kernel
+    return x
+```
+
+Inductor will automatically generate a fused Triton kernel for the bias + GELU + dropout + residual chain. The GEMM is dispatched to cuBLAS (which is already highly optimized), and LayerNorm gets its own fused kernel.
+
+You can inspect the generated code:
+
+```python
+model = torch.compile(model)
+output = model(input, residual)
+# View generated Triton code:
+# TORCH_COMPILE_DEBUG=1 python my_script.py
+```
+
+**Advantages:** Zero manual kernel writing. Automatically adapts to model changes. Handles complex graphs with conditional logic.
+
+**Disadvantages:** Compilation time can be significant (30 seconds to several minutes for large models). Dynamic shapes trigger recompilation. Generated kernels sometimes underperform hand-tuned ones by 10-20%. Graph breaks (unsupported operations) prevent fusion across boundaries.
+
+<Benchmark
+  title="torch.compile Fusion Impact on Transformer Layer (A100, FP16, batch=32, seq=2048)"
+  columns={["Mode", "Forward Time", "Kernels Launched", "HBM Traffic"]}
+  rows={[
+    { values: ["Eager (no fusion)", "1.82 ms", "24", "~380 MB"], highlight: false },
+    { values: ["torch.compile", "1.31 ms", "8", "~240 MB"], highlight: true },
+  ]}
+  notes="torch.compile fuses elementwise chains and some reductions, reducing kernel count by ~3x and HBM traffic by ~1.6x."
+/>
+
+### TensorRT
+
+NVIDIA's TensorRT is a dedicated inference optimization library that performs aggressive graph-level optimizations, including fusion. When you convert a model to TensorRT:
+
+1. **Layer fusion:** TensorRT identifies sequences of layers that can be fused: convolution + bias + ReLU, GEMM + bias + activation, etc.
+2. **Precision calibration:** TensorRT can fuse precision conversion (FP32 to FP16 to INT8) into adjacent operations, avoiding separate cast kernels.
+3. **Kernel auto-tuning:** For each fused operation, TensorRT benchmarks multiple kernel implementations and selects the fastest for your specific GPU and tensor shapes.
+4. **Tensor format optimization:** TensorRT selects optimal memory layouts (NCHW, NHWC, etc.) to minimize format conversion kernels.
+
+TensorRT's fusion is more aggressive than torch.compile because it operates on a static graph with known shapes. It can fuse across operation boundaries that torch.compile cannot, including some GEMM + elementwise fusions that require custom kernel implementations.
+
+### ONNX Runtime
+
+ONNX Runtime (ORT) performs graph-level optimization through a series of graph transformers that pattern-match common operation sequences and replace them with fused implementations:
+
+- **MatMul + Add** becomes a fused GEMM with bias
+- **LayerNorm** pattern (reduce_mean + sub + pow + reduce_mean + add + sqrt + div + mul + add) is recognized and replaced with a single fused LayerNorm kernel
+- **Attention** pattern (QKV projections + matmul + softmax + matmul) can be replaced with a fused multi-head attention kernel
+- **GELU** pattern (various subgraph representations) is recognized and replaced with a single kernel
+
+ORT also supports custom fused operation plugins and integrates with TensorRT as an execution provider for maximum fusion.
+
+## Real Fusion Example: Bias + GELU + Dropout
+
+Let us trace through a concrete example to solidify the concepts. We will compare unfused and fused implementations of a bias + GELU + dropout sequence, which appears after every feed-forward layer in a transformer.
+
+### Unfused Implementation
+
+```python
+# Three separate PyTorch operations = three kernel launches
+x = x + bias                    # Kernel 1: elementwise add
+x = F.gelu(x)                  # Kernel 2: elementwise GELU
+x = F.dropout(x, p=0.1)        # Kernel 3: elementwise dropout
+```
+
+<CodeCompare
+  beforeTitle="Unfused: 3 Kernels"
+  afterTitle="Fused: 1 Kernel (Triton)"
+>
+  <Fragment slot="before">
+```python
+# Kernel 1: bias add
+# READ x from HBM (2N bytes)
+# READ bias from HBM
+# WRITE x+bias to HBM (2N bytes)
+
+# Kernel 2: GELU
+# READ x+bias from HBM (2N bytes)
+# Compute GELU
+# WRITE gelu(x+bias) to HBM (2N bytes)
+
+# Kernel 3: dropout
+# READ gelu(x+bias) from HBM (2N bytes)
+# READ mask from HBM
+# WRITE output to HBM (2N bytes)
+
+# Total: 6 reads + 3 writes of N elements
+# = 18N bytes (FP16) + bias + mask
+```
+  </Fragment>
+  <Fragment slot="after">
+```python
+@triton.jit
+def fused_bias_gelu_dropout(
+    out_ptr, x_ptr, bias_ptr,
+    seed, p, n, hdim,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+
+    x = tl.load(x_ptr + offs, mask=mask)
+    b = tl.load(bias_ptr + (offs % hdim), mask=mask)
+
+    # All in registers - no HBM traffic
+    v = x + b
+    gelu = 0.5 * v * (1 + tl.math.tanh(
+        0.7978845608 * (v + 0.044715 * v**3)))
+    rng = tl.rand(seed, offs)
+    keep = rng > p
+    result = tl.where(keep, gelu / (1 - p), 0.0)
+
+    tl.store(out_ptr + offs, result, mask=mask)
+# Total: 1 read of x + 1 write = 4N bytes + bias
+```
+  </Fragment>
+</CodeCompare>
+
+### Memory Traffic Analysis
+
+For $N = 4{,}194{,}304$ elements (a batch of 32 tokens with hidden dimension 131,072, or equivalently batch 1024 with hidden dim 4096), in FP16:
+
+<Benchmark
+  title="Detailed Memory Traffic Breakdown"
+  columns={["Operation", "Unfused Reads", "Unfused Writes", "Fused Reads", "Fused Writes"]}
+  rows={[
+    { values: ["x tensor", "3 x 8MB = 24MB", "3 x 8MB = 24MB", "1 x 8MB = 8MB", "1 x 8MB = 8MB"], highlight: false },
+    { values: ["bias vector", "1 x 8KB", "—", "1 x 8KB", "—"], highlight: false },
+    { values: ["dropout mask", "1 x 4MB", "—", "generated in-kernel", "—"], highlight: false },
+    { values: ["TOTAL", "~28 MB", "~24 MB", "~8 MB", "~8 MB"], highlight: true },
+  ]}
+  notes="N = 4,194,304 elements in FP16. Unfused dropout mask read is 1 byte per element. Fused version generates random numbers in-kernel using Philox PRNG."
+/>
+
+The fused version also eliminates the need to allocate and store the dropout mask tensor, saving 4 MB of HBM capacity.
+
+### Performance Results
+
+<PerfChart
+  title="Bias + GELU + Dropout: Execution Time (A100, FP16)"
+  unit="microseconds"
+  data={[
+    { label: "Unfused (3 kernels)", value: 86, color: "red" },
+    { label: "torch.compile", value: 38, color: "blue" },
+    { label: "Hand-tuned Triton", value: 34, color: "green" },
+  ]}
+  baseline={0}
+/>
+
+The fused version is approximately 2.5x faster, closely matching the reduction in HBM traffic. This confirms that the operation is entirely memory-bound: reducing bytes moved directly reduces execution time.
+
+## FlashAttention: The Ultimate Fusion
+
+FlashAttention is the single most impactful kernel fusion in the history of deep learning. It transforms attention from an $O(N^2)$ memory operation into an $O(N)$ memory operation while producing exactly the same result (within numerical precision).
+
+### The Problem with Standard Attention
+
+Standard attention computes $S = QK^T / \sqrt{d_k}$, then $P = \text{softmax}(S)$, then $O = PV$. The matrix $S$ has shape $N \times N$ where $N$ is the sequence length. For $N = 8192$:
+
+- $S$ contains $8192^2 = 67{,}108{,}864$ elements
+- In FP16, that is 128 MB **per attention head**
+- With 32 heads, that is 4 GB of intermediate storage
+
+This intermediate matrix must be written to HBM after the $QK^T$ matmul and read back for softmax, then the softmax output must be written to HBM and read back for the $PV$ matmul. Total HBM traffic scales as $O(N^2)$.
+
+For $N = 32768$ (common in modern LLMs with long context), the attention matrix would be 32 GB per head. This is not just slow; it does not fit in memory at all.
+
+### How FlashAttention Fuses Everything
+
+FlashAttention processes the attention computation in tiles. For each tile:
+
+1. Load a block of $Q$ (size $B_r \times d$) into SRAM
+2. Load a block of $K$ (size $B_c \times d$) into SRAM
+3. Compute the local $QK^T$ block in SRAM (size $B_r \times B_c$)
+4. Apply scaling and causal mask
+5. Compute local softmax statistics (running max and sum)
+6. Update the running output accumulator
+
+The key insight is the **online softmax trick**. Standard softmax requires a pass over all elements to compute the max (for numerical stability), then another pass to compute the sum of exponentials. FlashAttention maintains running statistics that get updated as each new $K$ block is processed, enabling a single-pass algorithm.
+
+The full $N \times N$ attention matrix is never materialized. It is computed in tiles and immediately consumed. Total HBM traffic is:
+
+$$\text{FlashAttention HBM traffic} = O(N \cdot d) \text{ (just reading Q, K, V and writing O)}$$
+
+versus:
+
+$$\text{Standard attention HBM traffic} = O(N^2 + N \cdot d)$$
+
+For $N = 8192$ and $d = 128$, the ratio is roughly $\frac{N}{d} = 64\text{x}$ less HBM traffic.
+
+<Benchmark
+  title="Attention HBM Traffic: Standard vs FlashAttention (N=8192, d=128, FP16)"
+  columns={["Method", "Intermediate Storage", "Total HBM Traffic", "Relative"]}
+  rows={[
+    { values: ["Standard Attention", "128 MB (per head)", "~384 MB", "64x"], highlight: false },
+    { values: ["FlashAttention-2", "0 MB (tiled in SRAM)", "~6 MB", "1x"], highlight: true },
+  ]}
+  notes="Per attention head. Standard attention materializes the full NxN matrix. FlashAttention keeps tiles in SRAM."
+/>
+
+### Real-World Impact
+
+<PerfChart
+  title="FlashAttention Speedup vs Sequence Length (A100, FP16, 32 heads, d=128)"
+  unit="x speedup"
+  data={[
+    { label: "N=512", value: 1.5, color: "blue" },
+    { label: "N=1024", value: 2.1, color: "blue" },
+    { label: "N=2048", value: 3.2, color: "green" },
+    { label: "N=4096", value: 5.4, color: "green" },
+    { label: "N=8192", value: 7.8, color: "purple" },
+    { label: "N=16384", value: 10.3, color: "purple" },
+  ]}
+  baseline={0}
+/>
+
+The speedup grows with sequence length because the $O(N^2)$ vs $O(N)$ memory traffic gap widens. At $N = 16384$, FlashAttention is over 10x faster than standard attention. More importantly, it makes long-context inference possible at all, since standard attention would exceed HBM capacity.
+
+FlashAttention-2 improved upon FlashAttention-1 by reducing non-matmul FLOPs and improving the parallelization strategy. FlashAttention-3 (targeting Hopper architecture) further improves by exploiting the TMA (Tensor Memory Accelerator) hardware unit for asynchronous memory access and using FP8 tensor cores.
+
+<Callout type="perf" title="FlashAttention Is Not Optional">
+  Every modern LLM inference system uses FlashAttention or an equivalent tiled attention implementation. Using standard attention for sequence lengths beyond 2048 would be 3-10x slower and potentially impossible due to memory constraints. If you are not using FlashAttention, you are leaving the largest single optimization on the table.
+</Callout>
+
+## When NOT to Fuse
+
+Fusion is not always beneficial. There are situations where it adds complexity without meaningful performance improvement, or where it actually hurts performance.
+
+### Large Compute-Bound GEMMs
+
+When a GEMM is large enough to fully saturate the GPU's compute units (tensor cores), it is compute-bound rather than memory-bound. Fusing additional operations into its epilogue saves memory traffic but does not meaningfully reduce total runtime because the GEMM computation itself dominates.
+
+For example, a GEMM with dimensions $M = 4096, N = 4096, K = 4096$ in FP16 on an A100 performs approximately 137 billion FLOPs, taking about 440 microseconds. The output matrix is 32 MB. Reading and writing it takes about 32 microseconds at 2 TB/s. Fusing a bias add into the epilogue saves perhaps 16 microseconds (eliminating one read). That is a 3.6% improvement, which may not justify the engineering complexity of implementing custom epilogue fusion.
+
+However, during LLM decode with batch size 1, the same weight matrix operates on a single vector (M=1), performing only 33 million FLOPs. This takes only about 0.1 microseconds of compute but requires reading the entire 32 MB weight matrix, taking 16 milliseconds. In this regime, the operation is entirely memory-bound and epilogue fusion matters again.
+
+### Operations with Different Parallelization Strategies
+
+Some operations are best parallelized across different dimensions. A row-wise reduction (like softmax) parallelizes with one block per row. An elementwise operation following it might be better parallelized across all elements. Fusing them forces a compromise in parallelization strategy.
+
+Consider fusing softmax (which requires thread cooperation within each row) with a subsequent elementwise multiplication (which requires no cooperation). The softmax kernel's thread block assignment (one block per row) is optimal for the reduction but suboptimal for the elementwise operation if the row length does not fully utilize the block.
+
+### Debugging and Profiling Complexity
+
+Fused kernels are harder to debug and profile. When a fused kernel produces incorrect results, you cannot easily determine which of the fused operations is wrong. When profiling shows a fused kernel is slow, you cannot separately measure the individual operations to find the bottleneck.
+
+In development, it often makes sense to keep operations separate and only fuse them once the algorithm is correct and you have identified the performance-critical paths.
+
+### torch.compile Compilation Overhead
+
+`torch.compile` with Inductor generates and JIT-compiles Triton kernels on first invocation. For a large model, this compilation can take 30 seconds to several minutes. If your workload involves dynamic shapes (varying batch sizes, sequence lengths), each new shape triggers recompilation.
+
+This makes torch.compile less suitable for:
+- Short-lived processes that do not amortize compilation cost
+- Workloads with highly variable shapes (though `torch.compile(dynamic=True)` mitigates this with some performance cost)
+- Development and debugging workflows where rapid iteration is needed
+
+<Callout type="warning" title="The Fusion Trade-off">
+  Every fusion decision trades implementation complexity for runtime performance. Before investing days writing a custom fused kernel, measure the actual memory traffic with a profiler and calculate the theoretical speedup. If the theoretical speedup is under 1.5x, the fusion probably is not worth the engineering effort unless it is on the critical path of a high-volume production system.
+</Callout>
+
+## Memory Traffic Analysis Methodology
+
+Identifying fusion opportunities requires measuring actual memory traffic and comparing it to the theoretical minimum. Here is a systematic approach.
+
+### Step 1: Profile with NVIDIA Nsight Compute
+
+Nsight Compute (`ncu`) provides detailed per-kernel memory traffic metrics. The key metrics are:
+
+- **`dram__bytes_read.sum`**: Total bytes read from HBM
+- **`dram__bytes_write.sum`**: Total bytes written to HBM
+- **`l2__throughput_read.sum`**: L2 cache read throughput
+- **`sm__throughput.avg_pct_of_peak_sustained`**: SM utilization
+
+```bash
+ncu --metrics dram__bytes_read.sum,dram__bytes_write.sum \
+    --target-processes all \
+    python my_inference_script.py
+```
+
+For a more detailed view including L2 hit rates (which indicate whether fusion could help):
+
+```bash
+ncu --set full --target-processes all python my_inference_script.py
+```
+
+### Step 2: Calculate Theoretical Minimum Traffic
+
+For any sequence of operations, the theoretical minimum HBM traffic is:
+
+$$\text{Minimum traffic} = \text{(bytes of all unique inputs read)} + \text{(bytes of final output written)}$$
+
+Intermediate results that could live in registers or shared memory should not appear in HBM traffic. If the measured traffic significantly exceeds this minimum, there is a fusion opportunity.
+
+**Example:** For bias + GELU + dropout on $N$ elements in FP16:
+- Inputs: $x$ (2N bytes) + bias (small, ignore) + dropout seed (negligible)
+- Output: result (2N bytes)
+- Minimum: $\approx 4N$ bytes
+- Unfused measured: $\approx 14N$ bytes
+- Ratio: 3.5x above theoretical minimum, indicating strong fusion opportunity
+
+### Step 3: Identify Fusible Subgraphs
+
+Look for sequences of operations in your profiler trace that satisfy these conditions:
+
+1. **Consecutive in the execution timeline:** operations that run back-to-back with no other work between them
+2. **Data dependency chain:** each operation consumes the output of the previous one
+3. **Compatible parallelization:** all operations can share the same thread block decomposition
+4. **Register-feasible:** the combined live values fit within the register file (typically 64-256 registers per thread)
+
+Operations that are all elementwise are trivially fusible. Operations that mix elementwise with reductions along the same dimension are fusible with shared memory. Operations that require different tiling strategies (different dimensions) are generally not fusible.
+
+### Step 4: Estimate Expected Speedup
+
+For memory-bound operations, the expected speedup from fusion is:
+
+$$\text{Speedup} \approx \frac{\text{Unfused HBM traffic}}{\text{Fused HBM traffic}}$$
+
+This holds when the operations are purely memory-bound and the fused kernel does not introduce register spilling or occupancy problems. In practice, the achieved speedup is 80-95% of this theoretical value.
+
+For operations that are partially compute-bound, the speedup will be less than the traffic ratio because reducing memory traffic reveals the compute cost.
+
+### Step 5: Verify After Fusion
+
+After implementing the fused kernel, re-profile to confirm:
+
+1. HBM traffic matches expectations
+2. Register count per thread is acceptable (check `nvcc --ptxas-options=-v` or Nsight Compute)
+3. Occupancy has not dropped catastrophically (target &gt;50% for most workloads)
+4. No register spilling to local memory (check `lmem` in Nsight Compute; any non-zero value indicates spilling)
+
+<Benchmark
+  title="Register Pressure Guidelines"
+  columns={["Registers Per Thread", "Occupancy (A100)", "Assessment"]}
+  rows={[
+    { values: ["32 or fewer", "100%", "Excellent - plenty of room to fuse more"], highlight: true },
+    { values: ["64", "50-100%", "Good - typical for moderately fused kernels"], highlight: true },
+    { values: ["128", "25-50%", "Acceptable if memory-bound"], highlight: false },
+    { values: ["255 (max)", "12.5%", "Danger zone - likely spilling"], highlight: false },
+  ]}
+  notes="A100 has 65,536 registers per SM. Maximum 2048 threads per SM. Occupancy = min(2048, 65536/regs_per_thread * 32) / 2048."
+/>
+
+## Production Fusion Patterns in LLM Inference Systems
+
+Modern LLM serving systems like vLLM, SGLang, and TensorRT-LLM rely heavily on fusion. Here is how they apply it.
+
+### vLLM
+
+vLLM's core innovation is PagedAttention (a memory management technique for KV caches), but it also employs extensive fusion:
+
+- **FlashAttention / FlashInfer** for the attention computation itself. This is the single largest fusion.
+- **Fused RMSNorm kernels** that combine the reduction (compute RMS) with the normalization and scaling in one pass.
+- **Fused rotary embedding (RoPE)** that applies the rotation directly to Q and K after projection, avoiding a separate elementwise kernel.
+- **Fused add + RMSNorm** that combines the residual connection with the subsequent normalization, saving one HBM round-trip on the full hidden state.
+- **CUTLASS GEMM with epilogue fusion** for bias addition and activation functions after linear layers.
+
+vLLM uses torch.compile for some of these fusions automatically, but the performance-critical kernels (attention, LayerNorm) are custom implementations.
+
+### SGLang
+
+SGLang (by LMSYS) shares many of the same fused kernels as vLLM (both build on FlashAttention / FlashInfer for attention). SGLang additionally focuses on:
+
+- **RadixAttention** with fused prefix caching, avoiding redundant computation for shared prefixes.
+- **Fused token sampling** that combines top-k / top-p filtering with the temperature-scaled softmax and random sampling in a single kernel.
+- **Triton-based custom fusions** for model-specific operations, with autotuning for different GPU architectures.
+
+### TensorRT-LLM
+
+NVIDIA's TensorRT-LLM pushes fusion the furthest because it has access to the full NVIDIA software stack:
+
+- **Multi-head attention fusion** using highly tuned FMHA (Fused Multi-Head Attention) kernels that are architecture-specific (separate implementations for Ampere, Ada, Hopper).
+- **MoE (Mixture of Experts) fusion:** the gating network, expert selection, and expert GEMM execution are fused to minimize memory traffic for the routing decision.
+- **Quantization fusion:** INT8/FP8 quantization and dequantization are fused into adjacent GEMM and elementwise operations. The weight dequantization happens inside the GEMM kernel, avoiding a separate dequantization pass.
+- **AllReduce fusion:** in tensor-parallel deployments, TensorRT-LLM fuses the AllReduce communication with the subsequent bias add and residual connection. While the GPU waits for AllReduce to complete, it can pipeline the bias and residual operations for chunks that have already arrived.
+- **KV cache management:** operations that write to and read from the paged KV cache are fused with the attention computation.
+
+<Benchmark
+  title="Fusion Coverage by System (Approximate)"
+  columns={["Fusion Target", "vLLM", "SGLang", "TRT-LLM", "torch.compile"]}
+  rows={[
+    { values: ["Elementwise chains", "Custom + torch.compile", "Custom + Triton", "TRT optimizer", "Automatic"], highlight: false },
+    { values: ["LayerNorm / RMSNorm", "Custom kernel", "Custom kernel", "Custom kernel", "Partial"], highlight: false },
+    { values: ["Attention", "FlashAttention", "FlashInfer", "FMHA (custom)", "Not fused"], highlight: false },
+    { values: ["GEMM epilogue", "CUTLASS", "CUTLASS", "TRT + CUTLASS", "Not fused"], highlight: false },
+    { values: ["Quantization", "Separate kernels", "Separate kernels", "Fused into GEMM", "Not supported"], highlight: true },
+    { values: ["Communication overlap", "Manual", "Manual", "Fused AllReduce", "Not supported"], highlight: true },
+  ]}
+  notes="torch.compile covers basic elementwise fusion well but delegates compute-heavy operations to external libraries."
+/>
+
+### What Gets Fused Automatically vs Manually
+
+In practice, the fusion landscape breaks down as follows:
+
+**Automatically fused (torch.compile / TensorRT):**
+- Chains of elementwise operations (bias + activation + dropout + residual)
+- Simple reductions followed by elementwise operations
+- Cast operations (FP32 to FP16 and back)
+- View / reshape / permute operations (these are free and get folded away)
+
+**Manually fused (custom kernels):**
+- Attention (FlashAttention): too complex for automatic fusion
+- LayerNorm / RMSNorm: requires careful shared memory management
+- GEMM epilogues: requires CUTLASS integration
+- Quantized operations: requires format-specific logic
+- Cross-operation fusions that span GEMM boundaries
+
+**Not typically fused:**
+- GEMM + GEMM (two consecutive matrix multiplications): each GEMM has a different optimal tiling and the intermediate matrix may be too large for SRAM
+- Operations on different tensors that happen to be independent: fusion requires data dependency
+
+## Practical Recommendations
+
+Based on the patterns and analysis above, here is a decision framework for applying fusion in your own workloads:
+
+**1. Start with torch.compile.** It is free, requires minimal code changes, and handles the easy fusions automatically. Measure the before/after performance. If torch.compile gets you to within 20% of your target, stop there.
+
+**2. Use FlashAttention.** This is non-negotiable for any transformer model. Use the `flash-attn` package, FlashInfer, or your framework's built-in FlashAttention. The speedup is too large to leave on the table.
+
+**3. Profile to find the remaining bottlenecks.** Use Nsight Compute to identify kernels with high HBM traffic relative to their compute. These are your fusion candidates.
+
+**4. Write Triton kernels for the hot spots.** If a fused elementwise + reduction kernel (like RMSNorm + residual) shows up in your profile as a significant fraction of total time, write a Triton kernel. It will take hours, not days.
+
+**5. Resort to CUDA only for architecture-specific optimizations.** Custom CUDA is warranted when you need to exploit specific hardware features (TMA on Hopper, warp-specialized kernels, asynchronous copy) that Triton does not yet support.
+
+**6. Consider TensorRT-LLM for maximum performance in production.** If you are deploying on NVIDIA GPUs and can accept the constraints of a static graph, TensorRT-LLM's fusion and optimization passes will deliver the best end-to-end performance.
+
+<Callout type="tip" title="The 80/20 Rule of Fusion">
+  In most transformer models, FlashAttention alone accounts for 50-70% of the total fusion benefit. Fusing the elementwise chains (bias + activation + dropout + residual) accounts for another 15-25%. Everything else combined (GEMM epilogues, quantization fusion, communication overlap) adds the remaining 10-20%. Get the attention right first, then optimize the elementwise chains, then worry about the rest.
+</Callout>
 
 ## Conclusion
 
-Kernel fusion is about **moving bytes, not just moving code**:
-- fewer DRAM trips per element
-- fewer kernel launches
-- better cache reuse
+Kernel fusion is fundamentally about respecting the GPU's memory hierarchy. The key insight is simple: HBM is slow, registers are fast, and every unnecessary round-trip to HBM is wasted time. Fusion keeps intermediate values in fast storage and eliminates the redundant reads and writes that plague unfused operation sequences.
 
-Use it in transformer inference to collapse chains of elementwise ops, but always check the register and occupancy trade-offs in a profiler instead of guessing.
+The four major fusion patterns each address different scenarios: elementwise fusion for pointwise operation chains, reduction fusion for operations like LayerNorm, GEMM epilogue fusion for post-matmul operations, and attention fusion (FlashAttention) for the quadratic memory bottleneck in attention. Together, they can reduce total HBM traffic by 2-10x for transformer workloads, translating directly to proportional speedups for memory-bound operations.
 
+The tooling landscape has matured significantly. torch.compile handles basic fusion automatically, Triton makes custom fused kernels accessible without deep CUDA expertise, and production systems like vLLM and TensorRT-LLM bundle the most important fusions out of the box. The days of every team writing their own fused LayerNorm from scratch in CUDA are mostly behind us.
+
+But understanding fusion at a deep level remains essential. You need to know when the compiler's automatic fusion is leaving performance on the table, how to read a memory traffic profile and identify fusion opportunities, and when a custom kernel is warranted. The gap between a well-fused and poorly-fused LLM inference system is measured in multiples of throughput, not percentages. In a world where GPU time costs dollars per hour, that gap translates directly to the bottom line.

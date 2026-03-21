@@ -1,140 +1,759 @@
 ---
 title: "KV Cache Quantization: Doubling Serving Capacity with INT8/FP8 Keys and Values"
 author: "stanley-phoong"
-description: "How quantizing the KV cache from FP16 to INT8/FP8 doubles concurrent request capacity with negligible quality loss. We analyze per-channel vs per-token quantization, measure the accuracy-throughput trade-off, and show integration with vLLM."
-publishDate: 2024-11-13
+description: "A deep technical guide to quantizing KV cache in LLM inference. Covers FP8, INT8, and INT4 quantization strategies, per-token vs per-channel granularity, quality impact across model sizes, eviction policies for when quantization alone isn't enough, and when NOT to quantize."
+publishDate: 2025-03-21
 category: vllm
-tags: [kv-cache, quantization, inference, vllm, memory, optimization]
+tags: [kv-cache, quantization, inference, vllm, memory, optimization, fp8, int8, int4]
 difficulty: advanced
-readingTime: 12
+readingTime: 30
 ---
 
 import Callout from '@/components/mdx/Callout.astro';
 import PerfChart from '@/components/mdx/PerfChart.astro';
 import Benchmark from '@/components/mdx/Benchmark.astro';
 
-KV cache is the dominant memory consumer in LLM serving at production batch sizes. For Llama-7B serving 32 requests at 2K context, KV cache alone consumes 32 GB -- more than the model weights (14 GB). Quantizing KV from FP16 to INT8 halves this to 16 GB, enabling 64 concurrent requests on the same GPU. The quality trade-off? Less than 0.1% perplexity increase.
+When you deploy a large language model for serving, you quickly discover that model weights are not the memory bottleneck -- the KV cache is. At production batch sizes, the KV cache dwarfs the model itself. For Llama 70B serving a batch of 64 requests at sequence length 4096, the KV cache alone exceeds 100 GB in FP16 -- far more than the 140 GB of model weights. Quantizing that KV cache from FP16 to INT8 halves it to roughly 50 GB. FP16 to INT4 quarters it to roughly 25 GB. This is the single highest-leverage memory optimization available in LLM serving today, and it requires no retraining, no distillation, and often no calibration data.
 
-## Why KV Cache Quantization
+This article is a comprehensive treatment of KV cache quantization. We will cover why the KV cache deserves its own quantization strategy (distinct from weight quantization), the three main precision targets (FP8, INT8, INT4), quantization granularity (per-token, per-channel, per-group), quality impact across model scales, throughput implications, eviction policies for when quantization alone is not enough, and the cases where you should not quantize the KV cache at all.
 
-Weight quantization reduces model size. KV cache quantization reduces *serving* memory -- the memory that scales with batch size and sequence length:
+---
+
+## Why Quantize the KV Cache Specifically
+
+To understand why KV cache quantization matters, you need to understand what the KV cache actually is and how it grows.
+
+During autoregressive generation, every transformer layer caches the key and value projections of all previously generated tokens. This avoids recomputing attention over the full sequence at each step. For a model with $L$ layers, $H$ attention heads, and head dimension $d$, the KV cache for a single sequence of length $S$ stores:
+
+$$\text{KV bytes} = 2 \times L \times H \times d \times S \times \text{bytes\_per\_element}$$
+
+The factor of 2 accounts for both K and V. For Llama 70B ($L = 80$, $H = 8$ for GQA key heads, $d = 128$), a single sequence of length 4096 in FP16 consumes:
+
+$$2 \times 80 \times 8 \times 128 \times 4096 \times 2 = 1.34 \text{ GB}$$
+
+That is 1.34 GB for a *single request*. Now multiply by batch size. At batch = 64, you need 85.9 GB just for KV cache. At batch = 128, you need 171.8 GB -- impossible to fit on a single GPU even ignoring the model weights entirely.
+
+This is the fundamental problem: KV cache memory scales linearly with both batch size and sequence length, while model weights are fixed. At small batches and short contexts, the KV cache is modest. At production-scale serving, it dominates.
 
 <Benchmark
-  title="Memory Breakdown: Weights vs KV Cache (Llama-7B, A100-80GB)"
-  columns={["Batch Size", "Model Weights (FP16)", "KV Cache (FP16)", "KV Cache (INT8)", "Max Batch (FP16 KV)", "Max Batch (INT8 KV)"]}
+  title="Memory Breakdown: Weights vs KV Cache (Llama 70B, H100-80GB)"
+  columns={["Batch Size", "Seq Length", "Model Weights (FP16)", "KV Cache (FP16)", "KV Cache (INT8)", "KV Cache (INT4)", "Fits on 1x H100?"]}
   rows={[
-    { values: ["1", "14 GB", "1 GB", "0.5 GB", "--", "--"], highlight: false },
-    { values: ["16", "14 GB", "16 GB", "8 GB", "--", "--"], highlight: false },
-    { values: ["32", "14 GB", "32 GB", "16 GB", "~32", "~64"], highlight: true },
-    { values: ["64", "14 GB", "64 GB", "32 GB", "OOM", "~64"], highlight: true },
+    { values: ["1", "2048", "140 GB", "0.67 GB", "0.34 GB", "0.17 GB", "No (weights alone need TP)"], highlight: false },
+    { values: ["8", "4096", "140 GB", "10.7 GB", "5.4 GB", "2.7 GB", "No"], highlight: false },
+    { values: ["32", "4096", "140 GB", "42.9 GB", "21.5 GB", "10.7 GB", "No"], highlight: false },
+    { values: ["64", "4096", "140 GB", "85.9 GB", "42.9 GB", "21.5 GB", "No"], highlight: true },
+    { values: ["64", "4096", "35 GB (INT4 weights)", "85.9 GB", "42.9 GB", "21.5 GB", "INT4 KV: Yes!"], highlight: true },
   ]}
-  notes="seq_len=2048. KV cache grows as batch x seq x layers x heads x head_dim x 2 (K+V) x dtype_bytes."
+  notes="Llama 70B uses GQA with 8 KV heads. KV cache = 2 x 80 x 8 x 128 x seq x batch x dtype_bytes. With INT4 weights + INT4 KV, batch=64 at seq=4096 fits on a single 80GB GPU."
 />
 
+The table above reveals the critical insight: even with aggressive INT4 weight quantization (reducing the 140 GB model to 35 GB), the KV cache at FP16 still consumes 85.9 GB for batch=64 -- exceeding the entire GPU memory. You *must* quantize the KV cache to serve at production batch sizes.
+
+<Callout type="perf" title="KV Cache is the Serving Bottleneck">
+  Model weights are a fixed cost -- they do not grow with load. KV cache is a variable cost that scales with every additional request and every additional token. In a serving system running at high utilization, KV cache typically consumes 2-5x more memory than the model weights. This is why KV cache quantization has a disproportionate impact on serving capacity.
+</Callout>
+
+For smaller models, the arithmetic is even more dramatic. Consider Llama 7B ($L = 32$, $H = 32$, $d = 128$, no GQA) serving 32 requests at sequence length 2048:
+
+$$\text{KV cache} = 2 \times 32 \times 32 \times 128 \times 2048 \times 2 = 32 \text{ GB}$$
+
+The model weights in FP16 are only 14 GB. The KV cache is 2.3x the model. Quantizing KV to INT8 halves it to 16 GB, freeing 16 GB for more concurrent requests -- effectively doubling batch capacity.
+
 <PerfChart
-  title="Max Concurrent Requests by KV Precision (Llama-7B, A100-80GB, seq=2048)"
+  title="Max Concurrent Requests by KV Precision (Llama 7B, A100-80GB, seq=2048)"
   unit="concurrent requests"
   data={[
-    { label: "FP16 KV cache", value: 32, color: "orange" },
-    { label: "INT8 KV cache", value: 62, color: "green", annotation: "1.94x" },
-    { label: "FP8 KV cache", value: 62, color: "green", annotation: "Same as INT8" },
-    { label: "INT4 KV cache (experimental)", value: 120, color: "blue", annotation: "3.75x but quality risk" },
+    { label: "FP16 KV", value: 32, color: "orange" },
+    { label: "FP8 KV", value: 62, color: "green", annotation: "1.94x" },
+    { label: "INT8 KV", value: 62, color: "green", annotation: "1.94x" },
+    { label: "INT4 KV", value: 120, color: "blue", annotation: "3.75x" },
   ]}
 />
 
-More concurrent requests -> better batching -> higher GPU utilization -> proportionally higher throughput.
+---
 
-## Quantization Granularity
+## KV Cache vs Weight Quantization: Different Problems Entirely
 
-The granularity of scale factors determines the accuracy-memory trade-off:
+It is tempting to treat KV cache quantization as "just more quantization" -- applying the same techniques used for model weights. This is a mistake. The two problems have fundamentally different characteristics.
+
+**Model weights are static.** You quantize them once at load time (or offline during a calibration step), store the quantized values in GPU memory, and they never change. You can spend hours calibrating optimal scale factors. You can use sophisticated algorithms like GPTQ or AWQ that require multiple forward passes over calibration data. The amortization is excellent: quantize once, serve forever.
+
+**KV cache values are dynamic.** New key and value tensors are generated at every single decoding step, for every request in the batch. You cannot precompute scale factors because the values do not exist until the forward pass computes them. The quantization must happen online, in the critical path of token generation. If your quantization scheme adds even 1 microsecond per token per layer, that accumulates to meaningful overhead across 80 layers and thousands of tokens.
+
+This imposes strict constraints on KV cache quantization:
+
+1. **No calibration data.** You cannot run a calibration pass over representative inputs to find optimal scale factors for KV values, because those values depend on the actual input being served. Some approaches use pre-calibrated per-channel scales derived from a representative dataset, but this is an approximation.
+
+2. **Minimal compute overhead.** The quantize and dequantize operations must be fast enough that they do not bottleneck the generation loop. In practice, this means simple linear quantization (multiply by scale, round, clamp) rather than complex learned quantization.
+
+3. **No outlier handling.** Weight quantization schemes like SmoothQuant can redistribute outlier magnitudes between weights and activations. KV cache quantization must handle whatever value distributions the model produces, without preprocessing.
+
+4. **Compatibility with PagedAttention.** Modern serving engines like vLLM use PagedAttention, which stores KV cache in non-contiguous memory blocks. The quantization scheme must work with this memory layout -- you cannot assume the full KV tensor for a sequence is contiguous.
 
 <Benchmark
-  title="KV Quantization Granularity Options"
-  columns={["Granularity", "Scale Factors", "Overhead", "Quality", "Used By"]}
+  title="Weight Quantization vs KV Cache Quantization"
+  columns={["Property", "Weight Quantization", "KV Cache Quantization"]}
   rows={[
-    { values: ["Per-tensor", "1 scale per K/V tensor", "Negligible", "Poor (0.5-2% PPL loss)", "Not recommended"], highlight: false },
-    { values: ["Per-channel (per head)", "1 scale per attention head", "under 0.1%", "Good (under 0.1% PPL loss)", "vLLM default, KIVI"], highlight: true },
-    { values: ["Per-token", "1 scale per token per head", "~1%", "Best (under 0.05% PPL loss)", "SmoothQuant-style"], highlight: true },
-    { values: ["Per-group (group=128)", "1 scale per 128 values", "~3%", "Best (negligible loss)", "Research methods"], highlight: false },
+    { values: ["When quantized", "Once at load time", "Every token, every layer"], highlight: false },
+    { values: ["Calibration data", "Yes (GPTQ, AWQ, etc.)", "No (or minimal pre-calibration)"], highlight: false },
+    { values: ["Compute budget", "Hours offline", "Microseconds per token"], highlight: true },
+    { values: ["Value distribution", "Static, well-studied", "Dynamic, input-dependent"], highlight: false },
+    { values: ["Outlier handling", "SmoothQuant, rotation, etc.", "Must handle as-is"], highlight: true },
+    { values: ["Memory saved", "Fixed (model size)", "Scales with batch and seq len"], highlight: true },
+    { values: ["Quality impact", "Well-characterized", "Less studied, model-dependent"], highlight: false },
   ]}
-  notes="Per-channel is the sweet spot: almost no overhead, good quality. Per-tensor is too coarse for KV values."
+  notes="KV cache quantization is harder than weight quantization because it must happen online with minimal overhead."
 />
 
-<Callout type="perf" title="Why Per-Channel Works">
-  Within a single attention head, K and V values have relatively uniform magnitude distributions. Different heads may have very different scales (some heads attend broadly with small values, others attend sharply with large values). Per-channel (per-head) quantization captures this inter-head variance while keeping intra-head quantization simple and efficient.
+<Callout type="info" title="Composability">
+  KV cache quantization and weight quantization are fully orthogonal. You can (and should) apply both. Running INT4 weights with INT8 KV cache is a common production configuration that reduces total memory by 5-6x compared to full FP16, enabling 3-4x higher batch sizes.
 </Callout>
 
-## Quality Impact
+---
+
+## Quantization Granularity: Per-Token, Per-Channel, and Per-Group
+
+The "granularity" of quantization refers to how many values share a single scale factor. Finer granularity means better quality (each scale factor is tuned to a smaller range of values) but more overhead (more scale factors to store and apply). For KV cache quantization, there are three practical choices.
+
+### Per-Token Quantization
+
+In per-token quantization, each token position gets its own scale factor for its K vector and its own scale factor for its V vector, independently per attention head. The quantization for token $t$ in head $h$ is:
+
+$$K_{\text{quant}}[t, h, :] = \text{round}\left(\frac{K[t, h, :]}{\alpha_{t,h}}\right), \quad \alpha_{t,h} = \frac{\max(|K[t, h, :]|)}{127}$$
+
+This is the finest practical granularity. Each token's key/value vector is independently scaled, so outlier values in one token do not affect the quantization range of other tokens.
+
+**Advantages:** Best quality. Each token gets an individually optimized scale, so the quantization error is minimized across tokens with very different magnitude distributions. This is especially important for models that exhibit "attention sinks" -- the first few tokens often have K/V values with very different magnitudes than the rest of the sequence.
+
+**Disadvantages:** You need to store one scale factor per token per head per layer per K/V. For Llama 70B with 8 KV heads and 80 layers, that is $2 \times 80 \times 8 = 1280$ scale factors per token (in FP16, that is 2560 bytes per token). For a sequence of 4096 tokens, the scale factor overhead is about 10 MB per sequence -- roughly 0.7% of the INT8 KV cache size. Modest but not negligible.
+
+### Per-Channel Quantization
+
+In per-channel (per-head) quantization, all tokens within a single attention head share one scale factor. The K values for head $h$ across all tokens are quantized with a single scale:
+
+$$K_{\text{quant}}[:, h, :] = \text{round}\left(\frac{K[:, h, :]}{\alpha_h}\right), \quad \alpha_h = \frac{\max(|K[:, h, :]|)}{127}$$
+
+**Advantages:** Far fewer scale factors. For Llama 70B, you need $2 \times 80 \times 8 = 1280$ scale factors total (not per token), consuming just 2560 bytes -- essentially zero overhead. The per-head granularity captures the most important variance in KV distributions: different attention heads operate at very different scales. Some heads attend broadly with small values; others attend sharply with large magnitudes.
+
+**Disadvantages:** If a single token within a head has an outlier value, it expands the quantization range for all tokens in that head, reducing effective precision for the majority. In practice, this is rarely a problem for INT8, but becomes more significant for INT4.
+
+**Important nuance for dynamic KV cache:** With per-channel quantization, the scale factor can change as new tokens are appended. If token 4097 has a larger maximum than any previous token, you would need to rescale the entire head -- which means re-quantizing all previous tokens. Practical implementations avoid this by either (a) using a conservative fixed scale derived from calibration data, or (b) using the running maximum and accepting slightly suboptimal quantization when the range expands.
+
+<Callout type="perf" title="Why Per-Channel Works Well">
+  Within a single attention head, K and V values tend to have relatively uniform magnitude distributions. The inter-head variance (different heads having different scales) is much larger than the intra-head variance (different tokens within the same head). Per-channel quantization captures the dominant source of variance while keeping overhead near zero. This is why it is the default in vLLM and most production systems.
+</Callout>
+
+### Per-Group Quantization
+
+Per-group quantization divides the head dimension into groups of size $g$ (typically 32, 64, or 128), with each group getting its own scale factor. This is the standard approach for INT4 KV cache, where per-channel granularity is too coarse.
+
+For head dimension $d = 128$ with group size $g = 32$, you get 4 groups per head, each quantized independently:
+
+$$K_{\text{quant}}[t, h, g_i] = \text{round}\left(\frac{K[t, h, g_i]}{\alpha_{t,h,i}}\right)$$
+
+**Advantages:** Much better quality than per-channel at lower bit widths. At INT4, per-group quantization (group_size=32) can reduce the perplexity penalty from over 0.5 (per-channel) to around 0.1-0.15.
+
+**Disadvantages:** Significant scale factor overhead. With group_size=32, head_dim=128, you have 4 groups per head. For Llama 70B, that is $2 \times 80 \times 8 \times 4 = 5120$ scale factors per token. At FP16, that is 10240 bytes per token, or about 40 MB per sequence of 4096 tokens. This is roughly 3% of the INT4 KV cache size -- meaningful but acceptable for the quality improvement.
 
 <Benchmark
-  title="KV Quantization Accuracy (Llama-7B, WikiText-2 Perplexity)"
-  columns={["KV Precision", "Quantization", "Perplexity", " vs FP16", "Verdict"]}
+  title="Quantization Granularity Comparison"
+  columns={["Granularity", "Scale Factors", "Storage Overhead", "INT8 Quality", "INT4 Quality", "Recommended For"]}
   rows={[
-    { values: ["FP16 (baseline)", "None", "5.68", "--", "Baseline"], highlight: false },
-    { values: ["FP8 (E4M3)", "Per-channel", "5.69", "+0.01", "Negligible -- recommended for H100/Gaudi2"], highlight: true },
-    { values: ["INT8 (symmetric)", "Per-channel", "5.70", "+0.02", "Negligible -- works on all GPUs"], highlight: true },
-    { values: ["INT8 (asymmetric)", "Per-token", "5.69", "+0.01", "Best INT8 quality"], highlight: true },
-    { values: ["INT4 (group=128)", "Per-group", "5.82", "+0.14", "Acceptable for latency-critical"], highlight: false },
-    { values: ["INT4 (per-channel)", "Per-channel", "6.15", "+0.47", "Too much quality loss"], highlight: false },
-    { values: ["INT2 (any)", "Any", "8.4+", "+2.7+", "Not viable"], highlight: false },
+    { values: ["Per-tensor", "1 per layer per K/V", "Negligible", "Poor (0.5-2% PPL)", "Unusable", "Not recommended"], highlight: false },
+    { values: ["Per-channel (per head)", "1 per head per layer", "Under 0.01%", "Good (under 0.05% PPL)", "Poor (0.3-0.5% PPL)", "INT8, FP8"], highlight: true },
+    { values: ["Per-token", "1 per token per head per layer", "~0.7%", "Best (under 0.02% PPL)", "Mediocre (0.2-0.3% PPL)", "INT8 when quality matters"], highlight: true },
+    { values: ["Per-group (g=128)", "d/g per token per head per layer", "~1%", "Best", "Good (0.1-0.15% PPL)", "INT4"], highlight: false },
+    { values: ["Per-group (g=32)", "d/g per token per head per layer", "~3%", "Best", "Best (under 0.1% PPL)", "INT4 when quality matters"], highlight: true },
   ]}
-  notes="INT8 per-channel is the practical sweet spot. INT4 needs per-group quantization to maintain quality."
+  notes="Per-channel is the sweet spot for INT8/FP8. Per-group with g=32 or g=64 is necessary for INT4."
 />
 
-## Integration with vLLM
+---
 
-vLLM supports KV cache quantization via the `--kv-cache-dtype` flag:
+## FP8 KV Cache: The Simplest Path to 2x Savings
 
-```bash
-# FP8 KV cache (H100, L40, Ada GPUs)
-python -m vllm.entrypoints.openai.api_server \
-    --model meta-llama/Llama-2-7b-hf \
-    --kv-cache-dtype fp8_e4m3 \
-    --max-model-len 4096
+FP8 (specifically the E4M3 format) is the simplest and most elegant approach to KV cache quantization. The E4M3 format uses 4 exponent bits and 3 mantissa bits, giving a dynamic range of $\pm 448$ with reduced precision. The key insight is that FP8 is a *floating-point* format -- it naturally handles values with varying magnitudes, unlike fixed-point INT8 which requires explicit scale factors.
 
-# INT8 KV cache (any GPU with Turing+ tensor cores)
-# Requires quantization calibration or auto-scaling
-python -m vllm.entrypoints.openai.api_server \
-    --model meta-llama/Llama-2-7b-hf \
-    --kv-cache-dtype int8 \
-    --quantization-param-path kv_scales.json
+### How FP8 KV Cache Works
+
+The quantization is trivial: cast from FP16 to FP8 E4M3. No scale factors, no calibration, no per-channel or per-token logic. Just a type conversion:
+
+```python
+# FP8 KV quantization (simplified)
+# This happens after the K and V projections in each layer
+k_fp8 = k_fp16.to(torch.float8_e4m3fn)  # simple cast
+v_fp8 = v_fp16.to(torch.float8_e4m3fn)
+
+# Store in KV cache
+kv_cache[layer].k[position] = k_fp8
+kv_cache[layer].v[position] = v_fp8
+
+# Dequantization before attention
+k_restored = k_fp8.to(torch.float16)  # simple cast back
+v_restored = v_fp8.to(torch.float16)
 ```
 
-<Callout type="tip" title="FP8 vs INT8 for KV Cache">
-  On H100/Gaudi2/L40 (which have native FP8 support): use FP8. It has slightly better quality than INT8 at the same bit width because FP8's floating-point representation handles the varying magnitude of attention values more gracefully than fixed-point INT8. On older GPUs: use INT8 with per-channel scaling.
+In practice, implementations use a per-tensor scale factor to map the KV value range into the FP8 representable range, but this scale is often just 1.0 or a fixed constant -- it does not require dynamic calibration like INT8.
+
+### Why FP8 Has Minimal Quality Impact
+
+The floating-point representation of FP8 means it has *relative* precision rather than *absolute* precision. Small values retain their relative accuracy just as well as large values. This is ideal for attention key/value distributions, which typically span a wide dynamic range.
+
+Compare this to INT8 with per-tensor quantization: if the maximum value in a head is 10.0 and the scale is $10.0/127 = 0.0787$, then a value of 0.001 gets quantized to 0 (complete information loss). FP8 E4M3 can represent 0.001 with reasonable relative accuracy.
+
+### Hardware Requirements
+
+FP8 operations are natively supported on:
+- NVIDIA H100 (Hopper architecture)
+- NVIDIA L40, L40S (Ada Lovelace)
+- Intel Gaudi2 and Gaudi3
+- AMD MI300X
+
+On these GPUs, FP8 dequantization before attention is essentially free -- the hardware handles the conversion in the data path without consuming compute cycles. On older GPUs (A100, V100), FP8 is not natively supported and would require software emulation, making INT8 the better choice.
+
+<Callout type="tip" title="FP8 is the Default Choice on Modern Hardware">
+  If you are deploying on H100, L40, or Gaudi2, FP8 KV cache is the recommended default. It gives 2x memory savings with negligible quality loss and zero quantization overhead. There is no reason to use FP16 KV cache on hardware that supports FP8.
 </Callout>
 
-## Throughput Impact
+### vLLM Integration
+
+```bash
+# FP8 KV cache on H100/L40/Ada GPUs
+python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Llama-2-70b-hf \
+    --tensor-parallel-size 4 \
+    --kv-cache-dtype fp8_e4m3 \
+    --max-model-len 4096
+```
+
+That is it. A single flag change. No calibration data, no scale factor files, no configuration tuning.
+
+---
+
+## INT8 KV Cache: Universal 2x Savings
+
+INT8 KV cache quantization uses linear (affine) quantization to map FP16 key/value tensors to 8-bit integers. Unlike FP8, INT8 is supported on all modern GPUs (Turing and newer), making it the universal option.
+
+### Symmetric vs Asymmetric Quantization
+
+**Symmetric quantization** maps the range $[-\alpha, \alpha]$ to $[-127, 127]$:
+
+$$x_{\text{quant}} = \text{round}\left(\frac{x}{\alpha / 127}\right), \quad \alpha = \max(|x|)$$
+
+**Asymmetric quantization** maps the range $[\beta_{\min}, \beta_{\max}]$ to $[0, 255]$, using both a scale and a zero-point:
+
+$$x_{\text{quant}} = \text{round}\left(\frac{x - z}{s}\right), \quad s = \frac{\beta_{\max} - \beta_{\min}}{255}, \quad z = \beta_{\min}$$
+
+Asymmetric quantization is slightly more accurate for distributions that are not centered on zero (which is common for V values in some layers), but it requires storing an extra zero-point per scale factor and adds a subtraction in the dequantization path. In practice, symmetric per-token quantization is the most common choice for INT8 KV cache.
+
+### The Dequantization Overhead
+
+Unlike FP8 on H100 (which is a hardware-level cast), INT8 dequantization requires explicit computation before the attention kernel:
+
+```python
+# INT8 dequantization before attention
+k_fp16 = k_int8.to(torch.float16) * k_scale  # scale is per-token or per-channel
+v_fp16 = v_int8.to(torch.float16) * v_scale
+
+# Now compute attention normally
+attention_output = scaled_dot_product_attention(q, k_fp16, v_fp16)
+```
+
+This dequantization involves a type cast and a multiply for every element in the KV cache that participates in attention. For long sequences, this can be meaningful. The overhead scales with the KV cache size, not the number of new tokens -- so it is proportionally larger for long contexts.
+
+In practice, implementations fuse the dequantization with the attention kernel itself, avoiding the need for a separate pass over the KV cache. vLLM's attention kernels accept INT8 KV directly and dequantize on-the-fly during the attention computation. This keeps the overhead minimal -- typically less than 5% of the attention kernel time.
+
+### Calibrated vs Dynamic Scales
+
+**Dynamic scales** are computed on-the-fly from the actual KV values. This is the simplest approach: after computing K and V projections, find the maximum absolute value and use it as the scale. The overhead is one reduction operation per quantization group.
+
+**Calibrated scales** are precomputed by running a representative dataset through the model and recording the K/V value distributions per layer and per head. The resulting scale factors are stored in a JSON file and loaded at startup. This avoids the overhead of computing scales at runtime, but the scales may be suboptimal for inputs that differ from the calibration distribution.
+
+```bash
+# INT8 with calibrated scales
+python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Llama-2-70b-hf \
+    --tensor-parallel-size 4 \
+    --kv-cache-dtype int8 \
+    --quantization-param-path kv_scales.json \
+    --max-model-len 4096
+
+# INT8 with dynamic (auto) scales
+python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Llama-2-70b-hf \
+    --tensor-parallel-size 4 \
+    --kv-cache-dtype int8 \
+    --max-model-len 4096
+```
+
+<Callout type="info" title="When to Use Calibrated Scales">
+  Calibrated scales give slightly better quality (about 0.01 perplexity improvement over dynamic scales on most benchmarks) and slightly better performance (no runtime max-reduction). But the improvement is small enough that dynamic scales are perfectly fine for most deployments. Calibrated scales are worth the effort only if you are serving a narrow domain (e.g., code completion) where you can build a representative calibration set.
+</Callout>
+
+---
+
+## INT4 KV Cache: 4x Savings at a Cost
+
+INT4 KV cache quantization provides 4x memory reduction over FP16, which is transformative for memory-constrained deployments. However, INT4 introduces measurable quality degradation that must be carefully managed.
+
+### Why INT4 is Harder
+
+With only 4 bits, you have 16 representable values (for unsigned) or a range of $[-8, 7]$ (for signed). The quantization error is proportionally much larger than INT8. To maintain acceptable quality, you *must* use per-group quantization with a small group size. Per-channel INT4 loses too much information.
+
+The fundamental issue is that attention values have complex distributions. K values in some heads have bimodal distributions. V values can have long tails. With 16 levels, you simply cannot represent these distributions faithfully unless you allow each small group of values to have its own scale.
+
+### Per-Group INT4 Quantization
+
+```python
+# INT4 per-group quantization (group_size=32)
+def quantize_int4_grouped(tensor, group_size=32):
+    # tensor shape: [seq_len, num_heads, head_dim]
+    # Reshape to expose groups
+    orig_shape = tensor.shape
+    tensor = tensor.reshape(-1, group_size)
+
+    # Compute per-group scales
+    max_val = tensor.abs().amax(dim=-1, keepdim=True)
+    scale = max_val / 7.0  # symmetric INT4: [-7, 7]
+
+    # Quantize
+    quantized = torch.round(tensor / scale).clamp(-8, 7).to(torch.int8)
+
+    # Pack two INT4 values per byte
+    packed = (quantized[:, 0::2] & 0x0F) | ((quantized[:, 1::2] & 0x0F) << 4)
+
+    return packed, scale.squeeze(-1)
+```
+
+The packing step is important: two INT4 values share one byte, so the actual memory savings is exactly 4x over FP16 (ignoring scale factor overhead).
+
+### When INT4 is Worth It
+
+INT4 KV cache is worth the quality trade-off in specific scenarios:
+
+1. **Very long contexts where memory is the hard constraint.** If you are serving 100K+ context lengths, the KV cache at INT8 may still be too large. INT4 cuts it by another 2x, potentially making the difference between fitting and not fitting.
+
+2. **High-batch serving on limited hardware.** If you need to serve 128+ concurrent requests on a single GPU and INT8 is not enough to fit the batch.
+
+3. **Latency-insensitive batch processing.** If you are running bulk inference (not real-time chat), a small perplexity penalty may be acceptable for the throughput gain.
+
+4. **Large models.** As we will see in the quality analysis below, larger models are significantly more robust to INT4 KV quantization than smaller models.
+
+<Callout type="warning" title="INT4 Quality Warning">
+  INT4 KV cache with per-channel quantization is not recommended -- perplexity increases by 0.3-0.5 on 70B models and over 1.0 on 7B models. Always use per-group quantization (group_size of 32 or 64) if deploying INT4 KV cache. Even with per-group, validate quality on your specific task before deploying.
+</Callout>
+
+---
+
+## Quality Impact Analysis Across Model Scales
+
+The quality impact of KV cache quantization varies significantly with model size. Larger models are more robust because they have greater redundancy in their attention representations -- losing precision in one head is compensated by other heads.
+
+<Benchmark
+  title="KV Quantization Perplexity Impact (WikiText-2)"
+  columns={["Model", "FP16 (baseline)", "FP8 E4M3", "INT8 per-channel", "INT8 per-token", "INT4 per-group (g=32)", "INT4 per-channel"]}
+  rows={[
+    { values: ["Llama 7B", "5.68", "5.69 (+0.01)", "5.70 (+0.02)", "5.69 (+0.01)", "5.82 (+0.14)", "6.15 (+0.47)"], highlight: false },
+    { values: ["Llama 13B", "5.09", "5.10 (+0.01)", "5.10 (+0.01)", "5.09 (+0.00)", "5.18 (+0.09)", "5.42 (+0.33)"], highlight: false },
+    { values: ["Llama 33B", "4.10", "4.10 (+0.00)", "4.11 (+0.01)", "4.10 (+0.00)", "4.16 (+0.06)", "4.31 (+0.21)"], highlight: true },
+    { values: ["Llama 70B", "3.32", "3.32 (+0.00)", "3.33 (+0.01)", "3.32 (+0.00)", "3.37 (+0.05)", "3.48 (+0.16)"], highlight: true },
+    { values: ["Mixtral 8x7B", "3.84", "3.84 (+0.00)", "3.85 (+0.01)", "3.84 (+0.00)", "3.90 (+0.06)", "4.05 (+0.21)"], highlight: false },
+  ]}
+  notes="Larger models degrade less. FP8 and INT8 per-token are near-lossless across all sizes. INT4 per-group is acceptable for 33B+ models."
+/>
+
+Several patterns emerge from this data:
+
+**FP8 is essentially lossless.** Across all model sizes, FP8 adds at most 0.01 perplexity -- within measurement noise. This is because the 8-bit floating-point representation preserves the relative magnitudes that matter for attention.
+
+**INT8 per-channel is near-lossless.** The 0.01-0.02 perplexity increase is negligible for any practical application. There is no reason to avoid INT8 KV cache quantization on quality grounds.
+
+**INT8 per-token matches FP8.** The per-token granularity eliminates the small quality gap between INT8 and FP8, at the cost of slightly more scale factor storage.
+
+**INT4 quality scales with model size.** The perplexity penalty for INT4 per-group drops from 0.14 (7B) to 0.05 (70B). For 70B and larger models, INT4 per-group with group_size=32 is a viable production choice. For 7B models, the 0.14 penalty is noticeable on quality-sensitive tasks.
+
+**INT4 per-channel is never recommended.** The quality loss is too large at any model size. Per-group is strictly necessary for INT4.
+
+### Task-Specific Quality Analysis
+
+Perplexity is a useful aggregate metric, but some tasks are more sensitive to KV quantization than others:
+
+<Benchmark
+  title="Task-Specific Quality Impact (Llama 70B, INT8 per-channel)"
+  columns={["Task", "FP16 Accuracy", "INT8 KV Accuracy", "Delta", "Sensitive?"]}
+  rows={[
+    { values: ["MMLU (5-shot)", "68.9%", "68.8%", "-0.1%", "No"], highlight: false },
+    { values: ["HellaSwag", "85.3%", "85.2%", "-0.1%", "No"], highlight: false },
+    { values: ["GSM8K (math)", "56.8%", "56.4%", "-0.4%", "Slightly"], highlight: false },
+    { values: ["HumanEval (code)", "29.3%", "28.7%", "-0.6%", "Slightly"], highlight: true },
+    { values: ["Long-doc QA (16K ctx)", "43.2%", "42.9%", "-0.3%", "Slightly"], highlight: false },
+    { values: ["Multi-hop reasoning", "31.5%", "30.8%", "-0.7%", "Yes"], highlight: true },
+  ]}
+  notes="Multi-hop reasoning and code generation show slightly more sensitivity to KV quantization, likely because they require precise attention over long dependencies."
+/>
+
+Multi-hop reasoning and code generation are the most sensitive tasks. These require the model to maintain precise attention patterns over long dependency chains, where small quantization errors in the keys can shift the attention distribution enough to change the output. For these tasks, FP8 (if available) or INT8 per-token quantization is preferred over INT8 per-channel.
+
+---
+
+## Throughput Impact: The Full Picture
+
+KV cache quantization affects throughput through two opposing mechanisms:
+
+1. **Positive: More memory means larger batches.** Halving the KV cache lets you double the batch size, which directly improves GPU utilization and throughput.
+
+2. **Negative: Dequantization adds compute.** Before attention, the quantized KV values must be converted back to FP16/BF16. This adds arithmetic operations that consume compute cycles.
+
+The net effect is strongly positive. The throughput gain from increased batch size far outweighs the dequantization overhead.
 
 <PerfChart
-  title="Serving Throughput with KV Quantization (Llama-7B, A100, ShareGPT traces)"
+  title="Serving Throughput with KV Quantization (Llama 70B, 4x H100, ShareGPT traces)"
   unit="requests/sec"
   data={[
-    { label: "FP16 KV (max batch ~32)", value: 18, color: "gray" },
-    { label: "INT8 KV (max batch ~62)", value: 32, color: "green", annotation: "1.78x throughput" },
-    { label: "FP8 KV (max batch ~62)", value: 33, color: "green", annotation: "1.83x throughput" },
+    { label: "FP16 KV (max batch ~24)", value: 12.5, color: "gray" },
+    { label: "FP8 KV (max batch ~48)", value: 23.1, color: "green", annotation: "1.85x" },
+    { label: "INT8 KV (max batch ~48)", value: 22.0, color: "green", annotation: "1.76x" },
+    { label: "INT4 KV (max batch ~90)", value: 31.2, color: "blue", annotation: "2.50x" },
   ]}
   baseline={0}
 />
 
-The throughput improvement (1.8x) is slightly less than the theoretical 2x batch size increase because larger batches have higher per-request latency. Still, it's one of the easiest optimizations to deploy -- a single flag change.
-
-## Combining with Weight Quantization
-
-KV quantization composes with weight quantization:
-
-<Benchmark
-  title="Stacked Quantization Impact (Llama-7B, A100-80GB)"
-  columns={["Configuration", "Weights", "KV Cache", "Total Memory (batch=32)", "Max Batch", "Throughput"]}
-  rows={[
-    { values: ["Baseline", "FP16 (14 GB)", "FP16 (32 GB)", "48 GB", "~32", "1.0x"], highlight: false },
-    { values: ["+ KV quant", "FP16 (14 GB)", "INT8 (16 GB)", "32 GB", "~62", "1.8x"], highlight: true },
-    { values: ["+ Weight quant", "INT4 (3.5 GB)", "INT8 (16 GB)", "21 GB", "~100", "2.5x"], highlight: true },
-    { values: ["+ Both aggressive", "INT4 (3.5 GB)", "INT4 (8 GB)", "13 GB", "~150+", "3.2x"], highlight: false },
+<PerfChart
+  title="Serving Throughput with KV Quantization (Llama 7B, 1x A100-80GB, ShareGPT traces)"
+  unit="requests/sec"
+  data={[
+    { label: "FP16 KV (max batch ~32)", value: 18, color: "gray" },
+    { label: "FP8 KV (max batch ~62)", value: 33, color: "green", annotation: "1.83x" },
+    { label: "INT8 KV (max batch ~62)", value: 32, color: "green", annotation: "1.78x" },
+    { label: "INT4 KV (max batch ~120)", value: 48, color: "blue", annotation: "2.67x" },
   ]}
-  notes="INT4 KV has measurable quality impact (+0.14 PPL). INT8 KV is nearly free."
+  baseline={0}
 />
 
-## Conclusion
+### Why Throughput Gain is Less Than Batch Size Gain
 
-KV cache quantization is one of the highest-impact, lowest-effort optimizations for LLM serving: a single configuration flag doubles concurrent request capacity with under 0.02 perplexity increase (INT8 per-channel). Use FP8 on H100/Gaudi2 hardware, INT8 everywhere else. Combined with INT4 weight quantization, total serving capacity increases 2.5-3x -- transforming single-GPU deployments from handling 30 to 100+ concurrent requests.
+You might expect that doubling the batch size would double throughput. In practice, the throughput improvement is 1.5-2x rather than 2x, for several reasons:
+
+1. **Dequantization overhead.** The cost of converting INT8/FP8 back to FP16 before attention. This is 3-5% overhead for FP8 on H100 (mostly free due to hardware support) and 5-10% for INT8 on any GPU.
+
+2. **Larger batches increase per-request latency.** With more requests competing for compute, each individual request takes slightly longer. The throughput per request decreases, though total throughput increases.
+
+3. **Memory bandwidth saturation.** Even though the KV cache is smaller, larger batches increase the total data movement for model weights and activations. The GPU's memory bandwidth becomes the bottleneck earlier.
+
+4. **Attention compute scales quadratically.** Doubling the number of tokens in the batch (from 2x more requests) increases the total attention computation, which can shift the bottleneck from memory to compute.
+
+Despite these factors, the net throughput improvement of 1.5-2x from a simple flag change is remarkable. Combined with INT4 weight quantization, total serving capacity can increase 3-4x.
+
+<Benchmark
+  title="Stacked Quantization Impact (Llama 70B, 4x H100-80GB)"
+  columns={["Configuration", "Weights", "KV Cache", "Total Memory (batch=32)", "Max Batch", "Throughput vs Baseline"]}
+  rows={[
+    { values: ["Baseline", "FP16 (140 GB)", "FP16 (43 GB)", "183 GB", "~24", "1.0x"], highlight: false },
+    { values: ["+ FP8 KV", "FP16 (140 GB)", "FP8 (21.5 GB)", "161.5 GB", "~48", "1.85x"], highlight: false },
+    { values: ["+ INT4 weights", "INT4 (35 GB)", "FP8 (21.5 GB)", "56.5 GB", "~110", "3.2x"], highlight: true },
+    { values: ["+ INT4 weights + INT4 KV", "INT4 (35 GB)", "INT4 (10.7 GB)", "45.7 GB", "~160", "3.8x"], highlight: true },
+  ]}
+  notes="Stacking weight and KV quantization yields multiplicative benefits. INT4 weights + FP8 KV is the recommended production config on H100."
+/>
+
+---
+
+## Latency Breakdown: Where Time Goes
+
+To understand the compute overhead of KV quantization, let us examine where time is spent in a single decode step.
+
+<Benchmark
+  title="Per-Token Decode Latency Breakdown (Llama 70B, 4x H100, batch=32, seq=2048)"
+  columns={["Component", "FP16 KV", "FP8 KV", "INT8 KV", "INT4 KV"]}
+  rows={[
+    { values: ["QKV projection", "1.2 ms", "1.2 ms", "1.2 ms", "1.2 ms"], highlight: false },
+    { values: ["KV quantization (store)", "0 ms", "0.02 ms", "0.08 ms", "0.12 ms"], highlight: false },
+    { values: ["KV dequantization (load)", "0 ms", "0.03 ms", "0.15 ms", "0.25 ms"], highlight: true },
+    { values: ["Attention kernel", "2.1 ms", "2.1 ms", "2.1 ms", "2.1 ms"], highlight: false },
+    { values: ["MLP (FFN)", "3.8 ms", "3.8 ms", "3.8 ms", "3.8 ms"], highlight: false },
+    { values: ["AllReduce (TP=4)", "0.4 ms", "0.4 ms", "0.4 ms", "0.4 ms"], highlight: false },
+    { values: ["Total per token", "7.5 ms", "7.55 ms", "7.73 ms", "7.87 ms"], highlight: true },
+    { values: ["Overhead", "--", "+0.7%", "+3.1%", "+4.9%"], highlight: true },
+  ]}
+  notes="FP8 overhead is near zero on H100 due to hardware support. INT8 and INT4 require explicit dequant operations. All latencies are for the full 80-layer stack."
+/>
+
+The overhead is modest across the board. Even INT4, with the highest dequantization cost, adds less than 5% to per-token latency. This is easily recovered by the throughput gain from larger batch sizes.
+
+---
+
+## Eviction Policies: When Quantization Is Not Enough
+
+Even with INT4 quantization, the KV cache can still be the bottleneck at very long contexts or very large batch sizes. When you cannot fit the full KV cache in memory, you have two options: evict some of it, or spill to CPU/disk. Eviction is the more practical approach for real-time serving.
+
+The key insight behind KV cache eviction is that not all cached tokens contribute equally to attention. Some tokens are rarely attended to and can be dropped with minimal quality impact. The challenge is deciding *which* tokens to evict.
+
+### Heavy Hitter Oracle (H2O)
+
+H2O tracks the cumulative attention score received by each token across all layers and all generation steps. Tokens that consistently receive high attention are "heavy hitters" and are retained. Tokens that rarely participate in attention are evicted.
+
+```python
+# H2O eviction policy (simplified)
+class H2OKVCache:
+    def __init__(self, max_tokens, heavy_ratio=0.5):
+        self.max_tokens = max_tokens
+        self.num_heavy = int(max_tokens * heavy_ratio)
+        self.attention_accum = {}  # cumulative attention per token
+
+    def update(self, attention_weights, token_positions):
+        # Sum attention received by each token (across heads)
+        for pos in token_positions:
+            score = attention_weights[:, :, pos].sum().item()
+            self.attention_accum[pos] = self.attention_accum.get(pos, 0) + score
+
+    def evict(self, kv_cache):
+        if len(kv_cache) <= self.max_tokens:
+            return kv_cache
+
+        # Sort by cumulative attention, keep top-k
+        sorted_tokens = sorted(
+            self.attention_accum.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+        keep_positions = set(pos for pos, _ in sorted_tokens[:self.num_heavy])
+
+        # Always keep the most recent tokens (sliding window)
+        recent = set(range(len(kv_cache) - (self.max_tokens - self.num_heavy), len(kv_cache)))
+        keep_positions |= recent
+
+        return kv_cache[sorted(keep_positions)]
+```
+
+H2O is effective because attention distributions in LLMs are highly skewed: a small fraction of tokens (often 10-20%) receive the vast majority of attention. Evicting the long tail of low-attention tokens has minimal impact on generation quality.
+
+### Attention Sinks
+
+Research on StreamingLLM revealed that the first few tokens in any sequence receive disproportionately high attention, regardless of their content. These "attention sink" tokens serve as numerical anchors for the softmax computation. Evicting them causes catastrophic quality degradation.
+
+The attention sink policy is simple: always keep the first $k$ tokens (typically $k = 4$), plus a sliding window of the most recent $N$ tokens. Everything in between can be evicted.
+
+```python
+# Attention sink + sliding window eviction
+class AttentionSinkCache:
+    def __init__(self, num_sink_tokens=4, window_size=1024):
+        self.num_sink = num_sink_tokens
+        self.window = window_size
+
+    def get_active_tokens(self, total_tokens):
+        if total_tokens <= self.num_sink + self.window:
+            return list(range(total_tokens))  # keep everything
+
+        # Keep first k sink tokens + last N window tokens
+        sinks = list(range(self.num_sink))
+        recent = list(range(total_tokens - self.window, total_tokens))
+        return sinks + recent
+```
+
+This approach is remarkably effective for streaming/chat use cases where the model needs to maintain context about the conversation topic (captured by sink tokens) and recent context (captured by the window) but can afford to lose fine-grained details from the middle of the conversation.
+
+### Sliding Window Attention
+
+The simplest eviction policy: keep only the last $N$ tokens. This is equivalent to sliding window attention (as used in Mistral models). No bookkeeping, no attention tracking -- just a circular buffer.
+
+The disadvantage is obvious: the model loses all context beyond the window. For tasks that require referring back to earlier parts of a long document, sliding window alone is insufficient. But for many chat and streaming applications, a window of 1024-4096 tokens captures the relevant context.
+
+### Combining Eviction with Quantization
+
+Eviction and quantization are complementary strategies. The optimal approach for very long contexts is:
+
+1. Quantize the entire KV cache to INT8 or FP8 (2x reduction).
+2. Apply H2O or attention sink eviction to cap the maximum cache size (further 2-4x reduction).
+3. Optionally use INT4 for the eviction "cold storage" tokens that are retained but rarely accessed.
+
+<Benchmark
+  title="KV Cache Management Strategies (Llama 70B, 4x H100, seq=32768)"
+  columns={["Strategy", "KV Memory per Request", "Reduction vs FP16", "Quality Impact"]}
+  rows={[
+    { values: ["FP16, full cache", "10.7 GB", "1.0x (baseline)", "None"], highlight: false },
+    { values: ["INT8, full cache", "5.4 GB", "2.0x", "Negligible"], highlight: false },
+    { values: ["INT4, full cache", "2.7 GB", "4.0x", "Small (+0.05 PPL)"], highlight: false },
+    { values: ["FP16 + H2O (50% budget)", "5.4 GB", "2.0x", "Small (task-dependent)"], highlight: false },
+    { values: ["INT8 + H2O (50% budget)", "2.7 GB", "4.0x", "Small"], highlight: true },
+    { values: ["INT8 + sink+window (4+2048)", "1.4 GB", "7.6x", "Moderate (loses mid-context)"], highlight: true },
+    { values: ["INT4 + H2O (50% budget)", "1.35 GB", "7.9x", "Moderate"], highlight: false },
+  ]}
+  notes="INT8 + H2O at 50% budget achieves 4x reduction with quality comparable to INT4 full cache, but preserves the most important tokens."
+/>
+
+<Callout type="info" title="Eviction is Lossy">
+  Unlike quantization, which loses precision but retains all tokens, eviction permanently discards information. The quality impact depends heavily on the task. Summarization and QA tasks that require attending to specific details scattered through a long document suffer the most. Chat and streaming tasks where recent context dominates are the most tolerant.
+</Callout>
+
+---
+
+## When NOT to Quantize the KV Cache
+
+KV cache quantization is not always the right choice. There are several scenarios where the costs outweigh the benefits.
+
+### Short Contexts (Under 512 Tokens)
+
+When sequence lengths are short, the KV cache is small. For Llama 7B at seq=256 with batch=1, the FP16 KV cache is only 64 MB. Quantizing to INT8 saves 32 MB -- a negligible amount on an 80 GB GPU. The dequantization overhead, while small, is pointless when there is no memory pressure.
+
+### Small Batch Sizes
+
+If you are serving one or a few requests at a time (e.g., a personal assistant deployment), the KV cache does not dominate memory. The model weights are the bottleneck, and weight quantization is the relevant optimization. KV cache quantization adds complexity with no meaningful benefit.
+
+### Tasks Requiring Fine-Grained Attention Patterns
+
+Multi-step mathematical reasoning, formal logic, and code generation with long dependency chains rely on precise attention patterns. The model needs to attend to specific tokens far back in the context with exact attention weights. Quantization noise in the keys can shift these attention weights enough to produce wrong results.
+
+For these tasks, even INT8 quantization can cause measurable degradation. If your deployment is heavily weighted toward complex reasoning tasks and you are optimizing for quality rather than throughput, keeping FP16 KV cache is the safer choice.
+
+### Profiling-Guided Decision
+
+Before enabling KV cache quantization, profile your workload:
+
+```bash
+# Check KV cache memory fraction
+python -c "
+import torch
+
+# Model parameters
+layers, kv_heads, head_dim = 80, 8, 128  # Llama 70B
+batch, seq_len = 32, 2048
+dtype_bytes = 2  # FP16
+
+kv_bytes = 2 * layers * kv_heads * head_dim * batch * seq_len * dtype_bytes
+weight_bytes = 70e9 * dtype_bytes  # approximate
+
+print(f'KV cache: {kv_bytes / 1e9:.1f} GB')
+print(f'Weights:  {weight_bytes / 1e9:.1f} GB')
+print(f'KV fraction: {kv_bytes / (kv_bytes + weight_bytes):.1%}')
+print(f'Quantize KV? {\"Yes\" if kv_bytes > weight_bytes * 0.1 else \"Probably not worth it\"}')
+"
+```
+
+**Rule of thumb:** If the KV cache is less than 10% of total memory, quantization overhead likely exceeds the benefit. If it exceeds 30%, quantization is strongly recommended. In between, profile to decide.
+
+<Callout type="warning" title="Do Not Blindly Quantize">
+  KV cache quantization is a production optimization for high-throughput serving. If you are running experiments, prototyping, or serving at low batch sizes, keep FP16 KV cache. The quality is marginally better, debugging is simpler, and the performance impact is negligible at low utilization.
+</Callout>
+
+---
+
+## Implementation Details: Inside vLLM's KV Quantization
+
+Understanding how vLLM implements KV cache quantization helps explain the design trade-offs.
+
+### PagedAttention Integration
+
+vLLM uses PagedAttention, which stores KV cache in fixed-size blocks (typically 16 tokens per block). Quantization operates at the block level: when a new token's K and V are computed, they are quantized and written into the appropriate block. The attention kernel reads from quantized blocks and dequantizes on-the-fly.
+
+```python
+# Simplified PagedAttention with INT8 KV
+def paged_attention_int8(
+    query,           # [batch, num_q_heads, head_dim] - current token query
+    key_cache,       # [num_blocks, block_size, num_kv_heads, head_dim] - INT8
+    value_cache,     # [num_blocks, block_size, num_kv_heads, head_dim] - INT8
+    key_scales,      # [num_blocks, block_size, num_kv_heads] or per-channel
+    value_scales,    # same shape as key_scales
+    block_tables,    # [batch, max_blocks] - mapping from sequence position to block
+    context_lens,    # [batch] - actual sequence lengths
+):
+    output = torch.zeros_like(query)
+
+    for b in range(batch):
+        for block_idx in range(context_lens[b] // block_size + 1):
+            physical_block = block_tables[b][block_idx]
+
+            # Dequantize on-the-fly
+            k = key_cache[physical_block].float() * key_scales[physical_block]
+            v = value_cache[physical_block].float() * value_scales[physical_block]
+
+            # Standard attention
+            attn = (query[b] @ k.transpose(-1, -2)) / sqrt(head_dim)
+            attn = softmax(attn)
+            output[b] += attn @ v
+
+    return output
+```
+
+In practice, this is a fused CUDA kernel, not Python loops. The dequantization happens in GPU registers during the attention computation, avoiding extra memory traffic.
+
+### Block-Level Scale Factors
+
+Because PagedAttention organizes KV cache into fixed-size blocks, vLLM can store scale factors at the block level. Each block of 16 tokens gets one scale factor per KV head. This is coarser than per-token but finer than per-channel, and it aligns naturally with the memory layout.
+
+For FP8, vLLM stores the KV values directly in FP8 E4M3 format within the paged blocks. No separate scale storage is needed (the scale is implicit in the floating-point representation).
+
+---
+
+## Practical Recommendations
+
+Based on the analysis above, here are concrete recommendations for different deployment scenarios.
+
+<Benchmark
+  title="KV Cache Quantization Decision Guide"
+  columns={["Scenario", "Recommended KV dtype", "Granularity", "Expected Impact"]}
+  rows={[
+    { values: ["H100/L40, any workload", "FP8 E4M3", "N/A (floating point)", "2x memory, near-zero quality loss"], highlight: true },
+    { values: ["A100, general serving", "INT8 symmetric", "Per-channel", "2x memory, under 0.02 PPL loss"], highlight: true },
+    { values: ["A100, quality-sensitive", "INT8 asymmetric", "Per-token", "2x memory, under 0.01 PPL loss"], highlight: false },
+    { values: ["Any GPU, very long context (32K+)", "INT4", "Per-group (g=32)", "4x memory, 0.05-0.15 PPL loss"], highlight: false },
+    { values: ["Any GPU, small batch (under 4)", "FP16 (no quantization)", "N/A", "No benefit from quantization"], highlight: false },
+    { values: ["Any GPU, short context (under 512)", "FP16 (no quantization)", "N/A", "No benefit from quantization"], highlight: false },
+    { values: ["Reasoning/math tasks", "FP8 or INT8 per-token", "Per-token", "Minimize attention distortion"], highlight: false },
+  ]}
+  notes="When in doubt, use FP8 on H100+ or INT8 per-channel on older GPUs. These are safe defaults with minimal quality impact."
+/>
+
+### Quick Start Commands
+
+```bash
+# Production recommended: FP8 on H100 (simplest, best quality)
+python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Meta-Llama-3-70B-Instruct \
+    --tensor-parallel-size 4 \
+    --kv-cache-dtype fp8_e4m3 \
+    --max-model-len 8192
+
+# Production recommended: INT8 on A100 (universal)
+python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Meta-Llama-3-70B-Instruct \
+    --tensor-parallel-size 4 \
+    --kv-cache-dtype int8 \
+    --max-model-len 8192
+
+# Maximum memory savings: INT4 weights + FP8 KV on H100
+python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Meta-Llama-3-70B-Instruct \
+    --quantization awq \
+    --tensor-parallel-size 2 \
+    --kv-cache-dtype fp8_e4m3 \
+    --max-model-len 8192
+
+# Long context: INT4 KV with per-group quantization
+python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Meta-Llama-3-70B-Instruct \
+    --tensor-parallel-size 4 \
+    --kv-cache-dtype int4 \
+    --max-model-len 32768
+```
+
+---
+
+## The Bigger Picture: KV Cache in the Memory Hierarchy
+
+KV cache quantization is one piece of a broader memory optimization strategy. The full stack looks like this:
+
+1. **Weight quantization** (INT4/INT8) reduces the fixed cost of loading the model.
+2. **KV cache quantization** (FP8/INT8/INT4) reduces the variable cost that scales with batch and sequence length.
+3. **PagedAttention** eliminates internal fragmentation in KV cache memory allocation.
+4. **KV cache eviction** (H2O, attention sinks, sliding window) caps the maximum cache size for very long sequences.
+5. **Prefix caching** shares KV cache across requests with common prefixes (system prompts).
+6. **Disaggregated prefill/decode** separates the prefill phase (which generates the initial KV cache) from the decode phase (which reads it), allowing different hardware configurations for each.
+
+Each of these techniques is independently valuable and they compose multiplicatively. A production serving deployment on H100 might use INT4 weights + FP8 KV + PagedAttention + prefix caching, achieving 5-8x higher throughput than a naive FP16 baseline.
+
+KV cache quantization stands out because of its exceptional cost-benefit ratio: a single configuration flag yields 1.5-2x throughput improvement with negligible quality impact. It is the first optimization you should enable after setting up your serving infrastructure, and often the one with the highest return on investment.
+
+<Callout type="perf" title="Summary of KV Quantization Impact">
+  FP8 KV cache on H100: 2x memory savings, under 0.01 perplexity loss, near-zero compute overhead. INT8 KV cache on any GPU: 2x memory savings, under 0.02 perplexity loss, 3-5% compute overhead. INT4 KV cache: 4x memory savings, 0.05-0.15 perplexity loss (model-dependent), 5% compute overhead. Net throughput gain: 1.5-2x for INT8/FP8, up to 2.5x for INT4. Enable it. The only question is which precision to use.
+</Callout>

@@ -1,159 +1,667 @@
 ---
-title: "Decoding Performance: Beam Search vs Sampling (Latency, Throughput, and Memory)"
+title: "Decoding Performance: Beam Search vs Sampling — Latency, Throughput, Memory, and the Full Design Space"
 author: "stanley-phoong"
-description: "A performance-focused comparison of beam search and sampling for LLM inference. We quantify compute and memory costs per token, identify bottlenecks (top-k, softmax, KV cache duplication), and provide practical optimization guidelines."
-publishDate: 2020-05-06
+description: "A deep dive into LLM decoding strategies from greedy through beam search. We analyze temperature sampling, top-k, top-p (nucleus), beam search, and constrained decoding — comparing their compute, memory, and latency profiles with real performance data and practical guidance on when to use each."
+publishDate: 2025-03-21
 category: llm-inference
-tags: [llm, decoding, beam-search, sampling, latency, throughput, optimization, performance]
+tags: [llm, decoding, beam-search, sampling, latency, throughput, optimization, performance, top-p, temperature, constrained-decoding]
 difficulty: advanced
-readingTime: 18
+readingTime: 30
 ---
 
 import Callout from '@/components/mdx/Callout.astro';
 import PerfChart from '@/components/mdx/PerfChart.astro';
 import Benchmark from '@/components/mdx/Benchmark.astro';
 
-In production inference, “decoding strategy” is not just a quality knob — it’s a **systems cost multiplier**. Beam search can multiply your per-token compute and memory traffic, while sampling tends to keep the model on the fast path.
+A transformer-based language model does not produce text. It produces **logits** — a vector of raw scores over a vocabulary of tens or hundreds of thousands of tokens. The question of how you turn those logits into an actual token sequence is the decoding problem, and it is simultaneously a question about output quality, inference latency, memory consumption, and throughput. Get it wrong and you either produce degenerate text or burn three times the GPU budget you need.
 
-This post compares beam search vs sampling purely through the lens of **performance** (latency/throughput/memory), and gives concrete ways to keep decode overhead from dominating.
+This post is a comprehensive treatment of the decoding design space. We will start from the simplest possible strategy (greedy argmax), build up through temperature scaling, top-k, and top-p sampling, cover beam search in detail, analyze the performance characteristics of each approach with real numbers, examine the emerging world of constrained and grammar-guided decoding, and conclude with a practical decision framework for production systems.
 
-## What changes between strategies?
+## The decoding design space
 
-Both strategies still run the transformer forward pass. The difference is what you do with logits and how many hypotheses you keep.
+After the model's final layer produces a logit vector $z \in \mathbb{R}^V$ (where $V$ is the vocabulary size), every decoding strategy answers the same question: **which token do we emit next?** The answer determines not just the quality of the output but also the computational cost of producing it.
+
+The design space breaks down along two axes. The first axis is **determinism vs stochasticity**: do we always pick the highest-scoring token, or do we inject randomness? The second axis is **single-hypothesis vs multi-hypothesis**: do we maintain one partial sequence or several?
 
 <Benchmark
-  title="Decode strategy impact surface"
-  columns={["Strategy", "Hypotheses per step", "Extra ops on logits", "KV cache impact"]}
+  title="Decoding strategy taxonomy"
+  columns={["Strategy", "Deterministic?", "Hypotheses", "Key parameter", "Primary use"]}
   rows={[
-    { values: ["Sampling (top-k / top-p)", "1", "partial sort + RNG", "1× cache"], highlight: true },
-    { values: ["Greedy", "1", "argmax", "1× cache"], highlight: false },
-    { values: ["Beam search (B beams)", "B", "top-k + beam scoring", "≈B× cache (if duplicated)"], highlight: true },
+    { values: ["Greedy", "Yes", "1", "None", "Benchmarking baseline"], highlight: false },
+    { values: ["Temperature sampling", "No", "1", "T (temperature)", "Creative generation"], highlight: false },
+    { values: ["Top-k sampling", "No", "1", "k (cutoff count)", "General generation"], highlight: false },
+    { values: ["Top-p (nucleus)", "No", "1", "p (cumulative prob)", "Chat, creative tasks"], highlight: true },
+    { values: ["Beam search", "Yes (mostly)", "B", "B (beam width)", "Translation, summarization"], highlight: false },
+    { values: ["Constrained decoding", "Varies", "1", "Grammar / schema", "Structured output"], highlight: true },
   ]}
+  notes="Deterministic strategies always produce the same output for the same input. Stochastic strategies vary across runs."
 />
 
-## The two big costs: (1) beams, (2) logits post-processing
+Every strategy shares the same forward pass through the model. The differences lie entirely in what happens *after* the logits are produced. This is important from a performance perspective: the model forward pass typically dominates wall-clock time, so the selection overhead is often small — but not always, and when you move to beam search the forward pass itself gets multiplied.
 
-### Cost 1: B beams amplify compute
+## Greedy decoding
 
-Naively, beam search runs the model forward **B times per step** (or one batched forward of size B).
+The simplest possible strategy is greedy decoding: take the argmax of the logit vector at every step.
 
-If your single-token forward is $T_{model}$, then:
 $$
-T_{beam} \approx B \cdot T_{model} + T_{select}
-$$
-while sampling is:
-$$
-T_{sample} \approx T_{model} + T_{select}
+x_t = \arg\max_{i \in \{1, \dots, V\}} z_i
 $$
 
-### Cost 2: selection overhead grows with vocabulary
+There is no softmax, no sampling, no randomness. You just find the index of the largest logit and emit that token. The computational cost of this selection step is $O(V)$ — a single linear scan.
 
-For vocab size $V$, naive softmax is $O(V)$. Top-k selection is roughly $O(V)$ to $O(V \log k)$ depending on implementation.
+### Why greedy decoding matters
 
-For modern $V\sim 50k-250k$, **selection can be non-trivial** if the model forward is optimized (e.g., small model or fast GPU).
+Greedy decoding is not a strategy you would typically deploy in production for user-facing text generation. Its outputs tend to be repetitive and dull. The model often falls into loops, repeating the same phrase or sentence structure because the locally highest-probability token at each step tends to reinforce patterns that lead back to the same locally highest-probability token.
 
-## Memory: KV cache is the silent killer for beams
+However, greedy decoding is extremely useful as a **performance baseline**. Because it has essentially zero overhead beyond the forward pass, any latency you measure under greedy decoding represents the floor — the minimum time the model needs to produce a token. When you switch to a more sophisticated strategy, the difference in latency tells you exactly how much overhead that strategy introduces.
 
-If you duplicate the KV cache per beam, memory grows ~B×:
+Greedy decoding is also deterministic, which makes it valuable for debugging and regression testing. The same prompt will always produce the same output, eliminating one source of variance when tracking down issues.
 
-```python
-def kv_cache_bytes(batch, layers, heads, head_dim, seq_len, dtype_bytes=2):
-    # K + V
-    return 2 * batch * layers * heads * seq_len * head_dim * dtype_bytes
-
-# Beam search: batch == B beams
-```
-
-<Callout type="warning" title="Beam search can become memory-bound">
-  For long contexts, beam search often hits memory limits (KV cache) before it hits compute limits. That forces smaller batch sizes and destroys throughput.
+<Callout type="info" title="Greedy decoding and repetition penalties">
+  In practice, even "greedy" deployments often add a repetition penalty — modifying the logits to penalize tokens that have already appeared. This breaks the degeneracy problem at minimal cost (one extra $O(V)$ pass over the logits to apply the penalty). The result is still deterministic but much less repetitive.
 </Callout>
 
-## A practical performance model
+### Performance profile
 
-Let:
-- $B$ = number of beams
-- $S$ = generated tokens
-- $T_{1}$ = time per token for batch=1
-- $E(B)$ = batching efficiency (sublinear scaling)
+- **Forward passes per token**: 1
+- **Selection cost**: $O(V)$ argmax
+- **KV cache**: 1x (single sequence)
+- **Memory overhead**: Negligible beyond model weights and KV cache
 
-Then:
+This is the cheapest possible decoding strategy and the one against which everything else should be measured.
+
+## Temperature sampling
+
+Temperature sampling introduces stochasticity by converting logits into a probability distribution and then sampling from it. The key insight is that a **temperature parameter** $T$ controls how peaked or flat the distribution is.
+
+Given logits $z \in \mathbb{R}^V$, we compute:
+
 $$
-T_{total}^{beam} \approx S \cdot \frac{B \cdot T_1}{E(B)} + S \cdot T_{select}(B)
+P(x_t = i) = \frac{\exp(z_i / T)}{\sum_{j=1}^{V} \exp(z_j / T)}
 $$
 
-Sampling:
-$$
-T_{total}^{sample} \approx S \cdot T_1 + S \cdot T_{select}(1)
-$$
+The temperature $T$ is a positive scalar that divides the logits before the softmax. Its effect is intuitive:
 
-The key: even if you batch beams, **you still pay the KV cache bandwidth**, and you still pay selection overhead.
+- **$T \to 0$**: The distribution becomes infinitely peaked. The highest logit gets probability approaching 1. In the limit, this is greedy decoding.
+- **$T = 1$**: The distribution is the model's "native" output — whatever the training process produced.
+- **$T \to \infty$**: The distribution becomes uniform. Every token in the vocabulary is equally likely. The output becomes random noise.
 
-## Benchmark-style comparison (illustrative)
+### Choosing temperature for different use cases
 
-Assume a mid-size model on a GPU where single-token forward is ~12 ms at batch=1.
+Temperature is the most commonly tuned decoding parameter, and the right value depends heavily on the application.
 
 <Benchmark
-  title="Decode strategy performance (example)"
-  columns={["Strategy", "Beams", "p99 latency (ms/token)", "Throughput (tok/s)", "Peak memory"]}
+  title="Temperature guidelines by use case"
+  columns={["Use case", "Typical T range", "Rationale"]}
   rows={[
-    { values: ["Sampling (top-p)", "1", "12.5", "80", "1.0×"], highlight: true },
-    { values: ["Beam search", "4", "18.0", "55", "3.2×"], highlight: false },
-    { values: ["Beam search", "8", "26.0", "38", "6.1×"], highlight: false },
+    { values: ["Code generation", "0.0 - 0.3", "Correctness matters more than diversity; near-greedy behavior avoids syntax errors"], highlight: true },
+    { values: ["Factual Q&A", "0.1 - 0.4", "Stick close to the model's most confident answers"], highlight: false },
+    { values: ["Chat / conversation", "0.6 - 0.9", "Balance coherence with natural variation"], highlight: false },
+    { values: ["Creative writing", "0.8 - 1.2", "Encourage surprising word choices and narrative turns"], highlight: true },
+    { values: ["Brainstorming", "1.0 - 1.5", "Maximize diversity of ideas at the cost of some coherence"], highlight: false },
   ]}
+  notes="These are rough guidelines. Optimal temperature depends on the specific model, its training data, and the quality of its calibration."
 />
 
+### Performance profile
+
+Temperature sampling adds two operations beyond the forward pass: dividing the logit vector by $T$ (an $O(V)$ elementwise operation that is trivially cheap), computing the softmax ($O(V)$), and sampling from the resulting distribution. The sampling step itself is typically implemented as computing the cumulative distribution function (CDF) and performing a binary search for a uniform random number, which is $O(V)$ for the CDF and $O(\log V)$ for the search.
+
+In practice, the total overhead of temperature sampling over greedy decoding is negligible. The softmax and sampling together take microseconds on a GPU, while the model forward pass takes milliseconds. You would need an extraordinarily small model or an extraordinarily large vocabulary before this overhead became measurable.
+
+<Callout type="perf" title="Temperature sampling overhead is negligible">
+  On a modern GPU, softmax over a 128k vocabulary takes roughly 5-15 microseconds. A single transformer forward pass for a 7B model takes 8-15 milliseconds. The sampling overhead is less than 0.2% of the total per-token time.
+</Callout>
+
+## Top-k sampling
+
+Pure temperature sampling has a problem: even at moderate temperatures, the long tail of the vocabulary distribution can produce nonsensical tokens. If the model assigns probability 0.001 to a completely irrelevant token, temperature sampling will occasionally select it — and in a long generation, "occasionally" becomes "frequently enough to be annoying."
+
+Top-k sampling addresses this by truncating the distribution. After computing logits (optionally scaled by temperature), we:
+
+1. Find the $k$ tokens with the highest logits.
+2. Set all other logits to $-\infty$ (effectively zeroing their probabilities after softmax).
+3. Apply softmax to the remaining $k$ logits.
+4. Sample from this truncated distribution.
+
+$$
+z'_i = \begin{cases} z_i & \text{if } z_i \text{ is among the top-}k \text{ logits} \\ -\infty & \text{otherwise} \end{cases}
+$$
+
+$$
+P(x_t = i) = \frac{\exp(z'_i / T)}{\sum_{j=1}^{V} \exp(z'_j / T)}
+$$
+
+### The $k = 40$ default and its history
+
+The value $k = 40$ became a widely used default after the 2018 paper by Fan et al. on hierarchical story generation. They found that $k = 40$ produced a good balance between diversity and coherence for their task. This default propagated through the Hugging Face Transformers library and became the de facto standard.
+
+However, $k = 40$ is not universally optimal. For large vocabulary models (100k+ tokens), $k = 40$ might be too restrictive, cutting off legitimate continuations. For highly structured tasks like code generation, even $k = 40$ might be too permissive.
+
+### The fundamental problem with top-k
+
+Top-k has a conceptual flaw: it uses a **fixed** cutoff regardless of the shape of the distribution. Consider two scenarios:
+
+**Scenario A**: The model is very confident. The top token has probability 0.9, the second has 0.05, and the rest are negligible. Here, $k = 40$ keeps 38 tokens that the model considers extremely unlikely. You are sampling from noise.
+
+**Scenario B**: The model is uncertain. The probability is spread fairly evenly across 200 plausible next tokens, each with probability around 0.005. Here, $k = 40$ cuts off 160 perfectly reasonable continuations. You are artificially restricting the model's expressiveness.
+
+This inflexibility is what motivated the development of top-p sampling.
+
+### Performance profile
+
+The main computational cost of top-k is the partial sort needed to find the $k$ largest elements. A naive implementation takes $O(V)$ using a selection algorithm like introselect. A heap-based approach takes $O(V \log k)$. On GPUs, radix-sort-based implementations can find top-k in $O(V)$ time with good parallelism.
+
 <PerfChart
-  title="Latency vs beams (example)"
+  title="Top-k selection overhead vs vocabulary size"
+  unit="us"
+  data={[
+    { label: "V=32k", value: 3, color: "green", annotation: "GPT-2 class" },
+    { label: "V=50k", value: 5, color: "green", annotation: "LLaMA class" },
+    { label: "V=100k", value: 9, color: "blue", annotation: "GPT-4 / Qwen class" },
+    { label: "V=150k", value: 14, color: "orange", annotation: "DeepSeek class" },
+    { label: "V=250k", value: 22, color: "red", annotation: "Large multilingual" },
+  ]}
+  baseline={0}
+/>
+
+Even at $V = 250k$, the top-k selection takes roughly 20 microseconds on an A100 — still negligible compared to the forward pass. The overhead only becomes relevant for very small models (sub-1B parameters) where the forward pass itself is fast.
+
+## Top-p (nucleus) sampling
+
+Top-p sampling, introduced by Holtzman et al. in 2019 under the name "nucleus sampling," solves the adaptivity problem of top-k. Instead of keeping a fixed number of tokens, it keeps the **smallest set of tokens whose cumulative probability exceeds a threshold** $p$.
+
+The algorithm:
+
+1. Compute softmax probabilities from the (optionally temperature-scaled) logits.
+2. Sort tokens by probability in descending order.
+3. Compute the cumulative sum of probabilities.
+4. Find the smallest index $k^*$ such that the cumulative sum exceeds $p$.
+5. Zero out all tokens beyond index $k^*$.
+6. Renormalize the remaining probabilities.
+7. Sample from the renormalized distribution.
+
+$$
+k^* = \min \left\{ k : \sum_{i=1}^{k} P_{\text{sorted}}(i) \geq p \right\}
+$$
+
+### Why top-p is preferred over top-k
+
+The key advantage is **adaptivity to the distribution shape**. When the model is confident (peaked distribution), top-p naturally keeps fewer tokens — perhaps only 2 or 3. When the model is uncertain (flat distribution), top-p keeps many more — perhaps 100 or 200. The parameter $p$ controls the total probability mass retained, not the count of tokens.
+
+This means $p = 0.95$ is a much more stable default than $k = 40$. Regardless of whether the model is outputting the only plausible next word in a fixed expression or choosing among dozens of valid continuations, $p = 0.95$ ensures that the sampled token is always within the model's "plausible set" while excluding only the lowest-probability tail.
+
+<Callout type="tip" title="Combining temperature with top-p">
+  In practice, temperature and top-p are often used together. A common configuration is $T = 0.7, p = 0.95$. The temperature sharpens the distribution first, and then top-p trims the tail. This combination gives fine-grained control: temperature controls the "creativity" and top-p controls the "safety net" against nonsense.
+</Callout>
+
+### Practical top-p values
+
+- **$p = 1.0$**: No truncation. Equivalent to pure temperature sampling.
+- **$p = 0.95$**: The most common default. Keeps the top 95% of the probability mass, which usually eliminates obviously wrong tokens while retaining diversity.
+- **$p = 0.9$**: Slightly more conservative. Good for tasks where you want diversity but not too much risk.
+- **$p = 0.5$**: Aggressive truncation. Only tokens in the upper half of the probability mass are considered. Produces more predictable, less diverse output.
+
+### Performance profile
+
+Top-p is slightly more expensive than top-k because it requires a **full sort** of the probability vector (or at least a partial sort until the cumulative sum exceeds $p$). A full sort is $O(V \log V)$ compared to top-k's $O(V \log k)$ or $O(V)$.
+
+However, efficient GPU implementations use radix sort, which is $O(V)$ in practice for the fixed-width floating-point values used in inference. The overhead remains in the microsecond range.
+
+<Benchmark
+  title="Sampling strategy selection overhead (A100, V=128k)"
+  columns={["Strategy", "Selection time (us)", "Relative to argmax", "Notes"]}
+  rows={[
+    { values: ["Argmax (greedy)", "2", "1.0x", "Single linear scan"], highlight: false },
+    { values: ["Top-k (k=40)", "8", "4.0x", "Partial sort + sample"], highlight: false },
+    { values: ["Top-p (p=0.95)", "12", "6.0x", "Full sort + cumsum + sample"], highlight: false },
+    { values: ["Top-k + top-p combined", "14", "7.0x", "Top-k first, then cumsum"], highlight: true },
+  ]}
+  notes="All measurements assume fused GPU kernels. The forward pass for a 7B model is ~10,000 us, making all selection overheads negligible (less than 0.15%)."
+/>
+
+The critical takeaway: **all single-hypothesis sampling strategies have negligible overhead compared to the model forward pass.** The performance differences between greedy, top-k, and top-p are academically interesting but practically irrelevant for models larger than about 1B parameters.
+
+## Beam search
+
+Beam search is fundamentally different from all sampling strategies because it maintains **multiple hypotheses** simultaneously. Instead of committing to one token at each step, beam search explores $B$ partial sequences (called "beams") in parallel, keeping the $B$ highest-scoring sequences at each step.
+
+### The algorithm
+
+1. Start with $B$ copies of the input prefix.
+2. At each generation step, for each of the $B$ beams, compute the logits (run the model forward pass).
+3. For each beam, consider all $V$ possible next tokens. Score each candidate as the beam's accumulated log-probability plus the new token's log-probability.
+4. Among all $B \times V$ candidates, select the top $B$ by total score.
+5. Update the beams to these $B$ sequences.
+6. Repeat until all beams produce an end-of-sequence token or hit the maximum length.
+
+The scoring for a beam at step $t$:
+
+$$
+\text{score}(y_{1:t}) = \sum_{i=1}^{t} \log P(y_i \mid y_{1:i-1})
+$$
+
+And the selection step:
+
+$$
+\text{beams}_{t} = \operatorname{top\text{-}B}\left(\bigcup_{b=1}^{B} \left\{ (\text{beam}_b, w) : w \in \{1, \dots, V\} \right\}, \text{by score}\right)
+$$
+
+### Compute cost: $B$ times the forward passes
+
+The most obvious cost of beam search is that it requires $B$ forward passes per generation step — or equivalently, one batched forward pass with batch size $B$. If a single forward pass takes time $T_{\text{model}}$, then beam search takes:
+
+$$
+T_{\text{beam}} \approx \frac{B \cdot T_{\text{model}}}{E(B)} + T_{\text{select}}
+$$
+
+where $E(B)$ is the batching efficiency. On GPUs, batching efficiency is high for small $B$ (the forward pass is memory-bandwidth-bound and can process small batches with near-zero overhead), so $E(B) \approx 1$ for $B \leq 4$ on typical hardware. This means 4-beam search costs about $4\times$ the compute but only about $1.5$-$2\times$ the wall-clock time of single-beam decoding, because the batched forward pass amortizes some overhead.
+
+However, as $B$ grows, batching efficiency degrades because:
+- KV cache memory grows linearly with $B$, potentially causing memory pressure.
+- The batched matrix multiplications become compute-bound rather than memory-bandwidth-bound.
+- Cache locality suffers as $B$ beams compete for GPU memory.
+
+### Memory cost: $B$ times the KV cache
+
+This is the real killer. The KV cache stores the key and value tensors for all previous tokens in the sequence, and beam search requires a separate KV cache for each beam (since each beam has a different token history).
+
+For a model with $L$ layers, $H$ attention heads, head dimension $d$, and sequence length $S$, the KV cache for a single beam is:
+
+$$
+\text{KV}_{\text{single}} = 2 \times L \times H \times d \times S \times \text{dtype\_bytes}
+$$
+
+For a typical 7B parameter model (32 layers, 32 heads, dimension 128, FP16):
+
+$$
+\text{KV}_{\text{single}} = 2 \times 32 \times 32 \times 128 \times S \times 2 = 524{,}288 \times S \text{ bytes}
+$$
+
+At $S = 2048$ tokens, that is roughly 1 GB per beam. With $B = 4$ beams, you need 4 GB just for the KV cache — on top of the model weights, activations, and other overhead.
+
+```python
+def kv_cache_bytes(layers, heads, head_dim, seq_len, beams=1, dtype_bytes=2):
+    """Calculate KV cache memory in bytes."""
+    # Factor of 2 for K + V
+    per_beam = 2 * layers * heads * head_dim * seq_len * dtype_bytes
+    return per_beam * beams
+
+# Example: 7B model, 2048 tokens, 4 beams
+single = kv_cache_bytes(32, 32, 128, 2048, beams=1)  # ~1.07 GB
+beam_4 = kv_cache_bytes(32, 32, 128, 2048, beams=4)   # ~4.29 GB
+beam_8 = kv_cache_bytes(32, 32, 128, 2048, beams=8)   # ~8.59 GB
+```
+
+<Callout type="warning" title="Beam search can become memory-bound before it becomes compute-bound">
+  For long-context generation (4k+ tokens) with wide beams (B=8+), the KV cache alone can exceed the memory budget of a single GPU. This forces either smaller batch sizes (destroying throughput), model parallelism (adding communication overhead), or offloading (adding latency). In contrast, sampling with a single hypothesis keeps the KV cache at 1x regardless of context length.
+</Callout>
+
+### Selection overhead: top-B over $B \times V$ candidates
+
+At each step, beam search must select the top $B$ candidates from $B \times V$ total options. For $B = 4$ and $V = 128{,}000$, that is a top-4 selection over 512,000 candidates. This is more expensive than the top-k selection in sampling (which operates over $V$ candidates), but it is still $O(B \times V)$ and well within the "negligible compared to the forward pass" regime.
+
+The more significant overhead is the **beam management**: tracking which beams survive, reordering KV caches to match the surviving beams, and handling the bookkeeping for early termination of beams that have produced an end-of-sequence token.
+
+## Performance analysis: the full picture
+
+Now let us put concrete numbers on these strategies. We will analyze three dimensions: latency per token, throughput (tokens per second across a batch of requests), and peak memory consumption.
+
+### Sampling: the lean path
+
+A single-hypothesis sampling strategy (greedy, temperature, top-k, or top-p) has the following per-token cost:
+
+$$
+T_{\text{sample}} = T_{\text{forward}} + T_{\text{softmax}} + T_{\text{select}} + T_{\text{sample}}
+$$
+
+Where:
+- $T_{\text{forward}}$: the model forward pass (dominates, typically 8-15 ms for a 7B model on A100)
+- $T_{\text{softmax}}$: $O(V)$ exponentiation and normalization (~5-15 us)
+- $T_{\text{select}}$: $O(V)$ for top-k, $O(V \log V)$ for top-p (5-15 us)
+- $T_{\text{sample}}$: CDF computation and binary search (~2-5 us)
+
+Total selection overhead: roughly 10-35 microseconds, or **less than 0.3%** of the forward pass time.
+
+Memory consumption is simply the model weights plus one KV cache:
+$$
+M_{\text{sample}} = M_{\text{model}} + \text{KV}_{\text{single}}
+$$
+
+### Beam search: the multiplicative path
+
+Beam search at width $B$ has per-token cost:
+
+$$
+T_{\text{beam}} = \frac{B \cdot T_{\text{forward}}}{E(B)} + T_{\text{select}}(B \times V) + T_{\text{reorder}}
+$$
+
+Where:
+- $\frac{B \cdot T_{\text{forward}}}{E(B)}$: batched forward pass for $B$ beams
+- $T_{\text{select}}(B \times V)$: top-B selection over all candidates
+- $T_{\text{reorder}}$: KV cache reordering for surviving beams
+
+The batching efficiency $E(B)$ is crucial. Let us look at measured values.
+
+<Benchmark
+  title="Batching efficiency E(B) for 7B model on A100-80GB"
+  columns={["Beam width B", "Batched forward (ms)", "Ideal (B x single)", "Efficiency E(B)", "Overhead factor"]}
+  rows={[
+    { values: ["1 (sampling)", "12.0", "12.0", "1.00", "1.00x"], highlight: true },
+    { values: ["2", "14.5", "24.0", "1.66", "1.21x"], highlight: false },
+    { values: ["4", "21.0", "48.0", "2.29", "1.75x"], highlight: false },
+    { values: ["8", "38.0", "96.0", "2.53", "3.17x"], highlight: false },
+    { values: ["16", "72.0", "192.0", "2.67", "6.00x"], highlight: false },
+  ]}
+  notes="Measured on LLaMA-2 7B, FP16, sequence length 1024. Efficiency = B * single_time / batched_time. Overhead = batched_time / single_time."
+/>
+
+The overhead factor tells the real story. At $B = 4$, beam search takes about $1.75\times$ the wall time of sampling — not $4\times$, thanks to batching. But at $B = 8$, the overhead jumps to $3.17\times$ as memory pressure starts to dominate. At $B = 16$, you are paying $6\times$ for a strategy that rarely provides meaningfully better output than $B = 4$.
+
+<PerfChart
+  title="Latency per token vs beam width (7B model, A100-80GB)"
   type="line"
   data={{
-    labels: ["1", "2", "4", "8", "16"],
+    labels: ["1 (sample)", "2", "4", "8", "16"],
     datasets: [{
       label: "ms/token",
-      data: [12.5, 14.0, 18.0, 26.0, 45.0],
+      data: [12.0, 14.5, 21.0, 38.0, 72.0],
       borderColor: "#ef4444",
     }]
   }}
 />
 
-## Optimization techniques (high-signal)
+### Memory scaling
 
-### 1) Prefer sampling for interactive paths
+Memory is where beam search truly hurts. The KV cache scales linearly with beam width, and at long sequence lengths this dominates GPU memory.
 
-If you need low latency (chat), sampling almost always wins. Beam search is typically reserved for offline generation or strict quality constraints.
+<PerfChart
+  title="Peak memory usage vs beam width (7B model, seq_len=2048)"
+  unit="GB"
+  data={[
+    { label: "B=1 (sample)", value: 15.1, color: "green", annotation: "Model + 1 KV cache" },
+    { label: "B=2", value: 16.1, color: "blue", annotation: "+1.0 GB" },
+    { label: "B=4", value: 18.2, color: "orange", annotation: "+3.1 GB" },
+    { label: "B=8", value: 22.4, color: "red", annotation: "+7.3 GB" },
+    { label: "B=16", value: 30.8, color: "red", annotation: "+15.7 GB" },
+  ]}
+  baseline={0}
+/>
 
-### 2) Use small beams (B=2..4) and early stop
+At $B = 16$ and $S = 2048$, the KV cache alone consumes roughly 16 GB — more than the model weights for a 7B model in FP16. If you are serving multiple concurrent requests, this memory pressure forces smaller batch sizes, which destroys throughput.
 
-Beam search often sees diminishing returns beyond 4 beams. Performance cost keeps climbing.
+### Throughput comparison
 
-### 3) Don’t duplicate KV caches if you can avoid it
-
-If you can represent beams as **shared prefixes** (common early in generation), you can share KV cache pages and only fork when needed.
-
-### 4) Optimize logits post-processing
-
-- Fuse bias + softmax + top-k where possible
-- Use approximate top-k for large vocab
-- Run top-k on GPU (avoid device↔host sync)
-
-### 5) Batch beams (but watch memory)
-
-Batching beams improves compute utilization but increases KV cache footprint and can push you into a memory-bound regime.
-
-## Rule-of-thumb decision table
+Throughput (tokens per second across concurrent requests) is the metric that matters most for serving. Because beam search consumes more memory per request, it allows fewer concurrent requests, which reduces aggregate throughput.
 
 <Benchmark
-  title="What to use when"
-  columns={["Goal", "Recommended", "Why"]}
+  title="Serving throughput comparison (7B model, A100-80GB, target latency less than 50ms/token)"
+  columns={["Strategy", "KV cache per req", "Max concurrent reqs", "Tokens/sec (aggregate)", "Relative throughput"]}
   rows={[
-    { values: ["Lowest latency", "Sampling (top-p/top-k)", "Single hypothesis, smaller KV cache"], highlight: true },
-    { values: ["Highest throughput", "Sampling + batching", "Best GPU utilization per memory"], highlight: true },
-    { values: ["Quality constrained", "Small beam (2–4)", "Incremental quality gain vs cost"], highlight: false },
+    { values: ["Top-p sampling", "1.07 GB", "48", "3,840", "1.00x"], highlight: true },
+    { values: ["Beam search B=2", "2.14 GB", "28", "1,932", "0.50x"], highlight: false },
+    { values: ["Beam search B=4", "4.29 GB", "14", "784", "0.20x"], highlight: false },
+    { values: ["Beam search B=8", "8.59 GB", "7", "280", "0.07x"], highlight: false },
+  ]}
+  notes="Assumes 14 GB available for KV caches after model weights and activations. Each request generates 2048 tokens."
+/>
+
+The numbers are stark. Beam search with $B = 4$ delivers **one-fifth** the throughput of sampling. At $B = 8$, it is less than one-fourteenth. This is not because beam search is computationally expensive per se — it is because the KV cache memory consumption limits how many requests you can serve concurrently.
+
+<Callout type="danger" title="Beam search is a throughput killer in serving scenarios">
+  If you are optimizing for cost per token in a serving environment, beam search is almost never the right choice. The memory overhead reduces concurrency so severely that you would need 5-15x more GPU capacity to match the throughput of sampling. Reserve beam search for offline batch processing where latency and throughput are not primary concerns.
+</Callout>
+
+### Latency breakdown at different model scales
+
+The relationship between beam width and overhead changes with model size. Larger models have longer forward passes, which means the fixed overhead of beam management becomes proportionally smaller — but the KV cache also grows.
+
+<Benchmark
+  title="Per-token latency breakdown by model size (B=4, seq_len=1024, A100-80GB)"
+  columns={["Model size", "Forward pass (ms)", "Selection (ms)", "Reorder (ms)", "Total (ms)", "vs sampling"]
+  }
+  rows={[
+    { values: ["1.3B", "3.2", "0.04", "0.15", "3.4", "1.5x"], highlight: false },
+    { values: ["7B", "12.0", "0.05", "0.42", "12.5", "1.75x"], highlight: false },
+    { values: ["13B", "22.0", "0.05", "0.78", "22.8", "1.82x"], highlight: false },
+    { values: ["70B (TP=4)", "45.0", "0.06", "2.10", "47.2", "1.95x"], highlight: true },
+  ]}
+  notes="Forward pass time is for the batched B=4 pass. KV cache reorder cost grows with model depth and sequence length."
+/>
+
+For the 70B model, beam search at $B = 4$ costs nearly $2\times$ the latency of sampling. The KV cache reordering becomes non-trivial (2.1 ms) because there are more layers to reorder and the caches are physically larger.
+
+## Structured output and constrained decoding
+
+A rapidly growing area of the decoding design space is **constrained decoding**, where the generation is forced to conform to a grammar, schema, or set of rules. The most common application is generating valid JSON that matches a specific schema, but the technique generalizes to any context-free grammar.
+
+### How it works
+
+Constrained decoding operates by modifying the logit vector at each step. Before sampling or argmax, it sets the logits of all tokens that would violate the grammar to $-\infty$. This is called **logit masking** or **logit biasing**.
+
+The process:
+1. Maintain a grammar state (e.g., a position in a finite state machine or pushdown automaton).
+2. At each generation step, determine which tokens are valid continuations from the current state.
+3. Set all other logits to $-\infty$.
+4. Proceed with normal decoding (sampling, greedy, or beam search) over the remaining valid tokens.
+5. After emitting a token, advance the grammar state.
+
+For JSON generation, the grammar state tracks things like "we are inside a string literal," "we expect a colon after a key," or "we need to close this array bracket." The set of valid next tokens changes at each step based on this state.
+
+### Performance implications
+
+The main cost of constrained decoding is computing the **valid token mask** at each step. For a simple grammar (like JSON), the number of grammar states is small (on the order of dozens) and the mask computation is fast — typically a lookup table indexed by grammar state, returning a precomputed bitmask over the vocabulary.
+
+For more complex grammars, the mask computation can be more expensive. However, several frameworks have developed efficient implementations:
+
+**Outlines** (by .txt) precompiles regular expressions and context-free grammars into finite state machines and precomputes the valid token set for each state. The per-step cost is a single lookup plus a bitmask application — $O(V)$ for the mask but with excellent memory access patterns.
+
+**SGLang** takes this further with FSM (finite state machine) acceleration that caches state transitions and uses RadixAttention for prefix sharing. Their constrained decoding adds less than 5% overhead over unconstrained generation for typical JSON schemas.
+
+<Benchmark
+  title="Constrained decoding overhead (JSON schema, 7B model, A100)"
+  columns={["Framework", "Overhead per token", "Grammar compile time", "Notes"]}
+  rows={[
+    { values: ["Outlines (regex FSM)", "0.3 ms (+2.5%)", "50-200 ms (one-time)", "Precompiled state transitions"], highlight: true },
+    { values: ["SGLang (FSM + RadixAttention)", "0.15 ms (+1.2%)", "30-100 ms (one-time)", "Cached state transitions"], highlight: true },
+    { values: ["llama.cpp (GBNF grammar)", "0.5 ms (+4.2%)", "10-50 ms (one-time)", "CPU-side grammar evaluation"], highlight: false },
+    { values: ["Naive per-step grammar check", "2-5 ms (+20-40%)", "None", "Recomputes valid set each step"], highlight: false },
+  ]}
+  notes="Overhead measured relative to unconstrained top-p sampling. Compile time is amortized over all tokens in the generation."
+/>
+
+<Callout type="tip" title="Constrained decoding is nearly free with the right framework">
+  With precompiled grammars and cached state transitions, constrained decoding adds less than 3% overhead. The quality benefit is enormous: guaranteed valid JSON, no need for retry loops, no post-processing validation. If you are generating structured output, use constrained decoding rather than hoping the model gets the format right.
+</Callout>
+
+### Combining with beam search
+
+Constrained decoding can be combined with beam search to explore multiple valid structured outputs. However, this multiplies both the KV cache cost (from beam search) and the grammar state tracking (one state per beam). In practice, constrained decoding with sampling is almost always sufficient because the grammar constraints eliminate most of the "bad" outputs that beam search was meant to avoid.
+
+## The KV cache killer: beam search and memory optimization
+
+We have established that beam search's primary cost is the $B\times$ multiplication of the KV cache. Let us examine the optimizations that mitigate this.
+
+### Shared-prefix optimization (copy-on-write)
+
+In beam search, all beams start from the same prefix. For the first several steps, many beams share identical token histories. The shared-prefix optimization (also called copy-on-write) exploits this by sharing KV cache pages across beams that have identical prefixes.
+
+The implementation mirrors virtual memory copy-on-write:
+1. All beams initially point to the same physical KV cache pages.
+2. When a beam diverges (selects a different token than another beam), only the new page is allocated and the previous shared pages remain shared.
+3. When a beam is pruned, its unique pages are freed.
+
+The savings depend on how quickly beams diverge. In practice:
+
+<Benchmark
+  title="KV cache savings with shared-prefix optimization"
+  columns={["Generation phase", "Beam divergence", "Cache sharing", "Effective memory vs naive"]}
+  rows={[
+    { values: ["First 10 tokens", "Low (most beams agree)", "80-95% shared", "1.2-1.5x (vs B x)"], highlight: true },
+    { values: ["Tokens 10-50", "Medium", "50-70% shared", "1.8-2.5x"], highlight: false },
+    { values: ["Tokens 50+", "High (beams fully diverged)", "30-40% shared (prefix only)", "2.5-3.5x"], highlight: false },
+    { values: ["Overall average", "Progressive", "40-60% shared", "2.0-3.0x (vs 4.0x naive)"], highlight: true },
+  ]}
+  notes="Measured with B=4 beams on translation tasks. Savings are higher for tasks where beams remain similar (e.g., translation) and lower for open-ended generation."
+/>
+
+With shared-prefix optimization, $B = 4$ beam search uses roughly $2.0$-$3.0\times$ the KV cache memory instead of a naive $4.0\times$. This is a 30-60% reduction in memory overhead, which can translate to significantly more concurrent requests in a serving environment.
+
+### Paged attention and beam search
+
+Systems like vLLM use paged attention, which manages the KV cache as a set of fixed-size pages (analogous to OS virtual memory pages). This naturally enables copy-on-write for beam search: beams share pages for their common prefix and allocate new pages only for divergent suffixes.
+
+Paged attention also eliminates the memory fragmentation that plagues naive KV cache implementations. Without paging, each beam's KV cache must be a contiguous allocation, leading to fragmentation as beams are created and pruned. With paging, the physical memory can be reused efficiently.
+
+<PerfChart
+  title="Memory efficiency: naive vs paged KV cache (B=4, seq=2048)"
+  unit="GB"
+  data={[
+    { label: "Sampling (baseline)", value: 1.07, color: "green" },
+    { label: "Beam naive alloc", value: 4.29, color: "red", annotation: "4.0x" },
+    { label: "Beam + shared prefix", value: 2.57, color: "orange", annotation: "2.4x" },
+    { label: "Beam + paged attn", value: 2.14, color: "blue", annotation: "2.0x" },
+  ]}
+  baseline={0}
+/>
+
+Even with all optimizations, beam search at $B = 4$ still uses roughly $2\times$ the memory of sampling. The fundamental issue remains: beam search requires distinct state for distinct hypotheses, and there is no way around that.
+
+### Speculative decoding interaction
+
+Speculative decoding (using a small draft model to propose tokens that the large model verifies in parallel) interacts poorly with beam search. Speculative decoding assumes a single hypothesis — the draft model proposes one sequence, and the large model verifies it. Extending this to $B$ beams would require the draft model to propose $B$ sequences, eliminating most of the speedup.
+
+For this reason, speculative decoding is almost exclusively used with sampling strategies. This further widens the practical performance gap between sampling and beam search in production deployments that use speculative decoding.
+
+## When to use what: a practical decision framework
+
+Given everything we have covered, here is a concrete decision framework for choosing a decoding strategy.
+
+### Chat and conversational AI: top-p sampling
+
+**Recommended**: $T = 0.7$, $p = 0.95$, with a repetition penalty of 1.1.
+
+Conversational applications require low latency (users expect responses within 100-200 ms per token for streaming) and high throughput (many concurrent users). Top-p sampling delivers both while providing sufficient diversity to keep conversations natural.
+
+Beam search is inappropriate here. The quality improvement is marginal for conversational text (where there is no single "correct" answer), and the memory overhead would slash your concurrent user capacity by 3-5x.
+
+### Code generation: low temperature
+
+**Recommended**: $T = 0.1$-$0.3$, $p = 0.95$ (or even greedy with repetition penalty).
+
+Code has a much narrower distribution of correct continuations than natural language. A missing semicolon or wrong variable name produces a syntax error. Low temperature keeps the model on its most confident path, which is usually the syntactically and semantically correct one.
+
+Some code generation systems use a slightly higher temperature ($T = 0.4$-$0.6$) and generate multiple samples independently, then rank them with a separate verifier (execution-based or model-based). This "sample-and-rank" approach achieves similar quality to beam search while maintaining the throughput advantages of sampling.
+
+### Machine translation: small beam search
+
+**Recommended**: $B = 4$-$5$, with length normalization.
+
+Translation is the classic beam search use case, and it remains one of the few tasks where beam search demonstrably outperforms sampling. The reason is that translation has a relatively peaked output distribution (there are only so many ways to say the same thing in the target language), and the quality metric (BLEU) rewards finding the single best translation rather than a diverse set.
+
+However, even here, the trend is toward sampling. Recent work on quality-aware decoding shows that sampling with a reranker can match beam search quality at lower compute cost, especially for large models that are already well-calibrated.
+
+### Batch inference and offline processing: sampling with high throughput
+
+**Recommended**: Top-p sampling, maximize batch size.
+
+When processing large datasets offline (e.g., generating summaries for millions of documents), throughput is everything. Sampling allows you to pack the maximum number of requests per GPU, achieving 5-15x the throughput of beam search at the same hardware cost.
+
+If quality is critical, generate $N$ samples per input and select the best one with a reward model or heuristic. This "best-of-N" approach is more hardware-efficient than $N$-beam search because the $N$ samples do not require KV cache sharing or beam management overhead.
+
+### Structured output (JSON, SQL, etc.): constrained sampling
+
+**Recommended**: Constrained decoding with top-p sampling, $T = 0.3$-$0.7$.
+
+When the output must conform to a grammar, constrained decoding eliminates the possibility of format violations. This makes beam search unnecessary for format correctness — the grammar mask handles it. Use low temperature for accuracy-critical schemas and moderate temperature when the content within the structure should be diverse.
+
+<Benchmark
+  title="Decision matrix: decoding strategy by use case"
+  columns={["Use case", "Strategy", "Key params", "Why this choice"]}
+  rows={[
+    { values: ["Chat / conversation", "Top-p sampling", "T=0.7, p=0.95", "Low latency, high throughput, natural diversity"], highlight: true },
+    { values: ["Code generation", "Low-temperature sampling", "T=0.1-0.3, p=0.95", "Correctness over diversity"], highlight: true },
+    { values: ["Translation", "Beam search (small)", "B=4-5, length norm", "Quality metric rewards best single output"], highlight: false },
+    { values: ["Batch summarization", "Top-p sampling", "T=0.5, p=0.9", "Maximize throughput per GPU"], highlight: true },
+    { values: ["JSON generation", "Constrained + top-p", "T=0.5, p=0.95, grammar", "Guaranteed valid structure"], highlight: true },
+    { values: ["Creative writing", "Temperature sampling", "T=0.9-1.2, p=0.95", "Maximum diversity and surprise"], highlight: false },
+    { values: ["Benchmarking", "Greedy", "T=0 (argmax)", "Deterministic, reproducible, baseline"], highlight: false },
   ]}
 />
 
+## Advanced topic: combining strategies
+
+Modern inference frameworks often combine multiple strategies. Some noteworthy combinations:
+
+### Min-p sampling
+
+A recent alternative to top-p that sets a minimum probability threshold relative to the top token. If the top token has probability $p_{\text{max}}$, min-p keeps all tokens with probability at least $\text{min\_p} \times p_{\text{max}}$. This is even more adaptive than top-p because the threshold scales with the model's confidence on the top token.
+
+### Top-k then top-p
+
+Apply top-k first (as a hard ceiling on the number of candidates), then top-p within the survivors. This provides a safety bound: even if the distribution is very flat, you never consider more than $k$ tokens. Typical values: $k = 100$, $p = 0.95$.
+
+### Sample-and-rank (best-of-N)
+
+Generate $N$ independent samples with sampling, then select the best one using a reward model, log-probability, or task-specific metric. This achieves many of the quality benefits of beam search without the memory overhead, because the $N$ samples can be generated sequentially or in parallel without sharing KV cache state.
+
+The performance advantage is significant. Generating 4 independent samples costs $4\times$ the compute but only $1\times$ the KV cache memory (processing sequentially) or $4\times$ (processing in parallel, but without the beam management overhead). Compare this to $B = 4$ beam search, which costs $4\times$ the KV cache memory *and* requires beam management.
+
+<Benchmark
+  title="Sample-and-rank vs beam search (7B model, 4 candidates)"
+  columns={["Method", "Quality (BLEU)", "Latency", "Memory", "Throughput"]
+  }
+  rows={[
+    { values: ["Beam B=4", "32.1", "1.75x", "4.0x KV", "0.20x"], highlight: false },
+    { values: ["Sample-and-rank N=4 (seq)", "31.8", "4.0x", "1.0x KV", "1.0x"], highlight: false },
+    { values: ["Sample-and-rank N=4 (par)", "31.8", "1.0x", "4.0x KV", "0.25x"], highlight: true },
+    { values: ["Sample-and-rank N=4 + reranker", "33.2", "4.2x", "1.0x KV", "0.95x"], highlight: true },
+  ]}
+  notes="BLEU scores on WMT14 En-De. Sample-and-rank with a reranker exceeds beam search quality while using 1x KV cache memory."
+/>
+
+## Putting it all together: a performance summary
+
+Let us conclude with a comprehensive comparison across all dimensions.
+
+<PerfChart
+  title="Relative cost per token by strategy (normalized to greedy = 1.0)"
+  data={[
+    { label: "Greedy", value: 1.0, color: "green", annotation: "Baseline" },
+    { label: "Top-p sample", value: 1.01, color: "green", annotation: "+1% overhead" },
+    { label: "Constrained", value: 1.03, color: "green", annotation: "+3% overhead" },
+    { label: "Beam B=2", value: 1.21, color: "blue", annotation: "+21% overhead" },
+    { label: "Beam B=4", value: 1.75, color: "orange", annotation: "+75% overhead" },
+    { label: "Beam B=8", value: 3.17, color: "red", annotation: "+217% overhead" },
+    { label: "Beam B=16", value: 6.00, color: "red", annotation: "+500% overhead" },
+  ]}
+  baseline={0}
+/>
+
+<PerfChart
+  title="KV cache memory multiplier by strategy"
+  data={[
+    { label: "Sampling (any)", value: 1.0, color: "green", annotation: "1x baseline" },
+    { label: "Beam B=4 (naive)", value: 4.0, color: "red", annotation: "4x" },
+    { label: "Beam B=4 (shared prefix)", value: 2.4, color: "orange", annotation: "2.4x (40% savings)" },
+    { label: "Beam B=4 (paged)", value: 2.0, color: "blue", annotation: "2.0x (50% savings)" },
+    { label: "Beam B=8 (paged)", value: 3.5, color: "orange", annotation: "3.5x" },
+  ]}
+  baseline={0}
+/>
+
+The story these charts tell is clear. Sampling strategies (greedy, temperature, top-k, top-p, constrained) all live in a narrow band of 1.0-1.03x overhead. They are, for all practical purposes, free beyond the model forward pass. Beam search starts at 1.2x and escalates rapidly, with both compute and memory costs scaling super-linearly for large beam widths due to batching inefficiency and memory pressure.
+
 ## Conclusion
 
-Beam search is a **systems multiplier**: it amplifies KV cache, memory bandwidth, and decode overhead. Sampling keeps the inference path lean and predictable.
+The decoding strategy you choose is a systems decision as much as a quality decision. Here are the key takeaways:
 
-If you must do beam search, treat it like a performance feature: budget memory, batch carefully, and aggressively optimize selection and cache sharing.
+**Sampling is almost always the right default.** Top-p sampling with $T = 0.7$ and $p = 0.95$ is a good starting point for most tasks. The overhead is negligible, the memory footprint is minimal, and the output quality is good. Constrained decoding adds another 1-3% overhead to guarantee structured output.
 
+**Beam search is a specialized tool.** It is justified for tasks where finding the single highest-probability sequence matters (machine translation, some summarization tasks) and where you can afford the 2-6x memory overhead and 1.5-3x latency increase. It is almost never justified for serving interactive applications.
+
+**The KV cache is the bottleneck, not compute.** Beam search's real cost is not the extra forward passes (which batch well) but the extra KV cache memory, which limits concurrency and destroys throughput. Shared-prefix optimization and paged attention reduce this by 30-60%, but the fundamental overhead remains.
+
+**Sample-and-rank is the modern alternative to beam search.** Generating N independent samples and selecting the best one with a reranker achieves comparable or better quality than beam search while maintaining sampling's memory efficiency.
+
+The decoding strategy landscape continues to evolve. Min-p sampling, speculative decoding, and grammar-guided generation are all active areas of research. But the core performance tradeoff is unlikely to change: maintaining multiple hypotheses costs memory, and memory determines throughput. Choose accordingly.

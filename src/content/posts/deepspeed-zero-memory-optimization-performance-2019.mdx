@@ -1,1094 +1,868 @@
 ---
-title: "DeepSpeed ZeRO: Memory Optimization Performance (Oct 2019)"
+title: "DeepSpeed ZeRO: Memory Optimization for Distributed Training at Scale"
 author: "stanley-phoong"
-description: "Analysis of Microsoft DeepSpeed's ZeRO memory optimization techniques for distributed training, examining how partitioning optimizer states reduces memory usage."
-publishDate: 2019-10-01
+description: "A comprehensive analysis of ZeRO's three-stage memory optimization, communication trade-offs, FSDP comparison, offloading strategies, and practical guidance for training 70B+ parameter models across GPU clusters."
+publishDate: 2025-03-21
 category: distributed-training
-tags: [deepspeed, zero, memory, optimization, distributed-training]
+tags: [deepspeed, zero, memory, optimization, distributed-training, fsdp, offloading]
 ---
 
-import { PerfChart, Benchmark, Callout } from '@/components/mdx';
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+import MemoryLayout from '@/components/mdx/MemoryLayout.astro';
 
 ## Introduction
 
-In October 2019, Microsoft Research released DeepSpeed with its innovative ZeRO (Partitioning Optimizer States) technique, which revolutionized memory efficiency in distributed deep learning training. ZeRO addressed the critical challenge of memory limitations when training large neural networks by partitioning optimizer states across multiple devices, enabling training of models that would otherwise be impossible to fit in memory.
+Training large language models is fundamentally a memory problem. A 70 billion parameter model trained with mixed-precision Adam does not merely require enough compute to multiply matrices -- it demands enough memory to simultaneously hold the model parameters, their gradients, and the optimizer's internal bookkeeping. When that total exceeds the capacity of a single GPU, you cannot train the model at all, no matter how fast your hardware is.
 
-This analysis examines ZeRO's architecture, implementation, and performance characteristics.
+ZeRO (Zero Redundancy Optimizer), introduced by Microsoft Research as part of the DeepSpeed library, attacks this problem by observing a simple fact: in standard data-parallel training, every GPU holds a complete copy of everything -- parameters, gradients, and optimizer states. If you have 64 GPUs, you store 64 identical copies of the optimizer state. That is 63 copies too many. ZeRO eliminates this redundancy by partitioning (sharding) these tensors across the data-parallel group so that each GPU stores only a fraction of the total state.
 
-## Background: Memory Challenges in Distributed Training
+This post works through the precise memory arithmetic, explains each of ZeRO's three stages, quantifies the communication costs, compares ZeRO-3 against PyTorch FSDP, covers offloading to CPU and NVMe, presents real throughput numbers, and ends with guidance on when ZeRO is not the right tool.
 
-Traditional distributed training faced significant memory challenges:
+## Why ZeRO Exists: The Memory Arithmetic of Large Model Training
 
-```python
-import torch
-import torch.distributed as dist
+To understand ZeRO, you first need to understand exactly where memory goes during training. Consider a model with $\Phi$ parameters trained with mixed-precision Adam (the most common setup for LLMs).
 
-class TraditionalDistributedOptimizer:
-    def __init__(self, model, optimizer):
-        self.model = model
-        self.optimizer = optimizer
-        # Every GPU stores full optimizer state
-        self.setup_distributed_training()
-    
-    def setup_distributed_training(self):
-        """
-        In traditional approach, each GPU stores:
-        - Model parameters
-        - Gradients
-        - Optimizer states (momentum, velocity for Adam)
-        """
-        # Memory per GPU = model_params + gradients + optimizer_states
-        # For Adam: memory = 1 + 1 + 2 = 4x model size
-        pass
-    
-    def step(self):
-        # Each GPU performs local optimization
-        self.optimizer.step()
-        
-        # Synchronize parameters across GPUs
-        for param in self.model.parameters():
-            dist.all_reduce(param.data)
-            param.data /= dist.get_world_size()
+### Per-Parameter Memory Breakdown
 
-def calculate_traditional_memory(model_size_gb, optimizer_type='adam'):
-    """
-    Calculate memory requirements for traditional distributed training
-    """
-    if optimizer_type.lower() == 'adam':
-        # Adam: params + gradients + momentum + velocity = 4x model size
-        optimizer_overhead = 2.0  # momentum + velocity
-        gradient_overhead = 1.0   # gradients
-    elif optimizer_type.lower() == 'momentum_sgd':
-        # Momentum SGD: params + gradients + momentum = 3x model size
-        optimizer_overhead = 1.0  # momentum
-        gradient_overhead = 1.0   # gradients
-    else:
-        # SGD: params + gradients = 2x model size
-        optimizer_overhead = 0.0  # no optimizer state
-        gradient_overhead = 1.0   # gradients
-    
-    memory_per_gpu = model_size_gb * (1 + gradient_overhead + optimizer_overhead)
-    total_system_memory = memory_per_gpu * dist.get_world_size()
-    
-    return {
-        'model_memory_gb': model_size_gb,
-        'optimizer_overhead_gb': model_size_gb * optimizer_overhead,
-        'gradient_overhead_gb': model_size_gb * gradient_overhead,
-        'memory_per_gpu_gb': memory_per_gpu,
-        'total_system_memory_gb': total_system_memory,
-        'memory_efficiency': 1.0  # No optimization
-    }
+In mixed-precision training with Adam, each parameter consumes:
 
-# Example: 1B parameter model with Adam optimizer
-# Memory per GPU = 4GB (params) + 4GB (grads) + 8GB (Adam states) = 12GB per GPU!
-```
+- **FP16 parameters**: $2$ bytes per parameter (the weights used in forward/backward)
+- **FP16 gradients**: $2$ bytes per parameter (computed during backpropagation)
+- **FP32 master copy of parameters**: $4$ bytes per parameter (Adam updates happen in FP32 for numerical stability)
+- **FP32 first moment (momentum)**: $4$ bytes per parameter
+- **FP32 second moment (variance)**: $4$ bytes per parameter
 
-<Benchmark
-  title="Memory Requirements: Traditional vs ZeRO"
-  columns={["Model Size", "Optimizer", "Traditional Memory/GPU", "ZeRO Memory/GPU", "Memory Reduction"]}
-  rows={[
-    { values: ["100M params", "Adam", "4GB", "1.33GB", "67%"], highlight: false },
-    { values: ["1B params", "Adam", "40GB", "13.3GB", "67%"], highlight: false },
-    { values: ["10B params", "Adam", "400GB", "133GB", "67%"], highlight: false },
-    { values: ["100M params", "SGD", "2GB", "1.0GB", "50%"], highlight: false },
-    { values: ["1B params", "SGD", "20GB", "10GB", "50%"], highlight: false },
-  ]}
-/>
+Total per parameter: $2 + 2 + 4 + 4 + 4 = 16$ bytes.
 
-## ZeRO Architecture
+The optimizer states alone (FP32 copy + momentum + variance) account for $12$ bytes per parameter -- 75% of the total memory. The parameters and gradients that the model actually uses for computation are only $4$ bytes combined.
 
-### ZeRO-1: Partitioning Optimizer States
-
-The first level of ZeRO partitions optimizer states across data-parallel processes:
-
-```python
-class ZeRO1Optimizer:
-    def __init__(self, model, optimizer, dp_world_size, dp_rank):
-        self.model = model
-        self.optimizer = optimizer
-        self.dp_world_size = dp_world_size
-        self.dp_rank = dp_rank
-        
-        # Partition optimizer states across GPUs
-        self.partition_optimizer_states()
-    
-    def partition_optimizer_states(self):
-        """
-        Partition optimizer states across data-parallel processes
-        Each GPU stores only 1/dp_world_size of optimizer states
-        """
-        self.partitioned_states = {}
-        
-        for group_idx, param_group in enumerate(self.optimizer.param_groups):
-            for param_idx, param in enumerate(param_group['params']):
-                # Calculate which GPU owns this parameter's optimizer state
-                owner_rank = (group_idx * len(param_group['params']) + param_idx) % self.dp_world_size
-                
-                if owner_rank == self.dp_rank:
-                    # This GPU owns the optimizer state for this parameter
-                    if hasattr(self.optimizer, 'state'):
-                        self.partitioned_states[(group_idx, param_idx)] = {}
-                        
-                        # Store optimizer state (e.g., momentum, velocity for Adam)
-                        if param in self.optimizer.state:
-                            for key, value in self.optimizer.state[param].items():
-                                self.partitioned_states[(group_idx, param_idx)][key] = value.clone()
-                        
-                        # Initialize optimizer state if not present
-                        if (group_idx, param_idx) not in self.partitioned_states:
-                            self.initialize_optimizer_state((group_idx, param_idx), param)
-    
-    def initialize_optimizer_state(self, param_key, param):
-        """
-        Initialize optimizer state for the parameter
-        """
-        param_id = id(param)
-        self.partitioned_states[param_key] = {}
-        
-        # Initialize based on optimizer type
-        if isinstance(self.optimizer, torch.optim.Adam):
-            self.partitioned_states[param_key]['momentum_buffer'] = torch.zeros_like(param.data)
-            self.partitioned_states[param_key]['velocity_buffer'] = torch.zeros_like(param.data)
-    
-    def step(self):
-        """
-        Perform optimizer step with state partitioning
-        """
-        # Gather all optimizer states for the step
-        all_states = self.gather_all_optimizer_states()
-        
-        # Perform optimization
-        for group_idx, param_group in enumerate(self.optimizer.param_groups):
-            for param_idx, param in enumerate(param_group['params']):
-                if param.grad is not None:
-                    # Get the correct GPU that owns this parameter's state
-                    owner_rank = (group_idx * len(param_group['params']) + param_idx) % self.dp_world_size
-                    
-                    if owner_rank == self.dp_rank:
-                        # Perform optimization step for owned parameters
-                        self.perform_optimization_step(
-                            param, 
-                            param.grad, 
-                            (group_idx, param_idx)
-                        )
-        
-        # Scatter updated states back to respective GPUs
-        self.scatter_optimizer_states()
-    
-    def gather_all_optimizer_states(self):
-        """
-        Gather optimizer states from all processes
-        """
-        # This is a simplified representation
-        # Actual implementation uses efficient communication
-        all_states = {}
-        
-        # Gather state partitions from all ranks
-        for rank in range(self.dp_world_size):
-            # In practice, this would use collective communication
-            pass
-        
-        return all_states
-    
-    def scatter_optimizer_states(self):
-        """
-        Scatter updated optimizer states to respective processes
-        """
-        # Scatter updated states back to owning processes
-        pass
-    
-    def perform_optimization_step(self, param, grad, param_key):
-        """
-        Perform optimization step for a parameter
-        """
-        if param_key in self.partitioned_states:
-            state = self.partitioned_states[param_key]
-            
-            # Adam-like update (simplified)
-            if 'momentum_buffer' in state and 'velocity_buffer' in state:
-                # Update momentum
-                state['momentum_buffer'].mul_(0.9).add_(grad, alpha=1 - 0.9)
-                
-                # Update velocity  
-                state['velocity_buffer'].mul_(0.999).addcmul_(grad, grad, value=1 - 0.999)
-                
-                # Bias correction and parameter update
-                timestep = getattr(self.optimizer, 'timestep', 1)
-                timestep += 1
-                
-                m_hat = state['momentum_buffer'] / (1 - 0.9 ** timestep)
-                v_hat = state['velocity_buffer'] / (1 - 0.999 ** timestep)
-                
-                param.data.addcdiv_(m_hat, torch.sqrt(v_hat) + 1e-8, value=-self.optimizer.param_groups[0]['lr'])
-
-def analyze_zero1_memory_savings(total_params, dp_world_size):
-    """
-    Analyze memory savings with ZeRO-1
-    """
-    # Traditional: each GPU stores full optimizer states
-    traditional_memory = total_params * 4  # params + grads + momentum + velocity
-    
-    # ZeRO-1: optimizer states partitioned across GPUs
-    zero1_memory = total_params * 2 + (total_params * 2) / dp_world_size  # params + grads + partitioned optimizer states
-    
-    memory_saved = traditional_memory - zero1_memory
-    efficiency_improvement = traditional_memory / zero1_memory
-    
-    return {
-        'traditional_memory': traditional_memory,
-        'zero1_memory': zero1_memory,
-        'memory_saved': memory_saved,
-        'efficiency_improvement': efficiency_improvement,
-        'memory_utilization': zero1_memory / traditional_memory
-    }
-```
-
-<PerfChart
-  title="Memory Usage: Traditional vs ZeRO-1"
-  type="bar"
-  unit="GB"
-/>
-
-### ZeRO-2: Partitioning Gradients
-
-Building on ZeRO-1, ZeRO-2 also partitions gradients:
-
-```python
-class ZeRO2Optimizer(ZeRO1Optimizer):
-    def __init__(self, model, optimizer, dp_world_size, dp_rank):
-        super().__init__(model, optimizer, dp_world_size, dp_rank)
-        
-        # Additional partitioning for gradients
-        self.partition_gradients = True
-    
-    def partition_gradients(self):
-        """
-        Partition gradients across data-parallel processes
-        Each GPU stores only 1/dp_world_size of gradients
-        """
-        self.partitioned_gradients = {}
-        
-        for group_idx, param_group in enumerate(self.optimizer.param_groups):
-            for param_idx, param in enumerate(param_group['params']):
-                owner_rank = (group_idx * len(param_group['params']) + param_idx) % self.dp_world_size
-                
-                if owner_rank == self.dp_rank:
-                    # This GPU owns gradients for this parameter
-                    self.partitioned_gradients[(group_idx, param_idx)] = param.grad.clone() if param.grad is not None else torch.zeros_like(param.data)
-    
-    def backward_pass(self, loss):
-        """
-        Perform backward pass with gradient partitioning
-        """
-        # Compute gradients normally
-        loss.backward()
-        
-        # Partition gradients across GPUs
-        self.sync_and_partition_gradients()
-    
-    def sync_and_partition_gradients(self):
-        """
-        Synchronize and partition gradients across processes
-        """
-        # All-reduce gradients but only store partitioned portion
-        for group_idx, param_group in enumerate(self.optimizer.param_groups):
-            for param_idx, param in enumerate(param_group['params']):
-                if param.grad is not None:
-                    owner_rank = (group_idx * len(param_group['params']) + param_idx) % self.dp_world_size
-                    
-                    if owner_rank == self.dp_rank:
-                        # Store this gradient partition
-                        self.partitioned_gradients[(group_idx, param_idx)] = param.grad.data
-                    else:
-                        # Zero out gradients not owned by this rank
-                        param.grad = None
-    
-    def update_parameters(self):
-        """
-        Update parameters using partitioned gradients and states
-        """
-        for group_idx, param_group in enumerate(self.optimizer.param_groups):
-            for param_idx, param in enumerate(param_group['params']):
-                owner_rank = (group_idx * len(param_group['params']) + param_idx) % self.dp_world_size
-                
-                if owner_rank == self.dp_rank:
-                    # This GPU has both gradient and optimizer state
-                    grad = self.partitioned_gradients.get((group_idx, param_idx))
-                    if grad is not None:
-                        # Apply optimization step
-                        self.perform_optimization_step(param, grad, (group_idx, param_idx))
-
-def compare_memory_efficiency(model_params, dp_world_size):
-    """
-    Compare memory efficiency across different approaches
-    """
-    results = {
-        'traditional': {
-            'memory_per_gpu': model_params * 4,  # params + grads + mom + vel
-            'efficiency': 1.0
-        },
-        'zero1': {
-            'memory_per_gpu': model_params * 2 + (model_params * 2) / dp_world_size,
-            'efficiency': (model_params * 4) / (model_params * 2 + (model_params * 2) / dp_world_size)
-        },
-        'zero2': {
-            'memory_per_gpu': model_params * 1 + (model_params * 2) / dp_world_size,  # params + partitioned grads + partitioned opt states
-            'efficiency': (model_params * 4) / (model_params * 1 + (model_params * 2) / dp_world_size)
-        }
-    }
-    
-    return results
-```
-
-<Benchmark
-  title="ZeRO Memory Efficiency Comparison"
-  columns={["Approach", "Memory per GPU", "Efficiency Improvement", "Max Model Size"]}
-  rows={[
-    { values: ["Traditional", "4x model", "1.0x", "Baseline"], highlight: false },
-    { values: ["ZeRO-1", "2.25x model", "1.8x", "1.8x"], highlight: false },
-    { values: ["ZeRO-2", "1.25x model", "3.2x", "3.2x"], highlight: false },
-    { values: ["ZeRO-3", "1.0x model", "4.0x", "4.0x"], highlight: false },
-  ]}
-/>
-
-### ZeRO-3: Partitioning Parameters
-
-The most aggressive level partitions parameters themselves:
-
-```python
-class ZeRO3Optimizer(ZeRO2Optimizer):
-    def __init__(self, model, optimizer, dp_world_size, dp_rank):
-        super().__init__(model, optimizer, dp_world_size, dp_rank)
-        
-        # Partition parameters across GPUs
-        self.partition_parameters = True
-        self.setup_parameter_partitioning()
-    
-    def setup_parameter_partitioning(self):
-        """
-        Partition model parameters across data-parallel processes
-        Each GPU stores only 1/dp_world_size of model parameters
-        """
-        self.parameter_partitions = {}
-        self.param_owner_mapping = {}
-        
-        param_idx = 0
-        for group_idx, param_group in enumerate(self.optimizer.param_groups):
-            for local_param_idx, param in enumerate(param_group['params']):
-                # Assign parameter to a GPU
-                owner_rank = param_idx % self.dp_world_size
-                
-                self.param_owner_mapping[(group_idx, local_param_idx)] = owner_rank
-                
-                if owner_rank == self.dp_rank:
-                    # This GPU owns this parameter
-                    self.parameter_partitions[(group_idx, local_param_idx)] = {
-                        'param': param.data,
-                        'grad': param.grad if param.grad is not None else torch.zeros_like(param.data),
-                        'state': self.optimizer.state.get(param, {}).copy()
-                    }
-                
-                param_idx += 1
-    
-    def gather_parameters_for_forward(self):
-        """
-        Gather parameters from all processes for forward pass
-        """
-        # In practice, this uses efficient broadcast/gather operations
-        gathered_params = {}
-        
-        # Each GPU broadcasts its parameter partition
-        for (group_idx, param_idx), partition_data in self.parameter_partitions.items():
-            gathered_params[(group_idx, param_idx)] = partition_data['param']
-        
-        return gathered_params
-    
-    def scatter_parameters_after_backward(self):
-        """
-        Scatter updated parameters after backward pass
-        """
-        # After optimization, scatter updated parameters to respective owners
-        for (group_idx, param_idx), partition_data in self.parameter_partitions.items():
-            owner_rank = self.param_owner_mapping[(group_idx, param_idx)]
-            
-            if owner_rank == self.dp_rank:
-                # Update the stored parameter
-                self.parameter_partitions[(group_idx, param_idx)]['param'] = partition_data['param']
-    
-    def forward_with_partitioned_params(self, input_tensor):
-        """
-        Forward pass with parameter gathering/scattering
-        """
-        # Gather parameters from all processes
-        all_params = self.gather_parameters_for_forward()
-        
-        # Perform forward pass (conceptually)
-        # In practice, this is done more efficiently with parameter hooks
-        
-        # Scatter parameters after forward pass
-        # self.scatter_parameters_after_backward()  # Only after backward
-        
-        # For conceptual purposes, we'll return a mock output
-        return torch.randn(input_tensor.shape[0], 1000)  # Mock output
-
-def analyze_communication_overhead():
-    """
-    Analyze communication overhead of different ZeRO levels
-    """
-    overhead_analysis = {
-        'zero1': {
-            'additional_communication': 'Minimal - only optimizer state sync',
-            'comm_volume_per_step': '2x model size / world_size',
-            'bandwidth_requirement': 'Low'
-        },
-        'zero2': {
-            'additional_communication': 'Gradient reduction + optimizer state sync',
-            'comm_volume_per_step': '4x model size / world_size',
-            'bandwidth_requirement': 'Medium'
-        },
-        'zero3': {
-            'additional_communication': 'Parameter broadcast + gradient reduction + optimizer sync',
-            'comm_volume_per_step': '6x model size / world_size', 
-            'bandwidth_requirement': 'High'
-        }
-    }
-    
-    return overhead_analysis
-```
-
-<PerfChart
-  title="Communication Overhead vs Memory Savings"
-  type="line"
-  unit="GB per step"
-/>
-
-## Performance Analysis
-
-### Memory vs Communication Trade-offs
-
-```python
-def evaluate_zero_tradeoffs(model_size_gb, dp_world_size, network_bandwidth_gbps=10):
-    """
-    Evaluate trade-offs between memory savings and communication overhead
-    """
-    # Memory savings
-    memory_traditional = model_size_gb * 4  # params + grads + mom + vel
-    memory_zero3 = model_size_gb * 1       # partitioned across GPUs
-    
-    memory_saved_gb = memory_traditional - memory_zero3
-    memory_efficiency = memory_traditional / memory_zero3
-    
-    # Communication overhead
-    comm_volume_per_step_gb = (model_size_gb * 6) / dp_world_size  # Parameter + grad + opt state sync
-    
-    # Time to communicate (assuming 10GBps network)
-    comm_time_per_step_sec = (comm_volume_per_step_gb * 8) / network_bandwidth_gbps  # Convert GB to Gb
-    
-    # Effective training time increase due to communication
-    base_compute_time = 0.1  # 100ms per step (example)
-    total_time_with_comm = base_compute_time + comm_time_per_step_sec
-    slowdown_factor = total_time_with_comm / base_compute_time
-    
-    return {
-        'model_size_gb': model_size_gb,
-        'memory_traditional_gb': memory_traditional,
-        'memory_zero3_gb': memory_zero3,
-        'memory_saved_gb': memory_saved_gb,
-        'memory_efficiency': memory_efficiency,
-        'comm_volume_per_step_gb': comm_volume_per_step_gb,
-        'comm_time_per_step_sec': comm_time_per_step_sec,
-        'slowdown_factor': slowdown_factor,
-        'net_benefit': memory_efficiency / slowdown_factor if slowdown_factor > 0 else float('inf')
-    }
-
-def benchmark_zero_performance():
-    """
-    Benchmark performance of different ZeRO configurations
-    """
-    benchmarks = {
-        'model_1b_param': {
-            'traditional': {
-                'memory_per_gpu_gb': 12,  # 4*3 (params + grads + opt states)
-                'max_batch_size': 8,
-                'steps_per_second': 2.5
-            },
-            'zero2': {
-                'memory_per_gpu_gb': 3.5,  # Much more efficient
-                'max_batch_size': 32,     # Can fit larger batches
-                'steps_per_second': 2.2   # Slightly slower due to comm overhead
-            },
-            'zero3': {
-                'memory_per_gpu_gb': 1.2,  # Most efficient
-                'max_batch_size': 64,     # Largest possible batches
-                'steps_per_second': 1.8   # More communication overhead
-            }
-        }
-    }
-    
-    return benchmarks
-```
-
-<Benchmark
-  title="ZeRO Performance Benchmarks"
-  columns={["Model", "Approach", "Memory/GPU", "Max Batch Size", "Steps/Sec"]}
-  rows={[
-    { values: ["1B params", "Traditional", "12GB", "8", "2.5"], highlight: false },
-    { values: ["1B params", "ZeRO-2", "3.5GB", "32", "2.2"], highlight: false },
-    { values: ["1B params", "ZeRO-3", "1.2GB", "64", "1.8"], highlight: false },
-    { values: ["10B params", "Traditional", "120GB", "1", "0.2"], highlight: false },
-    { values: ["10B params", "ZeRO-2", "35GB", "4", "0.8"], highlight: false },
-    { values: ["10B params", "ZeRO-3", "12GB", "16", "0.6"], highlight: false },
-  ]}
-/>
-
-## Advanced ZeRO Optimizations
-
-### Gradient Compression Integration
-
-```python
-class ZeROWithCompression:
-    def __init__(self, base_zero_optimizer, compression_ratio=10):
-        self.base_optimizer = base_zero_optimizer
-        self.compression_ratio = compression_ratio
-        self.gradient_compressor = self.initialize_compressor()
-    
-    def initialize_compressor(self):
-        """
-        Initialize gradient compressor for ZeRO
-        """
-        # Could be Top-K sparsification, quantization, etc.
-        return TopKCompressor(k_ratio=1.0/self.compression_ratio)
-    
-    def sync_gradients_with_compression(self):
-        """
-        Synchronize gradients with compression in ZeRO context
-        """
-        # Get gradients that need to be synced
-        gradients_to_sync = self.get_gradients_for_sync()
-        
-        # Compress gradients before communication
-        compressed_gradients = {}
-        for param_key, grad in gradients_to_sync.items():
-            compressed_grad, metadata = self.gradient_compressor.compress(grad)
-            compressed_gradients[param_key] = (compressed_grad, metadata)
-        
-        # Communicate compressed gradients
-        synced_compressed = self.communicate_compressed_gradients(compressed_gradients)
-        
-        # Decompress and apply
-        for param_key, (compressed_grad, metadata) in synced_compressed.items():
-            decompressed_grad = self.gradient_compressor.decompress((compressed_grad, metadata))
-            self.apply_gradient(param_key, decompressed_grad)
-```
-
-### Checkpointing and Recovery
-
-```python
-class ZeROCheckpointManager:
-    def __init__(self, zero_optimizer):
-        self.zero_optimizer = zero_optimizer
-        self.checkpoint_dir = "./checkpoints"
-    
-    def save_checkpoint(self, epoch, step, model, optimizer, **kwargs):
-        """
-        Save checkpoint with ZeRO-specific state
-        """
-        import os
-        import torch
-        
-        checkpoint_path = os.path.join(self.checkpoint_dir, f"epoch_{epoch}_step_{step}.pt")
-        
-        # Gather full optimizer state before saving
-        full_optimizer_state = self.gather_full_optimizer_state()
-        
-        checkpoint = {
-            'epoch': epoch,
-            'step': step,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': full_optimizer_state,
-            'zero_state': self.zero_optimizer.get_zero_state(),
-            **kwargs
-        }
-        
-        torch.save(checkpoint, checkpoint_path)
-        print(f"Saved checkpoint to {checkpoint_path}")
-    
-    def load_checkpoint(self, checkpoint_path, model, optimizer):
-        """
-        Load checkpoint with ZeRO-specific state
-        """
-        checkpoint = torch.load(checkpoint_path)
-        
-        model.load_state_dict(checkpoint['model_state_dict'])
-        
-        # Load full optimizer state
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        
-        # Restore ZeRO-specific state
-        self.zero_optimizer.load_zero_state(checkpoint['zero_state'])
-        
-        return checkpoint['epoch'], checkpoint['step']
-    
-    def gather_full_optimizer_state(self):
-        """
-        Gather full optimizer state from all partitions
-        """
-        # This involves communication across all processes
-        # to reconstruct the complete optimizer state
-        pass
-    
-    def get_zero_state(self):
-        """
-        Get ZeRO-specific state for checkpointing
-        """
-        return {
-            'partition_info': self.zero_optimizer.param_owner_mapping,
-            'current_states': self.zero_optimizer.partitioned_states,
-            'dp_rank': self.zero_optimizer.dp_rank,
-            'dp_world_size': self.zero_optimizer.dp_world_size
-        }
-```
-
-## Hardware Considerations
-
-### Network Topology Impact
-
-```python
-def analyze_network_impact_on_zero():
-    """
-    Analyze how network topology affects ZeRO performance
-    """
-    network_types = {
-        'ethernet_1gbps': {
-            'bandwidth_gbps': 1,
-            'latency_ms': 1.0,
-            'zero1_max_efficiency': 2.5,
-            'zero2_max_efficiency': 1.8,
-            'zero3_max_efficiency': 1.2
-        },
-        'ethernet_10gbps': {
-            'bandwidth_gbps': 10,
-            'latency_ms': 0.5,
-            'zero1_max_efficiency': 3.2,
-            'zero2_max_efficiency': 2.5,
-            'zero3_max_efficiency': 1.8
-        },
-        'infiniband_100gbps': {
-            'bandwidth_gbps': 100,
-            'latency_ms': 0.01,
-            'zero1_max_efficiency': 3.8,
-            'zero2_max_efficiency': 3.2,
-            'zero3_max_efficiency': 2.8
-        },
-        'nvlink': {
-            'bandwidth_gbps': 300,  # Per connection
-            'latency_ms': 0.003,
-            'zero1_max_efficiency': 4.0,
-            'zero2_max_efficiency': 3.8,
-            'zero3_max_efficiency': 3.5
-        }
-    }
-    
-    return network_types
-
-def memory_bandwidth_requirements():
-    """
-    Analyze memory bandwidth requirements for ZeRO
-    """
-    requirements = {
-        'zero1': {
-            'peak_memory_bandwidth': 'Moderate - mainly for computation',
-            'communication_bandwidth': 'Low - only optimizer states',
-            'storage_bandwidth': 'Low'
-        },
-        'zero2': {
-            'peak_memory_bandwidth': 'Moderate',
-            'communication_bandwidth': 'Medium - gradients + optimizer states', 
-            'storage_bandwidth': 'Medium - for checkpoints'
-        },
-        'zero3': {
-            'peak_memory_bandwidth': 'Low - minimal parameter storage',
-            'communication_bandwidth': 'High - parameters + gradients + optimizer states',
-            'storage_bandwidth': 'High - distributed checkpoints'
-        }
-    }
-    
-    return requirements
-```
-
-<PerfChart
-  title="ZeRO Performance by Network Type"
-  type="bar"
-  unit="Efficiency Score"
-/>
-
-## Implementation Strategies
-
-### Integration with Existing Frameworks
-
-```python
-class DeepSpeedZeROInterface:
-    def __init__(self, model, optimizer_config):
-        self.model = model
-        self.optimizer_config = optimizer_config
-        self.setup_deepspeed_config()
-    
-    def setup_deepspeed_config(self):
-        """
-        Setup DeepSpeed configuration for ZeRO
-        """
-        self.deepspeed_config = {
-            "train_batch_size": 8,
-            "train_micro_batch_size_per_gpu": 1,
-            "gradient_clipping": 1.0,
-            "zero_optimization": {
-                "stage": 2,  # ZeRO-2
-                "allgather_partitions": True,
-                "allgather_bucket_size": 2e8,
-                "overlap_comm": True,
-                "reduce_scatter": True,
-                "reduce_bucket_size": 2e8,
-                "contiguous_gradients": True,
-                "cpu_offload": False
-            },
-            "optimizer": {
-                "type": "Adam",
-                "params": {
-                    "lr": 0.001,
-                    "betas": [0.9, 0.999],
-                    "eps": 1e-8
-                }
-            }
-        }
-    
-    def train_with_deepspeed(self, train_dataloader, epochs):
-        """
-        Train model using DeepSpeed with ZeRO
-        """
-        import deepspeed
-        
-        # Initialize DeepSpeed engine
-        model_engine, optimizer, _, _ = deepspeed.initialize(
-            args=None,
-            model=self.model,
-            model_parameters=self.model.parameters(),
-            config=self.deepspeed_config
-        )
-        
-        for epoch in range(epochs):
-            for step, batch in enumerate(train_dataloader):
-                # Forward pass
-                loss = model_engine(batch)
-                
-                # Backward pass and step - handled by DeepSpeed
-                model_engine.backward(loss)
-                model_engine.step()
-                
-                if step % 100 == 0:
-                    print(f"Epoch {epoch}, Step {step}, Loss: {loss.item()}")
-
-class ZeROOptimizerWrapper:
-    """
-    Wrapper to integrate ZeRO with existing PyTorch optimizers
-    """
-    def __init__(self, optimizer, partition_method='zero2'):
-        self.wrapped_optimizer = optimizer
-        self.partition_method = partition_method
-        self.partitioned_states = {}
-        self.grad_partition_map = {}
-    
-    def zero_grad(self):
-        """
-        Zero gradients - handle partitioning appropriately
-        """
-        # Only zero gradients for parameters owned by this process
-        for group in self.wrapped_optimizer.param_groups:
-            for param in group['params']:
-                if self.is_param_owned_by_this_process(param):
-                    param.grad = None  # Will be handled by ZeRO
-    
-    def step(self):
-        """
-        Perform optimization step with ZeRO
-        """
-        # Synchronize gradients across processes
-        self.synchronize_gradients()
-        
-        # Update parameters using partitioned optimizer states
-        self.update_partitioned_parameters()
-    
-    def is_param_owned_by_this_process(self, param):
-        """
-        Check if this process owns the parameter
-        """
-        param_id = id(param)
-        return self.grad_partition_map.get(param_id, 0) == self.get_process_rank()
-    
-    def get_process_rank(self):
-        """
-        Get current process rank
-        """
-        try:
-            import torch.distributed as dist
-            return dist.get_rank()
-        except:
-            return 0
-```
-
-## Performance Bottleneck Analysis
-
-### Identifying ZeRO Performance Issues
-
-```python
-def analyze_zezero_bottlenecks():
-    """
-    Analyze potential bottlenecks in ZeRO implementations
-    """
-    bottlenecks = {
-        'communication_saturation': {
-            'description': 'Network bandwidth becomes saturated with parameter/gradient sync',
-            'mitigation': 'Use faster interconnects (InfiniBand, NVLink)',
-            'severity': 'High for ZeRO-3'
-        },
-        'memory_fragmentation': {
-            'description': 'Frequent allocation/deallocation of partitioned states',
-            'mitigation': 'Use memory pools and pre-allocation',
-            'severity': 'Medium'
-        },
-        'load_imbalance': {
-            'description': 'Unequal parameter sizes across partitions',
-            'mitigation': 'Smart parameter assignment algorithms',
-            'severity': 'Medium'
-        },
-        'checkpoint_overhead': {
-            'description': 'Cost of gathering full state for checkpoints',
-            'mitigation': 'Asynchronous checkpointing, sharded checkpoints',
-            'severity': 'Medium'
-        },
-        'broadcast_overhead': {
-            'description': 'Parameter broadcasting in ZeRO-3 forward pass',
-            'mitigation': 'Overlap communication with computation',
-            'severity': 'High for ZeRO-3'
-        }
-    }
-    
-    return bottlenecks
-
-def zeero_profiling_tool():
-    """
-    Tool to profile ZeRO performance
-    """
-    profile_data = {
-        'memory_usage_timeline': {
-            'traditional_peak_gb': 12.0,
-            'zero2_peak_gb': 3.5,
-            'zero3_peak_gb': 1.2
-        },
-        'communication_timeline': {
-            'traditional_comm_gb': 0.0,  # No extra comm for traditional
-            'zero2_comm_gb': 0.8,       # Gradient + opt state sync
-            'zero3_comm_gb': 2.4        # Param + grad + opt state sync
-        },
-        'computation_timeline': {
-            'traditional_compute_time': 100,  # ms per step
-            'zero2_compute_time': 105,       # Slightly higher due to comm
-            'zero3_compute_time': 115        # Higher due to more comm
-        },
-        'overall_efficiency': {
-            'traditional': 1.0,
-            'zero2': 2.8,  # 2.8x more efficient in memory
-            'zero3': 3.5   # 3.5x more efficient in memory
-        }
-    }
-    
-    return profile_data
-```
-
-<Benchmark
-  title="ZeRO Bottleneck Impact Analysis"
-  columns={["Bottleneck", "Severity", "Mitigation Difficulty", "Performance Impact"]}
-  rows={[
-    { values: ["Communication Saturation", "High", "Medium", "30-50% slowdown"], highlight: false },
-    { values: ["Memory Fragmentation", "Medium", "Low", "10-20% slowdown"], highlight: false },
-    { values: ["Load Imbalance", "Medium", "High", "15-25% slowdown"], highlight: false },
-    { values: ["Checkpoint Overhead", "Medium", "Medium", "5-15% slowdown"], highlight: false },
-    { values: ["Broadcast Overhead", "High", "High", "20-40% slowdown"], highlight: false },
-  ]}
-/>
-
-## Practical Implementation Guidelines
-
-### When to Use Each ZeRO Level
-
-<Callout type="tip" title="ZeRO Level Selection">
-Use ZeRO-1 when: (1) Memory is moderately constrained, (2) Communication is limited. Use ZeRO-2 when: (1) Strong memory constraints exist, (2) Network is reasonably fast. Use ZeRO-3 when: (1) Extreme memory constraints, (2) High-speed interconnect available.
+<Callout type="info" title="The 16-Byte Rule">
+For mixed-precision Adam, multiply parameter count by 16 to get total training memory in bytes. A 1B parameter model needs 16 GB. A 70B parameter model needs 1,120 GB (1.12 TB). No single GPU comes close.
 </Callout>
 
-<Benchmark
-  title="ZeRO Level Selection Guide"
-  columns={["Scenario", "Recommended Level", "Rationale", "Expected Benefit"]}
-  rows={[
-    { values: ["Large model, moderate GPUs", "ZeRO-2", "Balance memory/comm", "3x memory efficiency"], highlight: false },
-    { values: ["Very large model, fast network", "ZeRO-3", "Max memory efficiency", "4x memory efficiency"], highlight: false },
-    { values: ["Limited network, OK memory", "ZeRO-1", "Minimize communication", "2x memory efficiency"], highlight: false },
-    { values: ["Budget hardware", "Traditional", "Avoid complexity", "Baseline"], highlight: false },
+### Concrete Numbers for a 70B Model
+
+Let $\Phi = 70 \times 10^9$ parameters.
+
+| Component | Bytes per Param | Total for 70B |
+|-----------|----------------|---------------|
+| FP16 Parameters | 2 | 140 GB |
+| FP16 Gradients | 2 | 140 GB |
+| FP32 Master Copy | 4 | 280 GB |
+| FP32 Momentum | 4 | 280 GB |
+| FP32 Variance | 4 | 280 GB |
+| **Total** | **16** | **1,120 GB** |
+
+An NVIDIA A100 has 80 GB of HBM. An H100 has 80 GB. Even the upcoming B200 tops out at 192 GB. A single GPU cannot hold 1.12 TB.
+
+<MemoryLayout
+  title="Memory Layout: 70B Model with Mixed-Precision Adam (Single GPU, No Sharding)"
+  description="Total: 1,120 GB -- does not fit on any single GPU"
+  regions={[
+    { start: "0x00000", end: "0x23000", name: "FP16 Parameters", size: "140 GB", color: "blue", notes: "Weights used in forward/backward pass" },
+    { start: "0x23000", end: "0x46000", name: "FP16 Gradients", size: "140 GB", color: "green", notes: "Computed during backpropagation" },
+    { start: "0x46000", end: "0x8C000", name: "FP32 Master Copy", size: "280 GB", color: "orange", notes: "Full-precision copy for Adam updates" },
+    { start: "0x8C000", end: "0xD2000", name: "FP32 Momentum (m)", size: "280 GB", color: "red", notes: "First moment estimate" },
+    { start: "0xD2000", end: "0x118000", name: "FP32 Variance (v)", size: "280 GB", color: "purple", notes: "Second moment estimate" }
   ]}
 />
 
-### Best Practices
+### The Redundancy Problem in Data Parallelism
+
+Standard data-parallel (DP) training replicates the entire model on every GPU. With 8 GPUs, you store 8 copies of everything: $8 \times 1{,}120 \text{ GB} = 8{,}960 \text{ GB}$ of total memory, but you only have $8 \times 80 = 640 \text{ GB}$ available. The model does not fit.
+
+Even if you had enough memory, the redundancy is wasteful. Every GPU holds the same optimizer states, does the same Adam update on different gradients, and ends up with the same updated parameters. The only unique work each GPU does is computing gradients on its own mini-batch. ZeRO exploits this observation.
+
+## ZeRO Stages: Eliminating Redundancy Progressively
+
+ZeRO comes in three stages, each sharding an additional component across the data-parallel group. Let $N_d$ be the data-parallel degree (number of GPUs).
+
+### Stage 1: Partition Optimizer States ($P_{os}$)
+
+ZeRO Stage 1 partitions only the optimizer states across GPUs. Each GPU stores $1/N_d$ of the optimizer states but keeps a full copy of both parameters and gradients.
+
+**Memory per GPU with ZeRO-1:**
+
+$$M_{\text{ZeRO-1}} = 2\Phi + 2\Phi + \frac{12\Phi}{N_d} = 4\Phi + \frac{12\Phi}{N_d}$$
+
+For our 70B model on 8 GPUs:
+
+$$M_{\text{ZeRO-1}} = 4(70 \times 10^9) + \frac{12(70 \times 10^9)}{8} = 280 \text{ GB} + 105 \text{ GB} = 385 \text{ GB per GPU}$$
+
+Still does not fit on an 80 GB GPU, but this is a dramatic improvement over 1,120 GB. With 64 GPUs, it drops to:
+
+$$M_{\text{ZeRO-1}} = 280 + \frac{840}{64} = 280 + 13.1 = 293.1 \text{ GB per GPU}$$
+
+Still too large because of the full parameter and gradient copies. This is why Stage 1 alone is insufficient for very large models.
+
+**How it works at runtime:**
+
+1. Forward pass: all GPUs use their local copy of parameters (normal).
+2. Backward pass: all GPUs compute gradients (normal), then all-reduce gradients across GPUs (same as standard DP).
+3. Optimizer step: each GPU updates only its $1/N_d$ partition of parameters using the all-reduced gradients and its local optimizer state partition. After the update, an all-gather broadcasts the updated parameter partitions to all GPUs.
 
 ```python
-def zeero_best_practices():
-    """
-    Best practices for implementing ZeRO
-    """
-    practices = {
-        'communication_optimization': [
-            'Overlap communication with computation',
-            'Use NCCL for efficient collective operations',
-            'Batch small communications together'
-        ],
-        'memory_management': [
-            'Pre-allocate memory pools',
-            'Use contiguous memory layouts',
-            'Minimize memory fragmentation'
-        ],
-        'load_balancing': [
-            'Distribute parameters evenly across processes',
-            'Consider parameter size when assigning ownership',
-            'Monitor memory usage across processes'
-        ],
-        'checkpointing': [
-            'Use sharded checkpointing',
-            'Asynchronously save checkpoints',
-            'Compress checkpoint data'
-        ]
-    }
-    
-    return practices
+# ZeRO-1: Conceptual optimizer step
+def zero1_step(params, grads, opt_states, rank, world_size):
+    # 1. All-reduce gradients (same as standard DP)
+    for g in grads:
+        dist.all_reduce(g, op=dist.ReduceOp.AVG)
 
-def calculate_optimal_zezero_configuration(model_size_gb, available_memory_gb, network_bandwidth_gbps):
-    """
-    Calculate optimal ZeRO configuration based on constraints
-    """
-    if model_size_gb * 4 <= available_memory_gb:
-        # Traditional approach works fine
-        return {
-            'recommended_level': 'traditional',
-            'memory_usage': model_size_gb * 4,
-            'efficiency': 1.0
-        }
-    elif model_size_gb * 2 <= available_memory_gb:
-        # ZeRO-1 is sufficient
-        return {
-            'recommended_level': 'zero1', 
-            'memory_usage': model_size_gb * 2 + (model_size_gb * 2) / 8,  # Assuming 8 GPUs
-            'efficiency': (model_size_gb * 4) / (model_size_gb * 2 + (model_size_gb * 2) / 8)
-        }
-    elif model_size_gb * 1.5 <= available_memory_gb:
-        # ZeRO-2 is needed
-        return {
-            'recommended_level': 'zero2',
-            'memory_usage': model_size_gb * 1 + (model_size_gb * 2) / 8,
-            'efficiency': (model_size_gb * 4) / (model_size_gb * 1 + (model_size_gb * 2) / 8)
-        }
+    # 2. Each GPU updates only its partition of parameters
+    chunk_size = len(params) // world_size
+    start = rank * chunk_size
+    end = start + chunk_size
+
+    for i in range(start, end):
+        # Adam update using local optimizer state
+        opt_states[i]['m'] = beta1 * opt_states[i]['m'] + (1 - beta1) * grads[i]
+        opt_states[i]['v'] = beta2 * opt_states[i]['v'] + (1 - beta2) * grads[i] ** 2
+        params[i] -= lr * opt_states[i]['m'] / (opt_states[i]['v'].sqrt() + eps)
+
+    # 3. All-gather updated parameters so every GPU has the full model
+    dist.all_gather(params)
+```
+
+### Stage 2: Partition Optimizer States + Gradients ($P_{os+g}$)
+
+ZeRO Stage 2 additionally partitions gradients. Each GPU only needs to store the gradients for the parameters whose optimizer states it owns. The key mechanism is replacing the all-reduce of gradients with a reduce-scatter: each GPU ends up with the reduced (averaged) gradient for only its parameter partition.
+
+**Memory per GPU with ZeRO-2:**
+
+$$M_{\text{ZeRO-2}} = 2\Phi + \frac{2\Phi}{N_d} + \frac{12\Phi}{N_d} = 2\Phi + \frac{14\Phi}{N_d}$$
+
+For 70B on 8 GPUs:
+
+$$M_{\text{ZeRO-2}} = 140 + \frac{14(70 \times 10^9)}{8} \text{ bytes} = 140 \text{ GB} + 122.5 \text{ GB} = 262.5 \text{ GB per GPU}$$
+
+For 70B on 64 GPUs:
+
+$$M_{\text{ZeRO-2}} = 140 + \frac{980}{64} = 140 + 15.3 = 155.3 \text{ GB per GPU}$$
+
+Still not fitting on 80 GB GPUs because we still hold the full FP16 parameter copy on each GPU (140 GB for a 70B model).
+
+**How it works at runtime:**
+
+1. Forward pass: same as Stage 1.
+2. Backward pass: as gradients are computed, a reduce-scatter operation immediately distributes and reduces them. Each GPU retains only the gradient shard it owns. Gradients not owned by this GPU are discarded after reduction.
+3. Optimizer step: each GPU runs Adam on its partition using its local gradient shard and optimizer state shard. Then an all-gather synchronizes updated parameters.
+
+```python
+# ZeRO-2: Replace all-reduce with reduce-scatter for gradients
+def zero2_backward_hook(grad, rank, world_size, param_index):
+    chunk_size = grad.numel() // world_size
+
+    # Reduce-scatter: each GPU gets the reduced gradient for its partition
+    reduced_shard = torch.zeros(chunk_size, device=grad.device)
+    dist.reduce_scatter(reduced_shard, list(grad.chunk(world_size)))
+
+    if param_index // chunk_size == rank:
+        return reduced_shard  # Keep only our shard
     else:
-        # ZeRO-3 is required, ensure network can handle it
-        if network_bandwidth_gbps >= 50:
-            return {
-                'recommended_level': 'zero3',
-                'memory_usage': model_size_gb * 1,  # Fully partitioned
-                'efficiency': 4.0  # Theoretical maximum
-            }
-        else:
-            return {
-                'recommended_level': 'zero2_with_offloading',
-                'memory_usage': model_size_gb * 1 + (model_size_gb * 2) / 8,
-                'efficiency': (model_size_gb * 4) / (model_size_gb * 1 + (model_size_gb * 2) / 8),
-                'note': 'Consider CPU offloading for remaining memory pressure'
-            }
+        return None  # Discard -- we don't own this gradient
 ```
 
-## Limitations and Considerations
+### Stage 3: Partition Everything ($P_{os+g+p}$)
 
-### Communication Overhead Analysis
+ZeRO Stage 3 partitions parameters as well. No GPU holds a full copy of the model. Each GPU stores only $1/N_d$ of the parameters, gradients, and optimizer states.
+
+**Memory per GPU with ZeRO-3:**
+
+$$M_{\text{ZeRO-3}} = \frac{2\Phi}{N_d} + \frac{2\Phi}{N_d} + \frac{12\Phi}{N_d} = \frac{16\Phi}{N_d}$$
+
+For 70B on 8 GPUs:
+
+$$M_{\text{ZeRO-3}} = \frac{16 \times 70 \times 10^9}{8} = \frac{1{,}120}{8} = 140 \text{ GB per GPU}$$
+
+Still too much for 80 GB. On 16 GPUs:
+
+$$M_{\text{ZeRO-3}} = \frac{1{,}120}{16} = 70 \text{ GB per GPU}$$
+
+This fits on an 80 GB A100/H100 with 10 GB headroom for activations.
+
+On 64 GPUs:
+
+$$M_{\text{ZeRO-3}} = \frac{1{,}120}{64} = 17.5 \text{ GB per GPU}$$
+
+Plenty of room for large batch sizes and activation memory.
+
+<Callout type="perf" title="The ZeRO-3 Trade-off">
+ZeRO-3 achieves perfect memory scaling ($1/N_d$ reduction) at the cost of additional communication. Before every forward layer computation, the full parameters for that layer must be all-gathered from all GPUs. After the backward pass through each layer, the parameters are discarded. This means parameters are materialized on-demand, layer by layer.
+</Callout>
+
+**How it works at runtime:**
+
+1. Forward pass: before computing each layer, all-gather that layer's parameters from all GPUs. Compute the layer. Discard the gathered parameters (keep only the local shard).
+2. Backward pass: all-gather parameters again for each layer (needed for gradient computation). Compute gradients. Reduce-scatter gradients so each GPU keeps only its shard. Discard gathered parameters.
+3. Optimizer step: each GPU updates its $1/N_d$ shard of parameters using its local gradient and optimizer state shards. No all-gather needed after the step because the next forward pass will gather parameters on demand.
 
 ```python
-def analyze_communication_overhead():
-    """
-    Detailed analysis of communication overhead
-    """
-    overhead_analysis = {
-        'zero1_communication': {
-            'operation': 'optimizer_state_sync',
-            'volume_per_step_gb': '2 * model_size / world_size',
-            'frequency': 'every_optimizer_step',
-            'bandwidth_requirement': 'moderate'
-        },
-        'zero2_communication': {
-            'operation': 'gradient_sync + optimizer_state_sync',
-            'volume_per_step_gb': '4 * model_size / world_size',
-            'frequency': 'every_backward_pass',
-            'bandwidth_requirement': 'high'
-        },
-        'zero3_communication': {
-            'operation': 'parameter_broadcast + gradient_sync + optimizer_sync',
-            'volume_per_step_gb': '6 * model_size / world_size',
-            'frequency': 'every_forward_backward',
-            'bandwidth_requirement': 'very_high'
-        }
-    }
-    
-    return overhead_analysis
+# ZeRO-3: Parameter gathering for forward pass
+class ZeRO3Linear(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, weight_shard, rank, world_size):
+        # All-gather the full weight from all shards
+        full_weight = all_gather_parameter(weight_shard, world_size)
+        output = input @ full_weight.T
 
-def scalability_limits():
-    """
-    Analyze scalability limits of ZeRO approaches
-    """
-    limits = {
-        'zero1': {
-            'network_dependence': 'Low',
-            'scalability_limit': 'Memory - still requires significant per-GPU memory',
-            'sweet_spot': '4-16 GPUs'
-        },
-        'zero2': {
-            'network_dependence': 'Medium', 
-            'scalability_limit': 'Communication - gradient sync overhead',
-            'sweet_spot': '8-32 GPUs'
-        },
-        'zero3': {
-            'network_dependence': 'High',
-            'scalability_limit': 'Communication - parameter broadcast overhead',
-            'sweet_spot': '16+ GPUs with fast interconnect'
-        }
-    }
-    
-    return limits
+        ctx.save_for_backward(input, weight_shard)
+        ctx.rank = rank
+        ctx.world_size = world_size
+
+        # Discard full_weight -- only keep our shard
+        del full_weight
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, weight_shard = ctx.saved_tensors
+
+        # All-gather weight again for gradient computation
+        full_weight = all_gather_parameter(weight_shard, ctx.world_size)
+        grad_input = grad_output @ full_weight
+
+        # Compute gradient w.r.t. weight, then reduce-scatter
+        grad_weight_full = grad_output.T @ input
+        grad_weight_shard = reduce_scatter(grad_weight_full, ctx.world_size)
+
+        del full_weight
+        return grad_input, grad_weight_shard, None, None
 ```
 
-## Future Developments
-
-By October 2019, ZeRO was already showing promise for large-scale training:
+### Memory Summary Across All Stages
 
 <Benchmark
-  title="ZeRO Evolution and Impact"
-  columns={["Date", "Development", "Memory Efficiency", "Adoption Impact"]}
+  title="Memory per GPU: 70B Model with Mixed-Precision Adam"
+  columns={["Configuration", "Formula", "8 GPUs", "16 GPUs", "64 GPUs"]}
   rows={[
-    { values: ["Oct 2019", "ZeRO Introduction", "2-4x improvement", "High"], highlight: false },
-    { values: ["Early 2020", "ZeRO-Offload", "Additional 2-3x", "Very High"], highlight: false },
-    { values: ["Mid 2020", "ZeRO-Infinity", "CPU-Memory unlimited", "Transformative"], highlight: false },
-    { values: ["Late 2020", "Integration in frameworks", "Mainstream adoption", "Ubiquitous"], highlight: false },
+    { values: ["No ZeRO (DP)", "16*Phi", "1,120 GB", "1,120 GB", "1,120 GB"], highlight: false },
+    { values: ["ZeRO-1 (Os)", "4*Phi + 12*Phi/Nd", "385 GB", "332.5 GB", "293.1 GB"], highlight: false },
+    { values: ["ZeRO-2 (Os+g)", "2*Phi + 14*Phi/Nd", "262.5 GB", "201.3 GB", "155.3 GB"], highlight: false },
+    { values: ["ZeRO-3 (Os+g+p)", "16*Phi/Nd", "140 GB", "70 GB", "17.5 GB"], highlight: true }
+  ]}
+  notes="Phi = 70B parameters. Memory shown excludes activations and temporary buffers. 80 GB GPUs highlighted where model fits."
+/>
+
+<PerfChart
+  title="Memory per GPU vs. Number of GPUs (70B Model)"
+  type="bar"
+  unit="GB"
+  data={[
+    { label: "No ZeRO", value: 1120, color: "red", annotation: "8 GPUs" },
+    { label: "ZeRO-1", value: 385, color: "orange", annotation: "8 GPUs" },
+    { label: "ZeRO-2", value: 262, color: "blue", annotation: "8 GPUs" },
+    { label: "ZeRO-3 (8)", value: 140, color: "cyan", annotation: "8 GPUs" },
+    { label: "ZeRO-3 (16)", value: 70, color: "green", annotation: "16 GPUs -- fits 80GB!" },
+    { label: "ZeRO-3 (64)", value: 17, color: "green", annotation: "64 GPUs" }
+  ]}
+  baseline={0}
+/>
+
+## Communication Analysis
+
+ZeRO's memory savings come at a communication cost. Understanding the exact communication volume is critical for predicting training throughput.
+
+### Baseline: Standard Data Parallelism
+
+Standard DP performs one all-reduce of the gradients per training step. An all-reduce of a tensor of size $S$ bytes over $N_d$ GPUs using a ring-based algorithm communicates $2S \cdot \frac{N_d - 1}{N_d} \approx 2S$ bytes total per GPU. For our 70B model with FP16 gradients ($S = 2\Phi = 140$ GB):
+
+$$V_{\text{DP}} = 2 \times 140 = 280 \text{ GB per GPU per step}$$
+
+### ZeRO-1: No Extra Communication
+
+ZeRO-1 replaces the all-reduce with a reduce-scatter (to distribute reduced gradients to the right owners) followed by an all-gather (to broadcast updated parameters). The reduce-scatter communicates $S \cdot \frac{N_d - 1}{N_d} \approx S$ bytes, and the all-gather communicates the same. Total:
+
+$$V_{\text{ZeRO-1}} = S + S = 2S = 280 \text{ GB per GPU per step}$$
+
+This is the same volume as standard DP all-reduce. ZeRO-1 adds no extra communication -- it just restructures it.
+
+### ZeRO-2: Same Communication, Better Overlap
+
+ZeRO-2 also communicates the same total volume as standard DP. The reduce-scatter happens during the backward pass (as gradients become available), and the all-gather happens after the optimizer step. The volume is identical:
+
+$$V_{\text{ZeRO-2}} = 2S = 280 \text{ GB per GPU per step}$$
+
+The advantage of ZeRO-2 over ZeRO-1 is purely in memory: gradients are discarded after reduce-scatter rather than stored in full. Communication volume is unchanged.
+
+### ZeRO-3: Additional All-Gather Overhead
+
+ZeRO-3 adds parameter all-gathers during both the forward and backward passes. For each layer, the full parameters must be gathered before computation. Since there are forward and backward passes, parameters are gathered twice per step (some implementations cache parameters from the forward pass for the backward pass, but this trades memory for communication).
+
+The parameter all-gather volume per pass: $\frac{N_d - 1}{N_d} \times 2\Phi \approx 2\Phi$ bytes per GPU. Two passes (forward + backward) give $2 \times 2\Phi = 4\Phi$ additional bytes.
+
+Total ZeRO-3 communication per step:
+
+$$V_{\text{ZeRO-3}} = \underbrace{2\Phi}_{\text{reduce-scatter (gradients)}} + \underbrace{2\Phi}_{\text{all-gather (forward params)}} + \underbrace{2\Phi}_{\text{all-gather (backward params)}} = 6\Phi \approx 3 \times V_{\text{DP}}$$
+
+For 70B: $V_{\text{ZeRO-3}} = 6 \times 140 = 840$ GB per GPU per step, compared to 280 GB for standard DP. That is a $3\times$ communication overhead.
+
+<Benchmark
+  title="Communication Volume per GPU per Training Step"
+  columns={["Method", "Volume Formula", "70B Model (GB)", "Overhead vs DP"]}
+  rows={[
+    { values: ["Standard DP", "2 * 2*Phi", "280", "1.0x (baseline)"], highlight: false },
+    { values: ["ZeRO-1", "2 * 2*Phi", "280", "1.0x"], highlight: false },
+    { values: ["ZeRO-2", "2 * 2*Phi", "280", "1.0x"], highlight: false },
+    { values: ["ZeRO-3", "3 * 2 * 2*Phi", "840", "3.0x"], highlight: false }
+  ]}
+  notes="Volume calculated using ring-based collective algorithms. Phi = 70B. FP16 parameters and gradients (2 bytes each)."
+/>
+
+### Can ZeRO-3 Communication Be Hidden?
+
+In practice, ZeRO-3's communication overhead is partially masked by overlapping communication with computation. The parameter all-gather for layer $L+1$ can be issued while layer $L$ is computing. On modern hardware with dedicated communication channels (NVLink, InfiniBand), this overlap can hide 50-80% of the communication latency for large enough layers.
+
+The key variables that determine how effectively communication is hidden:
+
+- **Layer size**: larger layers have more compute to overlap with.
+- **Interconnect bandwidth**: NVLink (900 GB/s on H100 NVSwitch) versus InfiniBand HDR (200 Gb/s = 25 GB/s) versus InfiniBand NDR (400 Gb/s = 50 GB/s).
+- **Batch size**: larger micro-batch sizes increase the compute-to-communication ratio.
+
+```python
+# DeepSpeed config for communication overlap in ZeRO-3
+ds_config = {
+    "zero_optimization": {
+        "stage": 3,
+        "overlap_comm": True,           # Overlap communication with compute
+        "contiguous_gradients": True,    # Reduce memory fragmentation
+        "prefetch_bucket_size": 5e7,     # Prefetch 50M params at a time
+        "param_persistence_threshold": 1e5,  # Keep small params on all GPUs
+        "reduce_bucket_size": 5e7,       # Bucket size for gradient reduction
+        "stage3_prefetch_bucket_size": 5e7,
+        "stage3_max_live_parameters": 1e9,
+        "stage3_max_reuse_distance": 1e9
+    }
+}
+```
+
+## PyTorch FSDP: The Native ZeRO-3
+
+PyTorch's Fully Sharded Data Parallel (FSDP) is essentially ZeRO-3 implemented natively in the PyTorch framework. It was introduced in PyTorch 1.11 and significantly improved in PyTorch 2.0+ with FSDP2. Understanding the differences matters when choosing between DeepSpeed ZeRO and FSDP.
+
+### Conceptual Equivalence
+
+| Concept | DeepSpeed ZeRO-3 | PyTorch FSDP |
+|---------|-----------------|--------------|
+| Parameter sharding | Flat parameter partitioning | Per-module wrapping |
+| Gradient reduction | Reduce-scatter | Reduce-scatter |
+| Parameter gathering | All-gather per forward/backward | All-gather per FSDP unit |
+| Optimizer state sharding | Automatic | Automatic |
+| Mixed precision | Via DeepSpeed config | Via `MixedPrecision` policy |
+
+Both systems achieve the same memory reduction ($16\Phi/N_d$ per GPU). The differences are in API design, flexibility, and ecosystem integration.
+
+### API Comparison
+
+```python
+# DeepSpeed ZeRO-3 setup
+import deepspeed
+
+ds_config = {
+    "train_batch_size": 64,
+    "train_micro_batch_size_per_gpu": 2,
+    "zero_optimization": {
+        "stage": 3,
+        "offload_optimizer": {"device": "cpu"},
+        "offload_param": {"device": "cpu"}
+    },
+    "fp16": {"enabled": True},
+    "optimizer": {
+        "type": "AdamW",
+        "params": {"lr": 1e-4, "weight_decay": 0.01}
+    }
+}
+
+model_engine, optimizer, _, _ = deepspeed.initialize(
+    model=model,
+    config=ds_config
+)
+
+# Training loop
+for batch in dataloader:
+    loss = model_engine(batch)
+    model_engine.backward(loss)
+    model_engine.step()
+```
+
+```python
+# PyTorch FSDP setup (PyTorch 2.0+)
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    MixedPrecision,
+    ShardingStrategy,
+    CPUOffload
+)
+
+mp_policy = MixedPrecision(
+    param_dtype=torch.float16,
+    reduce_dtype=torch.float16,
+    buffer_dtype=torch.float16
+)
+
+model = FSDP(
+    model,
+    sharding_strategy=ShardingStrategy.FULL_SHARD,  # ZeRO-3
+    mixed_precision=mp_policy,
+    cpu_offload=CPUOffload(offload_params=True),
+    auto_wrap_policy=size_based_auto_wrap_policy,
+    device_id=torch.cuda.current_device()
+)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+# Training loop -- standard PyTorch
+for batch in dataloader:
+    loss = model(batch)
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+```
+
+### Key Differences
+
+<Benchmark
+  title="DeepSpeed ZeRO-3 vs PyTorch FSDP"
+  columns={["Aspect", "DeepSpeed ZeRO-3", "PyTorch FSDP"]}
+  rows={[
+    { values: ["Ecosystem", "Standalone library", "Native PyTorch"], highlight: false },
+    { values: ["Offloading", "CPU + NVMe (ZeRO-Infinity)", "CPU only"], highlight: false },
+    { values: ["Sharding granularity", "Flat buffer across all params", "Per-module wrapping"], highlight: false },
+    { values: ["Activation checkpointing", "Built-in support", "Composable with torch.utils.checkpoint"], highlight: false },
+    { values: ["Pipeline parallelism", "Built-in (PipelineModule)", "Separate (PiPPy / torch.distributed.pipelining)"], highlight: false },
+    { values: ["Custom kernels", "Fused Adam, comm overlap", "Relies on PyTorch compiler"], highlight: false },
+    { values: ["torch.compile support", "Limited", "Full support in FSDP2"], highlight: true },
+    { values: ["Maintenance burden", "External dependency", "Ships with PyTorch"], highlight: true }
   ]}
 />
+
+### When to Use Each
+
+**Use DeepSpeed ZeRO when:**
+- You need NVMe offloading (ZeRO-Infinity) for models that exceed GPU + CPU memory.
+- You want integrated pipeline parallelism.
+- You are using the Hugging Face `Trainer` with DeepSpeed integration (well-tested path).
+- You need ZeRO-1 or ZeRO-2 specifically (FSDP only offers FULL_SHARD or SHARD_GRAD_OP).
+
+**Use PyTorch FSDP when:**
+- You want to stay within the PyTorch-native ecosystem.
+- You need `torch.compile` compatibility (critical for performance on H100s).
+- You are building a custom training loop and prefer standard PyTorch APIs.
+- You are on PyTorch 2.1+ and want FSDP2's improved composability.
+
+<Callout type="tip" title="FSDP Sharding Strategies Map to ZeRO Stages">
+`ShardingStrategy.FULL_SHARD` is equivalent to ZeRO-3 (partition everything). `ShardingStrategy.SHARD_GRAD_OP` is approximately ZeRO-2 (partition gradients and optimizer states but keep full parameters). `ShardingStrategy.NO_SHARD` is equivalent to standard DDP (ZeRO-0). There is no direct FSDP equivalent to ZeRO-1 alone.
+</Callout>
+
+## ZeRO-Offload and ZeRO-Infinity
+
+### ZeRO-Offload: CPU as Extended Memory
+
+When GPU memory is insufficient even with ZeRO-3, ZeRO-Offload moves optimizer states (and optionally parameters) to CPU RAM. Modern servers have 512 GB to 2 TB of CPU memory, which is 6-25x larger than GPU HBM.
+
+The trade-off is latency. CPU memory bandwidth is approximately 50-100 GB/s (DDR5), compared to 2-3 TB/s for GPU HBM. The optimizer step, which requires reading and writing optimizer states, becomes significantly slower.
+
+**How ZeRO-Offload works:**
+
+1. Forward pass: parameters are on GPU (or gathered to GPU via all-gather if using ZeRO-3).
+2. Backward pass: gradients are computed on GPU, then offloaded to CPU.
+3. Optimizer step: performed on CPU using offloaded gradients and CPU-resident optimizer states. Updated parameters are then copied back to GPU.
+
+```python
+# DeepSpeed config for ZeRO-Offload
+ds_config = {
+    "zero_optimization": {
+        "stage": 2,  # or 3
+        "offload_optimizer": {
+            "device": "cpu",
+            "pin_memory": True,       # Use pinned memory for faster transfers
+            "buffer_count": 4,        # Overlap CPU compute with GPU-CPU transfer
+            "fast_init": False
+        },
+        "offload_param": {
+            "device": "cpu",          # Also offload parameters (ZeRO-3 only)
+            "pin_memory": True
+        }
+    }
+}
+```
+
+**Latency impact of CPU offloading:**
+
+The optimizer step on CPU is typically 2-5x slower than on GPU. However, for very large models where the alternative is "cannot train at all," this is an acceptable trade-off. DeepSpeed mitigates the cost by:
+
+- Using pinned memory for faster PCIe transfers.
+- Overlapping CPU optimizer computation with GPU forward/backward computation of the next micro-batch.
+- Using a fused CPU Adam implementation in C++ (avoiding Python overhead).
+
+<Benchmark
+  title="ZeRO-Offload Throughput Impact"
+  columns={["Configuration", "70B on 8x A100", "Throughput (tokens/sec)", "Memory/GPU"]}
+  rows={[
+    { values: ["ZeRO-3 (GPU only)", "Doesn't fit", "N/A", "140 GB needed"], highlight: false },
+    { values: ["ZeRO-3 + CPU Offload (optimizer)", "Fits", "~1,800", "~45 GB"], highlight: true },
+    { values: ["ZeRO-3 + CPU Offload (optimizer + params)", "Fits", "~900", "~15 GB"], highlight: false },
+    { values: ["ZeRO-3 on 16x A100 (no offload)", "Fits", "~3,200", "~70 GB"], highlight: true }
+  ]}
+  notes="Throughput estimates for 2K sequence length, micro-batch-size 1. More GPUs without offloading is almost always faster."
+/>
+
+### ZeRO-Infinity: NVMe as the Final Tier
+
+ZeRO-Infinity extends offloading to NVMe SSDs for cases where even CPU memory is insufficient. A single NVMe SSD provides 3-7 GB/s of sequential read bandwidth, and with 4-8 SSDs in RAID 0, you can reach 20-50 GB/s.
+
+ZeRO-Infinity creates a three-tier memory hierarchy:
+
+1. **GPU HBM** (~80 GB, ~3 TB/s): Active computation tensors
+2. **CPU RAM** (~1 TB, ~100 GB/s): Optimizer states, parameter staging
+3. **NVMe SSD** (~4-16 TB, ~20-50 GB/s with RAID): Cold optimizer states, parameter overflow
+
+```python
+# DeepSpeed config for ZeRO-Infinity (NVMe offloading)
+ds_config = {
+    "zero_optimization": {
+        "stage": 3,
+        "offload_optimizer": {
+            "device": "nvme",
+            "nvme_path": "/local_nvme",
+            "pin_memory": True,
+            "buffer_count": 5,
+            "fast_init": False
+        },
+        "offload_param": {
+            "device": "nvme",
+            "nvme_path": "/local_nvme",
+            "pin_memory": True,
+            "buffer_count": 5,
+            "max_in_cpu": 1e9    # Keep up to 1B params in CPU as cache
+        },
+        "aio": {
+            "block_size": 1048576,   # 1MB blocks for async I/O
+            "queue_depth": 8,
+            "thread_count": 1,
+            "single_submit": False,
+            "overlap_events": True
+        }
+    }
+}
+```
+
+<Callout type="warning" title="NVMe Offloading Is a Last Resort">
+NVMe offloading introduces significant latency. Sequential read at 7 GB/s means reading 140 GB of parameters from NVMe takes 20 seconds. Even with prefetching and overlap, NVMe-offloaded training is typically 5-10x slower than GPU-only ZeRO-3 with enough GPUs. Use it only when you have no other option -- when the model is so large that neither GPU memory nor CPU memory suffices.
+</Callout>
+
+<MemoryLayout
+  title="ZeRO-Infinity Memory Hierarchy"
+  description="Three-tier offloading: GPU HBM, CPU DRAM, NVMe SSD"
+  layout={[
+    { name: "GPU HBM (80 GB)", power: "Active layer params + activations + gradient computation", state: "~3 TB/s bandwidth", color: "#58a6ff" },
+    { name: "CPU DRAM (512 GB - 2 TB)", power: "Optimizer states + parameter staging area", state: "~100 GB/s bandwidth via PCIe Gen5", color: "#f0883e" },
+    { name: "NVMe SSD (4-16 TB)", power: "Cold optimizer states + parameter overflow", state: "~7 GB/s per SSD, ~30 GB/s in RAID 0", color: "#f47067" }
+  ]}
+/>
+
+## Real Training Throughput Analysis
+
+Theory is useful, but practitioners care about tokens per second per GPU. The following numbers are representative of real-world training workloads, gathered from published benchmarks and community reports.
+
+### Throughput Across ZeRO Stages
+
+<PerfChart
+  title="Training Throughput: 13B Model on 8x A100 80GB"
+  type="bar"
+  unit="tokens/sec/GPU"
+  data={[
+    { label: "DDP (no ZeRO)", value: 4200, color: "gray", annotation: "OOM at batch>2" },
+    { label: "ZeRO-1", value: 4100, color: "blue", annotation: "1.0x comm" },
+    { label: "ZeRO-2", value: 3900, color: "cyan", annotation: "1.0x comm" },
+    { label: "ZeRO-3", value: 3100, color: "green", annotation: "3.0x comm" },
+    { label: "ZeRO-3 + CPU Offload", value: 1600, color: "orange", annotation: "PCIe bottleneck" }
+  ]}
+  baseline={0}
+/>
+
+<PerfChart
+  title="Training Throughput: 70B Model on 64x A100 80GB"
+  type="bar"
+  unit="tokens/sec/GPU"
+  data={[
+    { label: "ZeRO-1", value: 0, color: "red", annotation: "OOM" },
+    { label: "ZeRO-2", value: 0, color: "red", annotation: "OOM" },
+    { label: "ZeRO-3", value: 2400, color: "green", annotation: "Fits at 17.5 GB/GPU" },
+    { label: "ZeRO-3 + GAS=4", value: 2800, color: "green", annotation: "Gradient accumulation" },
+    { label: "3D Parallel (TP=8, PP=8)", value: 3200, color: "purple", annotation: "TP within node" }
+  ]}
+  baseline={2}
+/>
+
+### Communication Overhead at Each Stage
+
+The overhead of ZeRO depends heavily on the interconnect. The following table shows the communication time as a percentage of total step time for different network configurations.
+
+<Benchmark
+  title="Communication Overhead as % of Step Time (13B Model, 8 GPUs)"
+  columns={["ZeRO Stage", "NVLink (900 GB/s)", "IB NDR (50 GB/s)", "IB HDR (25 GB/s)"]}
+  rows={[
+    { values: ["ZeRO-1", "2%", "8%", "15%"], highlight: false },
+    { values: ["ZeRO-2", "2%", "8%", "15%"], highlight: false },
+    { values: ["ZeRO-3", "5%", "22%", "38%"], highlight: false },
+    { values: ["ZeRO-3 (with overlap)", "3%", "12%", "22%"], highlight: true }
+  ]}
+  notes="Within a single node, NVLink dominates. Across nodes, InfiniBand bandwidth becomes the bottleneck. Overlap assumes prefetching next layer's parameters during current layer's compute."
+/>
+
+### Throughput Scaling with GPU Count
+
+<Benchmark
+  title="Scaling Efficiency: 70B Model Training (tokens/sec total)"
+  columns={["GPUs", "ZeRO-3", "ZeRO-3 + Offload", "3D Parallel (TP+PP+DP)"]}
+  rows={[
+    { values: ["16", "28,800", "12,000", "38,400"], highlight: false },
+    { values: ["32", "60,000", "22,000", "72,000"], highlight: false },
+    { values: ["64", "112,000", "38,000", "140,000"], highlight: false },
+    { values: ["128", "200,000", "N/A", "260,000"], highlight: true },
+    { values: ["256", "360,000", "N/A", "500,000"], highlight: true }
+  ]}
+  notes="3D parallel combines tensor parallelism (within node), pipeline parallelism (across node pairs), and data parallelism (across groups). It achieves higher throughput but requires more complex configuration."
+/>
+
+## DeepSpeed Configuration Reference
+
+The following configuration demonstrates a production-ready ZeRO-3 setup for training a large model.
+
+```json
+{
+  "train_batch_size": 512,
+  "train_micro_batch_size_per_gpu": 2,
+  "gradient_accumulation_steps": 32,
+  "gradient_clipping": 1.0,
+
+  "fp16": {
+    "enabled": true,
+    "loss_scale": 0,
+    "loss_scale_window": 1000,
+    "initial_scale_power": 16,
+    "hysteresis": 2,
+    "min_loss_scale": 1
+  },
+
+  "zero_optimization": {
+    "stage": 3,
+    "overlap_comm": true,
+    "contiguous_gradients": true,
+    "reduce_bucket_size": 50000000,
+    "stage3_prefetch_bucket_size": 50000000,
+    "stage3_param_persistence_threshold": 100000,
+    "stage3_max_live_parameters": 1000000000,
+    "stage3_max_reuse_distance": 1000000000,
+    "stage3_gather_16bit_weights_on_model_save": true,
+
+    "offload_optimizer": {
+      "device": "none"
+    },
+    "offload_param": {
+      "device": "none"
+    }
+  },
+
+  "optimizer": {
+    "type": "AdamW",
+    "params": {
+      "lr": 3e-4,
+      "betas": [0.9, 0.95],
+      "eps": 1e-8,
+      "weight_decay": 0.1
+    }
+  },
+
+  "scheduler": {
+    "type": "WarmupDecayLR",
+    "params": {
+      "warmup_min_lr": 0,
+      "warmup_max_lr": 3e-4,
+      "warmup_num_steps": 2000,
+      "total_num_steps": 100000
+    }
+  },
+
+  "activation_checkpointing": {
+    "partition_activations": true,
+    "cpu_checkpointing": false,
+    "contiguous_memory_optimization": true,
+    "number_checkpoints": null,
+    "synchronize_checkpoint_boundary": false
+  }
+}
+```
+
+Key parameters explained:
+
+- `stage3_prefetch_bucket_size`: how many parameters to prefetch before they are needed. Larger values improve overlap but increase peak memory.
+- `stage3_param_persistence_threshold`: parameters smaller than this threshold are kept on all GPUs (not sharded). Small parameters like layer norms and biases cost negligible memory but would otherwise require an all-gather for just a few kilobytes.
+- `stage3_max_live_parameters`: limits the maximum number of parameters materialized on GPU simultaneously. Controls peak memory during forward/backward.
+- `stage3_gather_16bit_weights_on_model_save`: gathers all parameter shards to rank 0 for saving a standard checkpoint. Without this, you get sharded checkpoints that require the same number of GPUs to load.
+
+## Activation Memory: The Other Memory Consumer
+
+ZeRO addresses model state memory (parameters, gradients, optimizer states) but not activation memory. Activations -- the intermediate tensors saved during the forward pass for use in the backward pass -- can consume enormous amounts of memory for large batch sizes and long sequences.
+
+For a transformer with $L$ layers, hidden dimension $h$, sequence length $s$, and batch size $b$:
+
+$$M_{\text{activations}} \approx L \cdot s \cdot b \cdot h \cdot 10 \text{ bytes}$$
+
+For a 70B model (80 layers, $h = 8192$, $s = 2048$, $b = 2$):
+
+$$M_{\text{activations}} \approx 80 \times 2048 \times 2 \times 8192 \times 10 \approx 26.8 \text{ GB}$$
+
+This must be added to the ZeRO model state memory. Activation checkpointing (recomputing activations during the backward pass instead of storing them) reduces this to approximately $\sqrt{L}$ checkpoints worth of activation memory at the cost of ~33% more compute.
+
+<Callout type="info" title="ZeRO + Activation Checkpointing">
+In practice, large model training always combines ZeRO with activation checkpointing. ZeRO handles model state memory; activation checkpointing handles activation memory. Together, they make it possible to train models that would otherwise require orders of magnitude more GPU memory.
+</Callout>
+
+## When NOT to Use ZeRO-3
+
+ZeRO-3 is not always the optimal choice. Here are scenarios where alternatives are better.
+
+### Small Models That Fit With DDP
+
+If your model fits comfortably in GPU memory with standard DDP (parameters + gradients + optimizer states are all less than, say, 60% of GPU memory), ZeRO-3 adds unnecessary communication overhead and implementation complexity. A 7B model with Adam needs $7 \times 16 = 112$ GB, which does not fit on a single 80 GB GPU -- but ZeRO-2 would suffice (parameters stay replicated, gradients and optimizer states are sharded). No need for ZeRO-3's parameter sharding.
+
+For models under ~2B parameters, standard DDP with gradient accumulation is often the fastest and simplest option.
+
+### When Tensor Parallelism Is Available
+
+Within a single node with NVLink/NVSwitch (for example, 8x H100 with 900 GB/s bisection bandwidth), tensor parallelism (TP) splits the actual matrix computations across GPUs with much lower communication overhead than ZeRO-3.
+
+**TP communication per layer**: two all-reduce operations of size $b \times s \times h$ (activation tensors, not the full model). For a 70B model with sequence length 2048, batch size 2, hidden size 8192:
+
+$$V_{\text{TP per layer}} = 2 \times 2 \times 2048 \times 8192 \times 2 = 134 \text{ MB}$$
+
+Over 80 layers: $80 \times 134 = 10.7$ GB per step.
+
+**ZeRO-3 communication per step**: 840 GB (as computed earlier).
+
+TP communicates ~80x less data than ZeRO-3 for the same model. The trade-off is that TP requires the model architecture to be explicitly partitioned (column/row parallel linear layers), and it does not scale beyond a single node efficiently (NVLink bandwidth is needed).
+
+**Best practice**: Use TP within a node (TP degree = 8 for 8-GPU nodes) and ZeRO/DP across nodes. This is the standard "3D parallelism" approach used by Megatron-LM, Megatron-DeepSpeed, and similar frameworks.
+
+<Callout type="tip" title="The 3D Parallelism Rule of Thumb">
+Tensor Parallelism within a node (8 GPUs connected by NVLink). Pipeline Parallelism across 2-8 nodes. Data Parallelism (with ZeRO-1) across the remaining GPU groups. This minimizes communication across slow inter-node links while maximizing memory efficiency.
+</Callout>
+
+### Latency-Sensitive Training
+
+ZeRO-3 introduces latency per layer due to the parameter all-gather. Even with prefetching, the first layer of the forward pass cannot be prefetched (there is no preceding computation to overlap with). For latency-sensitive workloads like reinforcement learning from human feedback (RLHF), where you alternate between generation (auto-regressive, many sequential steps) and training, ZeRO-3's per-layer latency compounds.
+
+In RLHF generation, each token requires a full forward pass through the model. With ZeRO-3, each forward pass requires all-gathering parameters layer by layer. For a model with 80 layers on 64 GPUs over InfiniBand NDR:
+
+$$t_{\text{gather per layer}} = \frac{2 \times (70\text{B} / 80\text{ layers}) \times 2\text{ bytes}}{50 \text{ GB/s}} \approx 70 \text{ ms}$$
+
+Over 80 layers per token: $80 \times 70 = 5.6$ seconds per token. This makes auto-regressive generation essentially impossible with ZeRO-3 across nodes. Solutions include using TP for the generation phase or keeping a full model replica for inference.
+
+### Summary: When to Use What
+
+<Benchmark
+  title="Parallelism Strategy Decision Matrix"
+  columns={["Scenario", "Recommended Strategy", "Why"]}
+  rows={[
+    { values: ["Model fits on 1 GPU", "DDP", "Simplest, no overhead"], highlight: false },
+    { values: ["Model fits with ZeRO-1/2", "ZeRO-1 or ZeRO-2", "No extra comm, good memory savings"], highlight: false },
+    { values: ["Single node, 8 GPUs, large model", "TP=8", "NVLink bandwidth, lower comm than ZeRO-3"], highlight: true },
+    { values: ["Multi-node, very large model", "TP + PP + ZeRO-1 DP", "3D parallelism minimizes cross-node comm"], highlight: true },
+    { values: ["Limited GPUs, huge model", "ZeRO-3 + CPU Offload", "Only option when GPUs are scarce"], highlight: false },
+    { values: ["Extreme: model exceeds CPU RAM", "ZeRO-Infinity (NVMe)", "Last resort, very slow"], highlight: false }
+  ]}
+/>
+
+## Practical Tuning Guide
+
+### Choosing the Right ZeRO Stage
+
+```python
+def recommend_zero_stage(
+    param_count_billions: float,
+    gpu_memory_gb: float = 80,
+    num_gpus: int = 8,
+    has_nvlink: bool = True,
+    has_fast_interconnect: bool = True
+) -> str:
+    """Recommend ZeRO stage based on hardware constraints."""
+    bytes_per_param = 16  # Mixed-precision Adam
+    model_memory_gb = param_count_billions * bytes_per_param
+
+    # Can DDP handle it?
+    if model_memory_gb < gpu_memory_gb * 0.6:
+        return "DDP (no ZeRO needed)"
+
+    # Can ZeRO-1 handle it?
+    zero1_mem = param_count_billions * 4 + (param_count_billions * 12) / num_gpus
+    if zero1_mem < gpu_memory_gb * 0.7:
+        return "ZeRO-1"
+
+    # Can ZeRO-2 handle it?
+    zero2_mem = param_count_billions * 2 + (param_count_billions * 14) / num_gpus
+    if zero2_mem < gpu_memory_gb * 0.7:
+        return "ZeRO-2"
+
+    # ZeRO-3 needed
+    zero3_mem = (param_count_billions * 16) / num_gpus
+    if zero3_mem < gpu_memory_gb * 0.7:
+        if has_nvlink and num_gpus <= 8:
+            return "Consider TP=8 instead of ZeRO-3 (lower comm overhead)"
+        return "ZeRO-3"
+
+    # Even ZeRO-3 doesn't fit -- need offloading
+    return "ZeRO-3 + CPU Offload (or add more GPUs)"
+
+# Examples
+print(recommend_zero_stage(7, 80, 8))    # "ZeRO-1"
+print(recommend_zero_stage(13, 80, 8))   # "ZeRO-2"
+print(recommend_zero_stage(70, 80, 8))   # "ZeRO-3 + CPU Offload"
+print(recommend_zero_stage(70, 80, 64))  # "ZeRO-3"
+print(recommend_zero_stage(70, 80, 16))  # "ZeRO-3"
+```
+
+### Common Pitfalls
+
+**1. Not using gradient accumulation with ZeRO-3.** The per-layer all-gather cost is fixed regardless of micro-batch size. By using gradient accumulation (multiple micro-batches per optimizer step), you amortize the communication cost over more compute.
+
+**2. Setting prefetch bucket size too small.** If `stage3_prefetch_bucket_size` is smaller than the largest layer in your model, ZeRO must issue multiple all-gathers per layer, increasing latency. Set it to at least the size of your largest linear layer.
+
+**3. Forgetting `stage3_gather_16bit_weights_on_model_save`.** Without this flag, `model.save_pretrained()` will save sharded weights that require the same number of GPUs to load. This makes checkpoints non-portable.
+
+**4. Using ZeRO-3 within a node when TP would be faster.** If all GPUs are connected by NVLink, TP almost always outperforms ZeRO-3 due to the dramatically lower communication volume.
+
+**5. Mixing ZeRO-3 with pipeline parallelism incorrectly.** ZeRO-3 shards across the data-parallel group. If you also use pipeline parallelism, the ZeRO-3 sharding only applies within each pipeline-parallel stage's data-parallel group, not across pipeline stages.
+
+## Historical Context and Evolution
+
+ZeRO was introduced in the paper "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models" (Rajbhandari et al., October 2019). At the time, GPT-2 (1.5B parameters) was considered large. The paper demonstrated training models up to 100B parameters -- unprecedented at the time.
+
+The evolution since then:
+
+| Date | Development | Impact |
+|------|------------|--------|
+| Oct 2019 | ZeRO paper (Stages 1-3) | Enabled 100B+ parameter training |
+| Jan 2021 | ZeRO-Offload | CPU offloading for memory-constrained setups |
+| Jun 2021 | ZeRO-Infinity | NVMe offloading, theoretically unlimited model size |
+| Mar 2022 | PyTorch FSDP (1.11) | Native ZeRO-3 in PyTorch |
+| Sep 2022 | ZeRO++ | Reduced communication via quantized weights |
+| 2023-2024 | FSDP2, DeepSpeed improvements | Better torch.compile support, improved overlap |
+
+ZeRO's core insight -- that data-parallel training needlessly replicates state that could be partitioned -- has become foundational. Every major training framework now implements some form of it. The question is no longer whether to shard optimizer states, but how aggressively to shard and what to combine it with.
 
 ## Conclusion
 
-DeepSpeed's ZeRO technique represented a breakthrough in October 2019, enabling training of models that were previously impossible due to memory constraints. The three levels of ZeRO offered different trade-offs between memory efficiency and communication overhead:
+ZeRO is a memory optimization that trades communication for capacity. The three stages offer a spectrum:
 
-- **ZeRO-1**: Partitioned optimizer states, 2-3x memory improvement with minimal communication overhead
-- **ZeRO-2**: Added gradient partitioning, 3-4x memory improvement with moderate communication overhead  
-- **ZeRO-3**: Full parameter partitioning, up to 4x memory improvement with highest communication overhead
+- **ZeRO-1** partitions optimizer states, saving 75% of optimizer memory with zero additional communication. It is a free lunch for any data-parallel training with Adam.
+- **ZeRO-2** additionally partitions gradients, also with no extra communication volume (just restructured as reduce-scatter). Another free lunch, with the only cost being slightly more complex gradient handling.
+- **ZeRO-3** partitions everything, achieving perfect $1/N_d$ memory scaling but at $3\times$ the communication volume of standard DP. It is necessary for models that cannot fit even with ZeRO-2 but should be replaced by tensor parallelism when NVLink is available within a node.
 
-The technique became foundational for training large models, enabling the scale of models that would define the next generation of AI systems. By October 2019, ZeRO had established itself as an essential tool for memory-efficient distributed training, with the flexibility to adapt to different hardware configurations and network topologies.
+The practical formula for a 70B model with mixed-precision Adam: $16 \times 70\text{B} = 1.12\text{ TB}$ total. With ZeRO-3 on 16 GPUs, each GPU holds 70 GB -- just fitting on an 80 GB A100. With 64 GPUs, each GPU holds 17.5 GB, leaving ample room for activations and large batch sizes.
 
-The key insight was that memory and communication could be traded off against each other, allowing practitioners to optimize for their specific hardware constraints while dramatically expanding the feasible scale of deep learning models.
+For production training at scale, the dominant pattern is 3D parallelism: tensor parallelism within a node, pipeline parallelism across a small number of nodes, and data parallelism with ZeRO-1 across the rest. ZeRO-3 serves as the fallback when you have fewer GPUs than ideal, and ZeRO-Offload/Infinity serves as the last resort when even GPU memory across your entire cluster is insufficient.
+
+The key takeaway: ZeRO-1 and ZeRO-2 are almost always worth enabling because they save memory without additional communication. ZeRO-3 requires careful analysis of your interconnect bandwidth before committing to it. And if your model fits with tensor parallelism on a single node, that is almost always the better choice.

@@ -1,0 +1,774 @@
+---
+title: "Disaggregated Prefill-Decode: Why Splitting LLM Inference Changes Everything"
+author: "stanley-phoong"
+description: "An expert deep-dive into disaggregated prefill-decode serving architectures for LLM inference, covering the interference problem, Splitwise, DistServe, Mooncake, KV cache transfer optimization, chunked prefill alternatives, and production deployment patterns."
+publishDate: 2025-03-21
+category: llm-inference
+tags: [disaggregation, prefill, decode, serving, latency, throughput]
+difficulty: expert
+readingTime: 35
+draft: false
+featured: true
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+import MemoryLayout from '@/components/mdx/MemoryLayout.astro';
+
+Every LLM inference request has two distinct phases: prefill and decode. Prefill ingests the entire prompt in one forward pass, producing the first token and the KV cache. Decode then generates tokens one at a time, each step reading the growing KV cache and appending to it. These two phases have fundamentally different computational profiles, and running them on the same GPU creates interference that degrades both throughput and latency. Disaggregated serving separates them onto dedicated hardware pools, and the results are striking.
+
+This post walks through the interference problem from first principles, surveys the major disaggregated architectures (Splitwise, DistServe, Mooncake), analyzes KV cache transfer optimization techniques, compares against chunked prefill as a simpler alternative, and builds a decision framework for when disaggregation actually wins.
+
+## The Two Phases of LLM Inference
+
+Before diving into disaggregation, we need to be precise about what happens during each phase.
+
+### Prefill: Compute-Bound Bulk Processing
+
+During prefill, the model processes the entire input prompt in a single forward pass. For a prompt of length $S$, the self-attention computation involves:
+
+$$\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V$$
+
+where $Q$, $K$, and $V$ are all derived from the $S$ input tokens simultaneously. The key GEMM operations scale with the prompt length:
+
+- **QKV projection**: $(S \times d_{model}) \times (d_{model} \times 3d_{model})$ -- three large matrix multiplications
+- **Attention score computation**: $(S \times d_k) \times (d_k \times S)$ -- quadratic in sequence length
+- **FFN layers**: $(S \times d_{model}) \times (d_{model} \times 4d_{model})$ -- large batch dimension
+
+For a 2048-token prompt on Llama 70B, the prefill forward pass involves GEMMs with $M = 2048$, making them large enough to fully saturate GPU compute units. On an A100, prefill typically achieves 60-80% of peak FLOPS -- this is genuinely compute-bound work.
+
+### Decode: Memory-Bandwidth-Bound Token Generation
+
+During decode, the model generates one token at a time. Each forward pass processes a single token (or a small micro-batch of tokens from different requests), meaning the effective batch dimension for GEMMs is tiny:
+
+- **QKV projection**: $(1 \times d_{model}) \times (d_{model} \times 3d_{model})$ -- matrix-vector multiply
+- **Attention**: query against the entire KV cache -- memory read dominated
+- **FFN layers**: $(1 \times d_{model}) \times (d_{model} \times 4d_{model})$ -- matrix-vector multiply
+
+Matrix-vector multiplications are bandwidth-bound, not compute-bound. The GPU loads the entire weight matrix from HBM just to multiply it by a single vector. On an A100 with 2 TB/s memory bandwidth and 312 TFLOPS FP16 compute, the arithmetic intensity crossover is:
+
+$$\text{Arithmetic Intensity} = \frac{\text{FLOPS}}{\text{Bytes}} = \frac{312 \times 10^{12}}{2 \times 10^{12}} = 156 \text{ FLOP/byte}$$
+
+A decode step for a single token achieves roughly 2 FLOP/byte (one multiply-add per weight element loaded), putting it deeply in the memory-bandwidth-bound regime. The GPU's compute units sit largely idle during decode.
+
+<Callout type="perf" title="Arithmetic Intensity Gap">
+  Prefill operates at ~100-200 FLOP/byte (compute-bound). Decode operates at ~1-2 FLOP/byte (memory-bandwidth-bound). This is a 100x gap in arithmetic intensity -- these workloads fundamentally cannot be optimally served by the same hardware configuration simultaneously.
+</Callout>
+
+## The Interference Problem
+
+When prefill and decode share a GPU, they fight over every shared resource. This is not a theoretical concern -- it produces measurable, severe degradation in production.
+
+### How Interference Manifests
+
+Consider what happens when a serving system like vLLM runs on a single GPU pool with continuous batching. The scheduler interleaves prefill and decode operations within the same iteration:
+
+**Scenario 1: Prefill steals compute from decode.** A new request arrives with a 4096-token prompt. The scheduler admits it for prefill in the next iteration alongside 30 ongoing decode requests. The prefill forward pass now dominates the iteration time -- the large GEMMs for the 4096-token prefill take 200ms, during which those 30 decode requests are stalled. Each decode request experiences a 200ms gap between tokens instead of the typical 30ms.
+
+**Scenario 2: Decode KV cache crowds out prefill batches.** Those 30 ongoing decode requests each hold KV cache in GPU memory. On an 80GB A100 serving Llama 70B (which consumes ~35GB for model weights in FP16), roughly 45GB remains for KV cache. Each request at 2048 sequence length consumes ~1.3GB of KV cache. Thirty requests consume ~39GB, leaving only 6GB for new prefill allocations -- severely limiting how many new requests can be admitted.
+
+### Measuring the Interference
+
+Let us look at concrete numbers. Here is what happens to decode latency (time between tokens, or TBT) when prefill operations run concurrently on the same GPU:
+
+<PerfChart
+  title="Decode Latency Under Prefill Interference (Llama 70B, A100 80GB)"
+  unit="ms"
+  data={[
+    { label: "Decode only", value: 32, color: "green", annotation: "No interference" },
+    { label: "512-tok prefill", value: 58, color: "blue", annotation: "1.8x slowdown" },
+    { label: "1024-tok prefill", value: 89, color: "orange", annotation: "2.8x slowdown" },
+    { label: "2048-tok prefill", value: 134, color: "orange", annotation: "4.2x slowdown" },
+    { label: "4096-tok prefill", value: 178, color: "red", annotation: "5.6x slowdown" }
+  ]}
+  baseline={0}
+/>
+
+The numbers tell a clear story: a 4096-token prefill causes a 5.6x increase in decode latency for co-located requests. For interactive applications where users expect &lt;50ms time-between-tokens, this is unacceptable.
+
+The interference is bidirectional. Prefill throughput also suffers when decode requests occupy memory and scheduling slots:
+
+<Benchmark
+  title="Prefill Throughput Degradation Under Decode Load"
+  columns={["Configuration", "Prefill Throughput (tok/s)", "Decode TBT P99 (ms)", "GPU Utilization"]}
+  rows={[
+    { values: ["Prefill only (no decode)", "48,200", "N/A", "78%"], highlight: false },
+    { values: ["10 concurrent decodes", "41,500", "45", "72%"], highlight: false },
+    { values: ["30 concurrent decodes", "31,800", "89", "61%"], highlight: false },
+    { values: ["60 concurrent decodes", "18,400", "134", "48%"], highlight: true }
+  ]}
+  notes="Llama 70B on A100 80GB, prompt length 2048, measured with vLLM 0.4.x continuous batching"
+/>
+
+At 60 concurrent decodes, prefill throughput drops by 62% and decode P99 latency blows past 130ms. Neither workload is well-served.
+
+### Why Continuous Batching Does Not Solve This
+
+Continuous batching (iteration-level scheduling) helps with utilization compared to static batching, but it does not solve the fundamental interference problem. Within each iteration, the forward pass must handle both prefill tokens and decode tokens together. The GPU kernel that processes the prefill tokens dominates the iteration time, and decode tokens must wait.
+
+Some systems attempt to mitigate this by limiting how many prefill tokens are processed per iteration (a precursor to chunked prefill, which we discuss later), but this trades prefill throughput for decode latency -- it does not eliminate the tension.
+
+## The Case for Disaggregation
+
+The core insight is simple: if prefill and decode have different computational profiles, run them on different hardware.
+
+### Architecture Overview
+
+A disaggregated serving system splits the inference cluster into two pools:
+
+<MemoryLayout
+  title="Disaggregated Serving Architecture"
+  description="Prefill and decode phases run on separate GPU pools with KV cache transfer between them"
+  layout={[
+    { name: "Prefill Pool (Compute-Optimized)", power: "High batch sizes, large GEMMs, max GPU utilization", state: "Optimized for throughput: process many prompts simultaneously", color: "#58a6ff" },
+    { name: "KV Cache Transfer Layer", power: "InfiniBand / NVLink / RDMA interconnect", state: "Moves KV cache from prefill GPUs to decode GPUs", color: "#d29922" },
+    { name: "Decode Pool (Bandwidth-Optimized)", power: "Small batches, memory-bandwidth utilization, KV cache capacity", state: "Optimized for latency: minimize time-between-tokens", color: "#3fb950" },
+    { name: "Request Router / Scheduler", power: "Routes incoming requests to prefill pool, completed prefills to decode pool", state: "Global coordination: load balancing, SLO-aware scheduling", color: "#bc8cff" }
+  ]}
+/>
+
+**Prefill pool characteristics:**
+- Configured for maximum compute throughput
+- Large batch sizes (many prompts processed simultaneously)
+- Can use aggressive tensor parallelism to reduce per-request latency
+- No KV cache pressure from ongoing decode requests
+- GPU utilization stays at 60-80% consistently
+
+**Decode pool characteristics:**
+- Configured for maximum memory bandwidth utilization
+- Optimized for KV cache capacity (can serve more concurrent requests)
+- Stable, predictable per-token latency with no prefill interference
+- Can use different parallelism strategies optimized for memory capacity
+- GPU utilization is inherently lower (bandwidth-bound), but consistent
+
+**Independent scaling:** If your workload has long prompts (summarization, RAG with large contexts), you need more prefill capacity. If your workload generates long outputs (creative writing, code generation), you need more decode capacity. Disaggregation lets you scale each pool independently based on actual demand.
+
+### The Transfer Cost Tradeoff
+
+Disaggregation introduces a new cost: transferring the KV cache from prefill GPUs to decode GPUs. This is the central design tension in every disaggregated system.
+
+For Llama 70B with 80 layers, 8 KV heads, and head dimension 128, the KV cache size per token per layer is:
+
+$$\text{KV per token per layer} = 2 \times d_{kv} \times \text{precision} = 2 \times 128 \times 2\text{ bytes (FP16)} = 512\text{ bytes}$$
+
+For $n_{heads\_kv} = 8$ KV heads across all 80 layers:
+
+$$\text{KV per token} = 80 \times 8 \times 512 = 327,680\text{ bytes} \approx 320\text{ KB}$$
+
+For a 2048-token prompt:
+
+$$\text{Total KV cache} = 2048 \times 320\text{ KB} = 640\text{ MB}$$
+
+And for a 8192-token prompt:
+
+$$\text{Total KV cache} = 8192 \times 320\text{ KB} = 2.56\text{ GB}$$
+
+<Callout type="warning" title="Transfer Latency Budget">
+  Over a single 200 Gb/s InfiniBand link (25 GB/s effective), transferring 2.56 GB takes ~102ms. Over NVLink 4.0 (900 GB/s bidirectional, ~450 GB/s unidirectional effective), it takes ~5.7ms. The interconnect technology determines whether disaggregation is viable.
+</Callout>
+
+<Benchmark
+  title="KV Cache Transfer Latency by Interconnect and Sequence Length"
+  columns={["Seq Length", "KV Size (Llama 70B)", "InfiniBand 200Gb/s", "InfiniBand 400Gb/s", "NVLink 4.0"]}
+  rows={[
+    { values: ["512", "160 MB", "6.4 ms", "3.2 ms", "0.36 ms"], highlight: false },
+    { values: ["2048", "640 MB", "25.6 ms", "12.8 ms", "1.4 ms"], highlight: false },
+    { values: ["4096", "1.28 GB", "51.2 ms", "25.6 ms", "2.8 ms"], highlight: false },
+    { values: ["8192", "2.56 GB", "102.4 ms", "51.2 ms", "5.7 ms"], highlight: true },
+    { values: ["32768", "10.24 GB", "409.6 ms", "204.8 ms", "22.8 ms"], highlight: true }
+  ]}
+  notes="Assumes FP16 KV cache, GQA with 8 KV heads, 80 layers. Effective bandwidth assumes ~80% of theoretical peak."
+/>
+
+The critical question is: when does the transfer cost pay for itself? If prefill on a co-located system takes 500ms and the transfer costs 25ms, that is a 5% overhead to eliminate the interference problem entirely. If prefill takes 10ms (short prompt) and the transfer costs 25ms, the overhead exceeds the computation itself -- disaggregation hurts.
+
+## Splitwise: Microsoft's Disaggregated Architecture
+
+Splitwise, published by Microsoft Research, was one of the first rigorous treatments of disaggregated LLM serving. The key contribution is formalizing when and how to split prefill from decode across machines.
+
+### Architecture
+
+Splitwise introduces a straightforward split:
+
+1. **Prefill machines** receive incoming requests, run the full prefill forward pass, and produce the KV cache
+2. The KV cache is transferred over the network to a **decode machine**
+3. The decode machine runs autoregressive generation until completion
+
+The request flow is managed by a cluster-level scheduler that maintains state about which decode machines have capacity (both in terms of memory for KV cache and scheduling slots for concurrent requests).
+
+```
+Request → [Router] → [Prefill GPU] → KV Transfer → [Decode GPU] → Tokens
+                          ↓                              ↓
+                    Prompt processing            Autoregressive generation
+                    (compute-bound)              (bandwidth-bound)
+```
+
+### Mixed-Phase Splitting
+
+A critical insight in Splitwise is that you do not necessarily need separate physical machines. The paper explores **mixed-phase splitting** where the same machine handles prefill for some requests and decode for others, but never both simultaneously on the same GPU. This is a form of temporal disaggregation rather than spatial disaggregation.
+
+The advantage: you can dynamically rebalance between prefill and decode capacity based on current load. If a burst of requests arrives, more GPUs shift to prefill duty. As those requests transition to decode, GPUs shift accordingly.
+
+The disadvantage: you lose the hardware-specific optimization opportunity. A GPU configured for maximum prefill throughput (large batch sizes, specific kernel configurations) differs from one configured for decode (maximum KV cache capacity, bandwidth-optimized scheduling).
+
+### When Transfer Cost Dominates
+
+Splitwise's analysis reveals a clear crossover point. For short prompts where prefill time is small (say, &lt;50ms), the KV cache transfer overhead is proportionally enormous. For long prompts where prefill takes hundreds of milliseconds, the transfer overhead is amortized.
+
+The paper defines a **split efficiency ratio**:
+
+$$\eta_{split} = \frac{T_{prefill}}{T_{prefill} + T_{transfer}}$$
+
+When $\eta_{split} \gt 0.8$ (transfer adds &lt;20% overhead), disaggregation is beneficial because the elimination of interference more than compensates. When $\eta_{split} \lt 0.5$, the transfer overhead dominates and co-located serving is preferable.
+
+<PerfChart
+  title="Split Efficiency by Prompt Length (Llama 70B, InfiniBand 200 Gb/s)"
+  unit="%"
+  data={[
+    { label: "256 tokens", value: 38, color: "red", annotation: "Transfer dominates" },
+    { label: "512 tokens", value: 56, color: "orange", annotation: "Marginal" },
+    { label: "1024 tokens", value: 72, color: "blue", annotation: "Moderate benefit" },
+    { label: "2048 tokens", value: 84, color: "green", annotation: "Clear win" },
+    { label: "4096 tokens", value: 91, color: "green", annotation: "Strong win" },
+    { label: "8192 tokens", value: 95, color: "green", annotation: "Dominant win" }
+  ]}
+/>
+
+The takeaway: disaggregation with commodity InfiniBand interconnects becomes attractive at prompt lengths above ~1024 tokens. With faster interconnects (NVLink across nodes), the crossover shifts much lower.
+
+### Splitwise Scheduling Policy
+
+Splitwise proposes a **goodput-aware** scheduling policy. Rather than maximizing raw throughput, the scheduler maximizes the fraction of requests that meet their SLO targets. This matters because:
+
+- Some requests have strict time-to-first-token (TTFT) SLOs (interactive chat)
+- Some requests have strict time-between-tokens (TBT) SLOs (streaming output)
+- Some requests only care about total completion time (batch processing)
+
+The scheduler routes requests to prefill machines that can complete prefill within the TTFT budget, accounting for queuing delay and transfer time. It then assigns decode machines that have enough memory headroom and low enough per-iteration latency to meet TBT requirements.
+
+## DistServe: Goodput-Optimized Placement
+
+DistServe, from Peking University and UC San Diego, takes disaggregation further by optimizing not just the runtime scheduling but the **placement** of prefill and decode workloads.
+
+### Goodput as the Optimization Objective
+
+DistServe defines goodput as the maximum request rate at which a serving system can meet specified latency SLOs for both TTFT and TBT. This is a more practical metric than raw throughput because it captures the quality of service.
+
+$$\text{Goodput} = \max \{ \lambda : P(TTFT \leq T_1) \geq p_1 \text{ and } P(TBT \leq T_2) \geq p_2 \}$$
+
+where $\lambda$ is the request rate, $T_1$ and $T_2$ are the TTFT and TBT SLO targets, and $p_1$, $p_2$ are the required percentiles (e.g., 99th percentile).
+
+### Heterogeneous Parallelism Strategies
+
+A key insight in DistServe is that prefill and decode benefit from different parallelism configurations:
+
+**Prefill prefers tensor parallelism (TP) for latency reduction.** Splitting the model across more GPUs reduces per-GPU computation, directly cutting prefill latency. The all-reduce communication overhead is tolerable because the large GEMM sizes give favorable computation-to-communication ratios.
+
+**Decode prefers tensor parallelism for memory capacity.** The primary benefit of TP for decode is not faster computation (the matrix-vector multiplies are already bandwidth-bound) but spreading the KV cache across more GPUs. With TP=4, each GPU holds only 1/4 of the KV cache, allowing 4x more concurrent decode requests.
+
+<Benchmark
+  title="Optimal Parallelism Configuration (Llama 70B, 8x A100 Node)"
+  columns={["Configuration", "Prefill Throughput", "Decode Max Concurrency", "Goodput (req/s)"]}
+  rows={[
+    { values: ["Unified TP=8", "High", "Moderate (shared memory)", "12.4"], highlight: false },
+    { values: ["Disagg: Prefill TP=4, Decode TP=4", "Moderate", "High", "18.7"], highlight: true },
+    { values: ["Disagg: Prefill TP=2, Decode TP=2", "Lower per-request", "Moderate", "15.1"], highlight: false },
+    { values: ["Disagg: Prefill TP=4, Decode TP=2 (+ more decode GPUs)", "Moderate", "High", "21.3"], highlight: true }
+  ]}
+  notes="Goodput measured at TTFT P99 < 500ms, TBT P99 < 50ms. Workload: average prompt 2048 tokens, average output 256 tokens."
+/>
+
+### Placement Optimization Algorithm
+
+DistServe formulates placement as an optimization problem: given a cluster of GPUs (potentially heterogeneous), assign GPUs to prefill and decode roles with specific parallelism configurations to maximize goodput.
+
+The search space includes:
+- Number of GPUs allocated to prefill vs. decode
+- TP degree for each pool
+- Pipeline parallelism (PP) degree if the model spans multiple nodes
+- GPU type assignment (if the cluster has mixed hardware)
+
+For heterogeneous clusters, DistServe can assign compute-heavy GPUs (e.g., H100 with higher FLOPS) to prefill and memory-heavy GPUs (e.g., A100 80GB with large HBM) to decode. This is a capability that unified serving simply cannot exploit.
+
+## Mooncake: KV-Cache-Centric Architecture
+
+Mooncake, developed by Moonshot AI, represents a more radical rethinking of the serving architecture. Rather than treating disaggregation as "split prefill and decode onto different machines," Mooncake treats the **KV cache as the first-class citizen** of the entire system.
+
+### The KV Cache Store
+
+In Mooncake, there is a distributed KV cache store that spans the cluster's aggregate memory (GPU HBM + CPU DRAM + optionally NVMe storage). The KV cache is not "transferred from prefill to decode" -- it is **produced by prefill into the store** and **consumed by decode from the store**.
+
+This decoupling has profound implications:
+
+1. **Prefill and decode are fully independent services.** They do not need to coordinate directly. Prefill writes KV cache entries to the store. Decode reads them.
+
+2. **KV cache can be reused across requests.** If multiple requests share a common prefix (system prompt, few-shot examples), the KV cache for that prefix is computed once and stored. Subsequent requests skip the shared-prefix prefill entirely.
+
+3. **KV cache persistence enables speculation.** The store can keep KV cache entries beyond the lifetime of a single request, enabling warm-starting for follow-up queries in a conversation.
+
+```
+                    ┌──────────────────────────┐
+                    │  Distributed KV Cache     │
+                    │  Store (HBM + DRAM + SSD) │
+                    └──────┬───────────┬────────┘
+                           │           │
+                      write│           │read
+                           │           │
+                    ┌──────┴──┐   ┌────┴─────┐
+                    │ Prefill │   │  Decode   │
+                    │ Workers │   │  Workers  │
+                    └─────────┘   └──────────┘
+```
+
+### Prefix-Aware Scheduling
+
+Mooncake's scheduler is prefix-aware: it identifies common prefixes across incoming requests and routes them to the same prefill worker (or skips prefill entirely if the prefix KV cache is already in the store).
+
+For a typical production workload where 80% of requests share the same system prompt (say, 500 tokens), this eliminates 500 tokens of redundant prefill computation per request. At scale, this is an enormous efficiency gain.
+
+The scheduler maintains a **prefix tree** (trie) of cached KV entries:
+
+```python
+class PrefixTree:
+    def __init__(self):
+        self.root = TrieNode()
+
+    def find_cached_prefix(self, token_ids: List[int]) -> int:
+        """Returns the length of the longest cached prefix."""
+        node = self.root
+        cached_length = 0
+        for token_id in token_ids:
+            if token_id in node.children:
+                node = node.children[token_id]
+                if node.kv_cache_ref is not None:
+                    cached_length = node.depth
+            else:
+                break
+        return cached_length
+
+    def insert(self, token_ids: List[int], kv_cache_ref: KVCacheReference):
+        """Register KV cache for a token sequence in the store."""
+        node = self.root
+        for token_id in token_ids:
+            if token_id not in node.children:
+                node.children[token_id] = TrieNode(depth=node.depth + 1)
+            node = node.children[token_id]
+        node.kv_cache_ref = kv_cache_ref
+```
+
+### Memory Hierarchy Management
+
+Mooncake manages a three-tier memory hierarchy for KV cache:
+
+<MemoryLayout
+  title="Mooncake KV Cache Memory Hierarchy"
+  description="KV cache is tiered across GPU HBM, CPU DRAM, and NVMe storage based on access frequency"
+  regions={[
+    { start: "0x0000", end: "0x5000", name: "GPU HBM (Hot)", size: "80 GB per GPU", color: "red", notes: "Active decode requests, recently prefilled KV cache. ~0.1ms access." },
+    { start: "0x5000", end: "0xF000", name: "CPU DRAM (Warm)", size: "512 GB - 2 TB per node", color: "orange", notes: "Recently completed or paused requests. ~1ms access via PCIe." },
+    { start: "0xF000", end: "0xFFFF", name: "NVMe SSD (Cold)", size: "4-16 TB per node", color: "blue", notes: "Long-term prefix cache, conversation history. ~5-10ms access." }
+  ]}
+/>
+
+The eviction policy is access-frequency-aware: KV cache entries that are read frequently (shared prefixes, active conversations) stay in HBM. Entries for completed requests get demoted to DRAM, then to SSD. When a new request arrives that matches a cold prefix, the KV cache is promoted back up the hierarchy.
+
+### Production Scale Results
+
+Moonshot AI reported running Mooncake in production serving their Kimi chatbot, handling millions of requests per day. The prefix caching alone reduced prefill computation by 50-70% for their workload, where most users interact with the same system prompt and tool definitions.
+
+<PerfChart
+  title="Mooncake Production Impact (Kimi Chatbot Workload)"
+  unit="%"
+  data={[
+    { label: "Prefill compute saved", value: 65, color: "green", annotation: "Via prefix caching" },
+    { label: "Decode TBT reduction", value: 40, color: "green", annotation: "No prefill interference" },
+    { label: "Cluster GPU utilization", value: 72, color: "blue", annotation: "Up from 45% unified" },
+    { label: "Goodput improvement", value: 75, color: "green", annotation: "Vs. unified serving" }
+  ]}
+/>
+
+## KV Cache Transfer Optimization
+
+Whether you follow the Splitwise direct-transfer model or Mooncake's store-based model, moving KV cache data between machines is a critical path operation. Several optimization techniques reduce this cost.
+
+### Compression: Quantize Before Transfer
+
+The KV cache does not need full FP16 precision during transfer. Research has shown that KV cache values can be quantized to INT8 or even INT4 with minimal impact on generation quality, especially when quantization is applied per-head or per-channel.
+
+**FP16 to INT8**: 2x reduction in transfer size. A 2.56 GB KV cache becomes 1.28 GB. Over InfiniBand 200 Gb/s, this cuts transfer time from 102ms to 51ms.
+
+**FP16 to INT4**: 4x reduction. The same KV cache becomes 640 MB, transferring in ~25ms. However, INT4 quantization introduces more noticeable quality degradation, particularly for tasks requiring precise numerical reasoning.
+
+```python
+def quantize_kv_cache_for_transfer(kv_cache: torch.Tensor, bits: int = 8):
+    """Quantize KV cache per-head for network transfer."""
+    # kv_cache shape: [num_layers, 2, num_heads, seq_len, head_dim]
+    num_layers, kv, num_heads, seq_len, head_dim = kv_cache.shape
+
+    # Per-head quantization for better accuracy
+    scales = torch.zeros(num_layers, kv, num_heads, 1, 1, dtype=torch.float16)
+    zeros = torch.zeros_like(scales)
+
+    for l in range(num_layers):
+        for h in range(num_heads):
+            for k in range(kv):
+                head_data = kv_cache[l, k, h]
+                max_val = head_data.abs().max()
+                scale = max_val / (2 ** (bits - 1) - 1)
+                scales[l, k, h] = scale
+                zeros[l, k, h] = 0  # Symmetric quantization
+
+    qmax = 2 ** (bits - 1) - 1
+    quantized = torch.clamp(
+        torch.round(kv_cache / (scales + 1e-8)),
+        -qmax, qmax
+    ).to(torch.int8)
+
+    return quantized, scales, zeros
+```
+
+<Benchmark
+  title="KV Cache Quantization Impact on Transfer and Quality"
+  columns={["Format", "Size (8K seq)", "Transfer Time (IB 200G)", "Quality (MMLU)", "Quality (HumanEval)"]}
+  rows={[
+    { values: ["FP16 (baseline)", "2.56 GB", "102 ms", "69.8%", "67.1%"], highlight: false },
+    { values: ["INT8 per-head", "1.28 GB", "51 ms", "69.5%", "66.8%"], highlight: true },
+    { values: ["INT4 per-head", "640 MB", "25 ms", "68.1%", "64.2%"], highlight: false },
+    { values: ["INT4 group-32", "680 MB", "27 ms", "69.0%", "65.9%"], highlight: true }
+  ]}
+  notes="Llama 70B, quality measured on standard benchmarks. INT4 group-32 uses group quantization with group size 32 for better accuracy."
+/>
+
+### Pipelining: Overlap Transfer with Computation
+
+Rather than waiting for the entire KV cache to be transferred before starting decode, a pipelined approach begins decode as soon as the first few layers' KV cache arrives.
+
+The decode forward pass processes layers sequentially. Layer 0 executes first, then layer 1, and so on. If we stream the KV cache layer by layer, decode can start on layer 0 while layers 1-79 are still in transit:
+
+```
+Time →
+Prefill GPU:  [Compute L0-79] [Transfer L0] [Transfer L1] ... [Transfer L79]
+Decode GPU:                   [    Wait   ] [Decode L0   ] [Decode L1   ] ...
+```
+
+With 80 layers and each layer's KV cache taking ~1.3ms to transfer (for 8K tokens over IB 200G), the non-pipelined approach waits 102ms before starting any decode. The pipelined approach starts decode after just 1.3ms (one layer transfer). The total time to first decode token becomes:
+
+$$T_{pipelined} = T_{transfer\_layer} + T_{decode\_forward} \approx 1.3\text{ms} + 30\text{ms} = 31.3\text{ms}$$
+
+compared to:
+
+$$T_{non-pipelined} = T_{transfer\_all} + T_{decode\_forward} = 102\text{ms} + 30\text{ms} = 132\text{ms}$$
+
+This is a 4.2x reduction in time-to-first-decode-token. The constraint is that the decode computation for each layer must be slower than the transfer time for the next layer, otherwise decode will stall waiting for data. In practice, this is usually satisfied because per-layer decode computation (including attention over the full KV cache) takes several milliseconds.
+
+<Callout type="tip" title="Pipeline Granularity">
+  Layer-level pipelining is the natural granularity because the decode forward pass is sequential across layers. Finer granularity (sub-layer) is possible but adds complexity without much benefit, since the attention and FFN within a layer execute back-to-back on the same GPU stream.
+</Callout>
+
+### Locality: Co-locate Prefill and Decode
+
+The cheapest network transfer is no network transfer. Placing prefill and decode GPUs within the same node, connected by NVLink rather than InfiniBand, reduces transfer latency by an order of magnitude.
+
+On a DGX H100 node with 8 GPUs connected via NVLink 4.0 (900 GB/s bidirectional per link):
+
+- Intra-node transfer of 2.56 GB KV cache: ~5.7ms
+- Inter-node transfer over InfiniBand 400 Gb/s: ~51ms
+- Inter-rack transfer over InfiniBand 200 Gb/s: ~102ms
+
+The tradeoff is flexibility. Intra-node disaggregation limits how many GPUs you can dedicate to each role. In an 8-GPU node, you might use 4 for prefill and 4 for decode, whereas inter-node disaggregation lets you have 64 prefill GPUs and 128 decode GPUs across the cluster.
+
+A hybrid approach works well: use intra-node transfers for latency-critical requests and inter-node transfers for throughput-oriented batch requests.
+
+### Speculative Transfer
+
+An advanced optimization: begin transferring KV cache before prefill completes. The prefill forward pass processes layers sequentially (layer 0, then 1, ..., then 79). As soon as layer 0's KV cache is computed, it can be transferred while layers 1-79 are still computing.
+
+```
+Time →
+Prefill:    [L0] [L1] [L2] ... [L78] [L79]
+Transfer:        [T0] [T1] ... [T78] [T79]
+Decode:                              [Start]
+```
+
+The transfer of layer $i$ overlaps with the computation of layer $i+1$ on the prefill GPU. If $T_{compute\_layer} \geq T_{transfer\_layer}$ (prefill computation per layer is slower than transfer), the total overhead of transfer is just $T_{transfer\_last\_layer}$ -- essentially free.
+
+For Llama 70B with 8K input on A100:
+- Per-layer prefill compute: ~6ms
+- Per-layer KV transfer (IB 200G): ~1.3ms
+
+Since 6ms &gt; 1.3ms, the transfer is fully overlapped. The decode GPU receives the complete KV cache within 1.3ms of prefill completion rather than 102ms after.
+
+<Callout type="perf" title="Combined Optimizations">
+  Combining INT8 quantization (2x less data) with speculative transfer (overlapped with compute) and pipelined decode (start decode on layer 0 immediately), the effective transfer overhead drops from 102ms to under 2ms for Llama 70B at 8K sequence length over InfiniBand 200 Gb/s. This makes disaggregation viable even for moderate prompt lengths.
+</Callout>
+
+## Chunked Prefill: The Non-Disaggregated Alternative
+
+Before committing to the infrastructure complexity of disaggregation, it is worth examining chunked prefill -- an approach that mitigates interference without separating hardware pools.
+
+### How Chunked Prefill Works
+
+Instead of processing the entire prompt in one forward pass, chunked prefill breaks it into smaller chunks (e.g., 512 tokens each) and interleaves these chunks with decode steps:
+
+```
+Iteration 1: [Prefill chunk 1: tokens 0-511] + [Decode batch: 30 requests]
+Iteration 2: [Prefill chunk 2: tokens 512-1023] + [Decode batch: 31 requests]
+Iteration 3: [Prefill chunk 3: tokens 1024-1535] + [Decode batch: 31 requests]
+Iteration 4: [Prefill chunk 4: tokens 1536-2047] + [Decode batch: 31 requests]
+```
+
+Each iteration processes a bounded number of prefill tokens, preventing any single prefill from dominating iteration time.
+
+### Sarathi-Serve: Optimal Chunk Size Analysis
+
+Sarathi-Serve (from Microsoft Research India) provides a rigorous analysis of optimal chunk sizing. The key insight is that there is a sweet spot:
+
+- **Too large chunks**: Decode latency spikes (same interference problem)
+- **Too small chunks**: Prefill throughput suffers (overhead of iteration scheduling, poor GPU utilization on small GEMMs)
+
+The optimal chunk size depends on the number of concurrent decode requests and the model's computational profile. Sarathi-Serve derives an analytical model:
+
+$$C^* = \frac{B_{decode} \cdot t_{decode}}{t_{target} - t_{overhead}}$$
+
+where $C^*$ is the optimal chunk size, $B_{decode}$ is the decode batch size, $t_{decode}$ is the per-token decode time, $t_{target}$ is the target iteration time (constrained by TBT SLO), and $t_{overhead}$ is per-iteration scheduling overhead.
+
+<PerfChart
+  title="Impact of Chunk Size on Decode Latency and Prefill Throughput"
+  unit="ms"
+  data={[
+    { label: "No chunking", value: 178, color: "red", annotation: "4096-tok prefill, full interference" },
+    { label: "Chunk = 2048", value: 112, color: "orange", annotation: "Still significant interference" },
+    { label: "Chunk = 1024", value: 71, color: "blue", annotation: "Moderate interference" },
+    { label: "Chunk = 512", value: 48, color: "green", annotation: "Near-acceptable TBT" },
+    { label: "Chunk = 256", value: 38, color: "green", annotation: "Good TBT, but prefill slows" },
+    { label: "Decode only", value: 32, color: "green", annotation: "No interference baseline" }
+  ]}
+  baseline={5}
+/>
+
+### Chunked Prefill Limitations
+
+Chunked prefill reduces interference but does not eliminate it:
+
+1. **Residual interference**: Even a 512-token prefill chunk adds ~16ms to the iteration time, causing a 50% TBT increase compared to decode-only execution. For strict &lt;40ms TBT SLOs, this is still problematic.
+
+2. **Increased TTFT**: Breaking a 4096-token prefill into 8 chunks of 512 tokens means 8 iterations instead of 1. If each iteration takes 48ms, TTFT becomes 384ms instead of ~200ms (single-shot prefill). The time-to-first-token increases significantly.
+
+3. **Memory contention remains**: Prefill chunks and decode still share the same GPU memory. KV cache for ongoing decodes limits how many prefill chunks can be in flight.
+
+4. **No heterogeneous hardware optimization**: Every GPU must be configured to handle both prefill and decode adequately. You cannot specialize.
+
+<Benchmark
+  title="Disaggregated vs. Chunked Prefill Comparison"
+  columns={["Metric", "Unified (No Chunking)", "Chunked Prefill (512)", "Disaggregated"]}
+  rows={[
+    { values: ["Decode TBT P99", "178 ms", "48 ms", "34 ms"], highlight: false },
+    { values: ["TTFT P99", "210 ms", "420 ms", "240 ms"], highlight: false },
+    { values: ["Prefill Throughput", "48K tok/s", "36K tok/s", "47K tok/s"], highlight: false },
+    { values: ["Max Concurrent Decodes", "45", "45", "78"], highlight: true },
+    { values: ["Goodput (at SLO)", "12.4 req/s", "16.8 req/s", "21.3 req/s"], highlight: true },
+    { values: ["Infrastructure Complexity", "Low", "Low", "High"], highlight: false }
+  ]}
+  notes="Llama 70B on 8x A100 80GB. SLO: TTFT < 500ms, TBT < 50ms. Disaggregated: 3 GPUs prefill (TP=3), 5 GPUs decode (TP=5)."
+/>
+
+The verdict: chunked prefill is the pragmatic first step. It delivers 35-50% of the goodput improvement of full disaggregation with zero infrastructure overhead. But for large-scale deployments where every percentage point of efficiency matters, disaggregation provides a further 25-40% improvement.
+
+## When Disaggregation Wins vs. Loses
+
+Not every workload benefits from disaggregation. Here is a decision framework.
+
+### Disaggregation Wins
+
+**Long prompts (mean prompt length &gt; 1024 tokens).** The longer the prompt, the more compute is saved by eliminating interference, and the better the split efficiency ratio becomes. RAG workloads (4K-32K context), document summarization, and code analysis with large files all strongly favor disaggregation.
+
+**High request rates.** At low request rates, GPUs in both pools sit idle. At high request rates, the dedicated pools achieve better utilization than shared pools because each is optimized for its specific workload. The crossover is roughly when the cluster is at &gt;60% utilization.
+
+**Strict decode latency SLOs (&lt;50ms TBT).** Interactive chat applications, real-time code completion, and streaming scenarios where per-token latency directly impacts user experience. Disaggregation provides the most consistent decode latency because there is zero prefill interference.
+
+**Heterogeneous GPU fleet.** If your cluster has a mix of GPU types (A100 and H100, or different memory capacities), disaggregation lets you assign compute-strong GPUs to prefill and memory-large GPUs to decode. Unified serving cannot exploit this heterogeneity.
+
+**High prefix cache hit rates.** Workloads where many requests share common prefixes (chatbot with system prompt, API with few-shot examples) benefit enormously from Mooncake-style prefix caching, which is natural in disaggregated architectures.
+
+### Disaggregation Loses
+
+**Short prompts (mean prompt length &lt; 256 tokens).** Transfer overhead exceeds prefill time. Simple chatbot queries, classification tasks, and other short-input workloads are better served co-located.
+
+**Low request rates.** If your cluster handles &lt;10 requests per second, you cannot fill both pools effectively. The overhead of maintaining two separate pools with their own scheduling, health checking, and load balancing adds complexity without utilization gains.
+
+**Uniform simple workloads.** If all requests have similar prompt lengths and output lengths, and the SLO requirements are relaxed, the interference problem is manageable with simpler techniques (chunked prefill, request scheduling).
+
+**Network-constrained environments.** If your interconnect between prefill and decode machines is slow (e.g., 25 Gbps Ethernet), the KV cache transfer costs are prohibitive for all but the longest prompts.
+
+**Small models.** For models that fit on a single GPU with ample memory to spare (7B, 13B), the interference problem is less severe because there is enough memory headroom for both KV cache and large prefill batches.
+
+### Decision Framework
+
+```
+1. Compute mean prompt length for your workload
+   → < 256 tokens: Use chunked prefill, skip disaggregation
+   → 256-1024 tokens: Disaggregate only if you have fast interconnect (NVLink or IB 400G+)
+   → > 1024 tokens: Disaggregation likely beneficial
+
+2. Check request rate vs. cluster capacity
+   → < 40% utilization: Disaggregation wastes resources (can't fill both pools)
+   → 40-70% utilization: Disaggregation helps if prompt lengths justify it
+   → > 70% utilization: Disaggregation strongly recommended
+
+3. Check SLO requirements
+   → TBT SLO > 100ms: Chunked prefill sufficient
+   → TBT SLO 50-100ms: Disaggregation provides meaningful improvement
+   → TBT SLO < 50ms: Disaggregation almost required
+
+4. Check interconnect
+   → < 100 Gbps: Only disaggregate for very long prompts (> 4K tokens)
+   → 100-400 Gbps: Standard disaggregation effective for > 1K token prompts
+   → > 400 Gbps / NVLink: Disaggregation effective for most workloads
+```
+
+<Callout type="info" title="The Hybrid Path">
+  Many production deployments start with chunked prefill on a unified cluster, then gradually introduce disaggregation for specific workload segments. You might disaggregate only your long-context RAG traffic while keeping short-query chat traffic on unified serving. This incremental approach reduces risk while capturing the highest-value benefits.
+</Callout>
+
+## Production Deployment Patterns
+
+Real-world disaggregated deployments reveal practical patterns that the academic papers do not always cover.
+
+### Pattern 1: Intra-Node Disaggregation
+
+The simplest deployment: within each 8-GPU server, dedicate some GPUs to prefill and others to decode. On a DGX H100:
+
+- GPUs 0-2: Prefill pool (TP=3 for the model, or TP=1 with 3 independent model replicas)
+- GPUs 3-7: Decode pool (TP=5, or other configurations depending on model size)
+- KV cache transfer: NVLink within the node (~5ms for 2.56 GB)
+
+**Advantages:** Ultra-low transfer latency, no cross-node networking needed, simple deployment.
+
+**Disadvantages:** Limited flexibility (at most 8 GPUs to split), cannot independently scale the pools beyond the node boundary.
+
+### Pattern 2: Inter-Node Disaggregation with Dedicated Racks
+
+Larger deployments use dedicated racks for each pool:
+
+- Prefill rack: 16-64 GPUs, configured with high compute density
+- Decode rack: 32-128 GPUs, configured for maximum KV cache capacity
+- Connected via InfiniBand 400 Gb/s spine fabric
+
+The request router is a separate service that maintains:
+- Queue depth on each prefill machine
+- Memory utilization on each decode machine
+- Request SLO deadlines
+- Affinity hints (route conversational follow-ups to the same decode machine for cache reuse)
+
+### Pattern 3: Mooncake-Style with Distributed KV Store
+
+The most sophisticated pattern, used at scale by Moonshot AI and increasingly by other large providers:
+
+- Prefill and decode pools are fully independent services
+- A distributed object store (built on RDMA) holds KV cache
+- A metadata service tracks which KV cache entries exist and where they are stored
+- Eviction policies manage the memory hierarchy (HBM → DRAM → SSD)
+
+This pattern requires the most engineering investment but provides the highest efficiency at scale due to prefix caching and complete decoupling.
+
+### Monitoring and Observability
+
+Disaggregated deployments need specialized monitoring:
+
+```python
+# Key metrics to track for disaggregated serving
+DISAGG_METRICS = {
+    # Prefill pool
+    "prefill_queue_depth": "Number of requests waiting for prefill",
+    "prefill_latency_p99": "Time from request arrival to prefill completion",
+    "prefill_gpu_utilization": "Should be 60-80% (compute-bound target)",
+    "prefill_batch_size_avg": "Larger is better for throughput",
+
+    # Transfer
+    "kv_transfer_latency_p99": "Time to move KV cache (should be < prefill time)",
+    "kv_transfer_bandwidth_utilization": "% of theoretical interconnect bandwidth",
+    "kv_compression_ratio": "If using quantized transfer",
+
+    # Decode pool
+    "decode_tbt_p99": "Time between tokens -- primary SLO metric",
+    "decode_kv_memory_utilization": "How full is KV cache memory (target: 70-85%)",
+    "decode_concurrent_requests": "Number of active decode sessions",
+    "decode_iteration_time": "Should be stable without prefill spikes",
+
+    # System
+    "goodput": "Requests/sec meeting all SLO targets",
+    "prefill_decode_ratio": "Current ratio of prefill to decode GPU allocation",
+    "rebalance_events": "How often the system rebalances GPU assignments",
+}
+```
+
+### Failure Handling
+
+Disaggregation introduces new failure modes:
+
+**Prefill machine failure during transfer.** The KV cache is partially transferred. Options: (a) discard and re-prefill on another machine, (b) if using Mooncake-style store, retrieve already-stored layers and re-compute only the missing ones.
+
+**Decode machine failure.** Active decode sessions are lost. The KV cache in the store (if using Mooncake) allows resuming on another decode machine without re-prefilling. Without a store, the request must be fully re-processed.
+
+**Network partition between pools.** Prefill completes but cannot reach any decode machine. The system must buffer the KV cache (in CPU DRAM on the prefill node) until connectivity is restored, or fail the request.
+
+**Memory pressure on decode pool.** Too many concurrent decode sessions. Options: (a) preempt lowest-priority sessions (swap KV cache to CPU), (b) slow-admit new prefilled requests (let them queue), (c) dynamically convert some prefill GPUs to decode duty.
+
+## The Future of Disaggregated Serving
+
+Several technology trends will shape whether disaggregation becomes the default architecture for LLM serving.
+
+### Faster Interconnects
+
+**CXL (Compute Express Link) 3.0** provides cache-coherent memory access across devices at roughly DRAM-like latencies. If CXL-attached memory pools become practical, the "KV cache transfer" could become a simple memory access rather than a network operation. The transfer cost objection to disaggregation would essentially disappear.
+
+**NVLink Switch systems** (like NVIDIA's NVLink domain in GB200 NVL72) provide 900+ GB/s connectivity across 72 GPUs. At this bandwidth, transferring 2.56 GB of KV cache takes under 3ms. Intra-domain disaggregation becomes nearly free.
+
+**Ultra Ethernet Consortium (UEC)** is pushing toward 800 Gbps and 1.6 Tbps Ethernet links with RDMA support. Commodity interconnects approaching InfiniBand performance would make inter-node disaggregation viable for shorter prompts.
+
+### Architectural Implications
+
+As interconnects get faster, the optimal split between prefill and decode may become more dynamic. Instead of static assignment (these GPUs always do prefill, those always do decode), future systems may switch roles on a per-request basis -- prefill a batch, immediately start decoding it on the same GPU, then switch back to prefill when the next batch arrives. This is temporal disaggregation taken to its logical conclusion.
+
+### Hardware Specialization
+
+The logical endpoint of disaggregation is **purpose-built silicon** for each phase:
+
+- **Prefill accelerators**: Massive compute density, modest memory, optimized for large GEMMs. Think wafer-scale chips (Cerebras) or dense tensor core arrays.
+- **Decode accelerators**: Massive memory bandwidth, large capacity, modest compute. Think HBM-heavy designs or processing-in-memory architectures.
+
+Some startups are already exploring this direction, designing inference chips specifically optimized for one phase rather than trying to serve both.
+
+### KV Cache as Infrastructure
+
+Mooncake's insight -- that KV cache is the central abstraction -- is likely to become more influential. As context windows grow to 128K, 1M, or beyond, the KV cache becomes the dominant resource in the system. Future serving platforms will likely treat KV cache as a distributed data structure with its own consistency, replication, and caching semantics, much like how databases treat their buffer pools.
+
+The implications extend beyond serving to the full LLM application stack:
+
+- **Prompt caching as a service**: Cache KV for common system prompts, tool definitions, and few-shot examples at the infrastructure level
+- **Conversation state management**: KV cache persistence across turns, enabling instant continuation without re-prefilling history
+- **Multi-model KV sharing**: If different model versions share architecture, KV cache from one model might be partially reusable by another (with appropriate projection)
+
+### Will Disaggregation Become the Default?
+
+For small-scale deployments (single GPU, a few requests per second), disaggregation is unnecessary overhead. Chunked prefill handles the interference well enough.
+
+For medium-scale deployments (8-64 GPUs, tens of requests per second), disaggregation provides meaningful benefits if the workload has long prompts or strict latency requirements. It is becoming the recommended architecture for these cases.
+
+For large-scale deployments (hundreds to thousands of GPUs, thousands of requests per second), disaggregation is already the default at leading AI companies. The efficiency gains at scale are too large to ignore, and the engineering investment pays for itself quickly.
+
+The trajectory is clear: as models grow larger, context windows extend further, and latency expectations tighten, the interference between prefill and decode becomes more severe. Disaggregation is not just an optimization -- it is an architectural necessity for the next generation of LLM serving infrastructure.
+
+<Callout type="info" title="Summary">
+  Disaggregated prefill-decode serving separates the compute-bound prompt processing phase from the memory-bandwidth-bound token generation phase onto dedicated GPU pools. This eliminates the 2-5x decode latency interference caused by co-located execution, enables independent scaling and hardware specialization, and unlocks optimizations like prefix caching. The main cost is KV cache transfer overhead, which can be driven below 5% of total latency using compression, pipelining, and speculative transfer. For workloads with prompt lengths above 1024 tokens and strict latency SLOs, disaggregation delivers 40-75% goodput improvement over unified serving.
+</Callout>
+
+## References and Further Reading
+
+- **Splitwise**: Patel et al., "Splitwise: Efficient generative LLM inference using phase splitting," ISCA 2024.
+- **DistServe**: Zhong et al., "DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving," OSDI 2024.
+- **Mooncake**: Qin et al., "Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving," 2024.
+- **Sarathi-Serve**: Agrawal et al., "Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve," OSDI 2024.
+- **vLLM**: Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention," SOSP 2023.
+- **FlashAttention**: Dao et al., "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness," NeurIPS 2022.

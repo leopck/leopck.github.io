@@ -1,310 +1,701 @@
 ---
-title: "Quantization for LLM Inference: FP16, INT8, and INT4 Performance Analysis"
+title: "Quantization for LLM Inference: From FP16 to INT4 — A Deep Dive into Precision, Performance, and Production Deployment"
 author: "stanley-phoong"
-description: "Comprehensive analysis of quantization techniques for LLM inference, comparing FP16, INT8, and INT4 precision, performance impact, and quality trade-offs."
-publishDate: 2019-10-22
+description: "A comprehensive, in-depth analysis of quantization techniques for LLM inference — covering GPTQ, AWQ, SmoothQuant, FP8, KV cache quantization, hardware support, quality benchmarks, and production deployment with vLLM and TRT-LLM."
+publishDate: 2025-03-21
 category: llm-inference
-tags: [llm, quantization, inference, performance, optimization, precision]
+tags: [llm, quantization, inference, performance, optimization, precision, gptq, awq, smoothquant, fp8, kv-cache, vllm, tensorrt-llm]
 difficulty: advanced
-readingTime: 20
+readingTime: 30
 ---
 
 import Callout from '@/components/mdx/Callout.astro';
 import PerfChart from '@/components/mdx/PerfChart.astro';
 import Benchmark from '@/components/mdx/Benchmark.astro';
 
-Quantization reduces model size and improves inference speed by using lower precision arithmetic. Understanding the trade-offs between precision, performance, and quality is essential.
+Large language models are enormous. A 70-billion-parameter model stored in FP16 occupies 140 GB of GPU memory — more than a single A100 80 GB card can hold. Quantization is the single most impactful technique for making these models practical: it shrinks their memory footprint, accelerates inference, and in many cases costs almost nothing in output quality. This post is a deep, technical treatment of how quantization works for LLM inference, what methods exist, which hardware supports what, and how to make the right choices for production.
 
-## Quantization Overview
+## Why Quantization Matters for LLMs
 
-Quantization maps floating-point values to integers:
+LLM inference has two distinct phases: **prefill** (processing the prompt) and **decode** (generating tokens one at a time). Prefill is compute-bound — you are doing a large batched matrix multiplication over all prompt tokens simultaneously. Decode is **memory-bandwidth-bound** — each generated token requires reading the entire model's weights from GPU memory, but only performs a single matrix-vector product per layer.
+
+This memory-bandwidth bottleneck is the reason quantization matters so much. During decode, the GPU spends most of its time waiting for weights to arrive from HBM. Every byte you shave off each parameter translates almost linearly into faster token generation.
+
+<Callout type="tip">
+**The core insight**: During autoregressive decode, inference throughput is determined by how fast you can stream weights from memory, not by how fast you can multiply numbers. Quantization reduces the bytes per parameter, directly increasing throughput.
+</Callout>
+
+The arithmetic is straightforward:
+
+<Benchmark
+  title="Memory Footprint by Precision — Llama 2 70B"
+  columns={["Precision", "Bits/Param", "Model Size", "GPUs Needed (80 GB)", "Relative Decode Throughput"]}
+  rows={[
+    { values: ["FP32", "32", "280 GB", "4x A100", "0.5x (baseline)"], highlight: false },
+    { values: ["BF16/FP16", "16", "140 GB", "2x A100", "1.0x"], highlight: false },
+    { values: ["INT8 / FP8", "8", "70 GB", "1x A100", "~2.0x"], highlight: true },
+    { values: ["INT4 (packed)", "4", "35 GB", "1x A100 (half)", "~3.5-4.0x"], highlight: true },
+  ]}
+/>
+
+Going from FP16 to INT8 halves the memory, which means the model fits on half the GPUs. Going to INT4 quarters it. For a 70B model, the difference between needing two A100-80GB cards and needing one is enormous in terms of cost per token. At cloud GPU prices of roughly $2-3/hr per A100, halving GPU count halves your inference cost.
+
+But memory savings are only half the story. Because decode is bandwidth-bound, moving half the bytes means tokens come out roughly twice as fast. On an A100 with ~2 TB/s HBM bandwidth, a 140 GB FP16 model takes ~70 ms just to read all weights once (one decode step). At INT8, that drops to ~35 ms. At INT4, ~17.5 ms. These are theoretical lower bounds, but real-world measurements track closely.
+
+<PerfChart
+  title="Theoretical Decode Latency vs. Precision (70B Model, A100 80GB)"
+  type="bar"
+  data={{
+    labels: ["FP16 (140 GB)", "INT8 (70 GB)", "INT4 (35 GB)"],
+    datasets: [
+      {
+        label: "Time to Read Weights (ms)",
+        data: [70, 35, 17.5],
+        backgroundColor: ["#3b82f6", "#f59e0b", "#ef4444"],
+      }
+    ]
+  }}
+/>
+
+## Quantization Fundamentals
+
+Before diving into specific LLM methods, we need a solid understanding of the underlying math.
+
+### Linear (Uniform) Quantization
+
+The most common form of quantization is **linear quantization**, which maps a continuous range of floating-point values to a discrete set of integers. The mapping is defined by two parameters: a **scale factor** $s$ and a **zero point** $z$:
+
+$$x_q = \text{round}\left(\frac{x}{s}\right) + z$$
+
+To dequantize (reconstruct the approximate floating-point value):
+
+$$\hat{x} = s \cdot (x_q - z)$$
+
+The scale $s$ determines how much real-valued range each integer step covers. The zero point $z$ shifts the integer range so that the real value 0.0 maps exactly to an integer — this is important because neural networks are full of zeros (ReLU outputs, padding, sparse activations) and you want zero to be represented without error.
 
 ```python
 import torch
-import torch.nn as nn
 
-def quantize_fp32_to_int8(tensor, scale):
-    """
-    Quantize FP32 to INT8
-    """
-    # Scale and clamp to INT8 range
-    quantized = torch.clamp(tensor / scale, -128, 127)
-    return quantized.round().to(torch.int8)
+def linear_quantize(tensor: torch.Tensor, num_bits: int = 8, symmetric: bool = True):
+    """Linear quantization of a tensor to num_bits precision."""
+    if symmetric:
+        # Symmetric: zero point is 0, range is [-qmax, qmax]
+        qmax = (1 << (num_bits - 1)) - 1  # e.g., 127 for INT8
+        scale = tensor.abs().max() / qmax
+        zero_point = 0
+    else:
+        # Asymmetric: full range [qmin, qmax] maps to [tensor.min(), tensor.max()]
+        qmin = 0
+        qmax = (1 << num_bits) - 1  # e.g., 255 for UINT8
+        scale = (tensor.max() - tensor.min()) / (qmax - qmin)
+        zero_point = round(-tensor.min() / scale)
 
-def dequantize_int8_to_fp32(quantized, scale):
-    """
-    Dequantize INT8 to FP32
-    """
-    return quantized.to(torch.float32) * scale
+    quantized = torch.clamp(
+        torch.round(tensor / scale) + zero_point,
+        -(1 << (num_bits - 1)) if symmetric else 0,
+        (1 << (num_bits - 1)) - 1 if symmetric else (1 << num_bits) - 1,
+    )
+    return quantized.to(torch.int8 if num_bits <= 8 else torch.int16), scale, zero_point
 
-# Example
-fp32_tensor = torch.randn(100, 100)
-scale = fp32_tensor.abs().max() / 127.0
-int8_tensor = quantize_fp32_to_int8(fp32_tensor, scale)
-fp32_reconstructed = dequantize_int8_to_fp32(int8_tensor, scale)
+def linear_dequantize(quantized: torch.Tensor, scale: float, zero_point: int):
+    """Dequantize back to floating point."""
+    return scale * (quantized.float() - zero_point)
 ```
 
-## Precision Comparison
+### Symmetric vs. Asymmetric Quantization
+
+**Symmetric quantization** sets $z = 0$ and maps the range $[-\alpha, \alpha]$ to $[-2^{b-1}+1, 2^{b-1}-1]$, where $\alpha = \max(|x|)$. This is simpler — dequantization is just $\hat{x} = s \cdot x_q$ with no subtraction needed. The downside: if the distribution is skewed (e.g., all positive values from a ReLU), you waste half the integer range.
+
+**Asymmetric quantization** uses the full integer range by mapping $[\text{min}(x), \text{max}(x)]$ to $[0, 2^b - 1]$. This is more accurate for skewed distributions but adds the cost of storing and computing with the zero point.
+
+<Callout type="info">
+**In practice for LLMs**: Weights tend to be roughly symmetric around zero, so **symmetric quantization** works well for weights. Activations can be skewed (especially post-ReLU or post-GeLU), so **asymmetric quantization** sometimes helps for activations — though many production systems use symmetric for both to keep kernels simple.
+</Callout>
+
+### Granularity: Per-Tensor vs. Per-Channel vs. Per-Group
+
+The scale factor and zero point can be computed at different granularities, with a direct tradeoff between accuracy and storage overhead:
+
+**Per-tensor**: One scale and zero point for the entire weight matrix. Simplest, lowest overhead, but worst accuracy — a single outlier in a million-element tensor sets the scale for everything.
+
+**Per-channel (per-row/per-column)**: One scale per output channel of a linear layer. For a weight matrix $W \in \mathbb{R}^{m \times n}$, this means $m$ scales. This is the standard for INT8 weight quantization and works well because different output neurons can have very different magnitude distributions.
+
+**Per-group**: Divide each row into groups of $g$ elements (commonly $g = 128$) and compute a scale per group. For a weight matrix with $n$ columns, this means $n/g$ scales per row, or $m \cdot n / g$ total. Per-group quantization is the standard for INT4 weight quantization (GPTQ, AWQ) because at 4-bit precision, per-channel is not fine-grained enough.
 
 <Benchmark
-  title="Quantization Precision Comparison"
-  columns={["Precision", "Bits", "Range", "Memory", "Speedup"]}
+  title="Quantization Granularity Tradeoffs"
+  columns={["Granularity", "Scales Stored (m x n matrix)", "Overhead at INT4", "Typical Use"]}
   rows={[
-    { values: ["FP32", "32", "±3.4e38", "1.0x", "1.0x"], highlight: false },
-    { values: ["FP16", "16", "±65504", "0.5x", "1.5-2x"], highlight: true },
-    { values: ["INT8", "8", "-128 to 127", "0.25x", "2-4x"], highlight: true },
-    { values: ["INT4", "4", "-8 to 7", "0.125x", "4-8x"], highlight: false },
+    { values: ["Per-tensor", "1", "Negligible", "INT8 activations"], highlight: false },
+    { values: ["Per-channel", "m", "~0.4% (FP16 scales)", "INT8 weights"], highlight: false },
+    { values: ["Per-group (g=128)", "m * n / 128", "~3.1% (FP16 scales)", "INT4 weights (GPTQ, AWQ)"], highlight: true },
+    { values: ["Per-group (g=32)", "m * n / 32", "~12.5% (FP16 scales)", "Ultra-low-bit (2-3 bit)"], highlight: false },
   ]}
 />
 
-## FP16 Quantization
+The overhead column matters: with per-group quantization at group size 128 and FP16 scales, each group of 128 4-bit values (64 bytes) also needs a 2-byte scale, adding about 3.1% overhead. At group size 32, the overhead climbs to 12.5%. This is why group size 128 is the sweet spot for INT4.
 
-FP16 provides 2x memory reduction with minimal quality loss:
+### Why LLMs Are Hard to Quantize: The Outlier Problem
+
+Naive quantization of LLM activations often fails catastrophically, and the reason was identified by Dettmers et al. (2022) and later by the SmoothQuant paper (Xiao et al., 2023): **LLMs develop massive activation outliers**.
+
+In transformer models, certain hidden-state channels consistently produce values 10-100x larger than the rest. For example, in a layer where most activation values fall in $[-5, 5]$, a few channels might hit $[-60, 60]$. If you quantize per-tensor, the scale must accommodate those outliers, meaning the vast majority of "normal" values get crushed into a tiny fraction of the integer range — destroying information.
+
+These outliers appear in specific channels (feature dimensions) and are consistent across tokens, which means they are a property of the model weights, not the input data. This insight is what drives SmoothQuant and related methods: if the outliers are in known channels, you can mathematically redistribute the quantization difficulty.
+
+<Callout type="warning">
+**Key insight**: The difficulty of quantizing LLMs is not about the weights — weights are usually well-behaved and easy to quantize. The difficulty is in the **activations**, which develop systematic outlier channels. This is why weight-only quantization (W4A16, W8A16) is so much easier than weight+activation quantization (W8A8, W4A4).
+</Callout>
+
+## Weight-Only Quantization: W4A16 and W8A16
+
+Weight-only quantization stores the model weights in low precision (INT4 or INT8) but performs the actual matrix multiplication in FP16. At inference time, each weight group is dequantized on-the-fly to FP16 before the GEMM. Because weight loading from HBM is the bottleneck during decode, you still get the bandwidth savings — the dequantization happens in registers or shared memory, which is much faster.
+
+This approach sidesteps the activation outlier problem entirely: activations stay in FP16 throughout.
+
+### Round-to-Nearest (RTN)
+
+The simplest baseline: just round each weight to the nearest quantized value. Surprisingly, RTN works reasonably well at INT8. At INT4, it fails badly — a 70B model might lose 1-2 perplexity points on WikiText, and smaller models degrade much more.
+
+### GPTQ: One-Shot Post-Training Quantization
+
+GPTQ (Frantar et al., 2023) is the most widely used INT4 weight quantization method. It builds on the Optimal Brain Quantization (OBQ) framework, which quantizes weights one at a time and adjusts the remaining unquantized weights to compensate for each quantization error.
+
+**How GPTQ works, step by step:**
+
+1. **Collect calibration data**: Run a small calibration set (typically 128 samples from C4 or WikiText) through the model and record the input activations $X$ to each linear layer.
+
+2. **Compute the Hessian approximation**: For each linear layer with weight $W$ and calibration inputs $X$, compute $H = 2 X X^T$ (the Hessian of the layer-wise reconstruction error $\|WX - \hat{W}X\|^2$ with respect to $W$).
+
+3. **Quantize column by column**: Process the weight matrix one column at a time. For each column $j$:
+   - Quantize $w_j$ to $\hat{w}_j$ using round-to-nearest with the chosen bit-width and group size.
+   - Compute the quantization error: $\delta_j = w_j - \hat{w}_j$.
+   - Compensate by adjusting all remaining unquantized columns: $W_{:, j+1:} \mathrel{+}= -\frac{\delta_j}{H_{jj}} \cdot H_{j, j+1:}$. This is the key step — it uses the Hessian to distribute the error in a way that minimizes the impact on the layer's output.
+
+4. **Repeat for every linear layer** in the model, processing layers sequentially (so earlier layers are quantized before later ones).
+
+The Hessian-based error compensation is what makes GPTQ dramatically better than RTN at INT4. The entire process takes minutes on a single GPU, which is why it is called "one-shot" — no iterative training loop is required.
 
 ```python
-def fp16_inference(model, input_tensor):
+# Simplified GPTQ pseudocode for a single linear layer
+def gptq_quantize_layer(W, X_cal, num_bits=4, group_size=128):
     """
-    Convert model and inputs to FP16
+    W: weight matrix (out_features x in_features)
+    X_cal: calibration inputs (in_features x num_samples)
     """
-    # Convert model to FP16
-    model_fp16 = model.half()
-    
-    # Convert input to FP16
-    input_fp16 = input_tensor.half()
-    
-    # Inference
-    with torch.no_grad():
-        output_fp16 = model_fp16(input_fp16)
-    
-    return output_fp16.float()  # Convert back to FP32 if needed
+    H = 2 * X_cal @ X_cal.T  # Hessian approximation
+    H_inv = torch.linalg.cholesky(H + 1e-6 * torch.eye(H.shape[0]))
+
+    n_cols = W.shape[1]
+    for col in range(n_cols):
+        # Quantize this column
+        w = W[:, col].clone()
+        scale = compute_group_scale(w, num_bits, group_size)
+        w_q = quantize(w, scale, num_bits)
+        error = W[:, col] - dequantize(w_q, scale)
+
+        # Update remaining columns using Hessian information
+        W[:, col] = dequantize(w_q, scale)
+        if col + 1 < n_cols:
+            W[:, col+1:] -= error.unsqueeze(1) * H_inv[col, col+1:].unsqueeze(0) / H_inv[col, col]
+
+    return W  # Now contains dequantized quantized weights
 ```
 
-**Performance**: 1.5-2x speedup, 2x memory reduction, &lt;0.1% quality loss
+### AWQ: Activation-Aware Weight Quantization
+
+AWQ (Lin et al., 2024) takes a different approach based on a key observation: **not all weights are equally important**. Specifically, a small fraction of weight channels (roughly 1%) correspond to large activation magnitudes and are disproportionately important for model quality. Quantization errors in these "salient" channels cause much larger output errors.
+
+AWQ works by applying per-channel scaling to the weights before quantization:
+
+1. **Identify salient channels**: Run calibration data and measure the average magnitude of each input activation channel.
+
+2. **Compute optimal scales**: For each channel, find a scale $s_i$ that minimizes the quantization error when applied as $W_{\text{scaled}} = W \cdot \text{diag}(s)$ and $X_{\text{scaled}} = X \cdot \text{diag}(s)^{-1}$. The math is $Y = X W^T = (X \cdot \text{diag}(s)^{-1}) \cdot (\text{diag}(s) \cdot W)^T$, so the product is preserved exactly, but the weight distribution is "smoothed" before quantization.
+
+3. **Quantize the scaled weights**: Now quantize $W_{\text{scaled}}$. The salient channels have been scaled up (making them more robust to rounding) while the less important channels have been scaled down.
+
+The key difference from GPTQ: AWQ does not modify the remaining weights after quantizing each column. Instead, it finds a good pre-scaling that makes the entire weight matrix more quantization-friendly, then quantizes directly. This makes AWQ faster to run and sometimes more robust.
+
+### SqueezeLLM: Non-Uniform Quantization
+
+SqueezeLLM (Kim et al., 2024) departs from uniform (linear) quantization entirely. It uses two innovations:
+
+1. **Non-uniform quantization**: Instead of evenly spaced quantization levels, use k-means clustering to find the optimal placement of quantization levels for each weight group. This better matches the actual weight distribution, which is typically bell-shaped (not uniform).
+
+2. **Sparse outlier storage**: Extract the most extreme weight values and store them separately in a sparse format (CSR). The remaining weights, with outliers removed, are much easier to quantize uniformly.
+
+The combination allows SqueezeLLM to achieve INT3 quality that rivals other methods at INT4, but the non-uniform dequantization requires lookup tables, which can complicate kernel implementation.
+
+### Comparison: GPTQ vs. AWQ vs. RTN
+
+<Benchmark
+  title="INT4 Weight Quantization Methods — Llama 2 7B WikiText-2 Perplexity"
+  columns={["Method", "Group Size", "Perplexity", "Quantization Time", "Inference Speed"]}
+  rows={[
+    { values: ["FP16 (baseline)", "—", "5.47", "—", "1.0x"], highlight: false },
+    { values: ["RTN", "128", "6.29", "< 1 min", "1.0x (same kernels)"], highlight: false },
+    { values: ["GPTQ", "128", "5.63", "~5 min", "1.0x (same kernels)"], highlight: true },
+    { values: ["AWQ", "128", "5.60", "~3 min", "1.0x (same kernels)"], highlight: true },
+    { values: ["SqueezeLLM", "—", "5.54", "~20 min", "0.8-0.9x (LUT overhead)"], highlight: false },
+  ]}
+/>
+
+<Callout type="tip">
+**Practical takeaway**: GPTQ and AWQ produce comparable quality and use the same inference kernels. AWQ is slightly faster to quantize and often marginally better on quality. Both are far superior to naive RTN at INT4. For most production use cases, AWQ is the recommended default.
+</Callout>
+
+At INT4, inference speed for GPTQ and AWQ depends on the **dequantization kernel**, not the quantization method. Both produce the same format: INT4 weights with FP16 group scales. The actual speedup during inference comes from specialized kernels like Marlin (more on this in the production section).
+
+## Weight + Activation Quantization: W8A8 and Beyond
+
+Weight-only quantization is simple and effective, but it leaves performance on the table. If you also quantize the activations, you can use **integer GEMM kernels** that run natively on tensor cores — avoiding the dequantize-then-FP16-GEMM overhead entirely. This is the domain of W8A8 (INT8 weights, INT8 activations) and FP8 quantization.
+
+### SmoothQuant: Making Activations Quantizable
+
+As discussed above, the challenge is activation outliers. SmoothQuant (Xiao et al., 2023) solves this with a mathematically elegant trick: **migrate the quantization difficulty from activations to weights** using a per-channel scaling transformation.
+
+For a linear layer computing $Y = X \cdot W^T$, SmoothQuant introduces a diagonal scaling matrix $\text{diag}(s)$:
+
+$$Y = X \cdot W^T = \underbrace{(X \cdot \text{diag}(s)^{-1})}_{\hat{X}} \cdot \underbrace{(\text{diag}(s) \cdot W)^T}_{\hat{W}^T}$$
+
+The scale vector $s$ is chosen per-channel to balance the quantization difficulty:
+
+$$s_j = \frac{\max(|X_j|)^\alpha}{\max(|W_j|)^{1-\alpha}}$$
+
+where $\alpha$ is a hyperparameter (typically 0.5) that controls how much difficulty is migrated. When $\alpha = 1$, all difficulty goes to the weights; when $\alpha = 0$, all difficulty stays in the activations. The sweet spot is usually $\alpha = 0.5$, which equalizes the quantization ranges.
+
+After smoothing:
+- $\hat{X}$ has smaller per-channel outliers (divided by $s$) — easier to quantize.
+- $\hat{W}$ has slightly larger values in the corresponding channels (multiplied by $s$) — but weights are well-behaved, so this is fine.
+
+The scaling can be fused into the preceding LayerNorm or into the weight matrix directly, so there is **zero runtime overhead**. The result: both weights and activations can be quantized to INT8 with minimal quality loss, and the entire GEMM runs on INT8 tensor cores.
+
+```python
+def smooth_layer(weight, activation_scales, alpha=0.5):
+    """
+    Apply SmoothQuant transformation to a linear layer.
+
+    activation_scales: per-channel max absolute activation values
+                       from calibration (shape: [in_features])
+    """
+    weight_scales = weight.abs().max(dim=0).values  # per-channel max of weights
+
+    # Compute smoothing factor
+    s = (activation_scales.pow(alpha) / weight_scales.pow(1 - alpha)).clamp(min=1e-5)
+
+    # Apply: scale up weights, scale down activations (fused into LayerNorm)
+    smoothed_weight = weight * s.unsqueeze(0)  # broadcast across output dim
+
+    return smoothed_weight, s  # s is fused into preceding LayerNorm
+```
+
+### FP8: The Hopper Generation Native Format
+
+NVIDIA's H100 (Hopper architecture) introduced native FP8 tensor core support, and it has become the preferred precision for high-throughput LLM inference. FP8 comes in two formats:
+
+**E4M3** (4-bit exponent, 3-bit mantissa): Dynamic range of $\pm 448$, precision of about 1/8 of FP16. Used for **forward pass** (inference) because the limited range is sufficient for typical weight and activation distributions.
+
+**E5M2** (5-bit exponent, 2-bit mantissa): Dynamic range of $\pm 57344$ (same as FP16/BF16), but lower precision. Used for **backward pass** (training gradients) where the wider range prevents underflow in small gradients.
+
+<Benchmark
+  title="FP8 Formats Compared"
+  columns={["Format", "Exponent Bits", "Mantissa Bits", "Dynamic Range", "Primary Use"]}
+  rows={[
+    { values: ["FP32", "8", "23", "±3.4e38", "Training (master weights)"], highlight: false },
+    { values: ["BF16", "8", "7", "±3.4e38", "Training / Inference"], highlight: false },
+    { values: ["FP16", "5", "10", "±65504", "Inference baseline"], highlight: false },
+    { values: ["FP8 E5M2", "5", "2", "±57344", "Training (gradients)"], highlight: false },
+    { values: ["FP8 E4M3", "4", "3", "±448", "Inference (weights + activations)"], highlight: true },
+  ]}
+/>
+
+FP8 quantization is much simpler than INT8 because it is a floating-point format — you just need a single scale factor to shift the tensor's dynamic range into the representable FP8 range. There are no zero points, no group decomposition, and the tensor core GEMM produces FP16 or FP32 output directly. NVIDIA's Transformer Engine library handles the scaling automatically.
+
+<Callout type="info">
+**Why FP8 is winning**: FP8 E4M3 is essentially "free" quantization on H100. The tensor cores run FP8 GEMM at 2x the FLOPS of FP16 (3958 TFLOPS vs. 1979 TFLOPS on H100 SXM), the quality loss is negligible for most models, and the tooling (Transformer Engine) handles all the scaling automatically. If you are deploying on H100 or newer, FP8 should be your default inference precision.
+</Callout>
+
+### INT8 GEMM on A100
+
+On A100 (Ampere), there is no native FP8 support, but INT8 tensor cores deliver 624 TOPS vs. 312 TFLOPS for FP16 — a 2x compute throughput advantage. Combined with the 2x memory bandwidth savings from smaller weights, INT8 inference on A100 delivers roughly 2x end-to-end speedup over FP16 for decode-bound workloads.
+
+The cuBLAS library provides `cublasLtMatmul` with INT8 input types, accumulating in INT32 before converting to the output type. The main implementation challenge is the quantization overhead: computing scales, quantizing activations on-the-fly, and dequantizing the INT32 accumulator. With SmoothQuant or static per-tensor activation scales, this overhead is minimal.
+
+### W4A4: The Frontier
+
+W4A4 (4-bit weights and 4-bit activations) represents the frontier of quantization research. The potential is enormous: INT4 GEMM on hypothetical future hardware could deliver 4x the throughput of FP16. Current challenges:
+
+- **Activation quantization at INT4 is destructive**: Even with SmoothQuant, cramming activations into 16 levels (INT4) loses too much information for most models.
+- **No mainstream hardware support**: As of 2025, no production GPU has INT4 tensor cores.
+- **Quality gap**: W4A4 typically costs 2-5 perplexity points on 7B models, which is unacceptable for most applications.
+
+Research directions like QuIP# (Chee et al., 2024) and AQLM use vector quantization and learned codebooks to push effective precision below 4 bits, but these require specialized kernels and are not yet mainstream.
+
+## KV Cache Quantization
+
+The KV (key-value) cache stores the key and value projections for all past tokens during autoregressive generation. For long-context inference, the KV cache can become the dominant memory consumer — dwarfing even the model weights.
+
+**Example**: Llama 2 70B with 128K context length in FP16:
+- Model weights: 140 GB
+- KV cache per sequence: $2 \times 80 \times 8192 \times 128 \times 128000 \times 2 \text{ bytes}$ — this is roughly 40 GB per sequence at FP16
+
+KV cache quantization is **orthogonal** to weight quantization — you can (and should) apply both independently.
+
+### Per-Token KV Quantization
+
+The simplest approach: compute a scale factor for each token's key and value vectors independently. Because each token's KV vectors are relatively short (hidden_dim / num_heads per head), per-token quantization is fine-grained enough to work well.
+
+```python
+def quantize_kv_cache(key_states, value_states, num_bits=8):
+    """
+    Quantize KV cache per-token (per the last dimension grouping).
+    key_states: (batch, num_heads, seq_len, head_dim)
+    """
+    # Compute per-token scales (one scale per token per head)
+    k_scales = key_states.abs().amax(dim=-1, keepdim=True) / (2 ** (num_bits - 1) - 1)
+    v_scales = value_states.abs().amax(dim=-1, keepdim=True) / (2 ** (num_bits - 1) - 1)
+
+    k_quantized = (key_states / k_scales).round().clamp(-128, 127).to(torch.int8)
+    v_quantized = (value_states / v_scales).round().clamp(-128, 127).to(torch.int8)
+
+    return k_quantized, v_quantized, k_scales, v_scales
+```
+
+### FP8 KV Cache
+
+FP8 (E4M3) KV cache is the simplest and most effective option on H100:
+
+- **2x memory savings** compared to FP16 (no additional scale storage needed — FP8 is self-describing).
+- **Minimal quality loss**: Typically &lt;0.1 perplexity points on standard benchmarks.
+- **No specialized kernels needed**: Attention kernels like FlashAttention-3 support FP8 natively.
+
+### INT4 KV Cache
+
+INT4 KV cache is more aggressive:
+
+- **4x memory savings** compared to FP16 — enabling 4x longer context or 4x more concurrent sequences.
+- **Noticeable quality impact**: 0.2-0.5 perplexity points, with occasional degradation on tasks requiring precise recall of early context.
+- **Per-token or per-group scales required**: Adds storage overhead (FP16 scales).
+
+<Benchmark
+  title="KV Cache Quantization — Llama 2 70B, 4K Context"
+  columns={["KV Precision", "KV Cache Size", "Perplexity Delta", "Max Context (80 GB budget)"]  }
+  rows={[
+    { values: ["FP16", "1.0x (baseline)", "+0.00", "~32K tokens"], highlight: false },
+    { values: ["FP8 (E4M3)", "0.50x", "+0.05", "~64K tokens"], highlight: true },
+    { values: ["INT8", "0.50x + scales", "+0.08", "~60K tokens"], highlight: true },
+    { values: ["INT4", "0.25x + scales", "+0.30", "~100K+ tokens"], highlight: false },
+  ]}
+/>
+
+<Callout type="tip">
+**Recommendation**: If your hardware supports FP8 (H100, MI300X), use FP8 KV cache — it is nearly free. On older hardware, INT8 KV cache with per-token scales is the safest choice. INT4 KV cache is worth it only when you are severely memory-constrained for long-context workloads.
+</Callout>
+
+## Hardware Support Matrix
+
+Not all GPUs support all quantization formats. The mapping between quantization methods and hardware is critical for choosing the right approach.
+
+<Benchmark
+  title="GPU Hardware Quantization Support"
+  columns={["GPU", "Architecture", "INT8 Tensor Cores", "FP8 Tensor Cores", "Best Quantization Strategy"]}
+  rows={[
+    { values: ["A100 80GB", "Ampere", "Yes (624 TOPS)", "No", "W8A8 (SmoothQuant) or W4A16 (GPTQ/AWQ)"], highlight: false },
+    { values: ["H100 80GB", "Hopper", "Yes", "Yes (E4M3/E5M2, 3958 TFLOPS)", "FP8 (W8A8) via Transformer Engine"], highlight: true },
+    { values: ["H200 141GB", "Hopper", "Yes", "Yes (E4M3/E5M2)", "FP8 + larger KV cache budget"], highlight: true },
+    { values: ["MI300X 192GB", "CDNA3", "Yes", "Yes (E4M3/E5M2)", "FP8 (W8A8) via ROCm"], highlight: false },
+    { values: ["L40S 48GB", "Ada Lovelace", "Yes", "Yes (E4M3/E5M2)", "FP8 or INT8"], highlight: false },
+    { values: ["RTX 4090 24GB", "Ada Lovelace", "Yes", "Yes (E4M3/E5M2)", "W4A16 for large models (limited VRAM)"], highlight: false },
+  ]}
+/>
+
+The strategic implications:
+
+- **A100**: No FP8, so your best options are W8A8 with SmoothQuant (using INT8 tensor cores) or W4A16 with GPTQ/AWQ (dequantize to FP16, use FP16 tensor cores). For decode-bound workloads, W4A16 often wins because the bandwidth savings outweigh the lack of INT4 tensor cores.
+
+- **H100/H200**: FP8 is the clear winner. The Transformer Engine handles scaling automatically, FP8 tensor cores deliver 2x FLOPS over FP16, and quality loss is negligible. W4A16 is still useful when you need to fit very large models into limited GPU count.
+
+- **MI300X**: AMD's CDNA3 supports FP8 (E4M3/E5M2) and INT8. The software ecosystem (ROCm, hipBLAS) is catching up, with vLLM providing good support. The 192 GB HBM3 capacity means fewer quantization compromises are needed.
+
+- **Consumer GPUs (RTX 4090)**: With only 24 GB VRAM, aggressive quantization (W4A16) is essential for running 70B+ models. FP8 is supported but the small memory makes W4A16 the practical choice.
 
 <PerfChart
-  title="FP16 vs FP32 Performance"
+  title="Tensor Core Throughput by Precision — H100 SXM"
   type="bar"
   data={{
-    labels: ["Latency", "Throughput", "Memory"],
+    labels: ["FP32", "TF32", "BF16/FP16", "FP8 (E4M3)", "INT8"],
     datasets: [
       {
-        label: "FP32",
-        data: [100, 100, 100],
-        backgroundColor: "#3b82f6",
-      },
-      {
-        label: "FP16",
-        data: [65, 150, 50],
-        backgroundColor: "#10b981",
+        label: "TFLOPS / TOPS",
+        data: [67, 989, 1979, 3958, 3958],
+        backgroundColor: ["#6b7280", "#8b5cf6", "#3b82f6", "#10b981", "#f59e0b"],
       }
     ]
   }}
 />
 
-## INT8 Quantization
+## Quality Impact: Real Numbers
 
-INT8 provides 4x memory reduction with careful calibration:
+Theory is important, but what actually happens to model quality? Here are representative numbers from published papers and community benchmarks.
 
-```python
-def calibrate_int8_scale(tensor):
-    """
-    Calibrate scale for INT8 quantization
-    """
-    # Use max absolute value
-    scale = tensor.abs().max() / 127.0
-    return scale
-
-def int8_quantization(model, calibration_data):
-    """
-    Quantize model to INT8 using calibration data
-    """
-    # Collect activation statistics
-    activation_scales = {}
-    
-    def hook(name):
-        def forward_hook(module, input, output):
-            activation_scales[name] = calibrate_int8_scale(output)
-        return forward_hook
-    
-    # Register hooks
-    hooks = []
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
-            hooks.append(module.register_forward_hook(hook(name)))
-    
-    # Run calibration
-    with torch.no_grad():
-        for data in calibration_data:
-            model(data)
-    
-    # Remove hooks
-    for hook in hooks:
-        hook.remove()
-    
-    # Quantize weights and activations
-    quantized_model = quantize_model_int8(model, activation_scales)
-    
-    return quantized_model
-```
-
-**Performance**: 2-4x speedup, 4x memory reduction, 0.5-2% quality loss
-
-## INT4 Quantization
-
-INT4 provides maximum compression but requires careful handling:
-
-```python
-def pack_int4(weights):
-    """
-    Pack two INT4 values into one INT8 byte
-    """
-    # Quantize to INT4
-    scale = weights.abs().max() / 7.0
-    int4_0 = torch.clamp((weights / scale).round(), -8, 7).to(torch.int8)
-    
-    # Pack: two INT4 values per byte
-    packed = (int4_0[::2] & 0x0F) | ((int4_0[1::2] & 0x0F) << 4)
-    
-    return packed, scale
-
-def unpack_int4(packed, scale):
-    """
-    Unpack INT8 byte to two INT4 values
-    """
-    int4_0 = (packed & 0x0F).to(torch.float32) * scale
-    int4_1 = ((packed >> 4) & 0x0F).to(torch.float32) * scale
-    
-    # Interleave
-    unpacked = torch.zeros(int4_0.size(0) * 2)
-    unpacked[::2] = int4_0
-    unpacked[1::2] = int4_1
-    
-    return unpacked
-```
-
-**Performance**: 4-8x speedup, 8x memory reduction, 2-5% quality loss
-
-## Performance Analysis
-
-Quantization impact on inference:
+### Perplexity on WikiText-2
 
 <Benchmark
-  title="Quantization Performance Impact (GPT-2 Medium)"
-  columns={["Precision", "Latency (ms)", "Throughput (tok/s)", "Memory (GB)", "Quality"]}
+  title="WikiText-2 Perplexity — Lower is Better"
+  columns={["Model", "FP16", "INT8 (W8A8 SmoothQuant)", "INT4 GPTQ (g128)", "INT4 AWQ (g128)", "INT4 RTN (g128)"]}
   rows={[
-    { values: ["FP32", "45.2", "22", "2.8", "100%"], highlight: false },
-    { values: ["FP16", "28.5", "35", "1.4", "99.9%"], highlight: true },
-    { values: ["INT8", "18.3", "55", "0.7", "99.2%"], highlight: true },
-    { values: ["INT4", "12.1", "83", "0.35", "97.5%"], highlight: false },
+    { values: ["Llama 2 7B", "5.47", "5.51", "5.63", "5.60", "6.29"], highlight: false },
+    { values: ["Llama 2 13B", "4.88", "4.90", "4.97", "4.95", "5.20"], highlight: false },
+    { values: ["Llama 2 70B", "3.32", "3.33", "3.40", "3.38", "3.75"], highlight: true },
   ]}
 />
 
+Key observations:
+
+- **INT8 (W8A8) is nearly lossless**: Across all model sizes, INT8 with SmoothQuant adds &lt;0.05 perplexity points. This is within noise range and is effectively free quality-wise.
+- **INT4 with GPTQ/AWQ is good but not free**: The cost is 0.06-0.16 perplexity points on large models, which is acceptable for most applications.
+- **INT4 RTN is significantly worse**: Up to 0.43 perplexity points on 70B, demonstrating why naive quantization fails.
+- **Larger models quantize better**: The quality gap between FP16 and INT4 shrinks as model size increases (0.13 for 70B vs. 0.16 for 7B with AWQ).
+
+### Downstream Task Accuracy
+
+Perplexity is a proxy metric. What about actual task performance?
+
+<Benchmark
+  title="MMLU (5-shot) — Higher is Better"
+  columns={["Model", "FP16", "FP8 (E4M3)", "INT8 (SmoothQuant)", "INT4 (AWQ g128)"]}
+  rows={[
+    { values: ["Llama 2 7B", "45.3%", "45.2%", "45.0%", "44.5%"], highlight: false },
+    { values: ["Llama 2 13B", "54.8%", "54.7%", "54.6%", "54.0%"], highlight: false },
+    { values: ["Llama 2 70B", "68.9%", "68.8%", "68.7%", "68.0%"], highlight: true },
+  ]}
+/>
+
+<Benchmark
+  title="HumanEval (pass@1) — Higher is Better"
+  columns={["Model", "FP16", "FP8 (E4M3)", "INT8 (SmoothQuant)", "INT4 (AWQ g128)"]}
+  rows={[
+    { values: ["Llama 2 7B", "12.8%", "12.8%", "12.2%", "11.6%"], highlight: false },
+    { values: ["Llama 2 13B", "18.3%", "18.3%", "18.0%", "17.1%"], highlight: false },
+    { values: ["Llama 2 70B", "29.9%", "29.9%", "29.6%", "28.7%"], highlight: true },
+  ]}
+/>
+
+<Callout type="info">
+**Rule of thumb for production**: INT8 and FP8 are safe for virtually all use cases — expect &lt;0.5% accuracy drop on downstream tasks. INT4 (GPTQ/AWQ) is safe for 13B+ models with &lt;1-2% accuracy drop. For 7B models and below at INT4, benchmark on your specific task before deploying.
+</Callout>
+
+### Perplexity vs. Model Size at INT4
+
+The relationship between model size and quantization robustness deserves emphasis:
+
 <PerfChart
-  title="Speedup vs Quality Trade-off"
-  type="scatter"
+  title="Perplexity Degradation from INT4 AWQ (g128) vs. Model Size"
+  type="bar"
   data={{
+    labels: ["1.1B", "3B", "7B", "13B", "33B", "70B"],
     datasets: [
       {
-        label: "FP32",
-        data: [{x: 1.0, y: 100}],
-        backgroundColor: "#3b82f6",
-      },
-      {
-        label: "FP16",
-        data: [{x: 1.8, y: 99.9}],
-        backgroundColor: "#10b981",
-      },
-      {
-        label: "INT8",
-        data: [{x: 2.5, y: 99.2}],
-        backgroundColor: "#f59e0b",
-      },
-      {
-        label: "INT4",
-        data: [{x: 3.7, y: 97.5}],
-        backgroundColor: "#ef4444",
+        label: "Perplexity increase over FP16",
+        data: [0.85, 0.41, 0.13, 0.07, 0.08, 0.06],
+        backgroundColor: ["#ef4444", "#f59e0b", "#eab308", "#84cc16", "#22c55e", "#10b981"],
       }
     ]
   }}
 />
 
-## Mixed Precision
+Below about 3B parameters, INT4 quantization starts causing significant degradation. This is because smaller models have less redundancy — each weight carries more information, and the quantization error budget is tighter.
 
-Use different precision for different layers:
+## When NOT to Quantize
 
-```python
-def mixed_precision_model(model):
-    """
-    Use FP16 for most layers, FP32 for sensitive layers
-    """
-    for name, module in model.named_modules():
-        if isinstance(module, nn.LayerNorm):
-            # Keep LayerNorm in FP32 for stability
-            module.float()
-        elif isinstance(module, nn.Linear):
-            # Use FP16 for linear layers
-            module.half()
-    
-    return model
+Quantization is powerful but not always appropriate. Here are the cases where you should think twice.
+
+### Small Models (&lt;3B Parameters)
+
+As the chart above shows, small models suffer disproportionately from quantization. A 1.1B model at INT4 may lose nearly a full perplexity point — equivalent to using a model trained on half the data. For models this small, the memory savings (from ~2 GB to ~0.5 GB) are rarely worth the quality cost, since they already fit comfortably in a single GPU.
+
+If you must quantize a small model, stick to INT8 or FP8, which remain nearly lossless even at small scales.
+
+### Training and Fine-Tuning
+
+Integer quantization is not used during training. The standard for training is **mixed precision** with BF16 (for compute) and FP32 (for master weights and optimizer states). The reason: training requires gradients, and gradients need:
+
+1. **High dynamic range**: Gradients can span many orders of magnitude.
+2. **Precise accumulation**: Small gradient updates must not be rounded away.
+3. **Symmetric handling of positive and negative values**: Integer formats are awkward here.
+
+The one exception is **FP8 training** on H100, where E5M2 is used for gradient GEMM and E4M3 for forward-pass GEMM, with FP32 master weights. This is a form of quantized training, but it uses floating-point quantization, not integer.
+
+<Callout type="warning">
+**Quantization-aware training (QAT)** — where you simulate quantization during training and let the model adapt — can improve quantized model quality, but it requires a full training run and is rarely used for LLMs due to the enormous compute cost. Post-training quantization (PTQ) methods like GPTQ and AWQ are the standard.
+</Callout>
+
+### Activations with Extreme Outliers
+
+Some model architectures (particularly older ones without proper normalization, or models with very deep residual paths) develop activation outliers so extreme that even SmoothQuant cannot fully tame them. In these cases, W8A8 quantization may cause unacceptable quality loss, and you should fall back to weight-only quantization (W4A16 or W8A16) where activations remain in FP16.
+
+Fortunately, most modern LLM architectures (Llama, Mistral, Qwen, etc.) work well with SmoothQuant or FP8 quantization.
+
+### When Latency Is Not the Goal
+
+If you are running batch inference (large batches, high utilization), the workload may be **compute-bound rather than memory-bandwidth-bound**. In this regime, the decode bottleneck shifts from reading weights to performing the matrix multiplications, and quantization provides less benefit. FP8 or W8A8 with INT8 tensor cores still helps (2x compute throughput), but W4A16 provides less benefit because you still run the FP16 GEMM — you just save memory.
+
+## Production Deployment
+
+Theory and benchmarks are great, but what does it look like to actually deploy quantized models? The two dominant inference frameworks — vLLM and TensorRT-LLM — each handle quantization differently.
+
+### vLLM
+
+vLLM is the most popular open-source LLM inference framework, with built-in support for multiple quantization methods:
+
+**GPTQ/AWQ (W4A16)**: Load pre-quantized models directly. vLLM includes optimized dequantization kernels and the **Marlin kernel** for W4A16 GEMM.
+
+**FP8 (W8A8)**: Native support on H100. vLLM can quantize models to FP8 on-the-fly or load pre-quantized FP8 checkpoints. Uses cuBLAS FP8 GEMM.
+
+**SmoothQuant INT8 (W8A8)**: Supported via pre-quantized models from frameworks like AutoSmoothQuant.
+
+**FP8 KV Cache**: Enabled with a flag (`--kv-cache-dtype fp8_e4m3`), providing 2x KV cache memory savings with negligible quality impact.
+
+```bash
+# Launch vLLM with AWQ quantized model
+python -m vllm.entrypoints.openai.api_server \
+    --model TheBloke/Llama-2-70B-AWQ \
+    --quantization awq \
+    --dtype float16 \
+    --tensor-parallel-size 2 \
+    --max-model-len 4096
+
+# Launch with FP8 on H100
+python -m vllm.entrypoints.openai.api_server \
+    --model neuralmagic/Meta-Llama-3-70B-FP8 \
+    --dtype float16 \
+    --kv-cache-dtype fp8_e4m3 \
+    --tensor-parallel-size 2
 ```
 
-**Benefits**: Balance between performance and stability
+### The Marlin Kernel: W4A16 Done Right
 
-## Quantization-Aware Training
+Marlin (IST Austria, 2024) is a GPU kernel specifically designed for W4A16 GEMM (4-bit quantized weights, FP16 activations and output). It achieves near-ideal ($\sim$4x) speedup over FP16 GEMM on A100 by:
 
-Train with quantization to improve quality:
+1. **Fusing dequantization with GEMM**: Instead of dequantizing the entire weight matrix to FP16 and then calling cuBLAS, Marlin dequantizes small tiles of weights in shared memory immediately before the tensor core GEMM.
+
+2. **Asynchronous memory access**: Overlaps global memory loads with compute, keeping the tensor cores fed.
+
+3. **Optimal tile sizes**: Carefully tuned for the A100 memory hierarchy (L2 cache, shared memory, register file).
+
+The result: Marlin achieves ~3.8x speedup over FP16 cuBLAS for decode (batch size 1) on A100, close to the theoretical 4x from reading 4x fewer bytes. This kernel is integrated into vLLM and is the reason W4A16 is so effective in practice.
+
+<Benchmark
+  title="Marlin W4A16 Performance vs. FP16 cuBLAS — A100 80GB"
+  columns={["Matrix Size (M x N x K)", "FP16 (us)", "W4A16 Marlin (us)", "Speedup"]}
+  rows={[
+    { values: ["1 x 4096 x 4096", "15.2", "4.1", "3.71x"], highlight: false },
+    { values: ["1 x 8192 x 8192", "52.3", "14.0", "3.74x"], highlight: true },
+    { values: ["1 x 11008 x 4096", "22.4", "6.1", "3.67x"], highlight: true },
+    { values: ["16 x 4096 x 4096", "16.8", "5.9", "2.85x"], highlight: false },
+    { values: ["64 x 4096 x 4096", "19.1", "11.2", "1.71x"], highlight: false },
+  ]}
+/>
+
+Notice how the speedup decreases at larger batch sizes (M=16, M=64): as the workload shifts from memory-bound to compute-bound, the bandwidth savings from smaller weights matter less. At batch size 1, Marlin is nearly at the theoretical limit. This is exactly the decode scenario.
+
+### TensorRT-LLM
+
+NVIDIA's TensorRT-LLM provides tightly optimized quantization support with deeper hardware integration:
+
+**FP8**: First-class support with automatic scaling via Transformer Engine. The quantization is applied during the TRT engine build process.
+
+**SmoothQuant INT8 (W8A8)**: Built-in SmoothQuant implementation with per-channel weight scales and per-tensor activation scales.
+
+**INT4 AWQ/GPTQ**: Supported with optimized CUTLASS kernels.
+
+**INT4 KV Cache**: Supported alongside FP8 KV cache.
+
+TensorRT-LLM typically achieves 10-20% higher throughput than vLLM for a given quantization method due to deeper kernel fusion (e.g., fusing quantization into the preceding operation, fusing bias addition with dequantization), but at the cost of less flexibility and longer model compilation times.
 
 ```python
-class QuantizedLinear(nn.Module):
-    def __init__(self, in_features, out_features):
-        super().__init__()
-        self.weight = nn.Parameter(torch.randn(out_features, in_features))
-        self.scale = nn.Parameter(torch.ones(1))
-    
-    def forward(self, x):
-        # Quantize during forward pass
-        weight_q = quantize_fp32_to_int8(self.weight, self.scale)
-        weight_fp32 = dequantize_int8_to_fp32(weight_q, self.scale)
-        
-        return F.linear(x, weight_fp32)
+# TensorRT-LLM: Build a quantized engine (simplified)
+from tensorrt_llm import Builder
+from tensorrt_llm.quantization import QuantMode
+
+builder = Builder()
+quant_mode = QuantMode.use_smooth_quant(per_token=True, per_channel=True)
+# or: QuantMode.use_weight_only(use_int4_weights=True)
+# or: QuantMode.from_description(quantize_weights=True, quantize_activations=True,
+#                                  per_token=True, per_channel=True, use_fp8=True)
+
+engine = builder.build_engine(
+    model_config=config,
+    quant_mode=quant_mode,
+    max_batch_size=64,
+    max_input_len=2048,
+    max_output_len=512,
+)
 ```
 
-**Quality improvement**: 1-2% better than post-training quantization
+### End-to-End Deployment Decision Tree
 
-## Hardware Acceleration
+Choosing the right quantization strategy depends on your hardware, model size, and quality requirements. Here is a practical decision tree:
 
-Modern GPUs support INT8 natively:
+**On H100/H200**:
+1. Start with FP8 (W8A8) + FP8 KV cache. This is the default and nearly free.
+2. If the model does not fit in memory at FP8, use W4A16 (AWQ) + FP8 KV cache.
+3. If you need maximum throughput and have verified quality, combine W4A16 with INT4 KV cache.
 
-```python
-# Tensor Cores on V100/A100 support INT8
-# Automatic acceleration when using INT8 operations
+**On A100**:
+1. Start with W4A16 (AWQ) + Marlin kernel for best single-stream decode latency.
+2. If quality is paramount or batch sizes are large, use W8A8 (SmoothQuant) with INT8 tensor cores.
+3. For very long context, add INT8 KV cache quantization.
 
-def int8_matmul_tensor_core(A_int8, B_int8, scale_A, scale_B):
-    """
-    INT8 matrix multiplication with Tensor Cores
-    """
-    # Hardware automatically uses Tensor Cores
-    C_int32 = torch.matmul(A_int8.int(), B_int8.int())
-    C_fp32 = C_int32.float() * scale_A * scale_B
-    return C_fp32
-```
+**On consumer GPUs (RTX 3090/4090)**:
+1. W4A16 (AWQ or GPTQ) is the only practical option for 70B+ models.
+2. For 7B-13B models, W4A16 or even W8A16 may fit.
+3. Use INT4 KV cache if you need long context.
 
-**Speedup**: 4-8x on Tensor Core-enabled GPUs
+<PerfChart
+  title="End-to-End Throughput Comparison — Llama 2 70B, 1x A100 80GB"
+  type="bar"
+  data={{
+    labels: ["FP16 (2x A100)", "W8A8 SmoothQuant", "W4A16 AWQ (Marlin)", "W4A16 AWQ + INT8 KV"],
+    datasets: [
+      {
+        label: "Tokens/sec (decode, batch=1)",
+        data: [18, 34, 52, 55],
+        backgroundColor: ["#3b82f6", "#f59e0b", "#10b981", "#059669"],
+      }
+    ]
+  }}
+/>
 
-## Conclusion
+## Putting It All Together
 
-Quantization provides significant benefits:
+Quantization for LLM inference is a mature and essential technique in 2025. The landscape has settled into clear best practices:
 
-1. **Memory reduction**: 2x (FP16) to 8x (INT4)
-2. **Speed improvement**: 1.5x (FP16) to 8x (INT4)
-3. **Quality trade-off**: Minimal (FP16) to moderate (INT4)
-4. **Hardware support**: Native acceleration on modern GPUs
+<Benchmark
+  title="Summary: Recommended Quantization by Scenario"
+  columns={["Scenario", "Weight Precision", "Activation Precision", "KV Cache", "Method"]}
+  rows={[
+    { values: ["H100, quality-critical", "FP8 (E4M3)", "FP8 (E4M3)", "FP8", "Transformer Engine auto-quant"], highlight: true },
+    { values: ["H100, max throughput", "INT4", "FP16", "FP8", "AWQ + Marlin + FP8 KV"], highlight: false },
+    { values: ["A100, balanced", "INT4", "FP16", "INT8", "AWQ + Marlin + INT8 KV"], highlight: true },
+    { values: ["A100, quality-critical", "INT8", "INT8", "FP16", "SmoothQuant W8A8"], highlight: false },
+    { values: ["Consumer GPU, large model", "INT4", "FP16", "INT4", "AWQ/GPTQ + INT4 KV"], highlight: false },
+    { values: ["Small model (< 3B)", "FP16 or FP8", "FP16 or FP8", "FP16", "Minimal or no quantization"], highlight: false },
+  ]}
+/>
 
-Key strategies:
-- Use FP16 for minimal quality loss
-- Use INT8 for balanced performance
-- Use INT4 for maximum compression
-- Consider mixed precision
-- Use quantization-aware training
+The key principles to remember:
 
-Choose quantization level based on quality requirements and hardware capabilities.
+1. **LLM decode is memory-bandwidth-bound.** Every byte saved in weights and KV cache translates nearly linearly to faster inference. This is the fundamental reason quantization works so well.
+
+2. **INT8 and FP8 are nearly lossless.** For any model above 7B parameters, INT8/FP8 quantization costs &lt;0.1 perplexity points and &lt;0.5% on downstream tasks. There is almost no reason not to use it.
+
+3. **INT4 weight-only quantization is mature and practical.** AWQ and GPTQ with group size 128 produce high-quality INT4 models for 7B+ parameter models. Combined with the Marlin kernel, W4A16 delivers near-4x decode speedup on A100.
+
+4. **KV cache quantization is the next frontier.** As context lengths grow to 128K+ tokens, KV cache memory dominates. FP8 KV cache is nearly free; INT4 KV cache enables dramatically longer contexts at a small quality cost.
+
+5. **Hardware determines strategy.** FP8 on H100 is the easy button. INT8 SmoothQuant or W4A16 on A100 requires more careful choice. Always check your hardware's tensor core support before choosing a quantization format.
+
+6. **Always benchmark on your specific task.** Perplexity is a useful proxy, but production quality depends on your application. A 0.1 perplexity point difference might be invisible on summarization but noticeable on code generation. Quantize, evaluate, then deploy.
+
+Quantization is no longer an exotic optimization — it is table stakes for cost-effective LLM deployment. The tools are mature, the quality impact is well-understood, and the speedups are real. The only question is which method to use, and this post should help you answer that.

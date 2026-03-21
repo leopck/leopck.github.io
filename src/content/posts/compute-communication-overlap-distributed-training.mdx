@@ -1,0 +1,686 @@
+---
+title: "Compute-Communication Overlap: Hiding Distributed Training Latency"
+author: "stanley-phoong"
+description: "A deep dive into the techniques that hide communication latency behind useful computation in distributed training and inference. Covers gradient overlap in DDP/FSDP, tensor parallelism with sequence parallelism, pipeline parallelism bubble reduction including DualPipe, expert parallelism with DeepEP, CUDA stream mechanics, profiling methodology, and the fundamental limits of overlap strategies."
+publishDate: 2025-03-21
+category: distributed-training
+tags: [distributed-training, communication-overlap, pipeline-parallelism, tensor-parallelism, fsdp, nccl, cuda-streams, moe, deepseek, performance]
+difficulty: expert
+readingTime: 28
+draft: false
+featured: false
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import MemoryLayout from '@/components/mdx/MemoryLayout.astro';
+
+The single biggest performance mistake in distributed training is letting GPUs sit idle while the network moves data between them. In a naive implementation of data-parallel training on 256 GPUs connected via a fat-tree InfiniBand topology, communication can consume 30--50% of total step time. That is hundreds of thousands of dollars worth of GPU-hours per training run, doing absolutely nothing useful. The core insight behind every modern distributed training framework -- from PyTorch FSDP to Megatron-LM to DeepSeek's DualPipe -- is the same: **overlap communication with computation so that the network transfer happens concurrently with useful GPU work**.
+
+This post is a comprehensive treatment of compute-communication overlap across every parallelism dimension. We will cover the mechanisms, the math, the CUDA stream mechanics, the profiling methodology, and the fundamental limits.
+
+## The Fundamental Problem: Amdahl Meets the Network
+
+Consider a single training step on $N$ GPUs using data parallelism. Each GPU computes a forward pass, a backward pass, and then must synchronize gradients via all-reduce before the optimizer step. Without overlap:
+
+$$T_{\text{step}} = T_{\text{fwd}} + T_{\text{bwd}} + T_{\text{allreduce}} + T_{\text{opt}}$$
+
+The all-reduce time for a ring-based algorithm on $N$ GPUs with model size $M$ bytes and bisection bandwidth $B$ is:
+
+$$T_{\text{allreduce}} = 2 \cdot \frac{N-1}{N} \cdot \frac{M}{B}$$
+
+For a 70B parameter model in FP16 ($M \approx 140$ GB) on 256 GPUs with 400 Gbps (50 GB/s effective) InfiniBand:
+
+$$T_{\text{allreduce}} = 2 \cdot \frac{255}{256} \cdot \frac{140}{50} \approx 5.6 \text{ seconds}$$
+
+If the compute time (forward + backward) is 12 seconds, we are spending 32% of our step time on communication. At \$2/GPU-hour on 256 GPUs, that is \$4,000/day of pure waste. Over a 90-day training run: **\$360,000 burned on idle GPUs**.
+
+<Callout type="danger" title="The Real Cost of No Overlap">
+  The numbers above are conservative. With pipeline parallelism bubbles, tensor parallelism all-reduces, and expert parallelism all-to-all added on top, a poorly overlapped system can spend over 50% of wall-clock time on communication. At frontier model training scales (tens of thousands of GPUs), this translates to millions of dollars.
+</Callout>
+
+With perfect overlap, the communication cost disappears from the critical path as long as $T_{\text{comm}} \leq T_{\text{compute}}$:
+
+$$T_{\text{step,overlapped}} = \max(T_{\text{compute}}, T_{\text{comm}}) + T_{\text{opt}}$$
+
+The rest of this post is about making that $\max$ function evaluate to $T_{\text{compute}}$ in practice.
+
+## Gradient All-Reduce Overlap in DDP and FSDP
+
+### PyTorch DDP: Bucket-Based Overlap
+
+The simplest and most widely deployed form of compute-communication overlap is in PyTorch's `DistributedDataParallel` (DDP). The key insight: the backward pass computes gradients layer-by-layer, starting from the output and working toward the input. As soon as a layer's gradient is computed, it will not be modified again during this backward pass. Therefore, we can start its all-reduce immediately, while the GPU continues computing gradients for earlier layers.
+
+<MemoryLayout
+  title="DDP Backward Pass with Overlapped All-Reduce"
+  description="Gradients are computed from the last layer backward. All-reduce begins as soon as each bucket is full."
+  layout={[
+    {
+      name: "Layer N gradient computed",
+      power: "Gradient added to Bucket 0. Bucket not full yet -- wait.",
+      state: "GPU continues backward through Layer N-1",
+      color: "#3b82f6"
+    },
+    {
+      name: "Layer N-1 gradient computed",
+      power: "Gradient added to Bucket 0. Bucket is now full (25 MB).",
+      state: "NCCL all-reduce launched for Bucket 0 on comm stream",
+      color: "#10b981"
+    },
+    {
+      name: "Layer N-2 gradient computed",
+      power: "Gradient added to Bucket 1. All-reduce of Bucket 0 runs concurrently.",
+      state: "Compute and communication overlap!",
+      color: "#10b981"
+    },
+    {
+      name: "Layer 1 gradient computed",
+      power: "Final bucket all-reduce launched. Earlier buckets already done.",
+      state: "Backward complete. Only final bucket's all-reduce remains.",
+      color: "#ef4444"
+    }
+  ]}
+/>
+
+DDP does not launch an all-reduce for every individual gradient tensor. Instead, it accumulates gradients into **buckets** (default 25 MB each). When a bucket is full, the all-reduce is fired. This batching is critical for two reasons:
+
+1. **Reducing launch overhead**: Each NCCL all-reduce has a fixed launch latency of roughly 5--15 microseconds. Launching thousands of individual all-reduces (one per parameter tensor) would be dominated by this overhead.
+2. **Improving bandwidth utilization**: NCCL's ring/tree algorithms achieve peak bandwidth only for sufficiently large messages. A 25 MB bucket gets close to peak bandwidth on most interconnects.
+
+The bucket size is tunable via `bucket_cap_mb`. Making it smaller increases overlap granularity (more frequent, smaller all-reduces start sooner) but decreases per-operation bandwidth efficiency. Making it larger does the opposite.
+
+<Callout type="perf" title="Tuning bucket_cap_mb">
+  The optimal bucket size depends on your model architecture and interconnect. For models with many small layers on high-bandwidth interconnects (NVLink), larger buckets (50--100 MB) are often better because NVLink bandwidth is so high that overlap is easy regardless. For models on InfiniBand across nodes, smaller buckets (10--15 MB) can improve overlap by starting communication earlier, as long as each bucket is still large enough to saturate the link.
+</Callout>
+
+There is a subtlety with bucket ordering. DDP assigns parameters to buckets in **reverse** model order (from output to input), matching the backward pass execution order. This ensures that the first bucket to fill corresponds to the last layers of the model, whose gradients are computed first. If buckets were ordered forward (input to output), the first bucket would not fill until the backward pass reached the very first layer, eliminating all overlap opportunity.
+
+### FSDP: Overlapping All-Gather and Reduce-Scatter
+
+Fully Sharded Data Parallelism (FSDP) takes a different approach. Instead of replicating the full model on every GPU, FSDP shards both parameters and gradients across GPUs. Each GPU holds only $1/N$-th of the model. This slashes memory usage but introduces two communication operations per layer:
+
+1. **All-gather** before a layer's forward/backward: reconstruct the full parameters from shards across all GPUs.
+2. **Reduce-scatter** after a layer's backward: reduce gradients and scatter shards back so each GPU holds only its $1/N$-th of the gradient.
+
+Without overlap, FSDP is catastrophically slow -- every layer requires a blocking all-gather before it can execute. The solution is aggressive prefetching and pipelining.
+
+<MemoryLayout
+  title="FSDP Overlap Strategy (Forward Pass)"
+  description="All-gather for layer L+1 overlaps with compute for layer L"
+  layout={[
+    {
+      name: "Layer L: Compute forward",
+      power: "Full parameters already gathered. Running matmuls on compute stream.",
+      state: "Simultaneously: all-gather for Layer L+1 on comm stream",
+      color: "#3b82f6"
+    },
+    {
+      name: "Layer L: Free unsharded params",
+      power: "After forward compute, free the full parameter tensor (keep only local shard).",
+      state: "Reclaims (N-1)/N of the memory used by this layer's params",
+      color: "#ef4444"
+    },
+    {
+      name: "Layer L+1: Compute forward",
+      power: "All-gather completed during L's compute. Full params ready.",
+      state: "Simultaneously: all-gather for Layer L+2 on comm stream",
+      color: "#3b82f6"
+    }
+  ]}
+/>
+
+The backward pass is similar but works in reverse and adds reduce-scatter overlap:
+
+- While computing the backward for layer $L$, **all-gather** the parameters for layer $L-1$ (needed for its backward).
+- After computing layer $L$'s gradient, launch its **reduce-scatter** while computing layer $L-1$'s backward.
+
+This creates a three-stage pipeline: all-gather for the next layer, compute for the current layer, and reduce-scatter for the previous layer -- all running concurrently.
+
+**Prefetching depth** controls how far ahead all-gathers are issued. PyTorch FSDP's `forward_prefetch` and `backward_prefetch` options allow prefetching 1--2 layers ahead. Prefetching further ahead increases overlap robustness (the all-gather has more time to complete) but increases peak memory usage, since more full-sized parameter tensors are materialized simultaneously.
+
+<Benchmark
+  title="FSDP Overlap Effectiveness (Llama-70B, 64 GPUs, 400Gbps IB)"
+  columns={["Configuration", "Step Time", "Comm Time (Exposed)", "Overlap Ratio"]}
+  rows={[
+    { values: ["No overlap (blocking)", "18.2s", "7.8s (43%)", "0%"], highlight: false },
+    { values: ["Prefetch depth=1", "11.9s", "1.5s (13%)", "81%"], highlight: false },
+    { values: ["Prefetch depth=2", "11.1s", "0.7s (6%)", "91%"], highlight: true },
+    { values: ["Prefetch depth=2 + limit_all_gathers", "11.3s", "0.9s (8%)", "88%"], highlight: true }
+  ]}
+  notes="limit_all_gathers caps concurrent all-gathers to prevent OOM at the cost of slightly reduced overlap."
+/>
+
+The `limit_all_gathers` option is a practical necessity for large models. Without it, aggressive prefetching can cause two or more full-parameter tensors to be materialized at once, pushing memory usage past the GPU's capacity. It serializes some all-gathers to keep peak memory bounded, at a small cost to overlap.
+
+## Tensor Parallelism Overlap
+
+Tensor parallelism (TP) splits individual layers across GPUs. Each transformer layer requires an all-reduce (or reduce-scatter + all-gather in the sequence parallelism variant) after the attention output projection and after the FFN down-projection. That is two all-reduces per layer, and for an 80-layer model, 160 all-reduces per step.
+
+### On NVLink: Fast Enough to Not Need Overlap
+
+On a DGX node with NVLink (900 GB/s bidirectional on H100), these all-reduces are remarkably fast. For a decode step with batch size 32 and hidden dimension 8192 in FP16:
+
+$$\text{Data per all-reduce} = 32 \times 1 \times 8192 \times 2 = 512 \text{ KB}$$
+
+At 900 GB/s, this takes under 1 microsecond. Even for prefill with sequence length 4096:
+
+$$\text{Data per all-reduce} = 32 \times 4096 \times 8192 \times 2 = 2 \text{ GB}$$
+
+At 900 GB/s, this is roughly 2.2 ms -- spread across 160 all-reduces, each one is about 14 microseconds. The kernel launch overhead dominates the actual data transfer time.
+
+<Callout type="info" title="NVLink TP: Overlap Is Less Critical">
+  On NVLink, TP communication overhead is typically under 5% of step time for large models. The effort required to overlap these sub-millisecond operations is rarely justified. The all-reduces are so fast that the GPU barely notices them. Focus optimization effort on other parallelism dimensions first.
+</Callout>
+
+### On PCIe: Overlap Is Critical
+
+The picture changes dramatically on PCIe-connected GPUs (32--64 GB/s bidirectional). The same 2 GB prefill all-reduce that took 2.2 ms on NVLink takes **31--63 ms** on PCIe. Across 160 all-reduces, that is 5--10 seconds per step -- a massive fraction of total time.
+
+This is where **sequence parallelism** (SP) becomes essential. Introduced by Megatron-LM, SP replaces the all-reduce with a reduce-scatter followed by an all-gather. The key benefit: the reduce-scatter and all-gather each transfer half the data of an all-reduce (since each GPU only receives its $1/N$-th shard), and more importantly, **the all-gather of the next operation can overlap with the LayerNorm/dropout computation on the current output**.
+
+<PerfChart
+  title="TP Communication Overhead by Interconnect (Llama-70B, prefill 2048 tokens)"
+  unit="ms per step"
+  data={[
+    { label: "NVLink 4.0 (H100)", value: 3.2, color: "green", annotation: "Negligible" },
+    { label: "NVLink 3.0 (A100)", value: 5.8, color: "green", annotation: "Low" },
+    { label: "PCIe Gen5", value: 48, color: "orange", annotation: "Significant" },
+    { label: "PCIe Gen4", value: 95, color: "red", annotation: "Bottleneck" },
+    { label: "PCIe Gen4 + SP overlap", value: 38, color: "orange", annotation: "Improved with SP" }
+  ]}
+/>
+
+The sequence parallelism overlap works as follows. After the FFN down-projection, the TP all-reduce is decomposed into reduce-scatter (producing a sharded output) followed by all-gather (reconstructing the full tensor for the next layer's input). The LayerNorm at the start of the next transformer block operates on the sharded tensor produced by the reduce-scatter, and the all-gather of the LayerNorm output overlaps with the LayerNorm computation itself. This converts a serialized all-reduce into a pipelined reduce-scatter + overlapped all-gather.
+
+## Pipeline Parallelism Overlap
+
+Pipeline parallelism (PP) assigns groups of consecutive layers to different GPUs. The fundamental problem is the **pipeline bubble**: GPUs at later stages sit idle while earlier stages process the first micro-batch, and GPUs at earlier stages sit idle while later stages finish the last micro-batch.
+
+### 1F1B: The Baseline Schedule
+
+The 1F1B (one-forward-one-backward) schedule interleaves forward and backward micro-batches to minimize the bubble. After an initial warm-up phase where forward passes fill the pipeline, each GPU alternates: run one forward micro-batch, then one backward micro-batch.
+
+The bubble fraction for 1F1B with $P$ pipeline stages and $M$ micro-batches is:
+
+$$\text{Bubble fraction} = \frac{P - 1}{M}$$
+
+With $P = 8$ stages and $M = 64$ micro-batches, the bubble is $\frac{7}{64} \approx 11\%$. The overlap here is between **forward compute on one micro-batch and backward compute on another micro-batch**, running on the same GPU at different stages of their respective pipeline traversals.
+
+<Benchmark
+  title="Pipeline Parallelism Bubble Fraction"
+  columns={["Schedule", "Formula", "P=4, M=32", "P=8, M=64", "P=16, M=128"]}
+  rows={[
+    { values: ["GPipe (fill-drain)", "(P-1)/M", "9.4%", "10.9%", "11.7%"], highlight: false },
+    { values: ["1F1B", "(P-1)/M", "9.4%", "10.9%", "11.7%"], highlight: false },
+    { values: ["Interleaved (V=2)", "(P-1)/(M*V)", "4.7%", "5.5%", "5.9%"], highlight: false },
+    { values: ["Interleaved (V=4)", "(P-1)/(M*V)", "2.3%", "2.7%", "2.9%"], highlight: true },
+    { values: ["DualPipe (DeepSeek V3)", "~(P-1)/(2*M)", "4.7%", "5.5%", "5.9%"], highlight: true }
+  ]}
+  notes="V = number of virtual stages per GPU. DualPipe achieves near-zero bubble by overlapping forward and backward from opposite ends."
+/>
+
+Note that 1F1B and GPipe have the same bubble fraction formula, but 1F1B requires far less memory because it does not need to store activations for all $M$ micro-batches simultaneously. GPipe keeps all activations in memory until the backward pass begins; 1F1B can release them earlier because backward passes start sooner.
+
+### Interleaved Pipeline: More Virtual Stages, Smaller Bubbles
+
+Interleaved pipeline parallelism (used in Megatron-LM) assigns $V$ non-contiguous groups of layers to each GPU instead of one contiguous group. Each GPU processes $V$ "virtual stages," and micro-batches cycle through these stages more frequently.
+
+The bubble fraction becomes:
+
+$$\text{Bubble fraction} = \frac{P - 1}{M \times V}$$
+
+With $V = 4$, the bubble shrinks by $4\times$. The trade-off is increased communication: each micro-batch must traverse point-to-point links $V$ times more often, since it jumps between non-contiguous stages. On high-bandwidth interconnects this is acceptable, but on slower links the extra communication can negate the bubble reduction.
+
+The overlap mechanism in interleaved pipelines is straightforward: with more virtual stages, each stage is smaller (fewer layers), so the compute granularity is finer. This means more frequent hand-offs between stages, more opportunities for one GPU to be running forward on one micro-batch while receiving data for another, and smaller idle gaps.
+
+### DualPipe: Bidirectional Pipeline from DeepSeek V3
+
+DeepSeek V3 introduced DualPipe, a pipeline schedule that achieves near-zero bubble by exploiting a key observation: **forward and backward passes can run from opposite ends of the pipeline simultaneously**.
+
+In a standard 1F1B schedule, forward passes propagate left-to-right and backward passes propagate right-to-left, but they are sequential within each GPU's time slot. DualPipe splits the micro-batches into two halves:
+
+- **Left-to-right stream**: Forward passes flow from stage 0 to stage $P-1$, followed by their backward passes flowing $P-1$ to 0.
+- **Right-to-left stream**: A second set of forward passes flows from stage $P-1$ to stage 0, followed by backward passes flowing 0 to $P-1$.
+
+<MemoryLayout
+  title="DualPipe Bidirectional Schedule"
+  description="Forward and backward passes flow in opposite directions simultaneously, filling bubbles that would exist in 1F1B"
+  layout={[
+    {
+      name: "Stage 0 (Left End)",
+      power: "Left-to-right: computing forward micro-batch 1",
+      state: "Right-to-left: computing backward micro-batch B (from opposite direction)",
+      color: "#3b82f6"
+    },
+    {
+      name: "Stage P/2 (Middle)",
+      power: "Both streams active: forward from left meets backward from right",
+      state: "Maximum overlap -- both compute streams fully utilized",
+      color: "#10b981"
+    },
+    {
+      name: "Stage P-1 (Right End)",
+      power: "Right-to-left: computing forward micro-batch B",
+      state: "Left-to-right: computing backward micro-batch 1 (from opposite direction)",
+      color: "#3b82f6"
+    },
+    {
+      name: "Net Effect",
+      power: "Each GPU is always busy with either a forward or backward from one of the two streams",
+      state: "Bubble fraction approaches zero as M grows relative to P",
+      color: "#10b981"
+    }
+  ]}
+/>
+
+The critical trick in DualPipe is that on each GPU, the forward computation from one direction overlaps with the backward computation from the other direction. Since forward and backward passes use different micro-batches and different gradient buffers, there is no data dependency between them. The GPU's SMs can be partitioned (or time-multiplexed) between the two.
+
+DualPipe's bubble fraction is approximately:
+
+$$\text{Bubble fraction}_{\text{DualPipe}} \approx \frac{P - 1}{2M}$$
+
+This is half the bubble of standard 1F1B. But the more important property is that the remaining "bubble" time is actually filled with computation from the opposite direction, so the effective bubble is near zero for sufficiently large $M$. The main cost is $2\times$ the peak activation memory (since two streams of micro-batches are in flight), which DeepSeek mitigates with activation recomputation.
+
+<Callout type="perf" title="DualPipe's Practical Impact">
+  DeepSeek V3 reported that DualPipe reduced their pipeline bubble to under 3% on a 64-stage pipeline, compared to roughly 12% with standard 1F1B. On their 2048-GPU training cluster, this translated to a meaningful improvement in MFU (Model FLOPs Utilization), directly reducing training cost.
+</Callout>
+
+## Expert Parallelism Overlap with DeepEP
+
+Mixture-of-Experts (MoE) models introduce a unique communication pattern: **all-to-all dispatch and combine**. When a token is routed to an expert on a remote GPU, the token's hidden state must be sent to that GPU, processed, and the result sent back. Unlike all-reduce (where every GPU sends and receives roughly equal data), all-to-all traffic patterns are irregular and depend on the routing decisions.
+
+The cost is substantial. For a DeepSeek V3-scale MoE with 256 experts across 256 GPUs, each token dispatched to a remote expert requires transferring a hidden state vector (typically 4--7 KB in FP16/BF16). With thousands of tokens per micro-batch and each token routed to 2--8 experts, the aggregate all-to-all volume reaches hundreds of megabytes per layer.
+
+### DeepEP: Hook-Based RDMA Overlap
+
+DeepEP (Deep Expert Parallelism), introduced alongside DeepSeek V3, addresses this with a hook-based architecture that separates communication from SM (Streaming Multiprocessor) usage.
+
+The key insight: **NCCL's all-to-all implementation consumes GPU SMs to drive communication, which directly competes with compute kernels for SM resources**. If 10% of SMs are busy running NCCL kernels, the compute kernel runs 10% slower, partially negating the benefit of overlap.
+
+DeepEP offers two kernel variants that solve this differently:
+
+<MemoryLayout
+  title="DeepEP Communication Kernel Strategies"
+  description="Two approaches to minimizing SM consumption during expert communication"
+  layout={[
+    {
+      name: "Low-Latency Kernels (Pure RDMA)",
+      power: "Communication driven entirely by RDMA hardware, zero SM involvement",
+      state: "Best for latency-sensitive inference. Compute pipeline completely unaffected.",
+      color: "#10b981"
+    },
+    {
+      name: "High-Throughput Kernels (Asymmetric BW)",
+      power: "Exploits asymmetric NVLink/RDMA bandwidth. Minimal SM usage for staging data.",
+      state: "Best for training. Saturates interconnect bandwidth with near-zero compute impact.",
+      color: "#3b82f6"
+    },
+    {
+      name: "Hook-Based Scheduling",
+      power: "Hooks inserted at layer boundaries trigger dispatch/combine at optimal moments",
+      state: "Expert comm runs during attention/FFN compute of non-MoE layers",
+      color: "#ef4444"
+    }
+  ]}
+/>
+
+**Low-latency kernels** use pure RDMA (Remote Direct Memory Access) without involving any GPU SMs. The NIC (Network Interface Card) reads from and writes to GPU memory directly via GPUDirect RDMA. This means the communication has literally zero impact on compute throughput -- the SMs do not even know the transfer is happening. The trade-off is that RDMA has higher per-message latency than SM-driven approaches for small transfers, so this works best when the transfer can be started well in advance.
+
+**High-throughput kernels** use a small number of SMs to stage data between NVLink and RDMA paths, exploiting the asymmetric bandwidth between intra-node NVLink (900 GB/s on H100) and inter-node InfiniBand (400 Gbps). Within a node, tokens are first aggregated via NVLink to the GPU closest to the target NIC, then sent via RDMA to the remote node. This two-phase approach maximizes aggregate throughput.
+
+The hook-based scheduling inserts communication triggers at layer boundaries in the model execution. When a transformer layer's attention computation begins, the hook dispatches expert tokens for the MoE layer that will execute two layers later. By the time the compute reaches that MoE layer, the dispatched tokens have already arrived at their target GPUs. Similarly, the combine (result gathering) for the current MoE layer was initiated two layers ago.
+
+<PerfChart
+  title="Expert Communication Overlap Effectiveness"
+  unit="% of step time"
+  data={[
+    { label: "Naive all-to-all (blocking)", value: 34, color: "red", annotation: "No overlap" },
+    { label: "NCCL async all-to-all", value: 18, color: "orange", annotation: "SM contention" },
+    { label: "DeepEP low-latency", value: 4, color: "green", annotation: "Near-full overlap" },
+    { label: "DeepEP high-throughput", value: 3, color: "green", annotation: "Best throughput" }
+  ]}
+/>
+
+The result is near-complete overlap of expert communication with non-expert compute. The exposed (non-overlapped) communication time drops from 34% of step time to under 4%.
+
+## CUDA Streams: The Mechanism Behind Overlap
+
+All of the overlap techniques described above rely on **CUDA streams** as the underlying execution mechanism. Understanding streams is essential for debugging overlap failures.
+
+### How Streams Enable Concurrency
+
+A CUDA stream is an ordered sequence of operations (kernel launches, memory copies, synchronization primitives) that execute in the order they are enqueued. Operations in **different streams** can execute concurrently, subject to hardware resource availability and explicit synchronization.
+
+The typical overlap setup uses at least two streams:
+
+```
+Compute Stream:  [MatMul Layer N] [MatMul Layer N-1] [MatMul Layer N-2] ...
+                       |                |
+                       v                v
+Comm Stream:     [AllReduce Bucket 0]  [AllReduce Bucket 1] ...
+```
+
+The compute stream runs the main forward/backward kernels. The communication stream runs NCCL collective operations. Because they are on different streams, the GPU scheduler can interleave their execution.
+
+### Stream Synchronization Primitives
+
+Overlap requires careful synchronization to ensure correctness:
+
+- **cudaEventRecord / cudaStreamWaitEvent**: The primary mechanism. Record an event on one stream, wait for it on another. Example: record an event after a gradient is computed on the compute stream, then wait for that event on the comm stream before launching the all-reduce.
+- **cudaStreamSynchronize**: Blocks the CPU until all operations on a stream complete. Avoid this in performance-critical paths -- it serializes everything.
+- **cudaDeviceSynchronize**: Nuclear option. Blocks until all streams on the device are complete. Never use in production training loops.
+
+```python
+# Pseudocode for overlapped gradient all-reduce
+compute_stream = torch.cuda.Stream()
+comm_stream = torch.cuda.Stream()
+
+# Backward pass on compute stream
+with torch.cuda.stream(compute_stream):
+    loss.backward()  # Gradients computed layer by layer
+
+# DDP hooks fire all-reduce on comm_stream as buckets fill
+# Internally, PyTorch does:
+#   1. Record event on compute_stream after bucket is full
+#   2. Wait for event on comm_stream
+#   3. Launch NCCL all-reduce on comm_stream
+#   4. Record completion event on comm_stream
+#   5. Before optimizer step, wait for all comm events on compute_stream
+```
+
+### The SM Contention Pitfall
+
+This is the most common reason overlap fails in practice. CUDA streams enable *concurrency*, but actual parallel execution requires **available hardware resources**. If the compute kernel is using all 132 SMs on an H100, there are no SMs left for the NCCL kernel to run on. The NCCL kernel sits in the stream, ready to launch, but stalls until SMs become available.
+
+<Callout type="warning" title="SM Starvation Kills Overlap">
+  A large GEMM kernel (the dominant operation in transformer training) can easily saturate all SMs on a GPU. When this happens, NCCL kernels on the comm stream cannot launch, and you get zero overlap despite having separate streams. This manifests in Nsight Systems as the comm kernel waiting in the "pending" state until the compute kernel completes.
+</Callout>
+
+Mitigations for SM contention:
+
+1. **CUDA MPS (Multi-Process Service)**: Allows multiple processes to share SMs. Can be configured to reserve a fraction of SMs for communication.
+2. **SM partitioning**: NVIDIA's Hopper architecture supports hardware SM partitioning, which can guarantee SMs for communication kernels.
+3. **Kernel size tuning**: Use smaller compute kernel tile sizes to leave gaps where communication can execute. This trades compute efficiency for overlap.
+4. **DeepEP's approach**: Bypass SMs entirely by using RDMA hardware for communication (as discussed above).
+
+The general principle: overlap requires that compute and communication can truly execute in parallel. If they compete for the same hardware resources (SMs, memory bandwidth, NVLink bandwidth), the overlap is partial at best.
+
+### Memory Bandwidth Contention
+
+Even when SMs are available for both compute and communication, they share memory bandwidth. A large GEMM reading weights from HBM at near-peak bandwidth leaves little bandwidth for NCCL to read/write gradient buffers. On an H100 with 3.35 TB/s HBM bandwidth:
+
+- A BF16 GEMM with $M=N=K=8192$ achieves roughly 2.5 TB/s memory bandwidth utilization.
+- NCCL all-reduce for a 25 MB bucket needs roughly 50 MB of memory reads + writes, taking about 15 microseconds at the remaining 0.85 TB/s.
+- Without contention, it would take about 15 microseconds at 3.35 TB/s too -- in this case, memory bandwidth is not the bottleneck.
+
+Memory bandwidth contention matters more for **memory-bound** operations (LayerNorm, softmax, element-wise ops) that already consume most of the bandwidth. During compute-bound GEMMs, there is usually spare memory bandwidth for communication.
+
+## Profiling Overlap Effectiveness
+
+Measuring overlap is not optional. Without profiling, you are guessing whether your expensive distributed training job is actually overlapping communication or just pretending to.
+
+### Nsight Systems: The Gold Standard
+
+NVIDIA Nsight Systems provides a timeline view that shows exactly what is happening on each CUDA stream, each SM, and each NVLink/PCIe channel at every microsecond.
+
+To profile a PyTorch distributed training step:
+
+```bash
+nsys profile --trace=cuda,nvtx,osrt,cudnn,cublas \
+    --cuda-memory-usage=true \
+    --gpu-metrics-device=all \
+    -o profile_output \
+    torchrun --nproc_per_node=8 train.py --profile-steps=5-7
+```
+
+In the resulting timeline, look for:
+
+1. **Compute stream** (usually stream 7 or similar): Should show continuous GEMM/convolution kernels with minimal gaps.
+2. **NCCL stream** (usually the last stream): Should show all-reduce/all-gather/reduce-scatter operations overlapping temporally with compute stream operations.
+3. **Gaps**: Any period where both streams are idle indicates a synchronization barrier or a dependency stall.
+
+### Measuring Overlap Ratio
+
+The overlap ratio quantifies how much communication is hidden behind compute:
+
+$$\text{Overlap Ratio} = \frac{T_{\text{comm,overlapped}}}{T_{\text{comm,total}}}$$
+
+Where $T_{\text{comm,overlapped}}$ is the time during which communication runs concurrently with compute, and $T_{\text{comm,total}}$ is the total communication time.
+
+<Benchmark
+  title="Overlap Ratio Targets by Parallelism Strategy"
+  columns={["Strategy", "Target Overlap Ratio", "Typical Achieved", "Impact if Miss Target"]}
+  rows={[
+    { values: ["DDP gradient all-reduce", "greater than 90%", "85-95%", "5-15% step time increase"], highlight: false },
+    { values: ["FSDP all-gather/reduce-scatter", "greater than 80%", "75-90%", "10-25% step time increase"], highlight: false },
+    { values: ["TP all-reduce (NVLink)", "N/A (too fast)", "N/A", "Negligible"], highlight: false },
+    { values: ["TP all-reduce (PCIe)", "greater than 70%", "50-70%", "15-30% step time increase"], highlight: false },
+    { values: ["PP point-to-point", "greater than 85%", "80-90%", "5-15% bubble increase"], highlight: false },
+    { values: ["MoE all-to-all", "greater than 80%", "60-85%", "15-35% step time increase"], highlight: true }
+  ]}
+  notes="These targets assume the workload has sufficient compute to hide the communication. Communication-bound workloads cannot achieve high overlap ratios regardless of technique."
+/>
+
+To extract these numbers from Nsight Systems, use the `nsys stats` command to get per-stream kernel durations, then compute the temporal overlap between the compute and communication streams. For programmatic analysis, export the SQLite database and query it:
+
+```sql
+-- Find overlapped time between compute and NCCL kernels
+SELECT
+  SUM(MIN(c.end, n.end) - MAX(c.start, n.start)) as overlapped_ns
+FROM compute_kernels c
+JOIN nccl_kernels n
+  ON c.device_id = n.device_id
+  AND c.start < n.end
+  AND c.end > n.start;
+```
+
+### Common Profiling Mistakes
+
+**Mistake 1: Profiling with `torch.cuda.synchronize()` calls**. Many codebases add synchronize calls for timing purposes. These serialize all streams and destroy overlap. Remove them before profiling overlap effectiveness.
+
+**Mistake 2: Measuring wall-clock time only**. Wall-clock step time tells you the end result but not the cause. A step that takes 12 seconds might have 4 seconds of exposed communication, or 0.5 seconds -- you cannot tell without a timeline.
+
+**Mistake 3: Profiling too few steps**. The first few steps have cold caches, uncompiled kernels (if using torch.compile), and JIT compilation overhead. Profile steps 5--10 at minimum.
+
+**Mistake 4: Not profiling all ranks**. Communication overlap can vary across ranks. The slowest rank determines step time. Profile at least one rank from each node, and always profile the "last" pipeline stage.
+
+## Putting It All Together: Multi-Dimensional Overlap
+
+Real-world large model training uses multiple parallelism dimensions simultaneously: TP within a node, PP across node groups, DP/FSDP across the remaining GPUs, and EP for MoE models. Each dimension has its own communication that must be overlapped.
+
+<MemoryLayout
+  title="Multi-Dimensional Parallelism Communication Map"
+  description="Each parallelism dimension introduces communication that must be overlapped with compute from other dimensions"
+  layout={[
+    {
+      name: "Tensor Parallelism (intra-node, NVLink)",
+      power: "All-reduce per layer. Fast on NVLink, overlap not critical.",
+      state: "2 all-reduces x 80 layers = 160 ops, each under 50us on H100 NVLink",
+      color: "#3b82f6"
+    },
+    {
+      name: "Pipeline Parallelism (inter-node groups)",
+      power: "Point-to-point send/recv at stage boundaries.",
+      state: "Overlapped by 1F1B/interleaved/DualPipe scheduling. Bubble = (P-1)/M.",
+      color: "#10b981"
+    },
+    {
+      name: "Data Parallelism / FSDP (across remaining GPUs)",
+      power: "All-reduce (DDP) or all-gather + reduce-scatter (FSDP) for gradients.",
+      state: "Overlapped with backward pass compute. Bucket-based (DDP) or layer-based (FSDP).",
+      color: "#ef4444"
+    },
+    {
+      name: "Expert Parallelism (all-to-all, cross-node)",
+      power: "Dispatch tokens to remote experts, combine results.",
+      state: "Overlapped with non-MoE layer compute via DeepEP hooks or async NCCL.",
+      color: "#f59e0b"
+    }
+  ]}
+/>
+
+The challenge with multi-dimensional overlap is that communication from different dimensions can collide. For example, FSDP's all-gather and PP's point-to-point might both need InfiniBand bandwidth at the same time. Careful scheduling is required to avoid bandwidth contention:
+
+1. **TP communication** uses NVLink (intra-node), so it does not contend with inter-node traffic.
+2. **PP communication** uses inter-node InfiniBand but involves small tensors (one micro-batch's activations at one layer boundary). This rarely saturates the link.
+3. **FSDP communication** uses inter-node InfiniBand and involves large tensors (full gradient buckets). This can contend with EP communication.
+4. **EP communication** uses inter-node InfiniBand with irregular traffic patterns.
+
+The standard approach is to ensure FSDP and EP communications happen at different times by construction: FSDP all-reduce happens during the backward pass of non-MoE layers, while EP all-to-all happens during the forward pass of MoE layers. Since MoE layers and dense layers alternate, their communication naturally interleaves.
+
+<PerfChart
+  title="Step Time Breakdown: 70B MoE Model, 256 GPUs, All Parallelism Dimensions"
+  unit="seconds"
+  data={[
+    { label: "No overlap", value: 24.5, color: "red", annotation: "Baseline" },
+    { label: "DDP overlap only", value: 18.2, color: "orange" },
+    { label: "+ PP interleaved", value: 15.8, color: "orange" },
+    { label: "+ EP async", value: 13.1, color: "blue" },
+    { label: "+ Full overlap (DeepEP + DualPipe)", value: 11.2, color: "green", annotation: "54% faster" }
+  ]}
+  baseline={0}
+/>
+
+## When Overlap Does Not Help
+
+Overlap is not a silver bullet. There are fundamental scenarios where no amount of clever scheduling can eliminate communication overhead.
+
+### Communication-Dominated Workloads
+
+When $T_{\text{comm}} > T_{\text{compute}}$, even perfect overlap leaves the system communication-bound:
+
+$$T_{\text{step}} = \max(T_{\text{compute}}, T_{\text{comm}}) = T_{\text{comm}}$$
+
+This happens with:
+
+- **Small models on many GPUs**: A 7B model on 256 GPUs has very little compute per GPU per micro-batch, but the gradient all-reduce still transfers the full 14 GB of gradients. The compute-to-communication ratio is simply too low.
+- **Small batch sizes**: Reducing batch size reduces compute (fewer tokens to process) but does not reduce per-parameter communication (gradients are the same size regardless of batch).
+- **Extreme sharding**: FSDP with very high shard counts means each GPU does very little compute but still needs full all-gather/reduce-scatter of every layer.
+
+<Callout type="warning" title="The Compute-to-Communication Ratio">
+  A useful rule of thumb: compute the ratio $R = T_{\text{compute}} / T_{\text{comm}}$. If $R \gt 2$, you have plenty of room for overlap. If $1 \lt R \lt 2$, overlap is critical and must be well-tuned. If $R \lt 1$, overlap cannot help -- you need to either increase batch size, reduce the number of GPUs, or use a faster interconnect.
+</Callout>
+
+For the common case of a transformer model with hidden dimension $H$, sequence length $L$, batch size $B$, number of layers $N_L$, and TP degree $T$ on interconnect bandwidth $BW$:
+
+$$R \approx \frac{24 \cdot B \cdot L \cdot H^2 \cdot N_L / T}{\text{FLOPS}_{\text{GPU}}} \bigg/ \frac{2 \cdot H^2 \cdot N_L \cdot 2}{BW}$$
+
+The numerator is approximate FLOPs for the backward pass (roughly 2x forward), and the denominator is the all-reduce volume for FP16 gradients. Simplifying:
+
+$$R \approx \frac{12 \cdot B \cdot L \cdot BW}{T \cdot \text{FLOPS}_{\text{GPU}}}$$
+
+For an H100 ($\text{FLOPS} = 990$ TFLOPS BF16), $B=4$, $L=4096$, $BW = 400$ Gbps (50 GB/s), $T=8$:
+
+$$R \approx \frac{12 \times 4 \times 4096 \times 50 \times 10^9}{8 \times 990 \times 10^{12}} \approx 1.24$$
+
+This is dangerously close to communication-bound. Increasing batch size to $B=8$ gives $R \approx 2.5$, much safer. This is why large-batch training is so important for distributed efficiency -- it is not just about gradient noise, it is about having enough compute to overlap with communication.
+
+### Memory Pressure from Overlap Buffers
+
+Overlap requires **buffering**: data for multiple stages must be held in memory simultaneously. Each overlap technique adds to peak memory:
+
+<Benchmark
+  title="Memory Overhead of Overlap Techniques"
+  columns={["Technique", "Additional Memory", "Example (70B, 8 GPUs)", "Trade-off"]}
+  rows={[
+    { values: ["DDP gradient buckets", "1 bucket per concurrent all-reduce", "~50 MB", "Minimal"], highlight: false },
+    { values: ["FSDP prefetch depth=2", "2 full-parameter tensors", "~35 GB", "Can cause OOM"], highlight: true },
+    { values: ["PP interleaved V=4", "4x activation memory per stage", "~8 GB per stage", "Significant"], highlight: false },
+    { values: ["DualPipe", "2x activation memory (bidirectional)", "~12 GB per stage", "Requires recomputation"], highlight: true },
+    { values: ["EP async dispatch", "Token buffers for 2+ layers ahead", "~2 GB", "Moderate"], highlight: false }
+  ]}
+  notes="Memory values are approximate and depend heavily on batch size, sequence length, and precision."
+/>
+
+FSDP's prefetch depth is the most dangerous. With prefetch depth 2, two layers' worth of full (unsharded) parameters are materialized simultaneously. For a 70B model with 80 layers, each layer's parameters are about 1.75 GB in BF16. Two layers unsharded is 3.5 GB, which may not sound like much, but this is on top of the model shards, optimizer states, activations, and gradient buffers already in memory. On a GPU with 80 GB HBM, every gigabyte counts.
+
+The `limit_all_gathers` option in PyTorch FSDP addresses this by serializing some all-gathers when memory is tight, at the cost of reduced overlap. Finding the right balance between overlap and memory is model-specific and often requires iterative profiling.
+
+### Synchronization Barriers That Kill Overlap
+
+Certain operations force all streams to synchronize, destroying any in-flight overlap:
+
+1. **Loss logging with `.item()`**: Calling `loss.item()` in Python forces a device synchronize (CPU waits for GPU to finish the loss computation). If this happens before the backward pass's communication is complete, it will block.
+2. **Gradient clipping before all-reduce completes**: If you clip gradients before the all-reduce finishes, you are clipping local gradients, not global gradients. But if you wait for the all-reduce, you have serialized communication.
+3. **Dynamic batching / conditional execution**: Any control flow that depends on GPU-computed values forces synchronization.
+4. **torch.cuda.synchronize() in callbacks**: Logging, checkpointing, or profiling callbacks that synchronize the device mid-step.
+
+The solution is to move all synchronization points to after the backward pass and all-reduce are both complete, right before the optimizer step. Any "peeking" at intermediate values during the backward pass risks serializing the pipeline.
+
+### Mixed Parallelism Scheduling Conflicts
+
+When multiple parallelism dimensions compete for the same interconnect, overlap in one dimension can degrade another. For example:
+
+- FSDP reduce-scatter on InfiniBand competes with EP all-to-all on InfiniBand.
+- If both run simultaneously, neither gets full bandwidth, and both take longer.
+- This can actually be **worse** than serializing them, because both operations are bandwidth-efficient only when they get near-full bandwidth.
+
+The fix is explicit scheduling: use CUDA events to ensure FSDP and EP communications happen in non-overlapping time windows, even if it means some compute is not overlapped. Alternatively, use separate network rails for different traffic classes (some clusters have multiple InfiniBand ports per GPU, allowing traffic separation).
+
+## Advanced Techniques and Future Directions
+
+### Computation-Communication Co-Design with Kernel Fusion
+
+Rather than overlapping compute and communication as separate kernels on separate streams, some systems fuse them into a single kernel. NVIDIA's CUTLASS library and Flux framework demonstrate this: a GEMM kernel can incorporate communication operations within its tile computation loop. When a tile of the output is computed, it is immediately written to a remote GPU's memory via NVLink, without returning to the global scheduling layer.
+
+This eliminates the SM contention problem entirely -- the same SMs that compute the tile also drive the communication, but they do so within the natural "gaps" in the GEMM's memory access pattern. The GEMM already has memory latency to hide; using that latency to drive NVLink transfers is nearly free.
+
+### Async Tensor Parallelism
+
+Recent work by NVIDIA on "overlapping tensor parallelism" uses a technique where the all-reduce in TP is decomposed and interleaved with the computation of the next layer. Instead of:
+
+```
+[Layer L GEMM] -> [All-Reduce L] -> [Layer L+1 GEMM] -> [All-Reduce L+1]
+```
+
+The execution becomes:
+
+```
+[Layer L GEMM] -> [Reduce-Scatter L | Layer L+1 GEMM] -> [All-Gather L+1 | ...]
+```
+
+The reduce-scatter of layer $L$'s output overlaps with the GEMM of layer $L+1$, and the all-gather of layer $L+1$'s input overlaps with a later computation. This requires the GEMM to be able to work on partial data (operating on chunks as they arrive from the all-gather), which demands custom kernels but yields significant speedups on PCIe-connected systems.
+
+### Network Hardware Evolution
+
+The overlap problem is ultimately an artifact of the gap between compute throughput and network bandwidth. As network hardware improves, the problem evolves:
+
+- **NVLink 5.0 (Blackwell)**: 1.8 TB/s bidirectional per GPU. TP all-reduces become truly negligible.
+- **NVLink domain expansion**: Blackwell's NVLink domain supports up to 576 GPUs, potentially eliminating the need for slower interconnects in moderate-scale training.
+- **CXL and UCIe**: Future memory-semantic interconnects may allow direct load/store access to remote GPU memory, eliminating the need for explicit communication operations entirely.
+- **In-network compute**: Smart NICs and network switches that can perform reductions in-flight (NVIDIA SHARP) reduce the data that traverses the network by $2\times$ for all-reduce operations.
+
+Even with these improvements, overlap will remain important. Compute throughput grows with each GPU generation too (FP8 tensor cores, sparsity support), so the compute-communication ratio does not necessarily improve. The arms race between compute and communication bandwidth is a defining tension in distributed systems design.
+
+## Summary and Practical Recommendations
+
+Compute-communication overlap is not a single technique but a design philosophy that must be applied at every parallelism dimension. Here is a practical checklist:
+
+<Benchmark
+  title="Overlap Strategy Decision Matrix"
+  columns={["Parallelism", "Communication Op", "Overlap With", "Key Knob", "Priority"]}
+  rows={[
+    { values: ["DDP", "All-reduce", "Backward compute", "bucket_cap_mb", "High"], highlight: false },
+    { values: ["FSDP", "All-gather + Reduce-scatter", "Adjacent layer compute", "prefetch depth", "Critical"], highlight: true },
+    { values: ["TP (NVLink)", "All-reduce", "N/A -- too fast", "N/A", "Low"], highlight: false },
+    { values: ["TP (PCIe)", "Reduce-scatter + All-gather", "LayerNorm, activation", "Sequence parallelism", "High"], highlight: false },
+    { values: ["PP", "Point-to-point", "Other micro-batches", "Schedule type, V", "High"], highlight: false },
+    { values: ["EP (MoE)", "All-to-all", "Non-MoE layer compute", "DeepEP kernel type", "Critical"], highlight: true }
+  ]}
+  notes="Priority reflects impact on overall training throughput for a typical large-model training job."
+/>
+
+**Step 1**: Profile your baseline with Nsight Systems. Measure the overlap ratio for each parallelism dimension. Identify which communication is exposed (not overlapped).
+
+**Step 2**: Address the largest exposed communication first. Usually this is FSDP all-gather (if using FSDP) or gradient all-reduce (if using DDP). Tune prefetch depth and bucket sizes.
+
+**Step 3**: Check for SM contention. If Nsight shows NCCL kernels stuck in pending state while compute kernels run, you have SM contention. Consider DeepEP-style RDMA kernels, SM partitioning, or reducing compute kernel occupancy.
+
+**Step 4**: Verify that your compute-to-communication ratio $R$ is greater than 1.5. If not, increase batch size, reduce GPU count, or upgrade your interconnect. No amount of overlap engineering can fix $R \lt 1$.
+
+**Step 5**: Check memory pressure. If you are hitting OOM with overlap enabled, reduce prefetch depth, add `limit_all_gathers`, or enable activation recomputation. The fastest training run is one that does not crash.
+
+**Step 6**: Profile again after each change. Overlap behavior is highly sensitive to model architecture, batch size, sequence length, and hardware configuration. What works for one model may not work for another.
+
+The goal is simple in concept: keep every GPU's SMs busy with useful computation at every microsecond. The execution is complex because distributed systems have multiple communication patterns, each with different latency, bandwidth, and scheduling characteristics. But the payoff is enormous -- the difference between 50% MFU and 40% MFU on a 10,000-GPU cluster is millions of dollars in training cost. Getting overlap right is not optional for large-scale training; it is the difference between a viable training run and a budget overrun.

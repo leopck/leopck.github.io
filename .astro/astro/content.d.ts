@@ -159,13 +159,6 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
-"attention-performance-analysis-2019.mdx": {
-	id: "attention-performance-analysis-2019.mdx";
-  slug: "attention-performance-analysis-2019";
-  body: string;
-  collection: "posts";
-  data: InferEntrySchema<"posts">
-} & { render(): Render[".mdx"] };
 "attention-variants-mha-mqa-gqa.mdx": {
 	id: "attention-variants-mha-mqa-gqa.mdx";
   slug: "attention-variants-mha-mqa-gqa";
@@ -173,16 +166,16 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
-"batch-processing-llm-optimization-2019.mdx": {
-	id: "batch-processing-llm-optimization-2019.mdx";
-  slug: "batch-processing-llm-optimization-2019";
+"bert-gpt-architecture-performance-trade-offs-2019.mdx": {
+	id: "bert-gpt-architecture-performance-trade-offs-2019.mdx";
+  slug: "bert-gpt-architecture-performance-trade-offs-2019";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
-"bert-gpt-architecture-performance-trade-offs-2019.mdx": {
-	id: "bert-gpt-architecture-performance-trade-offs-2019.mdx";
-  slug: "bert-gpt-architecture-performance-trade-offs-2019";
+"compute-communication-overlap-distributed-training.mdx": {
+	id: "compute-communication-overlap-distributed-training.mdx";
+  slug: "compute-communication-overlap-distributed-training";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -215,13 +208,6 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
-"cuda-graphs-inference-startup-latency-2020.mdx": {
-	id: "cuda-graphs-inference-startup-latency-2020.mdx";
-  slug: "cuda-graphs-inference-startup-latency-2020";
-  body: string;
-  collection: "posts";
-  data: InferEntrySchema<"posts">
-} & { render(): Render[".mdx"] };
 "cuda-graphs-inference.mdx": {
 	id: "cuda-graphs-inference.mdx";
   slug: "cuda-graphs-inference";
@@ -232,13 +218,6 @@ declare module 'astro:content' {
 "cuda-kernel-fusion-memory-traffic-2020.mdx": {
 	id: "cuda-kernel-fusion-memory-traffic-2020.mdx";
   slug: "cuda-kernel-fusion-memory-traffic-2020";
-  body: string;
-  collection: "posts";
-  data: InferEntrySchema<"posts">
-} & { render(): Render[".mdx"] };
-"cuda-kernel-optimization-techniques-2019.mdx": {
-	id: "cuda-kernel-optimization-techniques-2019.mdx";
-  slug: "cuda-kernel-optimization-techniques-2019";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -271,13 +250,6 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
-"cuda-warp-occupancy-latency-hiding-2020.mdx": {
-	id: "cuda-warp-occupancy-latency-hiding-2020.mdx";
-  slug: "cuda-warp-occupancy-latency-hiding-2020";
-  body: string;
-  collection: "posts";
-  data: InferEntrySchema<"posts">
-} & { render(): Render[".mdx"] };
 "decoding-performance-beam-vs-sampling-2020.mdx": {
 	id: "decoding-performance-beam-vs-sampling-2020.mdx";
   slug: "decoding-performance-beam-vs-sampling-2020";
@@ -285,9 +257,23 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"deepseek-v3-architecture-deep-dive.mdx": {
+	id: "deepseek-v3-architecture-deep-dive.mdx";
+  slug: "deepseek-v3-architecture-deep-dive";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "deepspeed-zero-memory-optimization-performance-2019.mdx": {
 	id: "deepspeed-zero-memory-optimization-performance-2019.mdx";
   slug: "deepspeed-zero-memory-optimization-performance-2019";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"disaggregated-prefill-decode-serving.mdx": {
+	id: "disaggregated-prefill-decode-serving.mdx";
+  slug: "disaggregated-prefill-decode-serving";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -362,13 +348,6 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
-"feature-showcase.mdx": {
-	id: "feature-showcase.mdx";
-  slug: "feature-showcase";
-  body: string;
-  collection: "posts";
-  data: InferEntrySchema<"posts">
-} & { render(): Render[".mdx"] };
 "flashattention-memory-hierarchy.mdx": {
 	id: "flashattention-memory-hierarchy.mdx";
   slug: "flashattention-memory-hierarchy";
@@ -390,13 +369,6 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
-"gpu-memory-bandwidth-optimization-2020.mdx": {
-	id: "gpu-memory-bandwidth-optimization-2020.mdx";
-  slug: "gpu-memory-bandwidth-optimization-2020";
-  body: string;
-  collection: "posts";
-  data: InferEntrySchema<"posts">
-} & { render(): Render[".mdx"] };
 "gpu-memory-hierarchy-2019.mdx": {
 	id: "gpu-memory-hierarchy-2019.mdx";
   slug: "gpu-memory-hierarchy-2019";
@@ -407,13 +379,6 @@ declare module 'astro:content' {
 "gpu-memory-profiling.mdx": {
 	id: "gpu-memory-profiling.mdx";
   slug: "gpu-memory-profiling";
-  body: string;
-  collection: "posts";
-  data: InferEntrySchema<"posts">
-} & { render(): Render[".mdx"] };
-"gpu-shared-memory-optimization-2019.mdx": {
-	id: "gpu-shared-memory-optimization-2019.mdx";
-  slug: "gpu-shared-memory-optimization-2019";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -432,30 +397,9 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
-"grouped-query-attention.mdx": {
-	id: "grouped-query-attention.mdx";
-  slug: "grouped-query-attention";
-  body: string;
-  collection: "posts";
-  data: InferEntrySchema<"posts">
-} & { render(): Render[".mdx"] };
 "habana-gaudi-nvidia-v100-ai-training-performance-2020.mdx": {
 	id: "habana-gaudi-nvidia-v100-ai-training-performance-2020.mdx";
   slug: "habana-gaudi-nvidia-v100-ai-training-performance-2020";
-  body: string;
-  collection: "posts";
-  data: InferEntrySchema<"posts">
-} & { render(): Render[".mdx"] };
-"i2c-bus-optimization.mdx": {
-	id: "i2c-bus-optimization.mdx";
-  slug: "i2c-bus-optimization";
-  body: string;
-  collection: "posts";
-  data: InferEntrySchema<"posts">
-} & { render(): Render[".mdx"] };
-"kv-cache-allocator-memory-pool-2020.mdx": {
-	id: "kv-cache-allocator-memory-pool-2020.mdx";
-  slug: "kv-cache-allocator-memory-pool-2020";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -488,23 +432,9 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
-"llm-request-scheduling-batching-2020.mdx": {
-	id: "llm-request-scheduling-batching-2020.mdx";
-  slug: "llm-request-scheduling-batching-2020";
-  body: string;
-  collection: "posts";
-  data: InferEntrySchema<"posts">
-} & { render(): Render[".mdx"] };
-"llm-speculative-decoding-2020.mdx": {
-	id: "llm-speculative-decoding-2020.mdx";
-  slug: "llm-speculative-decoding-2020";
-  body: string;
-  collection: "posts";
-  data: InferEntrySchema<"posts">
-} & { render(): Render[".mdx"] };
-"memory-bandwidth-analysis-2019.mdx": {
-	id: "memory-bandwidth-analysis-2019.mdx";
-  slug: "memory-bandwidth-analysis-2019";
+"llm-serving-engine-comparison.mdx": {
+	id: "llm-serving-engine-comparison.mdx";
+  slug: "llm-serving-engine-comparison";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -600,13 +530,6 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
-"rope-embeddings-long-context.mdx": {
-	id: "rope-embeddings-long-context.mdx";
-  slug: "rope-embeddings-long-context";
-  body: string;
-  collection: "posts";
-  data: InferEntrySchema<"posts">
-} & { render(): Render[".mdx"] };
 "simd-optimization-basics-2019.mdx": {
 	id: "simd-optimization-basics-2019.mdx";
   slug: "simd-optimization-basics-2019";
@@ -663,23 +586,9 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
-"tensor-parallelism-allreduce.mdx": {
-	id: "tensor-parallelism-allreduce.mdx";
-  slug: "tensor-parallelism-allreduce";
-  body: string;
-  collection: "posts";
-  data: InferEntrySchema<"posts">
-} & { render(): Render[".mdx"] };
 "tensorrt-optimization-llm-inference-2019.mdx": {
 	id: "tensorrt-optimization-llm-inference-2019.mdx";
   slug: "tensorrt-optimization-llm-inference-2019";
-  body: string;
-  collection: "posts";
-  data: InferEntrySchema<"posts">
-} & { render(): Render[".mdx"] };
-"transformer-architecture-analysis-2020.mdx": {
-	id: "transformer-architecture-analysis-2020.mdx";
-  slug: "transformer-architecture-analysis-2020";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -708,13 +617,6 @@ declare module 'astro:content' {
 "vllm-pagedattention-introduction-2020.mdx": {
 	id: "vllm-pagedattention-introduction-2020.mdx";
   slug: "vllm-pagedattention-introduction-2020";
-  body: string;
-  collection: "posts";
-  data: InferEntrySchema<"posts">
-} & { render(): Render[".mdx"] };
-"vllm-pagedattention-memory-analysis.mdx": {
-	id: "vllm-pagedattention-memory-analysis.mdx";
-  slug: "vllm-pagedattention-memory-analysis";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">

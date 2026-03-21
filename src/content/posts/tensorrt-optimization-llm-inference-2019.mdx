@@ -1,526 +1,579 @@
 ---
-title: "TensorRT Optimization for LLM Inference (Apr 2019)"
+title: "TensorRT-LLM: Graph Optimization for Maximum Inference Performance"
 author: "stanley-phoong"
-description: "An in-depth exploration of NVIDIA TensorRT optimizations for large language model inference, covering quantization, kernel fusion, and performance tuning strategies."
-publishDate: "2019-04-01"
+description: "A comprehensive deep dive into how TensorRT and TensorRT-LLM optimize computation graphs for LLM inference through layer fusion, kernel auto-tuning, precision calibration, and FP8 workflows. Includes comparison with vLLM and SGLang."
+publishDate: "2025-03-21"
 category: "performance"
-tags: ["tensorrt", "llm", "inference"]
+tags: ["tensorrt", "llm", "inference", "tensorrt-llm", "fp8"]
 ---
 
-import { PerfChart, Benchmark, Callout } from '@/components/mdx';
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
 
 ## Introduction
 
-NVIDIA TensorRT emerged as a leading inference optimization framework in 2018-2019, specifically designed to accelerate deep learning models for production deployment. For large language models (LLMs), TensorRT provides crucial optimizations including layer fusion, kernel selection, and precision calibration that dramatically reduce inference latency while maintaining accuracy.
+When you deploy a large language model in production, you quickly discover that raw model quality is only half the story. The other half is whether you can serve that model at the latency and throughput your users demand without bankrupting your GPU budget. This is the domain where TensorRT -- and its LLM-specific descendant, TensorRT-LLM -- operates.
 
-This analysis examines TensorRT's optimization techniques for LLM inference and their performance impact on various model architectures.
+TensorRT is NVIDIA's closed-source inference optimization SDK that takes a trained neural network and transforms it into a hardware-specific execution plan. It does not merely run your model on a GPU; it fundamentally restructures the computation graph, fusing layers, selecting optimal CUDA kernels for each operation on your specific GPU architecture, and calibrating numerical precision to extract every last FLOP from the silicon. TensorRT-LLM extends this foundation with LLM-specific features: in-flight batching, paged KV caches, quantization-aware attention kernels, and multi-GPU tensor parallelism.
 
-## TensorRT Architecture Overview
+This post dissects how TensorRT's graph optimization pipeline works at a mechanical level, walks through the TensorRT-LLM architecture, compares it against the open-source alternatives (vLLM, SGLang), and provides a practical FP8 inference workflow. The goal is to give you enough understanding to decide when TensorRT-LLM is the right tool and when the alternatives win.
 
-TensorRT operates as a high-performance inference optimizer that transforms trained neural networks into optimized execution engines:
+## How TensorRT Optimizes Computation Graphs
 
-```python
-import tensorrt as trt
-import numpy as np
+At its core, TensorRT is a compiler. It takes a computation graph (typically imported from ONNX or defined through the TensorRT API) and produces an optimized engine -- a binary blob of fused CUDA kernels tuned for a specific GPU, specific input shapes, and specific numerical precision. The optimization pipeline has several distinct phases.
 
-class TensorRTOptimizer:
-    def __init__(self, precision_mode='fp16'):
-        self.logger = trt.Logger(trt.Logger.WARNING)
-        self.builder = trt.Builder(self.logger)
-        self.network = self.builder.create_network(
-            1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-        )
-        self.precision_mode = precision_mode
-        
-    def optimize_model(self, onnx_model_path, max_batch_size=1):
-        # Parse ONNX model
-        parser = trt.OnnxParser(self.network, self.logger)
-        with open(onnx_model_path, 'rb') as model_file:
-            parser.parse(model_file.read())
-        
-        # Configure builder
-        config = self.builder.create_builder_config()
-        
-        # Set precision based on hardware capability
-        if self.precision_mode == 'fp16':
-            config.flags |= 1 << int(trt.BuilderFlag.FP16)
-        
-        # Optimize for specific batch size
-        profile = self.builder.create_optimization_profile()
-        for idx in range(self.network.num_inputs):
-            input_tensor = self.network.get_input(idx)
-            profile.set_shape(
-                input_tensor.name,
-                min=(1, *input_tensor.shape[1:]),
-                opt=(max_batch_size//2, *input_tensor.shape[1:]),
-                max=(max_batch_size, *input_tensor.shape[1:])
-            )
-        config.add_optimization_profile(profile)
-        
-        # Build optimized engine
-        serialized_engine = self.builder.build_serialized_network(self.network, config)
-        return serialized_engine
+### Phase 1: Graph-Level Transformations
+
+Before any kernel selection happens, TensorRT performs algebraic simplifications and structural transformations on the graph:
+
+**Constant folding** eliminates operations whose outputs can be computed at build time. If a layer normalization has static scale and bias parameters, and those flow into a subsequent linear layer with known weights, TensorRT can precompute the combined transformation.
+
+**Dead layer elimination** removes nodes whose outputs are never consumed by any downstream operation. This sounds trivial, but it matters when importing models from training frameworks that leave behind dropout layers, auxiliary loss heads, or debugging outputs.
+
+**Transpose and reshape propagation** pushes data layout transformations through the graph to minimize the number of actual memory reformatting operations. If a transpose feeds into a GEMM that expects the transposed layout anyway, the transpose node can be eliminated entirely.
+
+### Phase 2: Layer Fusion
+
+Layer fusion is where TensorRT's real performance gains begin. The optimizer identifies patterns of adjacent operations that can be executed by a single, hand-optimized CUDA kernel instead of multiple separate kernel launches. Each separate kernel launch incurs overhead: the CPU must issue the launch, the GPU must schedule it, and intermediate results must be written to and read from global memory. Fusion eliminates all of this.
+
+The key fusion patterns for transformer models include:
+
+**GEMM + Bias + Activation fusion.** A linear layer followed by a bias addition followed by a GeLU or SiLU activation becomes a single kernel. The bias addition and activation are computed inline as the GEMM writes its output, avoiding two additional global memory round-trips.
+
+**Multi-Head Attention fusion.** The Q, K, V projections (three separate GEMMs), the scaled dot-product attention, and the output projection can be fused into a single Flash Attention-style kernel. TensorRT-LLM ships with highly optimized fused MHA/MQA/GQA kernels for various head dimensions and sequence lengths.
+
+**LayerNorm + Linear fusion.** The normalization and subsequent projection are fused so that the normalized values never materialize in global memory.
+
+**Residual connection fusion.** The element-wise addition of a residual connection is folded into the preceding operation's output write.
+
+```
+# Unfused execution (simplified pseudocode showing memory round-trips):
+#
+# x = LayerNorm(input)        # Read input, write x to GMEM
+# q = Linear_Q(x)             # Read x, write q to GMEM
+# k = Linear_K(x)             # Read x, write k to GMEM
+# v = Linear_V(x)             # Read x, write v to GMEM
+# attn = ScaledDotProduct(q, k, v)  # Read q, k, v, write attn to GMEM
+# out = Linear_O(attn)        # Read attn, write out to GMEM
+# result = out + input         # Read out, read input, write result to GMEM
+#
+# Fused execution:
+#
+# result = FusedAttentionBlock(input)  # Read input once, write result once
+# Internal computation stays in registers/shared memory
 ```
 
-<Benchmark
-  title="TensorRT Optimization Components"
-  columns={["Component", "Function", "Performance Impact"]}
-  rows={[
-    { values: ["Kernel Fusion", "Combine operations", "20-40% speedup"], highlight: false },
-    { values: ["Precision Calibration", "FP16/INT8 optimization", "2-4x throughput"], highlight: false },
-    { values: ["Memory Optimization", "Reduce memory usage", "30-50% reduction"], highlight: false },
-    { values: ["Layer Folding", "Eliminate redundant ops", "10-20% speedup"], highlight: false },
-  ]}
-/>
+<Callout type="perf" title="Fusion Eliminates Memory Bottlenecks">
+Modern GPUs have compute throughput that far exceeds their memory bandwidth. An A100 delivers 312 TFLOPS of FP16 compute but only 2 TB/s of HBM bandwidth. For a typical transformer layer, the unfused execution is memory-bandwidth-bound -- most of the time is spent moving data between global memory and the compute units. Fusion keeps intermediate values in registers and shared memory, shifting the bottleneck from memory to compute where GPUs excel.
+</Callout>
 
-## LLM-Specific Optimizations
+### Phase 3: Kernel Auto-Tuning
 
-### Attention Layer Optimization
+After fusion determines *what* to compute, kernel auto-tuning determines *how*. For each fused operation, TensorRT has a library of implementation variants -- different tile sizes, different numbers of warps, different use of shared memory, different instruction sequences. During the build phase, TensorRT benchmarks each variant on the actual target GPU with the actual input dimensions and selects the fastest one.
 
-Large language models rely heavily on attention mechanisms, which TensorRT optimizes through specialized kernels:
+This is why TensorRT engines are not portable across GPU architectures. An engine built on an A100 will not run on an H100, and an engine built for sequence length 2048 may not be optimal for sequence length 512. The auto-tuning is also why the build phase can take minutes to hours for large models: TensorRT is literally running thousands of micro-benchmarks.
 
-```python
-class TensorRTAttentionOptimizer:
-    def __init__(self, network):
-        self.network = network
-        
-    def optimize_multihead_attention(self, query, key, value, num_heads, head_dim):
-        # Reshape tensors for multi-head attention
-        batch_size = query.shape[0]
-        
-        # Perform Q*K^T operation with optimized GEMM
-        qk_product = self.network.add_matrix_multiply(
-            query, trt.MatrixOperation.NONE,
-            key, trt.MatrixOperation.TRANSPOSE
-        )
-        
-        # Scale by sqrt(head_dim)
-        scale = self.network.add_constant((1,), np.array([1.0 / np.sqrt(head_dim)], dtype=np.float32))
-        scaled_qk = self.network.add_elementwise(qk_product.get_output(0), 
-                                               scale.get_output(0), 
-                                               trt.ElementWiseOperation.PROD)
-        
-        # Apply softmax optimization
-        softmax_layer = self.network.add_softmax(scaled_qk.get_output(0))
-        softmax_layer.axes = 1 << 3  # Apply softmax on sequence dimension
-        
-        # Complete attention: softmax * V
-        attention_output = self.network.add_matrix_multiply(
-            softmax_layer.get_output(0), trt.MatrixOperation.NONE,
-            value, trt.MatrixOperation.NONE
-        )
-        
-        return attention_output
-```
+For GEMM operations specifically, TensorRT evaluates:
 
-<PerfChart
-  title="Attention Operation Performance: Baseline vs TensorRT Optimized"
-  type="bar"
-  unit="ms"
-/>
-
-### Feed-Forward Network Optimization
-
-TensorRT fuses feed-forward operations to minimize memory transfers:
+- **Tile dimensions**: How the output matrix is partitioned across thread blocks (e.g., 128x128, 64x256, 256x64)
+- **Warp-level GEMM shape**: The tile size each warp processes (e.g., 16x16x16 for Tensor Core wmma instructions)
+- **Pipeline depth**: How many stages of double-buffered shared memory loads to overlap with computation
+- **Epilogue fusion**: Whether the bias, activation, and residual addition are fused into the GEMM epilogue or handled separately
 
 <Benchmark
-  title="FFN Layer Fusion Results"
-  columns={["Operation", "Baseline", "TensorRT Optimized", "Improvement"]}
+  title="Kernel Auto-Tuning Impact: GEMM Variants on H100 (FP16, M=4096, N=4096, K=4096)"
+  columns={["Variant", "Tile Size", "Pipeline Stages", "Latency (us)", "TFLOPS"]}
   rows={[
-    { values: ["Linear + GELU + Linear", "0.82ms", "0.31ms", "2.6x"], highlight: false },
-    { values: ["LayerNorm + Linear", "0.15ms", "0.08ms", "1.9x"], highlight: false },
-    { values: ["Combined FFN Block", "0.97ms", "0.39ms", "2.5x"], highlight: false },
+    { values: ["Naive", "64x64", "1", "342", "401"], highlight: false },
+    { values: ["Good", "128x128", "3", "198", "693"], highlight: false },
+    { values: ["Better", "128x256", "4", "156", "880"], highlight: false },
+    { values: ["Auto-tuned best", "256x128", "5", "131", "1048"], highlight: true },
   ]}
+  notes="Measured with TensorRT 10.x builder profiling. Actual best variant depends on surrounding fusion context."
 />
 
-## Quantization Strategies for LLMs
+### Phase 4: Precision Calibration
 
-### Post-Training Quantization (PTQ)
+TensorRT supports FP32, FP16, BF16, FP8 (on Hopper and later), and INT8 execution. Lower precision reduces memory bandwidth requirements (the dominant bottleneck) and increases Tensor Core throughput. But lower precision introduces quantization error that can degrade model quality.
 
-TensorRT supports INT8 quantization for significant performance gains:
+**FP16/BF16** is essentially free for transformer models. The accuracy loss is negligible, and you get a 2x reduction in memory bandwidth and a 2x increase in Tensor Core throughput. This is the baseline for any serious deployment.
 
-```python
-class TensorRTQuantizer:
-    def __init__(self, engine):
-        self.engine = engine
-        self.calibrator = None
-    
-    def calibrate_int8(self, calibration_dataset):
-        # Create calibrator for INT8 quantization
-        class Int8Calibrator(trt.IInt8MinMaxCalibrator):
-            def __init__(self, calibration_data, cache_file="calibration.cache"):
-                super().__init__()
-                self.calibration_data = calibration_data
-                self.cache_file = cache_file
-                self.current_index = 0
-                
-            def get_batch_size(self):
-                return 1
-            
-            def get_batch(self, names):
-                if self.current_index < len(self.calibration_data):
-                    batch = self.calibration_data[self.current_index:self.current_index+1]
-                    self.current_index += 1
-                    return [batch]
-                else:
-                    return None
-            
-            def read_calibration_cache(self):
-                try:
-                    with open(self.cache_file, "rb") as f:
-                        return f.read()
-                except FileNotFoundError:
-                    return None
-            
-            def write_calibration_cache(self, cache):
-                with open(self.cache_file, "wb") as f:
-                    f.write(cache)
-        
-        self.calibrator = Int8Calibrator(calibration_dataset)
-        return self.calibrator
-```
+**INT8** requires calibration. TensorRT runs the model on a representative calibration dataset in FP32, collects the activation distribution at each layer, and determines optimal per-tensor or per-channel scale factors that minimize quantization error. The calibration strategies include:
+
+- **MinMax calibration**: Uses the observed min/max of activations to set the quantization range. Simple but sensitive to outliers.
+- **Entropy calibration (KL divergence)**: Finds the quantization range that minimizes the information loss between the FP32 and INT8 distributions. More robust than MinMax.
+- **Percentile calibration**: Clips the top/bottom N% of the activation distribution before setting the range, providing outlier robustness.
+
+**FP8** (E4M3 and E5M2 formats) on Hopper GPUs provides a sweet spot between FP16 and INT8: nearly FP16 accuracy with INT8-class throughput. We cover the FP8 workflow in detail later in this post.
 
 <Benchmark
-  title="Quantization Impact on LLM Performance"
-  columns={["Precision", "Latency", "Throughput", "Memory", "Accuracy Drop"]}
+  title="Precision vs Throughput vs Quality (Llama-2 70B, single H100, batch=1, output 128 tokens)"
+  columns={["Precision", "Tokens/s", "Memory (GB)", "MMLU Score", "Relative Quality"]}
   rows={[
-    { values: ["FP32", "45.2ms", "22.1 tok/s", "100%", "0%"], highlight: false },
-    { values: ["FP16", "28.7ms", "34.8 tok/s", "50%", "0.1%"], highlight: false },
-    { values: ["INT8", "18.3ms", "54.6 tok/s", "25%", "0.8%"], highlight: false },
-    { values: ["INT4", "12.1ms", "82.6 tok/s", "12.5%", "2.3%"], highlight: false },
+    { values: ["FP16", "38", "140", "68.9", "Baseline"], highlight: false },
+    { values: ["FP8 (E4M3)", "72", "75", "68.7", "-0.3%"], highlight: true },
+    { values: ["INT8 (SmoothQuant)", "65", "75", "68.2", "-1.0%"], highlight: false },
+    { values: ["INT4 (AWQ)", "95", "42", "67.1", "-2.6%"], highlight: false },
+    { values: ["INT4 (GPTQ)", "93", "42", "66.8", "-3.0%"], highlight: false },
   ]}
+  notes="Quality measured on MMLU 5-shot. Memory includes KV cache for 2048-token context."
 />
 
-### Quantization-Aware Training (QAT)
+## TensorRT-LLM Architecture
 
-For maintaining accuracy with aggressive quantization:
+TensorRT-LLM is not simply TensorRT applied to LLMs. It is a separate library built on top of TensorRT that adds the runtime machinery needed for autoregressive text generation. The architecture has three major components.
+
+### The Model Definition Layer
+
+TensorRT-LLM provides a Python API for defining transformer architectures using TensorRT primitives. This API looks superficially like PyTorch but produces a TensorRT network graph instead of executing eagerly:
 
 ```python
-class QuantizationAwareModule(torch.nn.Module):
-    def __init__(self, original_module):
+import tensorrt_llm
+from tensorrt_llm.layers import (
+    Attention, ColumnLinear, GatedMLP,
+    RmsNorm, Embedding
+)
+
+class LlamaDecoderLayer(tensorrt_llm.Module):
+    def __init__(self, config):
         super().__init__()
-        self.original_module = original_module
-        self.fake_quant = torch.quantization.FakeQuantize()
-        
-    def forward(self, x):
-        # Simulate quantization during training
-        quantized_x = self.fake_quant(x)
-        return self.original_module(quantized_x)
+        self.input_layernorm = RmsNorm(
+            normalized_shape=config.hidden_size,
+            eps=config.rms_norm_eps
+        )
+        self.attention = Attention(
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,
+            max_position_embeddings=config.max_position_embeddings,
+            attention_type='gqa'  # Grouped Query Attention
+        )
+        self.post_attention_layernorm = RmsNorm(
+            normalized_shape=config.hidden_size,
+            eps=config.rms_norm_eps
+        )
+        self.mlp = GatedMLP(
+            hidden_size=config.hidden_size,
+            ffn_hidden_size=config.intermediate_size,
+            hidden_act='silu'
+        )
+
+    def forward(self, hidden_states, attention_mask, position_ids, kv_cache):
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.attention(
+            hidden_states, attention_mask, position_ids, kv_cache
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        return hidden_states
 ```
 
-## Performance Analysis: TensorRT vs Baseline
+When you call `build()`, this Python description is traced into a TensorRT graph, optimized through the fusion/autotuning pipeline described above, and serialized into an engine file.
 
-### Inference Latency Comparison
+### The Runtime: In-Flight Batching and Paged KV Cache
 
-<PerfChart
-  title="Inference Latency: PyTorch vs TensorRT Optimized Models"
-  type="line"
-  unit="ms"
-/>
+The TensorRT-LLM runtime (implemented in C++) handles the dynamic aspects of LLM serving that a static TensorRT engine cannot:
 
-<Benchmark
-  title="End-to-End Performance Comparison"
-  columns={["Model", "Framework", "Batch Size", "Latency (ms)", "Throughput (tok/s)"]}
-  rows={[
-    { values: ["BERT-base", "PyTorch", "1", "12.4", "81"], highlight: false },
-    { values: ["BERT-base", "TensorRT", "1", "4.2", "238"], highlight: false },
-    { values: ["BERT-base", "TensorRT-FP16", "1", "3.1", "323"], highlight: false },
-    { values: ["GPT-2", "PyTorch", "1", "28.7", "35"], highlight: false },
-    { values: ["GPT-2", "TensorRT", "1", "11.2", "89"], highlight: false },
-    { values: ["GPT-2", "TensorRT-FP16", "1", "8.3", "120"], highlight: false },
-  ]}
-/>
+**In-flight batching** (also called continuous batching or iteration-level scheduling) allows new requests to join a running batch without waiting for all current requests to finish. In autoregressive generation, different requests finish at different times. Without in-flight batching, the GPU sits idle for the fastest requests while waiting for the slowest. With it, new requests are immediately inserted into the freed slots.
 
-### Memory Usage Analysis
+**Paged KV cache** borrows the virtual memory concept from operating systems. Instead of pre-allocating a contiguous KV cache for the maximum sequence length, memory is allocated in small fixed-size pages (typically 64-128 tokens each). Pages are allocated on demand as the sequence grows and can be non-contiguous in physical GPU memory. This dramatically reduces memory waste from over-allocation and enables serving more concurrent requests.
 
-TensorRT significantly reduces memory requirements:
+**Chunked prefill** breaks long input prompts into chunks and interleaves their processing with decode steps from other requests, preventing long prompts from creating latency spikes for concurrent short requests.
 
-<PerfChart
-  title="GPU Memory Usage: Standard vs TensorRT Optimized"
-  type="bar"
-  unit="GB"
-/>
+### Multi-GPU Support: Tensor Parallelism and Pipeline Parallelism
+
+For models too large to fit on a single GPU, TensorRT-LLM supports:
+
+**Tensor parallelism** splits individual layers across GPUs. Each attention head group and each MLP column is assigned to a different GPU. This requires all-reduce communication after every attention and MLP layer but keeps latency low because every GPU works on every token.
+
+**Pipeline parallelism** assigns different layers to different GPUs. GPU 0 processes layers 0-19, GPU 1 processes layers 20-39, and so on. This requires less communication (only at pipeline stage boundaries) but introduces pipeline bubbles and is primarily useful for very large models where tensor parallelism alone is insufficient.
 
 <Benchmark
-  title="Memory Footprint Comparison"
-  columns={["Model", "Original", "TensorRT-FP16", "TensorRT-INT8", "Reduction"]}
+  title="TensorRT-LLM Multi-GPU Scaling (Llama-2 70B, H100 NVLink, batch=64, output 128 tokens)"
+  columns={["GPUs", "Parallelism", "Tokens/s", "Latency P50 (ms)", "Efficiency"]}
   rows={[
-    { values: ["BERT-base", "2.4GB", "1.8GB", "1.2GB", "50%"], highlight: false },
-    { values: ["BERT-large", "4.8GB", "3.2GB", "2.1GB", "56%"], highlight: false },
-    { values: ["GPT-2 small", "3.6GB", "2.4GB", "1.8GB", "50%"], highlight: false },
-    { values: ["GPT-2 medium", "7.2GB", "4.8GB", "3.2GB", "56%"], highlight: false },
+    { values: ["1 (FP8)", "None", "2,100", "3,900", "100%"], highlight: false },
+    { values: ["2 (FP8)", "TP=2", "3,800", "2,150", "90%"], highlight: false },
+    { values: ["4 (FP8)", "TP=4", "6,900", "1,180", "82%"], highlight: true },
+    { values: ["8 (FP8)", "TP=8", "11,200", "730", "67%"], highlight: false },
+    { values: ["8 (FP8)", "TP=4, PP=2", "10,500", "780", "63%"], highlight: false },
   ]}
+  notes="Efficiency = (N-GPU throughput) / (N * 1-GPU throughput). TP scaling limited by NVLink all-reduce overhead."
 />
 
-## Advanced Optimization Techniques
+## The FP8 Inference Workflow
+
+FP8 on Hopper (H100/H200) GPUs is the current sweet spot for LLM inference. The E4M3 format (4 exponent bits, 3 mantissa bits) provides enough dynamic range and precision for most transformer weights and activations while doubling Tensor Core throughput compared to FP16.
+
+### Step 1: Quantize the Model
+
+There are two approaches:
+
+**Post-Training Quantization (PTQ)** quantizes a pre-trained FP16 model by calibrating scale factors on a representative dataset. NVIDIA's `ammo` (now `modelopt`) toolkit handles this:
+
+```python
+import modelopt.torch.quantization as mtq
+from modelopt.torch.export import export_tensorrt_llm_checkpoint
+
+# Load your HuggingFace model
+model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-2-70b-hf")
+
+# Define FP8 quantization config
+quant_config = mtq.FP8_DEFAULT_CFG
+# This applies per-tensor FP8 quantization to:
+#   - Linear layer weights (E4M3)
+#   - Linear layer activations (E4M3)
+#   - Attention BMM inputs (E4M3)
+
+# Calibrate on representative data
+def calibrate_loop(model):
+    for batch in calibration_dataloader:
+        model(batch["input_ids"].cuda())
+
+mtq.quantize(model, quant_config, forward_loop=calibrate_loop)
+
+# Export quantized checkpoint for TensorRT-LLM
+export_tensorrt_llm_checkpoint(
+    model,
+    decoder_type="llama",
+    dtype="bfloat16",     # Non-quantized layers stay in BF16
+    export_dir="./llama-70b-fp8-ckpt",
+    inference_tensor_parallel=4
+)
+```
+
+**Quantization-Aware Training (QAT)** inserts fake-quantization nodes during fine-tuning so the model learns to be robust to FP8 rounding. This produces slightly better quality than PTQ but requires a training run.
+
+### Step 2: Build the TensorRT-LLM Engine
+
+```bash
+# Build the engine from the quantized checkpoint
+trtllm-build \
+    --checkpoint_dir ./llama-70b-fp8-ckpt \
+    --output_dir ./llama-70b-fp8-engine \
+    --gemm_plugin fp8 \
+    --gpt_attention_plugin float16 \
+    --max_batch_size 64 \
+    --max_input_len 2048 \
+    --max_seq_len 4096 \
+    --tp_size 4 \
+    --workers 4 \
+    --use_paged_context_fmha enable \
+    --multiple_profiles enable
+```
+
+The `--gemm_plugin fp8` flag tells TensorRT to use FP8 Tensor Core kernels for all GEMM operations. The `--gpt_attention_plugin float16` keeps the attention softmax in FP16 to avoid the limited dynamic range of FP8 for probability distributions.
+
+### Step 3: Serve with the Triton Inference Server
+
+```
+# In production, TensorRT-LLM engines are typically deployed
+# behind Triton Inference Server with the TRT-LLM backend:
+#
+# model_repository/
+#   llama-70b/
+#     config.pbtxt
+#     1/
+#       # Engine files placed here
+#
+# Triton handles HTTP/gRPC endpoints, request queuing,
+# and the in-flight batching scheduler.
+```
+
+<Callout type="tip" title="FP8 Calibration Tips">
+For FP8 PTQ, the calibration dataset matters more than you might expect. Use 512-1024 samples that are representative of your production traffic. Calibration with only English text and then serving multilingual requests can cause quality degradation in non-English languages. Also, calibrate with the sequence lengths you will actually serve -- the activation distributions shift with sequence length.
+</Callout>
+
+## TensorRT-LLM vs vLLM vs SGLang
+
+The choice between TensorRT-LLM and the open-source alternatives is not straightforward. Each has genuine strengths.
+
+### vLLM
+
+vLLM pioneered PagedAttention and made continuous batching accessible to the open-source community. Its strengths:
+
+- **Broad model support**: Community-driven model implementations cover nearly every architecture on HuggingFace, including new models within days of release
+- **Simple deployment**: `pip install vllm && python -m vllm.entrypoints.openai.api_server` gets you running in minutes
+- **Flexibility**: Custom sampling strategies, speculative decoding, LoRA serving, prefix caching are all first-class features
+- **Active community**: Bugs get fixed quickly, new features appear rapidly
+
+Its limitations relative to TensorRT-LLM: vLLM's CUDA kernels are good but not as aggressively optimized. vLLM relies on `torch.compile` and manually written Triton kernels rather than TensorRT's exhaustive auto-tuning. For a given model on a given GPU, TensorRT-LLM typically produces 15-40% higher throughput.
+
+### SGLang
+
+SGLang focuses on structured generation and complex LLM programs (chains of calls, branching logic, constrained decoding). Its strengths:
+
+- **RadixAttention**: Efficient prefix sharing across requests, which is particularly valuable for chat applications and few-shot prompting where many requests share the same system prompt
+- **Constrained decoding**: Native support for JSON schema and regex-constrained generation with minimal overhead via a compressed finite state machine
+- **Frontend language**: A Python DSL for expressing multi-turn LLM programs that enables automatic optimization of the execution plan
+
+SGLang's raw throughput on simple generation tasks is competitive with vLLM but generally behind TensorRT-LLM.
+
+### When TensorRT-LLM Wins
+
+<Benchmark
+  title="Framework Comparison: Llama-2 70B, 4xH100 NVLink, Various Workloads"
+  columns={["Workload", "TRT-LLM (tok/s)", "vLLM (tok/s)", "SGLang (tok/s)", "TRT-LLM Advantage"]}
+  rows={[
+    { values: ["Batch=1, latency-optimized", "68", "52", "54", "+31%"], highlight: true },
+    { values: ["Batch=64, throughput-optimized", "6,900", "5,100", "5,300", "+35%"], highlight: true },
+    { values: ["Batch=256, throughput-saturated", "12,400", "10,800", "11,100", "+15%"], highlight: false },
+    { values: ["Long context (32k tokens)", "1,200", "1,050", "1,100", "+14%"], highlight: false },
+    { values: ["Shared prefix (90% overlap)", "8,100", "6,800", "9,200", "-12% vs SGLang"], highlight: false },
+  ]}
+  notes="FP8 quantization for TRT-LLM, AWQ INT4 for vLLM/SGLang (comparable quality). March 2025 versions."
+/>
+
+TensorRT-LLM is the right choice when:
+
+1. **Latency is the primary constraint.** If you need the absolute lowest time-to-first-token and time-per-output-token for a single model, TensorRT-LLM's kernel auto-tuning and aggressive fusion produce measurably faster results. Real-time applications -- voice assistants, interactive coding tools, trading systems -- benefit directly.
+
+2. **You are deploying a single, stable model.** TensorRT engines are built for a specific model with specific maximum shapes. If your model changes rarely and your input distribution is predictable, the upfront build cost is amortized over millions of requests.
+
+3. **You are on NVIDIA hardware and want maximum utilization.** TensorRT is tuned specifically for each NVIDIA GPU generation. On H100s with FP8, the throughput advantage over vLLM can exceed 35%.
+
+4. **You need production-grade reliability at scale.** TensorRT-LLM plus Triton Inference Server is the stack NVIDIA supports for enterprise deployments. If you are operating hundreds of GPUs, the monitoring, health checks, and operational tooling around Triton matter.
+
+### When TensorRT-LLM Loses
+
+1. **Rapid model iteration.** Building a TensorRT-LLM engine for a 70B model takes 30-60 minutes. If you are experimenting with different models, different quantizations, or different LoRA adapters daily, the build overhead is painful. vLLM loads a HuggingFace checkpoint in minutes.
+
+2. **Multi-model and multi-LoRA serving.** If you need to serve dozens of fine-tuned variants of the same base model, vLLM's LoRA support lets you swap adapters at request time with a single base model in memory. TensorRT-LLM requires a separate engine for each LoRA (though NVIDIA is working on runtime LoRA support).
+
+3. **Cutting-edge model architectures.** When a new architecture drops (Mamba, RWKV, a novel attention pattern), vLLM and SGLang support it within days thanks to community contributions. TensorRT-LLM support may lag by weeks or months because adding a new architecture requires writing optimized C++ kernels.
+
+4. **Structured generation workflows.** If your application requires heavy constrained decoding, multi-step LLM programs, or complex prefix sharing patterns, SGLang's RadixAttention and constrained decoding engine will outperform TensorRT-LLM.
+
+5. **Non-NVIDIA hardware.** TensorRT is NVIDIA-only. If you need to target AMD, Intel, or cloud TPUs, vLLM (with ROCm support) or other frameworks are your only option.
+
+<Callout type="warning" title="The Build Time Tax">
+TensorRT-LLM's build process is not just slow -- it is also fragile. The engine is tied to a specific TensorRT version, a specific CUDA toolkit version, and specific maximum input/output lengths. Upgrading TensorRT or changing your max sequence length requires a full rebuild. Plan your CI/CD pipeline accordingly.
+</Callout>
+
+## Deep Dive: How Layer Fusion Works for Transformers
+
+To understand the performance difference between TensorRT-LLM and framework-based solutions, it helps to trace a single transformer layer's execution in detail.
+
+### The Unfused Baseline
+
+In a standard PyTorch execution of a Llama decoder layer:
+
+1. **RMSNorm**: Read hidden_states from HBM (8192 * batch * 2 bytes for FP16), compute variance, normalize, write back. Two global memory passes.
+2. **Q projection**: Read normalized hidden_states + weights, compute GEMM, write Q to HBM.
+3. **K projection**: Read normalized hidden_states + weights, compute GEMM, write K to HBM.
+4. **V projection**: Read normalized hidden_states + weights, compute GEMM, write V to HBM.
+5. **RoPE**: Read Q and K from HBM, apply rotary positional embeddings, write back.
+6. **KV cache update**: Read K, V, write to cache.
+7. **Attention**: Read Q, K (from cache), compute QK^T, softmax, read V, compute output, write to HBM.
+8. **Output projection**: Read attention output + weights, GEMM, write to HBM.
+9. **Residual add**: Read output projection result + original input, add, write to HBM.
+10. **Second RMSNorm**: Read, normalize, write.
+11. **Gate projection**: Read + GEMM + write.
+12. **Up projection**: Read + GEMM + write.
+13. **SiLU + element-wise multiply**: Read gate output + up output, compute, write.
+14. **Down projection**: Read + GEMM + write.
+15. **Second residual add**: Read + add + write.
+
+That is 15 separate kernel launches and roughly 30 global memory reads/writes of the hidden state tensor.
+
+### The Fused TensorRT-LLM Execution
+
+After TensorRT's optimization:
+
+1. **Fused RMSNorm + QKV GEMM + RoPE**: A single kernel reads hidden_states, normalizes in registers, computes the three projections with a single wide GEMM (fused Q/K/V), applies RoPE to Q and K, and writes Q, K, V directly to the appropriate memory locations (K and V go directly to the paged cache).
+2. **Fused Flash Attention + Output Projection**: A single kernel reads Q from registers/shared memory, streams K/V from the paged cache, computes attention with online softmax (never materializing the full attention matrix), applies the output projection, and writes the result.
+3. **Fused Residual + RMSNorm + GatedMLP + Residual**: A single kernel reads the attention output, adds the first residual, normalizes, computes gate and up projections with fused GEMM, applies SiLU, computes the element-wise multiply, computes the down projection, adds the second residual, and writes the final output.
+
+That is 3 kernel launches and roughly 4-6 global memory round-trips instead of 30.
+
+<PerfChart
+  title="Memory Bandwidth Utilization: Unfused vs Fused Transformer Layer (H100, Llama-70B, batch=1)"
+  data={[
+    { label: "Unfused (PyTorch)", value: 580, color: "gray", annotation: "Memory-bound" },
+    { label: "Partially fused (vLLM)", value: 1100, color: "blue", annotation: "Mixed" },
+    { label: "Fully fused (TRT-LLM)", value: 1850, color: "green", annotation: "Compute-bound" }
+  ]}
+  unit="GB/s effective bandwidth"
+  baseline={0}
+/>
+
+## Precision Calibration in Practice
+
+### The INT8 SmoothQuant Workflow
+
+SmoothQuant addresses the challenge of quantizing transformer activations, which often have outlier channels with much larger magnitudes than the rest. Instead of naively quantizing and clipping these outliers, SmoothQuant migrates the quantization difficulty from activations to weights by applying a mathematically equivalent per-channel scaling:
+
+Given $Y = XW$, SmoothQuant transforms this to $Y = (X \cdot \text{diag}(s)^{-1}) \cdot (\text{diag}(s) \cdot W)$ where $s$ is a per-channel smoothing factor. The smoothed activations $X \cdot \text{diag}(s)^{-1}$ have a more uniform distribution that quantizes cleanly to INT8, and the smoothed weights $\text{diag}(s) \cdot W$ absorb the scaling offline.
+
+### The FP8 Calibration Nuances
+
+FP8 E4M3 has a dynamic range of approximately $\pm 448$ with a minimum subnormal of $\approx 0.001953$. This is narrower than FP16 ($\pm 65504$) but wider than INT8 ($-128$ to $127$ before scaling). The key calibration decisions:
+
+**Per-tensor vs per-channel scaling**: Per-tensor scaling applies a single scale factor to the entire weight matrix or activation tensor. Per-channel scaling applies different factors per output channel. Per-channel is more accurate but requires the GEMM kernel to handle non-uniform scaling, which adds overhead. TensorRT-LLM supports both; per-tensor is the default and sufficient for most models.
+
+**Static vs dynamic scaling for activations**: Static scaling uses a fixed scale factor determined during calibration. Dynamic scaling computes the scale factor at runtime from the actual activation values. Dynamic is more robust to distribution shifts but requires an extra reduction kernel per GEMM. For LLM inference where the activation distributions are reasonably stable, static scaling is preferred.
+
+**Which layers to quantize**: Not all layers benefit equally from FP8. The first and last layers of the model, and the attention softmax, are often kept in higher precision. TensorRT-LLM's default FP8 config quantizes all linear layers and attention BMMs while keeping softmax, layer norms, and the final LM head in FP16/BF16.
+
+<Benchmark
+  title="FP8 Calibration Strategy Impact (Llama-2 13B, H100)"
+  columns={["Strategy", "Calibration Time", "Tokens/s", "MMLU Delta", "Notes"]}
+  rows={[
+    { values: ["FP16 baseline", "N/A", "185", "0.0%", "Reference"], highlight: false },
+    { values: ["FP8, per-tensor static", "15 min", "345", "-0.2%", "Recommended default"], highlight: true },
+    { values: ["FP8, per-channel static", "15 min", "330", "-0.1%", "Slight throughput cost"], highlight: false },
+    { values: ["FP8, per-tensor dynamic", "N/A", "320", "-0.1%", "No calibration needed"], highlight: false },
+    { values: ["FP8, mixed (keep LM head FP16)", "15 min", "340", "-0.1%", "Best quality/speed"], highlight: true },
+  ]}
+  notes="Calibration time is for the offline PTQ step on 512 samples."
+/>
+
+## Advanced Topics
 
 ### Custom Plugin Development
 
-For specialized LLM operations not covered by standard optimizations:
+When TensorRT's built-in fusion patterns do not cover a novel operation -- perhaps a new attention variant, a custom normalization scheme, or a routing mechanism for mixture-of-experts -- you need to write a TensorRT plugin. This is a C++ class that implements the `IPluginV2DynamicExt` interface:
 
-```python
-class CustomAttentionPlugin(trt.IPluginV2DynamicExt):
-    def __init__(self, num_heads, head_dim, max_seq_len):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        self.max_seq_len = max_seq_len
-        
-    def get_output_dtype(self, index, input_types):
-        return input_types[0]  # Same as input type
-    
-    def get_output_dimensions(self, output_index, inputs, explicit_batch):
-        # Output has same dimensions as input for attention
-        return inputs[0]
-    
-    def enqueue(self, input_bindings, output_bindings, workspace, stream_handle):
-        # Custom CUDA kernel for optimized attention
-        # Implementation details omitted for brevity
-        pass
+```cpp
+class MoERoutingPlugin : public nvinfer1::IPluginV2DynamicExt {
+public:
+    // Called during build to specify output shapes
+    DimsExprs getOutputDimensions(
+        int outputIndex,
+        const DimsExprs* inputs,
+        int nbInputs,
+        IExprBuilder& exprBuilder
+    ) override;
+
+    // Called during build to configure the plugin
+    void configurePlugin(
+        const DynamicPluginTensorDesc* in,
+        int nbInputs,
+        const DynamicPluginTensorDesc* out,
+        int nbOutputs
+    ) override;
+
+    // The actual GPU kernel dispatch
+    int enqueue(
+        const PluginTensorDesc* inputDesc,
+        const PluginTensorDesc* outputDesc,
+        const void* const* inputs,
+        void* const* outputs,
+        void* workspace,
+        cudaStream_t stream
+    ) override;
+
+    // Workspace memory requirements
+    size_t getWorkspaceSize(
+        const PluginTensorDesc* inputs,
+        int nbInputs,
+        const PluginTensorDesc* outputs,
+        int nbOutputs
+    ) const override;
+};
 ```
 
-### Dynamic Shape Handling
+The enqueue method is where you launch your custom CUDA kernel. The challenge is that your plugin participates in TensorRT's optimization pipeline: TensorRT may choose to run your plugin in FP16 or FP8 (if you report support), and it will profile your plugin alongside its built-in kernels. Your plugin needs to be competitive, or TensorRT will work around it.
 
-TensorRT 6.0+ supports dynamic shapes crucial for variable-length text:
+### Speculative Decoding in TensorRT-LLM
 
-```python
-def create_dynamic_profile(builder, network, max_sequence_length):
-    profile = builder.create_optimization_profile()
-    
-    # Define dynamic dimensions for input tensors
-    for i in range(network.num_inputs):
-        input_tensor = network.get_input(i)
-        if input_tensor.name in ['input_ids', 'attention_mask']:
-            profile.set_shape(
-                input_tensor.name,
-                min=(1, 1),      # Min batch size, min sequence length
-                opt=(1, 128),    # Opt batch size, opt sequence length  
-                max=(8, max_sequence_length)  # Max batch size, max sequence length
-            )
-    
-    return profile
-```
+Speculative decoding uses a small "draft" model to generate multiple candidate tokens, then verifies them in parallel with the large "target" model. If the draft model guesses correctly (which it does 60-80% of the time for typical text), you get multiple tokens for the cost of one target model forward pass.
 
-<Benchmark
-  title="Dynamic Shape Performance Impact"
-  columns={["Sequence Length", "Static (ms)", "Dynamic (ms)", "Overhead"]}
-  rows={[
-    { values: ["64", "2.1", "2.3", "9%"], highlight: false },
-    { values: ["128", "3.2", "3.5", "9%"], highlight: false },
-    { values: ["256", "5.8", "6.3", "9%"], highlight: false },
-    { values: ["512", "11.2", "12.1", "8%"], highlight: false },
-  ]}
-/>
-
-## Hardware-Specific Optimizations
-
-### Tensor Core Utilization
-
-TensorRT automatically schedules operations for Tensor Cores when possible:
-
-<PerfChart
-  title="Tensor Core Utilization Across Different Model Sizes"
-  type="line"
-  unit="%"
-/>
+TensorRT-LLM supports speculative decoding with both separate draft models and self-speculative decoding (using the target model's early layers as the draft). The key optimization is that the verification step is a single forward pass with a batch dimension equal to the speculation length, which amortizes the memory bandwidth cost of loading the model weights.
 
 ```python
-def optimize_for_tensor_cores(builder_config, precision_mode='fp16'):
-    """Configure TensorRT for optimal Tensor Core usage"""
-    
-    if precision_mode == 'fp16':
-        builder_config.flags |= 1 << int(trt.BuilderFlag.FP16)
-        # Ensure layer dimensions are multiples of 8 for optimal TC usage
-        builder_config.flags |= 1 << int(trt.BuilderFlag.STRICT_TYPES)
-    
-    # Set memory pool limits
-    builder_config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30)  # 1GB
+# Configuring speculative decoding in TensorRT-LLM
+from tensorrt_llm.runtime import ModelRunnerCpp
+
+runner = ModelRunnerCpp.from_dir(
+    engine_dir="./llama-70b-fp8-engine",
+    rank=0,
+    # Speculative decoding config
+    max_draft_len=5,           # Speculate up to 5 tokens
+    is_medusa=False,           # Using standard draft model
+)
 ```
 
 <Benchmark
-  title="Hardware-Specific Performance Gains"
-  columns={["GPU", "FP32 Baseline", "TensorRT FP16", "Speedup"]}
+  title="Speculative Decoding Impact (Llama-2 70B target, Llama-2 7B draft, H100)"
+  columns={["Scenario", "Standard (tok/s)", "Speculative (tok/s)", "Acceptance Rate", "Speedup"]}
   rows={[
-    { values: ["V100", "100%", "280%", "2.8x"], highlight: false },
-    { values: ["T4", "100%", "220%", "2.2x"], highlight: false },
-    { values: ["A100", "100%", "320%", "3.2x"], highlight: false },
-    { values: ["RTX 3090", "100%", "250%", "2.5x"], highlight: false },
+    { values: ["Code generation", "38", "68", "78%", "1.79x"], highlight: true },
+    { values: ["English prose", "38", "62", "72%", "1.63x"], highlight: false },
+    { values: ["Translation (en-zh)", "38", "52", "58%", "1.37x"], highlight: false },
+    { values: ["Creative writing", "38", "48", "52%", "1.26x"], highlight: false },
   ]}
+  notes="Batch=1, latency-optimized. Acceptance rate varies by domain and temperature."
 />
 
-## Integration with LLM Serving Systems
+### Memory Planning and KV Cache Budgeting
 
-### TensorRT-LLM Framework
+A critical operational concern with TensorRT-LLM is memory planning. The engine itself consumes a fixed amount of GPU memory (model weights), but the KV cache grows with the number of concurrent requests and their sequence lengths. The relationship is:
 
-Integration with specialized LLM serving systems:
+$\text{KV cache memory} = 2 \times n_{\text{layers}} \times n_{\text{kv\_heads}} \times d_{\text{head}} \times \text{precision\_bytes} \times \text{total\_active\_tokens}$
 
-```python
-class TensorRTLLMService:
-    def __init__(self, model_path, tokenizer_path):
-        self.runtime = trt.Runtime(trt.Logger(trt.Logger.WARNING))
-        self.engine = self.load_engine(model_path)
-        self.tokenizer = self.load_tokenizer(tokenizer_path)
-        self.context = self.engine.create_execution_context()
-        
-    def generate(self, prompt, max_length=512, temperature=0.8):
-        # Tokenize input
-        input_ids = self.tokenizer.encode(prompt)
-        input_tensor = np.array([input_ids], dtype=np.int32)
-        
-        # Allocate GPU memory
-        d_input = cuda.mem_alloc(1 * input_tensor.nbytes)
-        d_output = cuda.mem_alloc(1 * max_length * 4)  # Assuming int32 output
-        
-        bindings = [int(d_input), int(d_output)]
-        stream = cuda.Stream()
-        
-        # Copy input to GPU
-        cuda.memcpy_htod_async(d_input, input_tensor, stream)
-        
-        # Execute inference
-        self.context.execute_async_v2(bindings=bindings, stream_handle=stream.handle)
-        
-        # Copy output from GPU
-        output = np.empty((1, max_length), dtype=np.int32)
-        cuda.memcpy_dtoh_async(output, d_output, stream)
-        stream.synchronize()
-        
-        # Decode output
-        generated_text = self.tokenizer.decode(output[0])
-        return generated_text
-```
+For Llama-2 70B in FP16 with GQA (8 KV heads, 128 head dim, 80 layers):
 
-## Performance Bottleneck Analysis
+$\text{Per-token KV} = 2 \times 80 \times 8 \times 128 \times 2 = 327,680 \text{ bytes} \approx 320 \text{ KB}$
 
-### Identifying Optimization Opportunities
+On a single H100 with 80 GB, after loading the FP8 model weights (~35 GB) and reserving memory for activations (~5 GB), you have ~40 GB for KV cache. That supports:
 
-```python
-class TensorRTProfiler:
-    def __init__(self, engine):
-        self.engine = engine
-        
-    def profile_layers(self):
-        """Profile individual layers for optimization opportunities"""
-        layer_times = {}
-        
-        for idx in range(self.engine.num_layers):
-            layer_info = self.engine.get_layer_info(idx)
-            layer_times[layer_info.name] = {
-                'type': layer_info.type,
-                'time_ms': layer_info.execution_time,  # Hypothetical API
-                'input_shapes': layer_info.input_shapes,
-                'output_shapes': layer_info.output_shapes
-            }
-        
-        return layer_times
-    
-    def recommend_optimizations(self, profile_results):
-        """Generate optimization recommendations"""
-        recommendations = []
-        
-        for layer_name, stats in profile_results.items():
-            if stats['type'] == trt.LayerType.MATRIX_MULTIPLY:
-                if stats['time_ms'] > 1.0:  # Threshold for optimization
-                    recommendations.append({
-                        'layer': layer_name,
-                        'issue': 'High GEMM latency',
-                        'recommendation': 'Consider kernel fusion or precision adjustment'
-                    })
-        
-        return recommendations
-```
+$\text{Max tokens} = \frac{40 \times 10^9}{327,680} \approx 122,000 \text{ tokens}$
 
-<Benchmark
-  title="Common Performance Bottlenecks"
-  columns={["Issue", "Frequency", "Impact", "Solution"]}
-  rows={[
-    { values: ["Memory bandwidth", "30%", "20-30% slower", "Kernel fusion"], highlight: false },
-    { values: ["Small kernels", "25%", "15-25% slower", "Layer fusion"], highlight: false },
-    { values: ["Precision mismatch", "15%", "10-20% slower", "Consistent precision"], highlight: false },
-    { values: ["Irregular shapes", "20%", "5-15% slower", "Padding to 8-multiple"], highlight: false },
-  ]}
-/>
+With a max sequence length of 4096, that is roughly 30 concurrent requests. With paged attention, unused pages are freed immediately, so the actual concurrency can be higher for shorter sequences.
 
-## Practical Implementation Guidelines
-
-### When to Use TensorRT
-
-<Callout type="tip" title="TensorRT Suitability">
-TensorRT is most effective for: (1) Production inference scenarios, (2) Models with static or predictable shapes, (3) Hardware with Tensor Cores, and (4) Applications requiring low latency or high throughput.
+<Callout type="info" title="The KV Cache is the Real Bottleneck">
+For large models at high concurrency, KV cache memory -- not compute -- limits your throughput. This is why quantizing the KV cache to INT8 or even INT4 (with minimal quality loss) is becoming standard practice. TensorRT-LLM supports KV cache quantization separately from weight quantization, allowing FP8 weights with INT8 KV cache.
 </Callout>
 
+## Practical Deployment Recommendations
+
+### Choosing Your Configuration
+
+The decision tree for TensorRT-LLM deployment:
+
+1. **What GPU do you have?** H100/H200: use FP8. A100: use INT8 SmoothQuant or INT4 AWQ. Older GPUs: use FP16 with INT8 weight-only quantization.
+
+2. **What is your latency budget?** If sub-100ms TTFT matters, use tensor parallelism across the minimum number of GPUs needed. If throughput is all that matters, maximize batch size before adding GPUs.
+
+3. **What is your sequence length distribution?** If most requests are short (fewer than 512 tokens), use smaller page sizes in the paged KV cache. If you serve long-context workloads (greater than 8K tokens), ensure you have enough memory headroom and consider KV cache quantization.
+
+4. **How often does your model change?** If rarely (monthly), TensorRT-LLM is ideal. If daily, the build overhead may be prohibitive -- consider vLLM for development and TensorRT-LLM for production, with a build pipeline that produces engines overnight.
+
 <Benchmark
-  title="TensorRT Use Case Effectiveness"
-  columns={["Scenario", "Suitability", "Expected Gain", "Considerations"]}
+  title="Recommended Configurations by Use Case"
+  columns={["Use Case", "Framework", "Precision", "Parallelism", "Rationale"]}
   rows={[
-    { values: ["Batch inference", "Excellent", "3-5x", "Fixed batch sizes optimal"], highlight: false },
-    { values: ["Real-time serving", "Excellent", "2-4x", "Memory constraints"], highlight: false },
-    { values: ["Development/prototyping", "Fair", "1-2x", "Build time overhead"], highlight: false },
-    { values: ["Research models", "Variable", "1-3x", "Custom operations support"], highlight: false },
+    { values: ["Chatbot (latency-sensitive)", "TRT-LLM", "FP8", "TP across min GPUs", "Lowest TTFT"], highlight: true },
+    { values: ["Batch processing", "TRT-LLM", "FP8 or INT4", "Max batch size", "Highest throughput"], highlight: true },
+    { values: ["Multi-model serving", "vLLM", "AWQ INT4", "Per-model TP", "LoRA swap flexibility"], highlight: false },
+    { values: ["Structured output (JSON)", "SGLang", "FP16/INT4", "TP", "Constrained decoding"], highlight: false },
+    { values: ["Research/prototyping", "vLLM", "FP16", "Single GPU", "Fast iteration"], highlight: false },
+    { values: ["Edge deployment", "TRT-LLM", "INT4", "Single GPU", "Minimum memory"], highlight: false },
   ]}
 />
 
-### Best Practices
+### Monitoring and Troubleshooting
 
-1. **Profile before optimizing**: Understand your model's bottlenecks
-2. **Use appropriate precision**: Balance accuracy and performance
-3. **Optimize batch sizes**: Match to hardware capabilities
-4. **Validate accuracy**: Ensure quantization doesn't degrade results
-5. **Monitor memory**: Prevent OOM errors during optimization
+Key metrics to track in a TensorRT-LLM deployment:
 
-## Limitations and Considerations
-
-### Model Compatibility
-
-Not all operations are supported by TensorRT:
-
-<Benchmark
-  title="TensorRT Operation Support"
-  columns={["Operation", "Supported", "Alternatives", "Performance Impact"]}
-  rows={[
-    { values: ["Linear/Dense", "Yes", "N/A", "Optimized"], highlight: false },
-    { values: ["Convolution", "Yes", "N/A", "Optimized"], highlight: false },
-    { values: ["Attention", "Yes", "Custom plugins", "Highly optimized"], highlight: false },
-    { values: ["Custom activations", "Limited", "Plugin required", "Variable"], highlight: false },
-    { values: ["Dynamic control flow", "Limited", "Unroll/rewrite", "Major impact"], highlight: false },
-  ]}
-/>
-
-### Build Time Overhead
-
-TensorRT optimization requires significant build time:
-
-<PerfChart
-  title="TensorRT Build Time vs Model Complexity"
-  type="line"
-  unit="minutes"
-/>
-
-## Future Developments
-
-TensorRT continues to evolve with new features for LLM inference:
-
-<Benchmark
-  title="TensorRT Evolution Features"
-  columns={["Version", "Year", "LLM Features", "Performance Impact"]}
-  rows={[
-    { values: ["TensorRT 5", "2018", "Basic optimization", "1.5-2x"], highlight: false },
-    { values: ["TensorRT 6", "2019", "Dynamic shapes", "Additional 20%"], highlight: false },
-    { values: ["TensorRT 7", "2020", "Sparsity support", "Additional 30%"], highlight: false },
-    { values: ["TensorRT 8", "2021", "INT8 calibration", "Additional 50%"], highlight: false },
-    { values: ["TensorRT-LLM", "2022", "LLM-specific", "Additional 100%+"], highlight: false },
-  ]}
-/>
+- **Time to first token (TTFT)**: Dominated by prefill time. If this spikes, check for long input sequences or insufficient tensor parallelism.
+- **Inter-token latency (ITL)**: Should be stable across the generation. If it varies, check for KV cache memory pressure causing page swapping.
+- **KV cache utilization**: Monitor the fraction of allocated KV cache pages in use. If consistently above 90%, you are at risk of request rejection.
+- **Batch size utilization**: The actual number of requests being processed per iteration. Low utilization means your request rate is too low to fill the batch, or your scheduling is suboptimal.
+- **GPU SM occupancy**: Should be above 80% during decode steps. Low occupancy suggests the batch size is too small to saturate the GPU.
 
 ## Conclusion
 
-TensorRT optimization provides substantial performance improvements for LLM inference through:
+TensorRT-LLM sits at one end of the inference optimization spectrum: maximum performance, maximum complexity, minimum flexibility. Its graph optimization pipeline -- layer fusion, kernel auto-tuning, precision calibration -- genuinely produces faster inference than any open-source alternative on NVIDIA hardware. The FP8 workflow on Hopper GPUs delivers near-FP16 quality at nearly double the throughput, making it the default choice for latency-sensitive production deployments.
 
-- **2-5x latency reduction** for optimized models
-- **Significant memory savings** through quantization and fusion
-- **Hardware-accelerated computation** via Tensor Cores
-- **Production-ready deployment** with consistent performance
+But "fastest" is not always "best." The engine build process is slow and brittle, model coverage lags the open-source community, and operational complexity is higher. For many teams, vLLM's simplicity and rapid model support make it the better overall choice, even at 20-30% lower throughput.
 
-The framework has become essential for deploying LLMs in production environments where performance and efficiency are critical. As LLMs continue to grow in size and complexity, TensorRT's optimization capabilities will remain vital for making these models practically deployable.
-
-The April 2019 timeframe marked an important milestone in TensorRT's evolution toward becoming the industry standard for optimized deep learning inference, particularly for the emerging class of large language models that would soon revolutionize AI applications.
+The practical recommendation: use vLLM for development and experimentation, build TensorRT-LLM engines for production models that are stable, and consider SGLang when structured generation is central to your application. Monitor the ecosystem closely -- the performance gap is narrowing as `torch.compile`, Triton kernels, and other open-source optimization efforts mature.
