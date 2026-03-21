@@ -10,5 +10,5 @@ export { default as Benchmark } from './Benchmark.astro';
 export { default as Theorem } from './Theorem.astro';
 export { default as DiagramContainer } from './DiagramContainer.astro';
 
-// Re-export types
+// Re-export types if needed
 export type CalloutType = 'info' | 'warning' | 'danger' | 'tip' | 'perf' | 'success';
