@@ -1,0 +1,318 @@
+---
+title: "vLLM's Scheduler: How Continuous Batching Actually Works in Code"
+author: "stanley-phoong"
+description: "A code-level deep dive into vLLM's scheduler — the three-queue system, budget allocation algorithm, preemption policies, chunked prefill implementation, and the scheduling decisions that determine throughput and latency."
+publishDate: 2025-03-21
+category: vllm
+tags: [vllm, scheduler, continuous-batching, preemption, chunked-prefill, code-walkthrough]
+difficulty: expert
+readingTime: 32
+draft: false
+featured: false
+series: "vLLM Internals"
+seriesOrder: 2
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+import MemoryLayout from '@/components/mdx/MemoryLayout.astro';
+
+The scheduler is the brain of vLLM. Every inference iteration — roughly every 20-50 milliseconds — the scheduler makes a series of decisions that collectively determine whether your serving deployment achieves 100 tokens/sec or 3,000 tokens/sec. Which requests get prefilled? Which continue decoding? Which get preempted to make room? How many tokens should we allocate to prefill vs decode? These decisions cascade through the entire system.
+
+This post walks through vLLM's `Scheduler` class at the code level, explaining each algorithm and data structure. By the end, you will understand exactly how continuous batching is implemented and why certain scheduling decisions dominate throughput.
+
+## The Scheduling Problem
+
+Each iteration of the vLLM engine runs one forward pass through the model. This forward pass processes a **batch** of tokens — some from new requests being prefilled, others from ongoing requests being decoded. The scheduler decides the composition of this batch.
+
+The constraints are:
+- **GPU memory**: KV cache blocks are finite. Each running sequence consumes blocks proportional to its length. New prefills allocate blocks for the entire prompt.
+- **Token budget**: The model processes a fixed maximum number of tokens per iteration (typically 8192-16384). This budget must be split between prefill tokens and decode tokens.
+- **Sequence limit**: The maximum number of sequences in a batch (limited by memory and compute).
+- **Latency targets**: Decode requests expect low time-between-tokens (TBT). Long prefills that monopolize the budget hurt decode latency.
+
+The scheduler must balance throughput (process as many total tokens as possible) against latency (keep each individual request's decode rate acceptable).
+
+## Three-Queue Architecture
+
+vLLM's scheduler maintains three queues:
+
+<MemoryLayout
+  title="vLLM Scheduler Queue Architecture"
+  layout={[
+    { name: "Waiting Queue", power: "New requests awaiting first prefill", state: "Ordered by arrival time (FCFS)", color: "#3b82f6" },
+    { name: "Running Queue", power: "Requests actively being decoded", state: "KV cache allocated in GPU HBM", color: "#10b981" },
+    { name: "Swapped Queue", power: "Preempted requests with KV on CPU", state: "Will be resumed when memory frees up", color: "#f59e0b" },
+  ]}
+/>
+
+**Waiting queue**: New requests enter here. They have been tokenized but no KV cache has been allocated yet. The scheduler will start their prefill when budget and memory allow.
+
+**Running queue**: Requests that have completed prefill and are generating tokens one at a time (decode phase). Each has KV cache blocks allocated in GPU HBM. These are the "steady-state" requests.
+
+**Swapped queue**: Requests that were running but got **preempted** — their KV cache was copied to CPU memory (or discarded) to free GPU memory for higher-priority work. They will be resumed (swapped back in or recomputed) when GPU memory becomes available.
+
+The lifecycle of a request: `Waiting → Running → (possibly Swapped → Running) → Finished`.
+
+## The Schedule Loop
+
+Each iteration, the `Scheduler._schedule()` method executes this logic:
+
+```python
+def _schedule(self):
+    # Phase 1: Can we swap any preempted requests back in?
+    swapped_in = self._schedule_swapped()
+
+    # Phase 2: Continue decoding running requests (1 token each)
+    running = self._schedule_running()
+
+    # Phase 3: Start prefilling new requests from waiting queue
+    prefills = self._schedule_prefills()
+
+    # Combine into one batch for the model forward pass
+    return SchedulerOutput(prefills + running + swapped_in)
+```
+
+The order matters: swap-ins first (honor commitments to preempted requests), then running decodes (maintain TBT for active users), then new prefills (start new work if budget remains).
+
+<Callout type="info" title="Decode Tokens Are Cheap in the Budget">
+Each decode request contributes exactly 1 token to the batch. With 100 running requests and a budget of 8192 tokens, decode consumes only 100 tokens — leaving 8092 for prefill. This is why continuous batching is efficient: decode overhead is minimal per request.
+</Callout>
+
+## Budget Allocation
+
+Each iteration has two budgets:
+
+1. **Token budget** (`max_num_batched_tokens`): Maximum tokens processed in one forward pass. Default: 8192. This is the fundamental throughput lever.
+2. **Sequence budget** (`max_num_seqs`): Maximum sequences in the batch. Default: 256. Limits memory overhead per iteration.
+
+The allocation algorithm:
+
+```python
+remaining_tokens = max_num_batched_tokens
+remaining_seqs = max_num_seqs
+
+# Decode phase: each running request uses 1 token, 1 seq slot
+for req in running_queue:
+    if remaining_tokens > 0 and remaining_seqs > 0:
+        schedule(req, num_tokens=1)
+        remaining_tokens -= 1
+        remaining_seqs -= 1
+
+# Prefill phase: new requests use their prompt length in tokens
+for req in waiting_queue:
+    prompt_len = len(req.prompt_tokens)
+    tokens_needed = min(prompt_len, remaining_tokens)  # May chunk
+    if tokens_needed > 0 and remaining_seqs > 0:
+        schedule_prefill(req, num_tokens=tokens_needed)
+        remaining_tokens -= tokens_needed
+        remaining_seqs -= 1
+```
+
+<Benchmark
+  title="Budget Allocation Example (max_tokens=8192)"
+  columns={["Phase", "Requests", "Tokens Each", "Total Tokens", "Remaining"]}
+  rows={[
+    { values: ["Running decode", "120 requests", "1", "120", "8072"], highlight: false },
+    { values: ["New prefill #1", "1 request", "4096 (full prompt)", "4096", "3976"], highlight: false },
+    { values: ["New prefill #2", "1 request", "3976 (chunked)", "3976", "0"], highlight: true },
+  ]}
+  notes="With 120 decode requests consuming 120 tokens, there's still 8072 tokens for prefill. Two large prompts can be processed (one chunked)."
+/>
+
+The key insight: **decode is extremely budget-efficient**. Even with 200 active decode requests, they only consume 200 of the 8192-token budget, leaving 97.5% for prefill.
+
+## Chunked Prefill
+
+When a prompt is longer than the remaining budget, vLLM chunks it:
+
+```python
+prompt_len = 32000  # Long prompt
+remaining_budget = 3976
+
+# Chunk 1: process first 3976 tokens this iteration
+# Chunk 2: remaining 28024 tokens in future iterations
+chunks = split_prompt(prompt_len, remaining_budget)
+```
+
+Chunking is critical for latency. Without it, a 32K-token prompt would monopolize the GPU for ~100ms, causing all decode requests to stall. With chunking at 4K tokens per iteration, the prefill takes 8 iterations but decode requests keep flowing between chunks.
+
+<PerfChart
+  title="TTFT vs TBT Tradeoff by Chunk Size"
+  data={[
+    { label: "No chunking", value: 120, color: "red", annotation: "TTFT: 120ms, TBT spike: 120ms" },
+    { label: "8K chunks", value: 35, color: "orange", annotation: "TTFT: 4x120=480ms, TBT: 35ms" },
+    { label: "4K chunks", value: 22, color: "blue", annotation: "TTFT: 8x120=960ms, TBT: 22ms" },
+    { label: "2K chunks", value: 15, color: "green", annotation: "TTFT: 16x120=1920ms, TBT: 15ms" },
+  ]}
+  unit="ms max TBT"
+/>
+
+Smaller chunks improve TBT (decode latency) but increase TTFT (time to first token) because the prefill takes more iterations. The default in vLLM is effectively no chunking unless `enable_chunked_prefill=True` is set, which uses `max_num_batched_tokens` as the chunk size.
+
+<Callout type="warning" title="Chunked Prefill Has a Hidden Cost">
+Each prefill chunk requires attention over ALL previously processed chunks of the same prompt (the KV cache from prior chunks). So chunk 8 of a 32K prompt must attend to 28K cached tokens plus its own 4K tokens. The total prefill FLOPs across all chunks is higher than a single unchunked prefill because of this redundant attention. The tradeoff is worth it for latency, but be aware of the extra compute.
+</Callout>
+
+## Preemption: When Memory Runs Out
+
+When all GPU KV cache blocks are allocated and a higher-priority request needs memory, the scheduler must preempt a running request. This is the most delicate part of the scheduler.
+
+### When Preemption Triggers
+
+```python
+def can_allocate(self, seq_group):
+    required_blocks = compute_required_blocks(seq_group)
+    free_blocks = self.block_manager.get_num_free_blocks()
+    return free_blocks >= required_blocks
+
+# During scheduling, if we can't allocate for a new prefill
+# or a swap-in, consider preempting a running request
+if not can_allocate(new_request):
+    victim = select_preemption_victim(running_queue)
+    preempt(victim)
+```
+
+### Two Preemption Strategies
+
+**Swap**: Copy the victim's KV cache from GPU HBM to CPU DRAM. The request enters the swapped queue. Later, when memory frees up, the KV cache is copied back (swap-in) and the request resumes decoding.
+
+- **Cost**: PCIe transfer time. For a sequence with 2K tokens on Llama 70B: KV cache ~640KB per layer x 80 layers = ~50MB. At PCIe Gen4 (25 GB/s): ~2ms swap-out, ~2ms swap-in later.
+- **When it wins**: Long sequences where recomputing the prefill would be expensive.
+
+**Recompute**: Discard the victim's KV cache entirely. When the request is rescheduled, it re-runs the full prefill from scratch.
+
+- **Cost**: Full prefill computation. For a 2K-token prompt on Llama 70B: ~50ms on A100.
+- **When it wins**: Short sequences where prefill is cheap.
+
+<Benchmark
+  title="Swap vs Recompute Breakeven"
+  columns={["Sequence Length", "Swap Cost (out+in)", "Recompute Cost", "Better Strategy"]}
+  rows={[
+    { values: ["256 tokens", "0.3ms + 0.3ms = 0.6ms", "3ms", "Swap"], highlight: false },
+    { values: ["2048 tokens", "2ms + 2ms = 4ms", "50ms", "Swap"], highlight: false },
+    { values: ["8192 tokens", "8ms + 8ms = 16ms", "200ms", "Swap"], highlight: true },
+    { values: ["32768 tokens", "32ms + 32ms = 64ms", "800ms", "Swap"], highlight: true },
+  ]}
+  notes="Swap is almost always cheaper for LLM-scale sequences. Recompute only wins for very short sequences AND when CPU memory is exhausted."
+/>
+
+### Victim Selection
+
+vLLM uses a simple LIFO (last-in-first-out) policy: the most recently arrived request is preempted first. The rationale: recently arrived requests have generated fewer tokens, so less work is lost. Alternative policies (least-tokens-generated, lowest-priority) are possible but not the default.
+
+### Preemption Cascades
+
+If preempting one request doesn't free enough memory, the scheduler preempts another, then another. This cascade can happen when a very long prefill request arrives and needs many blocks. Anti-thrashing protection: if the preemption rate exceeds a threshold, the scheduler stops admitting new prefills until memory stabilizes.
+
+## Memory Watermark
+
+The scheduler reserves a fraction of GPU blocks as a safety margin:
+
+```python
+watermark_blocks = int(total_gpu_blocks * watermark_fraction)  # Default: 1%
+usable_blocks = total_gpu_blocks - watermark_blocks
+```
+
+The watermark prevents a scenario where ALL blocks are allocated, leaving zero headroom for temporary allocations (like intermediate tensors during the forward pass). A 1% watermark on an A100 with 80GB HBM means roughly 800MB reserved — enough for most temporary allocations.
+
+Setting the watermark too high wastes memory (fewer concurrent requests). Setting it too low risks OOM during computation spikes. The default 1% works for most deployments.
+
+## Prefix Caching in the Scheduler
+
+When automatic prefix caching is enabled, the scheduler checks for cached KV blocks before scheduling a prefill:
+
+```python
+def schedule_prefill(self, request):
+    # Check if any prefix of this prompt is already cached
+    cached_blocks = self.block_manager.find_cached_prefix(request.prompt_tokens)
+
+    if cached_blocks > 0:
+        # Skip prefill for cached portion — reuse existing KV blocks
+        request.num_computed_tokens = cached_blocks * block_size
+        tokens_to_prefill = request.prompt_len - request.num_computed_tokens
+    else:
+        tokens_to_prefill = request.prompt_len
+
+    return tokens_to_prefill  # Only prefill the non-cached suffix
+```
+
+For a system prompt shared across all requests (e.g., 2K tokens), the first request pays the full prefill cost. Every subsequent request with the same prefix skips those 2K tokens and only prefills the user-specific suffix.
+
+<PerfChart
+  title="TTFT With and Without Prefix Caching"
+  data={[
+    { label: "No cache (2K system + 1K user)", value: 75, color: "red", annotation: "Prefill all 3K tokens" },
+    { label: "Cache hit (2K cached, 1K user)", value: 25, color: "green", annotation: "Prefill only 1K tokens" },
+  ]}
+  unit="ms TTFT"
+/>
+
+The TTFT improvement is directly proportional to the cache hit ratio and the length of the cached prefix. In production chatbot deployments with a fixed system prompt, hit rates of 80-95% are common, making prefix caching one of the highest-impact optimizations.
+
+## Multi-Step Scheduling
+
+Standard vLLM invokes the scheduler every iteration. Multi-step scheduling runs N decode steps between scheduler invocations:
+
+```python
+for step in range(num_multi_steps):
+    outputs = model.forward(batch)  # Decode step
+    # Don't re-schedule, just decode again with same batch
+
+# After N steps, re-invoke scheduler to check for:
+# - Finished sequences (hit EOS or max length)
+# - New waiting requests to admit
+# - Memory pressure requiring preemption
+```
+
+Multi-step reduces scheduling overhead (Python-side computation between GPU steps) at the cost of responsiveness — new requests must wait up to N iterations before being admitted. With N=4 and 25ms per iteration, worst-case admission delay is 100ms.
+
+<Callout type="tip" title="When Multi-Step Helps Most">
+Multi-step scheduling benefits deployments with many small requests and high throughput requirements. The Python scheduling overhead (0.5-2ms per iteration) becomes significant when the model forward pass is fast (5-10ms for a 7B model). For 70B models where the forward pass is 30-50ms, scheduling overhead is negligible and multi-step provides minimal benefit.
+</Callout>
+
+## Observing the Scheduler
+
+Key metrics to monitor for diagnosing scheduling bottlenecks:
+
+<Benchmark
+  title="Scheduler Diagnostic Metrics"
+  columns={["Metric", "Healthy Range", "Problem Indicator", "Fix"]}
+  rows={[
+    { values: ["Waiting queue length", "0-5 requests", "Steadily growing", "Increase max_num_batched_tokens or add GPUs"], highlight: false },
+    { values: ["Running batch size", "Near max_num_seqs", "Much lower than max", "Not enough traffic or memory pressure"], highlight: false },
+    { values: ["Preemption rate", "0-1 per second", "More than 10 per second", "Reduce max_num_seqs or increase GPU memory"], highlight: true },
+    { values: ["Tokens per iteration", "Near max_num_batched_tokens", "Consistently low", "Requests are short or batch is under-filled"], highlight: false },
+    { values: ["Prefill ratio", "20-40% of tokens", "More than 80%", "Prefill-dominated, consider disaggregation"], highlight: false },
+    { values: ["Swap-in latency", "1-5ms", "More than 20ms", "Large sequences, consider recompute policy"], highlight: false },
+  ]}
+/>
+
+The most common scheduling pathology is **preemption thrashing**: the scheduler admits too many requests, runs out of memory, preempts some, then admits new ones that fill memory again, causing another round of preemptions. The fix: reduce `max_num_seqs` or increase the watermark.
+
+## How the Scheduler Determines Throughput
+
+The scheduler's decisions cascade through the entire system:
+
+1. **Batch size** determines GPU utilization. Larger batches (more concurrent decode requests) amortize the weight-loading bandwidth cost across more tokens, increasing throughput.
+
+2. **Prefill/decode ratio** determines how much budget goes to new requests vs ongoing generation. Too much prefill starves decode latency. Too little prefill leaves the GPU under-utilized when requests finish.
+
+3. **Preemption frequency** determines wasted work. Every preemption either wastes swap bandwidth or wastes prefill compute. Minimizing preemptions maximizes useful work.
+
+4. **Prefix cache hit rate** determines redundant compute. Higher hit rates mean less prefill work, leaving more budget for decode throughput.
+
+The optimal scheduler configuration depends on your workload: short prompts with many concurrent users want large `max_num_seqs` and small `max_num_batched_tokens`. Long prompts with few users want small `max_num_seqs` and large `max_num_batched_tokens` with chunked prefill enabled.
+
+<Callout type="perf" title="The Scheduler Is Rarely the Bottleneck">
+The scheduler itself runs on CPU in Python and takes 0.5-2ms per iteration. The model forward pass on GPU takes 10-50ms. The scheduler is only a throughput bottleneck for very small models (sub-1B) or extremely high request rates (10K+ QPS). For most deployments, the scheduler's decisions matter far more than its execution time.
+</Callout>
+
+## Conclusion
+
+The vLLM scheduler transforms the simple idea of "process requests as they arrive" into a sophisticated resource allocation problem. The three-queue architecture, budget-based allocation, chunked prefill, and preemption policies work together to maximize GPU utilization while maintaining acceptable latency for every request.
+
+The key insight: **continuous batching's power comes not from any single scheduling decision, but from the iteration-level granularity**. By re-evaluating the batch composition every 20-50ms, the scheduler adapts to workload changes in real time — something static batching fundamentally cannot do.
+
+Understanding the scheduler is essential for tuning vLLM deployments. The next post in this series dives into the other critical component: the PagedAttention CUDA kernel that makes paged KV cache access fast enough to be practical.

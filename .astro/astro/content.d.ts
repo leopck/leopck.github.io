@@ -390,6 +390,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"frontier-models-2025-architectural-convergence.mdx": {
+	id: "frontier-models-2025-architectural-convergence.mdx";
+  slug: "frontier-models-2025-architectural-convergence";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "gaudi2-memory-optimization.mdx": {
 	id: "gaudi2-memory-optimization.mdx";
   slug: "gaudi2-memory-optimization";
@@ -449,6 +456,13 @@ declare module 'astro:content' {
 "inference-time-compute-scaling-chain-of-thought.mdx": {
 	id: "inference-time-compute-scaling-chain-of-thought.mdx";
   slug: "inference-time-compute-scaling-chain-of-thought";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"kimi-k2-trillion-parameter-moe-architecture.mdx": {
+	id: "kimi-k2-trillion-parameter-moe-architecture.mdx";
+  slug: "kimi-k2-trillion-parameter-moe-architecture";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -519,6 +533,13 @@ declare module 'astro:content' {
 "memory-mapping-large-model-loading-2020.mdx": {
 	id: "memory-mapping-large-model-loading-2020.mdx";
   slug: "memory-mapping-large-model-loading-2020";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"minimax-01-lightning-attention-long-context.mdx": {
+	id: "minimax-01-lightning-attention-long-context.mdx";
+  slug: "minimax-01-lightning-attention-long-context";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -726,9 +747,30 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"vllm-architecture-source-code-walkthrough.mdx": {
+	id: "vllm-architecture-source-code-walkthrough.mdx";
+  slug: "vllm-architecture-source-code-walkthrough";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"vllm-paged-attention-kernel-implementation.mdx": {
+	id: "vllm-paged-attention-kernel-implementation.mdx";
+  slug: "vllm-paged-attention-kernel-implementation";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "vllm-pagedattention-introduction-2020.mdx": {
 	id: "vllm-pagedattention-introduction-2020.mdx";
   slug: "vllm-pagedattention-introduction-2020";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"vllm-scheduler-continuous-batching-internals.mdx": {
+	id: "vllm-scheduler-continuous-batching-internals.mdx";
+  slug: "vllm-scheduler-continuous-batching-internals";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">

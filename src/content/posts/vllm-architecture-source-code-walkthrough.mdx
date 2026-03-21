@@ -1,0 +1,210 @@
+---
+title: "vLLM Architecture: A Source Code Walkthrough of the Most Popular LLM Serving Engine"
+author: "stanley-phoong"
+description: "A guided tour through vLLM's source code — from the LLMEngine entry point through the scheduler, worker, model runner, and attention backends. How 50,000+ lines of Python and CUDA work together to serve LLMs at production scale."
+publishDate: 2025-03-21
+category: vllm
+tags: [vllm, architecture, source-code, scheduler, worker, model-runner, serving]
+difficulty: expert
+readingTime: 35
+draft: false
+featured: true
+series: "vLLM Internals"
+seriesOrder: 1
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+import MemoryLayout from '@/components/mdx/MemoryLayout.astro';
+
+vLLM serves more LLM traffic than any other open-source inference engine. It handles everything from single-GPU laptop deployments to multi-node clusters serving thousands of concurrent requests. Understanding how it works at the code level — not just the concepts, but the actual modules, classes, and data flow — is essential for anyone operating, extending, or debugging a vLLM deployment.
+
+This post is a guided tour of the vLLM codebase. We trace the lifecycle of a single request from HTTP arrival to token output, identifying every major component it touches.
+
+## The Request Lifecycle at 10,000 Feet
+
+When a request arrives at vLLM, it flows through these stages:
+
+<MemoryLayout
+  title="vLLM Request Lifecycle"
+  layout={[
+    { name: "1. API Server", power: "HTTP/OpenAI-compatible endpoint", state: "Receives request, tokenizes prompt", color: "#3b82f6" },
+    { name: "2. LLMEngine", power: "Central coordinator", state: "Manages scheduler + workers + output processing", color: "#a371f7" },
+    { name: "3. Scheduler", power: "Brain of the system", state: "Decides what runs each iteration (prefill/decode/preempt)", color: "#ef4444" },
+    { name: "4. Block Manager", power: "Memory allocator", state: "Allocates/frees KV cache blocks in GPU HBM", color: "#f59e0b" },
+    { name: "5. Worker", power: "GPU executor", state: "Prepares inputs, runs model forward pass, returns outputs", color: "#10b981" },
+    { name: "6. Model Runner", power: "Forward pass manager", state: "Handles CUDA graphs, input preparation, attention metadata", color: "#39c5cf" },
+    { name: "7. Attention Backend", power: "Kernel dispatcher", state: "Selects FlashAttention (prefill) or PagedAttention (decode)", color: "#db61a2" },
+  ]}
+/>
+
+Each stage corresponds to a major module in the codebase:
+
+<Benchmark
+  title="vLLM Source Code Modules"
+  columns={["Module", "Path", "Key Classes", "Responsibility"]}
+  rows={[
+    { values: ["API Server", "vllm/entrypoints/", "OpenAIServingChat, APIServer", "HTTP endpoint, request parsing, streaming"], highlight: false },
+    { values: ["Engine", "vllm/engine/", "LLMEngine, AsyncLLMEngine", "Orchestrate scheduler + workers"], highlight: false },
+    { values: ["Scheduler", "vllm/core/scheduler.py", "Scheduler", "Batch composition, preemption, budget"], highlight: true },
+    { values: ["Block Manager", "vllm/core/block_manager.py", "BlockSpaceManager", "KV cache block allocation/deallocation"], highlight: true },
+    { values: ["Worker", "vllm/worker/", "Worker, GPUModelRunner", "GPU execution, TP coordination"], highlight: false },
+    { values: ["Model Executor", "vllm/model_executor/", "ModelRunner, model implementations", "Forward pass, CUDA graphs, input prep"], highlight: false },
+    { values: ["Attention", "vllm/attention/", "AttentionBackend, PagedAttention", "Attention kernel selection and execution"], highlight: false },
+    { values: ["CUDA Kernels", "csrc/", "C++/CUDA implementations", "Paged attention, cache ops, activations"], highlight: false },
+  ]}
+/>
+
+## LLMEngine: The Central Coordinator
+
+The `LLMEngine` is the entry point for all inference. It ties together the scheduler, workers, and tokenizer into a single `step()` loop:
+
+```python
+class LLMEngine:
+    def step(self):
+        # 1. Scheduler decides what to run
+        scheduler_output = self.scheduler.schedule()
+
+        # 2. If nothing to do, return empty
+        if scheduler_output.is_empty():
+            return []
+
+        # 3. Send work to GPU workers
+        model_output = self.model_executor.execute_model(scheduler_output)
+
+        # 4. Process outputs (decode tokens, check stop conditions)
+        request_outputs = self._process_model_outputs(model_output)
+
+        # 5. Update scheduler state (mark finished, update token counts)
+        self.scheduler.update(scheduler_output, model_output)
+
+        return request_outputs
+```
+
+The `step()` method runs once per iteration (~20-50ms). The `AsyncLLMEngine` wraps this in an async loop that continuously calls `step()` and streams results back to clients.
+
+<Callout type="info" title="Offline vs Online Mode">
+vLLM has two modes: **offline** (`LLM` class for batch processing) and **online** (`AsyncLLMEngine` for serving). Both use the same scheduler and workers underneath. The difference is how requests enter (all at once vs streaming) and how results exit (returned vs streamed).
+</Callout>
+
+## The Scheduler: Brain of the System
+
+The scheduler (detailed in Part 2 of this series) maintains three queues — waiting, running, and swapped — and decides the batch composition each iteration. Its output is a `SchedulerOutput` containing:
+
+- Which sequences to prefill (and how many tokens each)
+- Which sequences to continue decoding (1 token each)
+- Which sequences to preempt (and whether to swap or recompute)
+- Block allocation/deallocation instructions for the block manager
+
+The scheduler operates entirely on CPU. Its execution time (~0.5-2ms) is negligible compared to the GPU forward pass (~10-50ms). But its **decisions** determine throughput — a bad scheduling policy can waste 50%+ of GPU capacity.
+
+## Block Manager: Virtual Memory for KV Cache
+
+The `BlockSpaceManager` implements the paged KV cache allocation described in the PagedAttention paper. It divides GPU HBM into fixed-size blocks (default: 16 tokens per block) and manages them like an OS manages physical memory pages:
+
+```python
+class BlockSpaceManager:
+    def __init__(self, block_size, num_gpu_blocks, num_cpu_blocks):
+        self.gpu_allocator = BlockAllocator(num_gpu_blocks)  # Free list
+        self.cpu_allocator = BlockAllocator(num_cpu_blocks)   # For swap
+        self.block_tables = {}  # seq_id -> list of physical block IDs
+
+    def allocate(self, seq_id, num_blocks):
+        blocks = [self.gpu_allocator.allocate() for _ in range(num_blocks)]
+        self.block_tables[seq_id] = blocks
+
+    def free(self, seq_id):
+        for block in self.block_tables[seq_id]:
+            self.gpu_allocator.free(block)
+        del self.block_tables[seq_id]
+
+    def swap_out(self, seq_id):
+        # Copy GPU blocks to CPU blocks
+        cpu_blocks = [self.cpu_allocator.allocate() for _ in self.block_tables[seq_id]]
+        # ... initiate GPU->CPU copy
+        self.gpu_allocator.free_all(self.block_tables[seq_id])
+        self.block_tables[seq_id] = cpu_blocks
+```
+
+The block table maps logical block indices to physical block pointers. This indirection is what enables: (a) non-contiguous KV cache storage, (b) zero-fragmentation allocation, (c) copy-on-write for beam search, (d) prefix sharing across requests.
+
+## Workers and Model Runner
+
+Workers execute on each GPU. In tensor-parallel setups, multiple workers coordinate:
+
+```python
+class Worker:
+    def execute_model(self, scheduler_output):
+        # 1. Prepare model inputs (token IDs, positions, attention metadata)
+        inputs = self.model_runner.prepare_input(scheduler_output)
+
+        # 2. Run model forward pass (potentially via CUDA graph)
+        output = self.model_runner.execute(inputs)
+
+        # 3. Sample next tokens from logits
+        sampled = self.model_runner.sample(output.logits)
+
+        return sampled
+```
+
+The `ModelRunner` handles the critical details:
+- **Input preparation**: Packing variable-length sequences into padded tensors, computing position IDs, building attention metadata (block tables, sequence lengths)
+- **CUDA graph management**: For decode steps with fixed batch sizes, captured CUDA graphs eliminate kernel launch overhead
+- **Tensor parallelism**: Distributing computation across GPUs, handling all-reduce communication
+
+<Callout type="perf" title="Where Time Actually Goes">
+In a typical iteration at batch=64 on Llama 70B with H100: GPU forward pass ~30ms (90%), input preparation ~2ms (6%), scheduling ~1ms (3%), sampling ~0.5ms (1.5%). The forward pass dominates. Optimizing anything else gives marginal returns.
+</Callout>
+
+## Attention Backends
+
+vLLM abstracts attention computation behind an `AttentionBackend` interface, allowing different kernels for different scenarios:
+
+<Benchmark
+  title="vLLM Attention Backend Selection"
+  columns={["Backend", "Used For", "Key Property", "When Selected"]}
+  rows={[
+    { values: ["FlashAttention-2", "Prefill", "Contiguous Q,K,V — maximum throughput", "Default for prefill on CUDA GPUs"], highlight: true },
+    { values: ["PagedAttention v2", "Decode", "Handles non-contiguous KV blocks via block tables", "Default for decode"], highlight: true },
+    { values: ["FlashInfer", "Both", "Alternative implementation with different tradeoffs", "When explicitly selected"], highlight: false },
+    { values: ["Torch SDPA", "Fallback", "PyTorch native, broadest compatibility", "When no optimized backend available"], highlight: false },
+  ]}
+/>
+
+The critical split: **prefill uses FlashAttention** (contiguous KV, maximum throughput) while **decode uses PagedAttention** (non-contiguous blocks, necessary for paged memory). Part 3 of this series details the PagedAttention kernel implementation.
+
+## The CUDA Kernels
+
+The `csrc/` directory contains the C++/CUDA code that makes vLLM fast:
+
+- **`csrc/attention/`**: Paged attention kernels (v1 and v2). The most performance-critical CUDA code.
+- **`csrc/cache_kernels.cu`**: KV cache operations — reshape_and_cache (write new KV to blocks), swap (GPU to CPU copy), copy (for COW beam search).
+- **`csrc/activation_kernels.cu`**: Fused activation functions (SiLU, GELU).
+- **`csrc/layernorm_kernels.cu`**: Fused RMS normalization.
+- **`csrc/quantization/`**: Quantized GEMM kernels for INT4/INT8/FP8.
+
+These custom CUDA kernels exist because PyTorch's default operators don't handle the paged memory layout. Standard `torch.nn.functional.scaled_dot_product_attention` expects contiguous tensors — vLLM's KV cache lives in scattered blocks that require custom addressing.
+
+## How It All Connects: End-to-End Trace
+
+Let's trace a single request through every component:
+
+1. **User sends** `"Explain transformers"` to the OpenAI-compatible API
+2. **API server** tokenizes: `[849, 11187, 88146]` (3 tokens)
+3. **LLMEngine.add_request()** creates a `SequenceGroup` and places it in the scheduler's waiting queue
+4. **Scheduler._schedule()** sees the waiting request. Budget allows 3 prefill tokens. Block manager allocates 1 block (16-token capacity). Request moves to running queue.
+5. **Worker.execute_model()** prepares inputs: token_ids=[849, 11187, 88146], positions=[0, 1, 2], attention metadata (no KV cache to read yet)
+6. **Model forward pass**: FlashAttention for prefill (3 tokens, contiguous). Produces logits for position 2.
+7. **Sampling**: Top-p selects token 578 ("Trans")
+8. **Engine updates**: Token 578 appended to sequence. Block manager records KV cache now has 4 tokens (3 prompt + 1 generated).
+9. **Next iteration**: Scheduler sees 1 running request. Decode: token_ids=[578], positions=[3], PagedAttention reads KV from block, produces logits for position 3.
+10. **Repeat** until EOS token or max length.
+
+Each iteration takes ~10-50ms depending on model size and batch. The request generates tokens at 20-100 tokens/sec, streamed back to the client in real time.
+
+<Callout type="tip" title="The Takeaway for vLLM Users">
+You don't need to understand every line of code to use vLLM effectively. But knowing the architecture helps you: (1) choose the right configuration parameters (`max_num_batched_tokens`, `max_num_seqs`, `gpu_memory_utilization`), (2) diagnose performance issues (is the bottleneck scheduling, memory, or compute?), and (3) understand when vLLM is the right tool vs when SGLang or TRT-LLM might be better.
+</Callout>
+
+The next two posts in this series go deeper: Part 2 covers the scheduler's algorithms, and Part 3 covers the PagedAttention CUDA kernel — the two most technically interesting components of the system.

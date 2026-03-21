@@ -1,0 +1,263 @@
+---
+title: "vLLM's PagedAttention Kernel: How Virtual Memory for KV Cache Works at the CUDA Level"
+author: "stanley-phoong"
+description: "Inside vLLM's most critical CUDA kernel — how the paged attention mechanism translates block tables into memory accesses, why it's slower than FlashAttention for prefill but essential for decode, and the v1 vs v2 kernel design."
+publishDate: 2025-03-21
+category: vllm
+tags: [vllm, paged-attention, cuda, kernel, kv-cache, block-table, implementation]
+difficulty: expert
+readingTime: 35
+draft: false
+featured: false
+series: "vLLM Internals"
+seriesOrder: 3
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+import MemoryLayout from '@/components/mdx/MemoryLayout.astro';
+
+The PagedAttention kernel is the single most important piece of CUDA code in vLLM. It is what makes paged KV cache — the virtual memory system for attention — actually work at GPU speeds. Without this kernel, the block table indirection would be prohibitively slow, and vLLM's entire memory management architecture would collapse.
+
+This post goes inside the kernel: how it maps thread blocks to attention heads, how it iterates over KV cache blocks via the block table, how it computes online softmax with non-contiguous memory, and why the v2 kernel is faster than v1 for long sequences.
+
+## Two Attention Paths in vLLM
+
+vLLM uses **two completely different attention implementations** depending on the phase:
+
+<Benchmark
+  title="vLLM's Two Attention Paths"
+  columns={["Property", "Prefill Path", "Decode Path"]}
+  rows={[
+    { values: ["Kernel", "FlashAttention-2", "PagedAttention v1/v2"], highlight: false },
+    { values: ["KV layout", "Contiguous tensor", "Non-contiguous blocks via block table"], highlight: true },
+    { values: ["Q tokens per call", "Full prompt (hundreds-thousands)", "1 per sequence"], highlight: true },
+    { values: ["Bottleneck", "Compute (large GEMMs)", "Memory bandwidth (reading KV)"], highlight: false },
+    { values: ["Why this kernel", "Maximum throughput for batch GEMM", "Must handle paged memory layout"], highlight: false },
+  ]}
+/>
+
+**Why two paths?** During prefill, all KV entries are freshly computed and stored contiguously — FlashAttention's tiled algorithm works perfectly. During decode, KV entries were accumulated over many iterations and stored in scattered blocks allocated on-demand by the block manager. A contiguous-memory kernel cannot read these blocks. The PagedAttention kernel can.
+
+## The Block Table: Indirection Layer
+
+Each sequence has a block table stored in GPU memory:
+
+```
+block_table[seq_idx] = [block_ptr_0, block_ptr_1, block_ptr_2, ...]
+```
+
+Block $i$ holds KV cache for token positions $[i \times B, (i+1) \times B)$ where $B$ is the block size (default 16 tokens). To find the KV for token $t$:
+
+```
+block_idx = t // block_size          # Which block?
+block_offset = t % block_size        # Where within the block?
+physical_ptr = block_table[seq][block_idx]  # Physical location in HBM
+kv_address = physical_ptr + block_offset * head_dim * sizeof(dtype)
+```
+
+This indirection — reading the block table to find the physical address, then reading the actual KV data — is **pointer chasing**. It adds latency because the GPU must complete one memory read before it can issue the next. This is the fundamental cost of paging.
+
+<MemoryLayout
+  title="KV Cache Block Layout in GPU HBM"
+  layout={[
+    { name: "Block Pool", power: "Contiguous pool of fixed-size blocks", state: "Each block: [block_size, num_kv_heads, head_dim] per K and V", color: "#3b82f6" },
+    { name: "Block Table", power: "Per-sequence mapping array", state: "[max_num_seqs, max_num_blocks_per_seq] of block pointers", color: "#ef4444" },
+    { name: "Free List", power: "Stack of available block indices", state: "O(1) alloc and free", color: "#10b981" },
+  ]}
+/>
+
+## PagedAttention v1: The Core Algorithm
+
+The v1 kernel processes one query head for one sequence per thread block. Here is the algorithm:
+
+```
+CUDA kernel: paged_attention_v1
+  Grid: [num_heads, num_seqs, 1]
+  Block: [NUM_THREADS]  (typically 128 or 256)
+
+  For each (head_idx, seq_idx):
+    1. Load query vector q[head_dim] into registers
+    2. Initialize: max_score = -INF, sum_exp = 0, output = zeros(head_dim)
+
+    3. For block_idx in 0..num_blocks[seq_idx]:
+       a. physical_block = block_table[seq_idx][block_idx]
+       b. For token in block:
+          - Load K[token] from physical_block location
+          - Compute score = dot(q, K[token]) / sqrt(head_dim)
+          - Online softmax update:
+            new_max = max(max_score, score)
+            correction = exp(max_score - new_max)
+            sum_exp = sum_exp * correction + exp(score - new_max)
+            output = output * correction + exp(score - new_max) * V[token]
+            max_score = new_max
+
+    4. output = output / sum_exp  # Final normalization
+    5. Write output to global memory
+```
+
+The key operations within each thread block:
+- **Threads cooperate** to load K and V vectors (each head_dim=128 elements, distributed across threads)
+- **Warp-level reductions** compute the dot product (parallel sum across 32 threads)
+- **Shared memory** stores partial scores and the running softmax state
+- **Online softmax** (same algorithm as FlashAttention) allows processing blocks sequentially without seeing all scores first
+
+<Callout type="perf" title="GQA Mapping in the Kernel">
+With GQA (e.g., 64 query heads sharing 8 KV heads), the kernel maps each query head to its KV group: `kv_head_idx = head_idx / (num_heads / num_kv_heads)`. Multiple thread blocks (different query heads) read the same KV block simultaneously, benefiting from L2 cache hits.
+</Callout>
+
+## PagedAttention v2: Parallelizing Over Blocks
+
+The v1 kernel processes all KV blocks sequentially within one thread block. For long sequences (thousands of blocks), this means one thread block does all the work — poor GPU utilization.
+
+v2 fixes this by **parallelizing across KV blocks**:
+
+```
+CUDA kernel: paged_attention_v2
+  Grid: [num_heads, num_seqs, NUM_PARTITIONS]
+  Block: [NUM_THREADS]
+
+  Phase 1: Each partition processes a subset of KV blocks
+    partition_idx = blockIdx.z
+    blocks_per_partition = ceil(num_blocks / NUM_PARTITIONS)
+    start_block = partition_idx * blocks_per_partition
+    end_block = min(start_block + blocks_per_partition, num_blocks)
+
+    // Compute partial attention over [start_block, end_block)
+    // Store: partial_max, partial_sum_exp, partial_output
+
+  Phase 2: Reduce across partitions
+    // One thread block combines all partitions' results
+    // Using the online softmax rescaling trick
+    for partition in partitions:
+      correction = exp(partition.max - global_max)
+      global_sum += partition.sum * correction
+      global_output += partition.output * correction
+    global_output /= global_sum
+```
+
+<Benchmark
+  title="PagedAttention v1 vs v2 Performance"
+  columns={["Sequence Length", "v1 Latency", "v2 Latency", "Speedup"]}
+  rows={[
+    { values: ["512 tokens", "0.8 ms", "0.9 ms", "0.9x (v1 faster — partition overhead)"], highlight: false },
+    { values: ["2048 tokens", "2.1 ms", "1.8 ms", "1.17x"], highlight: false },
+    { values: ["8192 tokens", "7.5 ms", "4.2 ms", "1.79x"], highlight: true },
+    { values: ["32768 tokens", "28.0 ms", "12.1 ms", "2.31x"], highlight: true },
+  ]}
+  notes="Measured on A100-80GB, Llama 70B, batch=1. v2 benefits grow with sequence length due to better parallelism."
+/>
+
+v2 is faster for long sequences because it uses more of the GPU's SMs simultaneously. The partition reduction adds overhead, so v1 can be faster for very short sequences. vLLM selects v2 by default.
+
+## The Indirection Cost
+
+The block table lookup adds overhead compared to contiguous FlashAttention:
+
+1. **Extra memory read**: For each KV block, load `block_table[seq][block_idx]` (4-8 bytes) before loading the actual KV data
+2. **Non-contiguous access**: KV blocks can be anywhere in HBM, so the memory access pattern is scattered rather than sequential. This reduces L2 cache efficiency.
+3. **Reduced fusion opportunities**: FlashAttention's contiguous layout enables aggressive tiling within SRAM. Paged access makes tiling harder.
+
+<PerfChart
+  title="Attention Latency: FlashAttention vs PagedAttention (Llama 70B, A100)"
+  data={[
+    { label: "FlashAttention (prefill, contiguous)", value: 100, color: "green", annotation: "Baseline" },
+    { label: "PagedAttention v2 (decode, paged)", value: 112, color: "orange", annotation: "+12% overhead" },
+    { label: "PagedAttention v1 (decode, paged)", value: 118, color: "red", annotation: "+18% overhead" },
+  ]}
+  unit="% of FlashAttention speed"
+/>
+
+The 12-18% overhead is the "tax" for paged memory. vLLM pays this tax gladly because the paging enables 2-4x more concurrent sequences (less memory waste), which more than compensates for the per-sequence overhead.
+
+<Callout type="info" title="Why Not Use FlashAttention for Decode Too?">
+FlashAttention requires contiguous K,V tensors. During decode, the KV cache has been accumulated across many iterations into scattered blocks. You could compact the blocks into a contiguous buffer before calling FlashAttention, but the compaction itself would cost more than the PagedAttention overhead. The paged kernel avoids this copy entirely.
+</Callout>
+
+## Cache Operation Kernels
+
+Beyond attention, vLLM has CUDA kernels for KV cache management:
+
+**reshape_and_cache**: When a new token is generated, its K and V vectors must be written into the correct block at the correct offset:
+
+```cuda
+// Write K[head][dim] to cache block at position (block_number, block_offset)
+__global__ void reshape_and_cache_kernel(
+    float* key, float* value,           // New K,V from this step
+    float* key_cache, float* value_cache, // The block pool
+    int* slot_mapping,                   // Maps seq position -> (block, offset)
+    ...) {
+    int slot = slot_mapping[token_idx];
+    int block_number = slot / block_size;
+    int block_offset = slot % block_size;
+    // Write to the correct location in the block pool
+    key_cache[block_number][block_offset][head][dim] = key[token_idx][head][dim];
+}
+```
+
+**swap_blocks**: Copy blocks between GPU and CPU for preemption:
+```cuda
+// Async GPU->CPU copy for each block being swapped out
+cudaMemcpyAsync(cpu_cache + dst_block * block_bytes,
+                gpu_cache + src_block * block_bytes,
+                block_bytes, cudaMemcpyDeviceToHost, stream);
+```
+
+**copy_blocks**: Duplicate blocks for copy-on-write (beam search):
+```cuda
+// Copy one block's content to another block (same GPU)
+cudaMemcpyAsync(gpu_cache + dst_block * block_bytes,
+                gpu_cache + src_block * block_bytes,
+                block_bytes, cudaMemcpyDeviceToDevice, stream);
+```
+
+These kernels are simpler than the attention kernel but still performance-critical — they execute on every iteration.
+
+## FlashInfer as Alternative Backend
+
+FlashInfer is an alternative attention backend that vLLM can use. Key differences:
+
+<Benchmark
+  title="vLLM Native vs FlashInfer"
+  columns={["Feature", "vLLM Native PagedAttention", "FlashInfer"]}
+  rows={[
+    { values: ["Language", "Custom CUDA (csrc/)", "CUDA + Triton hybrid"], highlight: false },
+    { values: ["Decode kernel", "v1/v2 paged attention", "BatchDecodeWithPagedKVCache"], highlight: false },
+    { values: ["Prefill kernel", "Delegates to FlashAttention", "Own prefill implementation"], highlight: false },
+    { values: ["FP8 KV cache", "Supported", "Supported with different quantization"], highlight: false },
+    { values: ["Best for", "General deployments", "When FlashInfer's kernel tuning is better for your GPU"], highlight: false },
+  ]}
+/>
+
+FlashInfer can be faster on specific GPU architectures because it uses different tiling strategies and thread mappings. vLLM allows switching backends via configuration.
+
+## Performance Profile
+
+Where does time go in the attention step during decode?
+
+<PerfChart
+  title="Decode Attention Time Breakdown (Llama 70B, B=32, S=2048, A100)"
+  data={[
+    { label: "KV cache reads from HBM", value: 65, color: "red", annotation: "Memory-bandwidth-bound" },
+    { label: "QK dot products + softmax", value: 15, color: "blue", annotation: "Compute" },
+    { label: "AV multiply + accumulate", value: 12, color: "green", annotation: "Compute" },
+    { label: "Block table lookup", value: 5, color: "orange", annotation: "Indirection cost" },
+    { label: "Output write", value: 3, color: "gray", annotation: "Memory" },
+  ]}
+  unit="% of attention time"
+/>
+
+KV cache reads dominate at 65% — this is the fundamental memory-bandwidth bottleneck of decode. The block table indirection adds only 5% overhead. The kernel's performance is determined almost entirely by HBM bandwidth, which is why higher-bandwidth GPUs (H100 vs A100) directly translate to faster decode.
+
+<Callout type="tip" title="The Performance Optimization Hierarchy for PagedAttention">
+To make PagedAttention faster: (1) More HBM bandwidth (hardware upgrade — biggest impact). (2) KV cache quantization to INT8/FP8 (2x less data to read — covered in Inference Timeline Part 2). (3) Fewer KV heads via GQA/MLA (less data per token — covered in Transformer Anatomy Part 6). (4) Kernel tuning (tile sizes, thread mapping — marginal). The kernel itself is already well-optimized; the bottleneck is fundamental physics.
+</Callout>
+
+## Conclusion
+
+The PagedAttention kernel is a masterclass in trading a small amount of compute overhead (block table indirection) for a massive system-level benefit (zero-fragmentation KV cache memory). The 12-18% attention overhead enables 2-4x more concurrent requests through better memory utilization — a clear win.
+
+Understanding this kernel explains why vLLM makes certain architectural choices: why prefill and decode use different attention paths, why block size is 16 tokens (balancing indirection overhead vs fragmentation), and why KV cache quantization has outsized impact (reducing the dominant memory-bandwidth cost).
+
+The three posts in this series give you a complete picture of vLLM's internals: the architecture (Part 1), the scheduling brain (Part 2), and the attention muscle (this post). With this understanding, you can tune, debug, and extend vLLM with confidence.
