@@ -1,0 +1,309 @@
+---
+title: "Building a Transformer From Scratch: Putting Every Component Together"
+author: "stanley-phoong"
+description: "The capstone of the Transformer Anatomy series. We walk through the complete forward pass of a modern LLM end-to-end, annotating every step with tensor shapes, parameter counts, and memory usage — tying together all 14 previous posts into a single coherent picture."
+publishDate: 2025-03-21
+category: transformers
+tags: [transformer, architecture, implementation, forward-pass, llm, from-scratch]
+difficulty: expert
+readingTime: 35
+draft: false
+featured: true
+series: "Transformer Anatomy"
+seriesOrder: 15
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+import MemoryLayout from '@/components/mdx/MemoryLayout.astro';
+
+You have now read 14 posts covering every component of a modern transformer in isolation. This capstone post does what none of the individual posts could: it assembles every piece into a single, annotated forward pass through a production-scale LLM. By the end, you will understand exactly what happens to a string of text as it enters a Llama-3-class model and emerges as a probability distribution over the next token — every matrix multiply, every normalization, every memory access.
+
+We will use concrete numbers throughout: a Llama 3 70B-class model with $d_{\text{model}} = 8192$, $n_{\text{heads}} = 64$, $n_{\text{kv\_heads}} = 8$ (GQA), $d_{\text{ff}} = 28672$ (SwiGLU), $V = 128256$, and $L = 80$ layers.
+
+## The Complete Forward Pass
+
+### Step 1: Tokenization (Series Part 2)
+
+Input: a raw string like `"The quick brown fox"`.
+
+The tokenizer (BPE, Part 2) converts this to a sequence of integer IDs:
+
+```python
+token_ids = tokenizer.encode("The quick brown fox")
+# Result: [791, 4996, 14198, 39935]  (4 tokens)
+# Shape: [seq_len] = [4]
+```
+
+For a batch of $B$ sequences, we pad to the longest and get shape $[B, S_{\max}]$. The tokenizer is CPU-bound and typically takes microseconds — negligible compared to the model forward pass.
+
+### Step 2: Token Embedding (Series Part 3)
+
+The embedding table $E \in \mathbb{R}^{V \times d}$ maps each token ID to a dense vector:
+
+$$h^{(0)} = E[\text{token\_ids}]$$
+
+```python
+# E shape: [128256, 8192]  (1.05B parameters, 2.1 GB in FP16)
+# Input:   [B, S] of integer IDs
+# Output:  [B, S, 8192]
+h = embedding_table[token_ids]  # Simple lookup, no computation
+```
+
+<Callout type="info" title="Weight Tying (Part 11)">
+In Llama 3, the same matrix $E$ is reused as the output projection (unembedding). This saves 2.1 GB of parameters. The embedding lookup at the start and the linear projection at the end share the same weights.
+</Callout>
+
+### Step 3: The Transformer Block Loop (80 layers)
+
+Each of the $L = 80$ layers applies the same pattern: **Norm → Attention → Residual → Norm → FFN → Residual**.
+
+```python
+for layer in range(80):
+    # === Attention sublayer ===
+    h_norm = rms_norm(h)                    # [B, S, 8192] -> [B, S, 8192]
+    attn_out = gqa_attention(h_norm, layer) # [B, S, 8192] -> [B, S, 8192]
+    h = h + attn_out                        # Residual connection
+
+    # === FFN sublayer ===
+    h_norm = rms_norm(h)                    # [B, S, 8192] -> [B, S, 8192]
+    ffn_out = swiglu_ffn(h_norm, layer)     # [B, S, 8192] -> [B, S, 8192]
+    h = h + ffn_out                         # Residual connection
+```
+
+Let's trace each operation in detail.
+
+#### 3a: RMSNorm (Series Part 7)
+
+$$\text{RMSNorm}(x) = \gamma \odot \frac{x}{\sqrt{\frac{1}{d}\sum_{i=1}^{d} x_i^2 + \epsilon}}$$
+
+```python
+# Input:  [B, S, 8192]
+# Params: gamma [8192]  (8192 parameters per norm, 2 norms per layer)
+# Output: [B, S, 8192]
+# Cost: O(B * S * d) -- negligible compared to attention/FFN
+```
+
+No mean subtraction (unlike LayerNorm), no bias term. Just RMS scaling with a learned $\gamma$. Each layer has two RMSNorm instances (one before attention, one before FFN) = 16,384 parameters per layer. Across 80 layers: 1.3M parameters total — negligible.
+
+#### 3b: GQA Attention (Series Parts 1, 4, 5, 6)
+
+This is where most of the complexity lives. Llama 3 uses Grouped-Query Attention with 64 query heads and 8 KV heads (each query group of 8 heads shares one KV head):
+
+```python
+# Projections
+Q = h_norm @ W_Q  # [B,S,8192] @ [8192, 8192] -> [B,S,8192] = [B,S,64,128]
+K = h_norm @ W_K  # [B,S,8192] @ [8192, 1024] -> [B,S,1024] = [B,S,8,128]
+V = h_norm @ W_V  # [B,S,8192] @ [8192, 1024] -> [B,S,1024] = [B,S,8,128]
+
+# Apply RoPE to Q and K (Series Part 4)
+Q, K = apply_rope(Q, K, positions)
+
+# Attention with GQA: each of 64 Q heads maps to one of 8 KV heads
+# Effective: 8 groups of 8 query heads sharing 1 KV head
+# Score: Q_head @ K_group.T / sqrt(128), with causal mask
+# Output: softmax(scores) @ V_group
+
+O = h_norm @ W_O  # [B,S,8192] @ [8192, 8192] -> [B,S,8192]
+```
+
+**Attention parameters per layer:**
+- $W_Q$: $8192 \times 8192 = 67.1$M
+- $W_K$: $8192 \times 1024 = 8.4$M (reduced by GQA 8x)
+- $W_V$: $8192 \times 1024 = 8.4$M (reduced by GQA 8x)
+- $W_O$: $8192 \times 8192 = 67.1$M
+- **Total attention per layer: 151M parameters**
+
+**RoPE** (Part 4) rotates Q and K by position-dependent angles. This encodes relative position without any learned parameters — just trigonometric functions applied to pairs of dimensions.
+
+**Online softmax** (Part 5) computes the attention weights without materializing the full $S \times S$ matrix when using FlashAttention. The log-sum-exp trick prevents numerical overflow.
+
+**KV Cache** (covered in Inference Timeline): During autoregressive generation, K and V for previous tokens are cached. Per token per layer: $2 \times 8 \times 128 \times 2 = 4{,}096$ bytes (FP16). Across 80 layers: 327 KB per token.
+
+#### 3c: Residual Connection (Series Part 8)
+
+```python
+h = h + attn_out  # Element-wise addition, [B, S, 8192]
+```
+
+Simple addition. This is the "residual stream" — the persistent vector that carries information through the network. Without it, gradients would vanish through 80 layers.
+
+#### 3d: SwiGLU FFN (Series Part 9)
+
+$$\text{SwiGLU}(x) = (\text{SiLU}(xW_1) \odot xW_3) W_2$$
+
+```python
+# Three weight matrices per FFN layer:
+gate   = silu(h_norm @ W_1)  # [B,S,8192] @ [8192, 28672] -> [B,S,28672]
+up     = h_norm @ W_3        # [B,S,8192] @ [8192, 28672] -> [B,S,28672]
+hidden = gate * up            # Element-wise multiply [B,S,28672]
+out    = hidden @ W_2         # [B,S,28672] @ [28672, 8192] -> [B,S,8192]
+```
+
+**FFN parameters per layer:**
+- $W_1$: $8192 \times 28672 = 234.9$M
+- $W_3$: $8192 \times 28672 = 234.9$M
+- $W_2$: $28672 \times 8192 = 234.9$M
+- **Total FFN per layer: 704.6M parameters**
+
+The FFN is 82% of each layer's parameters. This is where factual knowledge is stored (Part 9: the FFN-as-key-value-memory hypothesis).
+
+### Step 4: Final Normalization
+
+```python
+h = rms_norm(h)  # [B, S, 8192] -> [B, S, 8192]
+```
+
+One final RMSNorm before the output projection.
+
+### Step 5: Output Projection / Unembedding (Series Part 11)
+
+```python
+# With weight tying: reuse the embedding matrix
+logits = h @ E.T  # [B, S, 8192] @ [8192, 128256] -> [B, S, 128256]
+```
+
+This produces raw logits over the entire 128K vocabulary for each position. For autoregressive generation, we only need the logits at the **last** position: `logits[:, -1, :]` of shape $[B, V]$.
+
+### Step 6: Sampling (Inference Timeline Series)
+
+```python
+# Temperature scaling + top-p sampling
+probs = softmax(logits[:, -1, :] / temperature)  # [B, 128256]
+next_token = top_p_sample(probs, p=0.95)          # [B]
+```
+
+The softmax (Part 5) converts logits to probabilities. Top-p sampling (covered in the Inference Timeline) selects from the smallest set of tokens covering 95% of probability mass.
+
+## Parameter Count Audit
+
+<Benchmark
+  title="Llama 3 70B Parameter Breakdown"
+  columns={["Component", "Params per Layer", "Total (80 layers)", "% of Model"]}
+  rows={[
+    { values: ["Token Embedding (E)", "N/A (shared)", "1.05B", "1.5%"], highlight: false },
+    { values: ["RMSNorm (2 per layer)", "16.4K", "1.3M", "0.002%"], highlight: false },
+    { values: ["Attention (Q+K+V+O)", "151M", "12.1B", "17.3%"], highlight: false },
+    { values: ["FFN (W1+W2+W3 SwiGLU)", "704.6M", "56.4B", "80.8%"], highlight: true },
+    { values: ["Output Head (tied with E)", "0 (tied)", "0", "0%"], highlight: false },
+    { values: ["TOTAL", "856M/layer", "~69.8B", "100%"], highlight: true },
+  ]}
+  notes="GQA reduces K,V projections 8x vs MHA. SwiGLU uses 3 matrices instead of 2, at 8/3 expansion ratio. Weight tying saves 1.05B parameters."
+/>
+
+The FFN dominates at **80.8%** of all parameters. Attention is only 17.3%. This is why MoE (Part 10) replaces the FFN with multiple expert FFNs — it's the component with the most parameters to distribute.
+
+<PerfChart
+  title="Where Parameters Live in Llama 3 70B"
+  data={[
+    { label: "FFN (SwiGLU)", value: 80.8, color: "blue", annotation: "56.4B params" },
+    { label: "Attention (GQA)", value: 17.3, color: "green", annotation: "12.1B params" },
+    { label: "Embeddings", value: 1.5, color: "orange", annotation: "1.05B params" },
+    { label: "Normalization", value: 0.002, color: "gray", annotation: "1.3M params" },
+  ]}
+  unit="% of parameters"
+/>
+
+## Memory Audit
+
+<Benchmark
+  title="Memory Requirements for Llama 3 70B"
+  columns={["Component", "FP16", "INT8", "INT4"]}
+  rows={[
+    { values: ["Model Weights", "140 GB", "70 GB", "35 GB"], highlight: false },
+    { values: ["KV Cache (B=32, S=4096)", "40.8 GB", "20.4 GB", "10.2 GB"], highlight: false },
+    { values: ["Activations (per layer peak)", "~2 GB", "~2 GB", "~2 GB"], highlight: false },
+    { values: ["Total Inference Memory", "~183 GB", "~92 GB", "~47 GB"], highlight: true },
+    { values: ["Fits on 1x H100 80GB?", "No", "Yes (tight)", "Yes (comfortable)"], highlight: true },
+  ]}
+  notes="KV cache uses GQA dimensions (8 KV heads x 128 dim). Activations are dominated by the FFN hidden layer (B x S x d_ff)."
+/>
+
+<Callout type="warning" title="KV Cache Grows with Every Token">
+At batch=32 and sequence length 4096, the KV cache is 40.8 GB — almost as much as the INT4 model weights. At 8192 tokens, it doubles to 81.6 GB. KV cache, not model weights, is the binding memory constraint for long-context serving. This is why KV cache quantization (Inference Timeline Part 2), PagedAttention (Part 5), and prefix caching (Part 8) are critical.
+</Callout>
+
+## The Design Space: What Llama 3 Architects Chose (and Why)
+
+Every component in the model represents a design decision. Here's what the Llama 3 team chose at each point, and why:
+
+<Benchmark
+  title="Llama 3 70B Architecture Decisions"
+  columns={["Decision", "Choice", "Alternatives", "Why This Choice"]}
+  rows={[
+    { values: ["Attention", "GQA-8", "MHA, MQA, MLA", "GQA-8 balances quality and KV cache size. MQA too aggressive, MHA too expensive."], highlight: false },
+    { values: ["FFN", "SwiGLU (8/3 ratio)", "ReLU, GELU MLP", "SwiGLU gives ~1% perplexity improvement. Three matrices at 8/3 ratio matches parameter count."], highlight: false },
+    { values: ["Normalization", "RMSNorm (Pre-Norm)", "LayerNorm, Post-Norm", "RMSNorm is 10-15% faster, Pre-Norm stabilizes deep training."], highlight: false },
+    { values: ["Position", "RoPE (base 500K)", "Learned, ALiBi", "RoPE enables context extension. High base for 128K context training."], highlight: false },
+    { values: ["Vocab Size", "128,256", "32K, 50K, 100K", "128K improves multilingual compression 15-20%. Embedding cost is 1.5% of model."], highlight: false },
+    { values: ["Architecture", "Dense", "MoE", "Meta can afford the training compute. Dense is simpler to serve."], highlight: false },
+    { values: ["Weight Tying", "Yes", "Separate head", "Saves 1.05B params (2.1 GB). No quality cost for large models."], highlight: false },
+    { values: ["Embedding Dim", "8192", "4096, 12288", "Scaling law optimal for 70B parameters."], highlight: false },
+  ]}
+/>
+
+<Callout type="tip" title="The Key Insight From This Series">
+Architecture design is not about finding the "best" component — it's about finding the right tradeoff for your constraints. DeepSeek V3 chose MoE + MLA because they optimized for training efficiency. Meta chose dense + GQA because they optimized for serving simplicity. Both are correct for their context.
+</Callout>
+
+## Where Innovation Happens
+
+After 14 posts of analysis, we can map the transformer design space into **settled** components and **active frontiers**:
+
+**Settled (unlikely to change fundamentally):**
+- Residual connections (Part 8) — the identity skip path is non-negotiable
+- Pre-Norm placement (Part 7) — Post-Norm is dead for new architectures
+- Weight tying (Part 11) — free memory savings, no quality cost
+- BPE tokenization (Part 2) — may evolve to byte-level but BPE principle stays
+- Cross-entropy loss (Part 12) — pre-training objective is stable
+
+**Active frontiers (changing rapidly):**
+- Attention mechanism (Parts 1, 6) — MLA may replace GQA, linear attention and SSMs (Mamba) challenge the attention paradigm entirely
+- Position encoding (Part 4) — NoPE, dynamic encodings, context extension beyond 1M tokens
+- Expert routing (Part 10) — loss-free balancing, fine-grained experts, expert parallelism optimization
+- FFN variants (Part 9) — MoE replaces dense FFN at scale, knowledge neuron editing
+- Training objectives (Part 12) — multi-token prediction, DPO/RLHF post-training, inference-time compute scaling
+
+## Implementation Checklist
+
+If you're implementing a transformer from this series, here are the most common bugs and their fixes:
+
+<Benchmark
+  title="Common Implementation Bugs"
+  columns={["Bug", "Symptom", "Fix", "Series Reference"]}
+  rows={[
+    { values: ["Missing causal mask", "Model sees future tokens, perfect loss on training", "Apply causal mask before softmax: set future positions to -inf", "Part 1"], highlight: true },
+    { values: ["Wrong RoPE frequencies", "Model fails at long sequences", "Use theta = 10000^(-2i/d) with correct dim pairing", "Part 4"], highlight: true },
+    { values: ["Softmax overflow", "NaN in attention weights", "Subtract max before exp (log-sum-exp trick)", "Part 5"], highlight: true },
+    { values: ["Post-Norm instead of Pre-Norm", "Training diverges at 60+ layers", "Normalize BEFORE sublayer, not after", "Part 7"], highlight: false },
+    { values: ["Missing residual scaling", "Activation magnitude explodes in deep models", "Scale output projection by 1/sqrt(2L)", "Part 8"], highlight: false },
+    { values: ["SwiGLU wrong expansion", "Parameter count mismatch", "Use d_ff = 8/3 * d_model (not 4x) to compensate for 3 matrices", "Part 9"], highlight: false },
+    { values: ["FP16 norm computation", "Gradient instability in mixed precision", "Keep RMSNorm in FP32 even when forward pass is FP16/FP8", "Part 7"], highlight: false },
+  ]}
+/>
+
+## What You Now Know
+
+If you've read all 15 parts of this series, you understand:
+
+1. **How text becomes tokens** and why subword tokenization exists (Part 2)
+2. **How tokens become vectors** through embedding lookup (Part 3)
+3. **How position is encoded** via RoPE rotation (Part 4)
+4. **How attention works** — the QKV mechanism, multi-head decomposition, and O(n^2) cost (Part 1)
+5. **How softmax creates a distribution** and why numerical stability matters (Part 5)
+6. **Why GQA/MLA reduce memory** and how to choose between attention variants (Part 6)
+7. **Why normalization enables depth** and why RMSNorm replaced LayerNorm (Part 7)
+8. **Why residual connections are essential** and the residual stream mental model (Part 8)
+9. **How the FFN stores knowledge** and why SwiGLU's gating mechanism helps (Part 9)
+10. **How MoE scales parameters** without proportional compute cost (Part 10)
+11. **How the output head produces probabilities** and why weight tying works (Part 11)
+12. **How cross-entropy shapes learning** and why models hallucinate (Part 12)
+13. **Why decoder-only won** over encoder and encoder-decoder architectures (Part 13)
+14. **How DeepSeek V3 pushes the frontier** with MLA, fine-grained MoE, and FP8 training (Part 14)
+
+You have the foundation to read any LLM paper, understand any serving system, and identify where the next breakthrough might come from. The transformer is not magic — it's engineering. Every component has a reason, every design choice has a tradeoff, and every tradeoff creates an opportunity for innovation.
+
+<Callout type="success" title="What Comes Next">
+This series covered the architecture. The companion **Inference Optimization Timeline** series covers what happens when you try to make these models fast and cheap in production — from KV cache management to speculative decoding to disaggregated serving. The two series together give you the complete picture: how transformers work and how to deploy them at scale.
+</Callout>

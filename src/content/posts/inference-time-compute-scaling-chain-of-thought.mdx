@@ -1,0 +1,596 @@
+---
+title: "Inference-Time Compute Scaling: When More Thinking Helps (o1, DeepSeek-R1, and the Reasoning Frontier)"
+author: "stanley-phoong"
+description: "An expert deep-dive into inference-time compute scaling: chain-of-thought reasoning, o1 and DeepSeek-R1 architectures, the scaling law for test-time compute, verification strategies, cost implications, and systems impact of reasoning models on LLM serving infrastructure."
+publishDate: 2025-03-21
+category: llm-inference
+tags: [inference-scaling, chain-of-thought, reasoning, o1, deepseek-r1, compute-budget]
+difficulty: expert
+readingTime: 32
+series: "Inference Optimization Timeline"
+seriesOrder: 13
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+
+For the first decade of deep learning scaling, the recipe was simple: make the model bigger, train it on more data, and performance improves. The scaling laws of Kaplan et al. (2020) and Hoffmann et al. (2022, "Chinchilla") formalized this into precise power-law relationships between training compute, model size, data size, and loss. Every dollar of compute went into training. Inference was cheap -- one forward pass per token, done.
+
+Then something changed. OpenAI's o1 (September 2024) and DeepSeek-R1 (January 2025) demonstrated that you can also scale compute at inference time -- and the returns are dramatic. Instead of generating the answer immediately, the model *thinks*. It produces a long internal chain of reasoning tokens before answering. A math problem that a standard GPT-4-class model gets wrong 70% of the time becomes solvable 90% of the time if you let the model spend 10,000 tokens reasoning through it. The cost is 10-100x more tokens per query, but for hard problems the quality improvement is worth every token.
+
+This post covers the full arc: why chain-of-thought works from a computational complexity perspective, how o1 and DeepSeek-R1 train reasoning models, the empirical scaling law for test-time compute, verification strategies that amplify reasoning, the cost calculus, and the systems-level impact on serving infrastructure.
+
+---
+
+## 1. The Paradigm Shift: Training Compute vs. Inference Compute
+
+### The Traditional Scaling Paradigm
+
+The Chinchilla scaling law tells us that for a compute budget $C$ spent on training, the optimal allocation is:
+
+$$L(N, D) \approx \left(\frac{N_c}{N}\right)^{\alpha_N} + \left(\frac{D_c}{D}\right)^{\alpha_D} + L_0$$
+
+where $N$ is parameters, $D$ is training tokens, and $\alpha_N \approx \alpha_D \approx 0.34$. The key insight: loss decreases as a power law with training compute, and you should scale model size and data size roughly in proportion.
+
+Under this paradigm, inference is a fixed-cost operation. For a model with $N$ parameters, each generated token requires approximately $2N$ FLOPs (one multiply-add per parameter). A 70B model uses ~140 GFLOPS per token, regardless of the difficulty of the question. Asking "What is 2+2?" costs the same as asking "Prove the Riemann Hypothesis."
+
+### The Inference Scaling Paradigm
+
+The new paradigm recognizes that *some problems are harder than others* and benefit from more computation at inference time. Instead of a fixed forward pass, the model generates a variable-length reasoning trace before producing its answer. The total inference cost becomes:
+
+$$C_{\text{inference}} = (T_{\text{reasoning}} + T_{\text{answer}}) \times c_{\text{per-token}}$$
+
+where $T_{\text{reasoning}}$ is the number of reasoning tokens (potentially thousands) and $c_{\text{per-token}}$ is the per-token generation cost. The model -- or an external controller -- decides how many reasoning tokens to spend based on the problem difficulty.
+
+<Callout type="info" title="Two Knobs, Not One">
+  We now have two independent scaling axes: training compute (bigger models, more data) and inference compute (more thinking per query). The optimal allocation between them depends on the use case. For a high-volume chatbot answering simple questions, invest in training compute. For a math competition or code generation benchmark, invest in inference compute.
+</Callout>
+
+### Why This Matters Economically
+
+Consider a concrete example. Training a frontier model like Llama 3.1 405B costs approximately $30M in compute. This cost is amortized over every query the model serves. If the model serves 1 billion queries, the training cost per query is $0.03.
+
+Now consider inference scaling. If reasoning adds 5,000 tokens per query at $0.01 per 1K tokens, that is $0.05 per query -- already exceeding the amortized training cost. For the hardest problems requiring 50,000 reasoning tokens, the inference cost per query reaches $0.50.
+
+<PerfChart
+  title="Cost Per Query: Standard vs. Reasoning Models"
+  unit="$/query"
+  data={[
+    { label: "Standard (short answer)", value: 0.005, color: "green", annotation: "~50 output tokens" },
+    { label: "Light reasoning (1K CoT)", value: 0.015, color: "blue", annotation: "~1K reasoning tokens" },
+    { label: "Medium reasoning (5K CoT)", value: 0.06, color: "orange", annotation: "~5K reasoning tokens" },
+    { label: "Heavy reasoning (20K CoT)", value: 0.22, color: "orange", annotation: "~20K reasoning tokens" },
+    { label: "Maximum effort (50K CoT)", value: 0.55, color: "red", annotation: "~50K reasoning tokens" }
+  ]}
+  baseline={0}
+/>
+
+The economics flip: for reasoning models, *inference* compute dominates total cost, not training. This fundamentally changes how we think about model optimization. Traditional optimizations (quantization, batching, speculative decoding) become even more critical because every token is expensive, and there are many more tokens per query.
+
+---
+
+## 2. Chain-of-Thought: The Original Insight
+
+### Wei et al. 2022: Prompting Models to Think
+
+Chain-of-thought (CoT) prompting, introduced by Wei et al. at Google Brain in January 2022, is deceptively simple: instead of asking a language model to produce an answer directly, you prompt it to show its work. For example, instead of:
+
+**Standard prompt**: "Roger has 5 tennis balls. He buys 2 cans of 3 balls each. How many does he have now? Answer:"
+
+**CoT prompt**: "Roger has 5 tennis balls. He buys 2 cans of 3 balls each. How many does he have now? Let's think step by step."
+
+The addition of "Let's think step by step" (or providing few-shot examples with reasoning traces) causes the model to generate intermediate steps: "He buys 2 cans of 3 balls, so he buys 2 x 3 = 6 balls. He started with 5 and adds 6, so 5 + 6 = 11 balls." This trivial change improved GSM8K (grade school math) accuracy from 17.7% to 58.1% on PaLM 540B -- a 3.3x improvement from prompt engineering alone.
+
+### Why It Works: Reducing Effective Reasoning Depth
+
+The deep reason chain-of-thought helps is *computational*: it reduces the effective depth of the reasoning circuit the model must implement in a single forward pass.
+
+A transformer with $L$ layers and hidden dimension $d$ can be viewed as a depth-$L$ computation circuit. Each layer applies attention (which can copy and route information) followed by an MLP (which can perform local computation). The total computational capacity per forward pass is bounded.
+
+Consider a problem that requires $k$ sequential reasoning steps. If $k \leq L$, the model can potentially solve it in a single forward pass -- each layer handles one reasoning step. But if $k \gg L$, the model is fundamentally unable to compute the answer in one pass. A 32-layer transformer cannot perform 100 sequential reasoning steps in a single forward pass.
+
+Chain-of-thought solves this by *serializing* the computation across multiple forward passes. Each generated token provides a new opportunity for the model to read its previous reasoning (via attention to the generated context) and perform the next step. The effective computational depth becomes:
+
+$$D_{\text{effective}} = L \times T_{\text{reasoning}}$$
+
+For a 32-layer model generating 100 reasoning tokens, the effective depth is $32 \times 100 = 3{,}200$ layers -- far deeper than any single forward pass could achieve.
+
+<Callout type="perf" title="The Circuit Depth Argument">
+  Chain-of-thought converts a depth-$L$ computation into a depth-$(L \times T)$ computation by serializing across $T$ autoregressive steps. This is why CoT helps on multi-step problems but provides no benefit on single-step lookups: the depth was never the bottleneck for simple tasks.
+</Callout>
+
+### Empirical Evidence: Where CoT Helps (and Where It Does Not)
+
+CoT provides enormous gains on tasks requiring multi-step reasoning -- arithmetic, symbolic logic, planning, code generation -- but minimal improvement on tasks that are essentially pattern matching or retrieval.
+
+<Benchmark
+  title="Chain-of-Thought Impact by Task Type (PaLM 540B)"
+  columns={["Task", "Standard Prompting", "CoT Prompting", "Improvement", "Reasoning Steps"]}
+  rows={[
+    { values: ["GSM8K (math)", "17.7%", "58.1%", "+40.4pp", "3-8 steps"], highlight: true },
+    { values: ["SVAMP (math)", "69.2%", "79.0%", "+9.8pp", "2-4 steps"], highlight: false },
+    { values: ["StrategyQA (commonsense)", "73.9%", "77.8%", "+3.9pp", "2-3 steps"], highlight: false },
+    { values: ["Date Understanding", "64.3%", "77.3%", "+13.0pp", "3-5 steps"], highlight: false },
+    { values: ["Sports Understanding", "91.4%", "93.7%", "+2.3pp", "1 step"], highlight: false },
+    { values: ["BoolQ (reading comp.)", "88.0%", "87.1%", "-0.9pp", "1 step"], highlight: false }
+  ]}
+  notes="Numbers from Wei et al. 2022. Percentage points (pp) improvement. Tasks requiring more sequential reasoning steps show larger gains."
+/>
+
+The pattern is clear: the more sequential reasoning steps a task requires, the more CoT helps. Single-step tasks (BoolQ, simple classification) show no improvement or even slight degradation from the overhead of unnecessary reasoning.
+
+### The Scaling Interaction
+
+A critical finding from Wei et al.: CoT only helps models above a certain size threshold. For PaLM, CoT had minimal effect below 62B parameters and became increasingly beneficial as the model scaled to 540B. This makes sense: the model needs sufficient per-layer computational capacity to perform useful reasoning at each step. A very small model generates plausible-looking but incorrect reasoning traces -- it lacks the per-step computation needed to get intermediate results right.
+
+This observation has important implications: *you need a capable base model before inference-time compute scaling pays off*. A 7B model spending 10,000 tokens reasoning will generally underperform a 70B model spending 100 tokens, because the 7B model's per-step reasoning is too unreliable.
+
+---
+
+## 3. o1 and Reasoning Models: Internal Chain-of-Thought
+
+### From Prompted CoT to Trained Reasoning
+
+Wei et al.'s chain-of-thought was a prompting technique -- the model was never explicitly trained to reason. It just happened that sufficiently large language models, trained on text that includes step-by-step solutions, could be elicited to produce similar traces. The quality of reasoning was limited by whatever reasoning patterns happened to exist in the training data.
+
+OpenAI's o1 (released September 2024) represents a fundamental shift: the model is explicitly trained to reason. Rather than relying on prompting tricks, o1 generates an internal chain-of-thought as part of its core behavior. The model was trained with reinforcement learning to produce reasoning traces that lead to correct answers.
+
+### How o1 Works (What We Know)
+
+OpenAI has not published the full technical details, but from the system card, blog posts, and behavioral analysis, we can reconstruct the key architectural elements:
+
+**Variable-length internal reasoning.** When o1 receives a query, it generates a potentially very long hidden reasoning trace (not shown to the user) before producing the visible response. For simple questions, the reasoning might be 100 tokens. For competition math problems, it can exceed 50,000 tokens. The model *learns* how much to think -- it allocates compute proportional to problem difficulty.
+
+**Reinforcement learning for reasoning.** The model is trained with RL to maximize the probability of producing correct final answers. The reward signal propagates back through the reasoning trace, teaching the model which reasoning strategies lead to correct conclusions. This is fundamentally different from supervised fine-tuning on reasoning traces, because RL can discover novel reasoning strategies not present in any training data.
+
+**Test-time compute scaling.** The key empirical finding: o1's performance improves predictably with the amount of inference compute (reasoning tokens) allocated. On the AIME 2024 math competition, performance scales from ~50% accuracy with minimal thinking to ~83% with maximum thinking budget.
+
+<PerfChart
+  title="o1 Performance vs. Inference Compute (AIME 2024)"
+  unit="% accuracy"
+  data={[
+    { label: "GPT-4o (no CoT)", value: 13.4, color: "red", annotation: "Standard model" },
+    { label: "o1-mini (low compute)", value: 56.7, color: "orange", annotation: "~2K reasoning tokens" },
+    { label: "o1-preview (medium)", value: 74.4, color: "blue", annotation: "~10K reasoning tokens" },
+    { label: "o1 (high compute)", value: 83.3, color: "green", annotation: "~30K+ reasoning tokens" },
+    { label: "o1 with 64 samples", value: 93.3, color: "green", annotation: "Best-of-64 majority vote" }
+  ]}
+  baseline={0}
+/>
+
+The jump from GPT-4o (13.4%) to o1 (83.3%) on the same benchmark is remarkable -- a 6x improvement in accuracy. And this is on problems written *after* the training data cutoff, so it reflects genuine reasoning ability, not memorization.
+
+### The Compute Budget as a Learned Decision
+
+One of o1's most interesting properties is that the model itself decides how much to think. It does not reason for a fixed number of tokens. Instead, it has learned (through RL) to allocate more reasoning to harder problems.
+
+This is analogous to how humans approach problems: you do not spend 30 minutes thinking about what 2+2 equals, but you might spend hours on a novel proof. The model exhibits similar behavior -- simple factual questions get a few reasoning tokens, while competition-level math problems get thousands.
+
+The mechanism is straightforward in principle: the model can generate a token that transitions from reasoning to answering at any point. RL training shaped this transition policy -- if the model stops reasoning too early, it gets wrong answers and low reward; if it reasons too long on easy problems, it wastes compute without improving accuracy (and there may be length penalties or efficiency bonuses in the reward).
+
+<Callout type="warning" title="The Hidden Cost of Variable Compute">
+  Variable-length reasoning creates a scheduling challenge for serving systems. With standard models, the output length is somewhat predictable (and bounded by max_tokens). With reasoning models, a single query might generate 50 tokens or 50,000 tokens, and you cannot know in advance. This makes KV cache allocation, request scheduling, and SLO management significantly harder.
+</Callout>
+
+---
+
+## 4. DeepSeek-R1: Open Reasoning via Reinforcement Learning
+
+### The Open Alternative
+
+While o1's details remain proprietary, DeepSeek-R1 (January 2025) published a detailed technical report describing how to train a reasoning model from scratch. This is arguably the most important open contribution to inference-time compute scaling because it demonstrates that you do not need a secret proprietary recipe -- the approach is reproducible.
+
+### The DeepSeek-R1 Training Pipeline
+
+The R1 training pipeline has four stages, and understanding each is essential for grasping how reasoning emerges.
+
+**Stage 1: Cold Start with Supervised Fine-Tuning.** DeepSeek starts with their base model (DeepSeek-V3, a 671B MoE model) and fine-tunes it on a small dataset of human-written reasoning traces. This gives the model the *format* of reasoning -- it learns to produce step-by-step traces enclosed in special tokens. The quality of reasoning at this stage is mediocre; the model can mimic the format but has not learned to reason effectively.
+
+**Stage 2: Reinforcement Learning with Group Relative Policy Optimization (GRPO).** This is the core innovation. Instead of standard PPO (Proximal Policy Optimization), DeepSeek uses GRPO, which has a critical advantage: *it does not require a separate value model*. PPO requires training a value network (often the same size as the policy model) to estimate the advantage of each action. For a 671B parameter model, this doubles the memory requirement. GRPO eliminates this by estimating advantages *relative to other samples within the same group*.
+
+The GRPO algorithm works as follows. For each prompt $x$, sample $G$ complete reasoning traces $\{o_1, o_2, \ldots, o_G\}$ from the current policy $\pi_\theta$. Compute the reward $r_i$ for each trace (e.g., whether the final answer is correct). Then compute the advantage of each sample relative to the group:
+
+$$\hat{A}_i = \frac{r_i - \text{mean}(\{r_1, \ldots, r_G\})}{\text{std}(\{r_1, \ldots, r_G\})}$$
+
+The policy gradient update is:
+
+$$\nabla_\theta J = \frac{1}{G} \sum_{i=1}^G \hat{A}_i \cdot \nabla_\theta \log \pi_\theta(o_i | x) \cdot \min\left(\frac{\pi_\theta(o_i | x)}{\pi_{\theta_\text{old}}(o_i | x)}, \text{clip}(\ldots)\right)$$
+
+with a KL penalty to prevent the policy from deviating too far from the base model.
+
+<Callout type="info" title="Why GRPO Matters for Reasoning">
+  GRPO's key advantage is scalability. Training a value model for PPO on a 671B parameter policy requires another ~671B parameter value network -- this is 1.3 trillion parameters in total, requiring enormous GPU clusters just for training infrastructure. GRPO replaces the value network with group-based advantage estimation, halving the memory requirement and simplifying the training pipeline.
+</Callout>
+
+**Stage 3: Rejection Sampling and SFT.** After RL training, DeepSeek generates thousands of reasoning traces for each problem and filters for correct answers. The resulting high-quality (correct, well-reasoned) traces form a curated dataset for additional supervised fine-tuning. This step distills the RL policy's best reasoning patterns into a more stable model.
+
+**Stage 4: Final RL Alignment.** A second round of RL fine-tunes the model for helpfulness, harmlessness, and formatting preferences while preserving the reasoning capabilities from Stage 2-3.
+
+### The GRPO Details
+
+Let us examine GRPO more carefully because its efficiency is central to making reasoning model training practical.
+
+In standard PPO, the value function $V_\phi(s)$ estimates the expected reward from state $s$. Computing advantages requires running the value network on every intermediate state in the reasoning trace, which for a 50,000-token trace means 50,000 value network forward passes. Each forward pass through a 671B model costs ~1.3 TFLOPS. The total value network cost for a single training example can exceed the policy network cost.
+
+GRPO sidesteps this entirely. For a group of $G$ samples from the same prompt, the advantage is just the z-score of the reward within the group. No per-token value estimation needed. The reward can be as simple as a binary signal (correct/incorrect) applied to the complete trace.
+
+<Benchmark
+  title="Training Efficiency: PPO vs. GRPO for Reasoning Models"
+  columns={["Method", "GPU Memory", "Forward Passes/Sample", "Training Speed", "Reasoning Quality"]}
+  rows={[
+    { values: ["PPO (with value model)", "2x policy model", "T (per token)", "1x (baseline)", "Strong"], highlight: false },
+    { values: ["GRPO (group relative)", "1x policy model", "G (per group)", "~2-3x faster", "Comparable"], highlight: true },
+    { values: ["SFT only (no RL)", "1x policy model", "1 (per sample)", "~5x faster", "Weak"], highlight: false }
+  ]}
+  notes="T = reasoning trace length (can be 10K-50K tokens). G = group size (typically 8-64). GRPO's advantage is that it scales with group size, not trace length."
+/>
+
+### Emergent Reasoning Behaviors
+
+The most fascinating aspect of DeepSeek-R1's training is the *emergent* reasoning behaviors that arise from RL, without being explicitly taught:
+
+**Self-correction.** The model learns to recognize and fix its own mistakes mid-trace. It generates statements like "Wait, that's not right -- let me reconsider" and then produces a corrected derivation. This behavior was never present in the SFT data; it emerged purely from RL optimization.
+
+**Exploration of multiple approaches.** When stuck on a problem, the model tries different solution strategies within a single trace. It might attempt a direct algebraic approach, realize it leads to a dead end, and switch to a geometric argument. This is genuine problem-solving behavior that mirrors how human mathematicians work.
+
+**Verification and checking.** The model develops a habit of checking its intermediate results. After computing a value, it might substitute it back into the original equation to verify correctness. This self-verification significantly reduces errors.
+
+**Extended deliberation.** For hard problems, the model produces very long traces (30,000-50,000+ tokens) that genuinely work through the problem from multiple angles. This is not padding or repetition -- the content is substantive reasoning.
+
+---
+
+## 5. The Scaling Law: Quality vs. Inference Tokens
+
+### The Empirical Relationship
+
+One of the most important findings from the reasoning model literature is that output quality scales *predictably* with inference compute. This is not just "more thinking is better" -- it follows a quantifiable relationship.
+
+For both o1 and DeepSeek-R1, across benchmarks like AIME, MATH-500, and Codeforces, the relationship between accuracy and reasoning tokens follows an approximate log-linear pattern:
+
+$$\text{Accuracy}(T) \approx a \cdot \log(T) + b$$
+
+where $T$ is the number of reasoning tokens and $a$, $b$ are task-dependent constants. Doubling the reasoning budget yields a roughly constant improvement in accuracy -- but the absolute gain decreases with each doubling.
+
+<PerfChart
+  title="MATH-500 Accuracy vs. Reasoning Token Budget"
+  unit="% accuracy"
+  data={[
+    { label: "256 tokens", value: 62, color: "red", annotation: "Minimal thinking" },
+    { label: "1K tokens", value: 74, color: "orange", annotation: "Light reasoning" },
+    { label: "4K tokens", value: 83, color: "blue", annotation: "Moderate reasoning" },
+    { label: "16K tokens", value: 89, color: "green", annotation: "Heavy reasoning" },
+    { label: "64K tokens", value: 92, color: "green", annotation: "Maximum effort" },
+    { label: "256K tokens", value: 93, color: "green", annotation: "Diminishing returns" }
+  ]}
+  baseline={0}
+/>
+
+The jump from 256 to 4K tokens (+21 percentage points) is dramatically larger than the jump from 16K to 256K tokens (+4 percentage points). This has profound cost implications: the last few percentage points of accuracy cost orders of magnitude more than the first.
+
+### The Diminishing Returns Boundary
+
+For any given model and task, there exists a "saturation point" beyond which additional reasoning provides negligible improvement. This point depends on:
+
+1. **Model capability.** A more capable base model saturates at higher accuracy. DeepSeek-R1 (671B) saturates higher than a distilled 7B reasoning model.
+
+2. **Task difficulty.** Easy tasks saturate quickly (a few hundred tokens). Hard tasks have later saturation points but may never reach 100% regardless of compute.
+
+3. **Reasoning quality.** A model trained with strong RL (DeepSeek-R1) produces higher-quality reasoning per token than one relying on prompted CoT, so it saturates at fewer tokens.
+
+<Callout type="perf" title="When to Stop Thinking">
+  A practical heuristic: if the model's confidence in its answer (measured by the probability of the most likely answer token) does not increase after doubling the reasoning budget, you have likely hit the saturation point. Some systems implement early stopping based on confidence thresholds to avoid wasting compute on further reasoning.
+</Callout>
+
+### The Compute-Optimal Frontier
+
+Given a fixed compute budget for a single query, how should you allocate it? The options include:
+
+1. **Bigger model, less thinking.** Use a 405B model with 1K reasoning tokens.
+2. **Smaller model, more thinking.** Use a 70B model with 16K reasoning tokens.
+3. **Small model, maximum thinking.** Use a 7B model with 100K reasoning tokens.
+
+The compute-optimal choice depends on the task. For problems where per-step reasoning quality matters (complex proofs, multi-step code generation), the bigger model with moderate thinking tends to win. For problems where exploration matters (trying many solution approaches), the smaller model with more thinking can be competitive because each reasoning token is cheaper.
+
+<Benchmark
+  title="Compute-Equivalent Configurations on MATH-500"
+  columns={["Configuration", "Model", "Reasoning Tokens", "FLOPS/Query", "Accuracy"]}
+  rows={[
+    { values: ["Big + light", "405B", "1K", "~810 TFLOPS", "82%"], highlight: false },
+    { values: ["Medium + moderate", "70B", "8K", "~1,120 TFLOPS", "86%"], highlight: true },
+    { values: ["Small + heavy", "7B", "64K", "~896 TFLOPS", "71%"], highlight: false },
+    { values: ["Big + heavy", "405B", "16K", "~12,960 TFLOPS", "93%"], highlight: true }
+  ]}
+  notes="Approximate FLOPS assuming 2N FLOPS/token. 'Big + heavy' costs ~16x more but only achieves 7pp higher accuracy than 'Medium + moderate'."
+/>
+
+The "medium + moderate" configuration often hits the sweet spot for cost-efficiency. The "big + heavy" configuration achieves the highest accuracy but at enormous cost. The "small + heavy" configuration underperforms because the 7B model's per-step reasoning quality is too low -- more tokens of bad reasoning do not converge to correct answers.
+
+---
+
+## 6. Verification: Amplifying Reasoning Quality
+
+### The Verification Problem
+
+Here is a fundamental asymmetry in reasoning: *verifying a solution is often easier than generating one*. You can check that a proof is valid by following each step, even if you could not have discovered the proof yourself. Reasoning models exploit this asymmetry through verification strategies that amplify quality beyond what a single reasoning trace can achieve.
+
+### Majority Voting (Self-Consistency)
+
+The simplest verification strategy is majority voting, introduced by Wang et al. (2022) as "self-consistency." Generate $N$ independent reasoning traces for the same problem, extract the final answer from each, and return the answer that appears most frequently.
+
+If each trace has probability $p$ of reaching the correct answer, and traces are approximately independent, then the probability that the majority vote is correct is:
+
+$$P(\text{majority correct}) = \sum_{k=\lceil N/2 \rceil}^{N} \binom{N}{k} p^k (1-p)^{N-k}$$
+
+For $p = 0.6$ (each trace correct 60% of the time), majority voting with $N = 5$ gives 68% accuracy. With $N = 64$, accuracy reaches ~99%. The scaling is remarkably effective.
+
+<PerfChart
+  title="Majority Vote Accuracy vs. Number of Samples (per-trace p=0.6)"
+  unit="% accuracy"
+  data={[
+    { label: "N=1", value: 60, color: "red" },
+    { label: "N=3", value: 65, color: "orange" },
+    { label: "N=8", value: 73, color: "blue" },
+    { label: "N=16", value: 81, color: "blue" },
+    { label: "N=32", value: 89, color: "green" },
+    { label: "N=64", value: 95, color: "green" }
+  ]}
+  baseline={0}
+/>
+
+The cost scales linearly with $N$: 64 samples costs 64x as much as 1 sample. But the accuracy gains are often worth it for high-stakes queries where correctness matters more than cost.
+
+### Process Reward Models (PRMs)
+
+Majority voting treats each reasoning trace as a black box -- it only looks at the final answer. Process Reward Models (PRMs) provide finer-grained verification by scoring each *step* in the reasoning trace.
+
+A PRM is a separate model trained to predict whether each step in a reasoning trace is correct. Given a trace $[s_1, s_2, \ldots, s_k]$, the PRM produces scores $[r_1, r_2, \ldots, r_k]$ where $r_i$ indicates the probability that step $i$ is correct given all previous steps.
+
+The overall trace score can be computed as:
+
+$$R_{\text{trace}} = \prod_{i=1}^{k} r_i \quad \text{or} \quad R_{\text{trace}} = \min_{i} r_i$$
+
+The product formulation rewards traces where every step is likely correct. The minimum formulation is more conservative -- a single low-confidence step kills the trace score.
+
+<Callout type="info" title="Outcome vs. Process Reward Models">
+  **Outcome Reward Models (ORMs)** score only the final answer -- binary correct/incorrect. They are easy to train (you just need final answer labels) but cannot distinguish a trace that got the right answer through sound reasoning from one that got lucky with a wrong intermediate step. **Process Reward Models (PRMs)** score each reasoning step, enabling much better trace selection. Training PRMs is harder because you need per-step correctness labels, which typically require human annotation or careful automated labeling.
+</Callout>
+
+### Best-of-N with PRMs
+
+The combination of sampling + PRM verification is more powerful than either alone. Generate $N$ reasoning traces, score each with a PRM, and return the answer from the highest-scoring trace.
+
+This approach (sometimes called "best-of-N" or "reranking") is the standard verification strategy used in practice:
+
+<Benchmark
+  title="Verification Strategy Comparison on MATH-500"
+  columns={["Strategy", "Samples (N)", "Selector", "Accuracy", "Total Tokens"]}
+  rows={[
+    { values: ["Single trace", "1", "None", "74%", "4K"], highlight: false },
+    { values: ["Majority vote", "16", "Answer frequency", "85%", "64K"], highlight: false },
+    { values: ["Best-of-N (ORM)", "16", "Outcome reward", "87%", "64K + ORM cost"], highlight: false },
+    { values: ["Best-of-N (PRM)", "16", "Process reward", "91%", "64K + PRM cost"], highlight: true },
+    { values: ["Majority vote", "64", "Answer frequency", "90%", "256K"], highlight: false },
+    { values: ["Best-of-N (PRM)", "64", "Process reward", "94%", "256K + PRM cost"], highlight: true }
+  ]}
+  notes="PRM verification achieves the same accuracy as majority voting with 4x fewer samples, or higher accuracy at the same sample count."
+/>
+
+PRM-guided best-of-N consistently outperforms majority voting at the same sample budget. The PRM effectively concentrates your compute on *evaluating* the reasoning quality rather than *generating* more samples.
+
+### Monte Carlo Tree Search (MCTS) for Reasoning
+
+The most sophisticated verification approach applies tree search over the reasoning space. Instead of generating complete traces and evaluating them post-hoc, MCTS builds a tree of partial reasoning paths, using a PRM as the value function to guide exploration.
+
+The algorithm follows standard MCTS phases:
+
+1. **Selection**: Traverse the tree from root, choosing children by UCB (upper confidence bound) scores that balance exploitation (high-value steps) and exploration (under-visited steps).
+2. **Expansion**: When reaching a leaf, generate the next reasoning step.
+3. **Evaluation**: Score the new step with the PRM.
+4. **Backpropagation**: Update value estimates along the path from root to the new leaf.
+
+MCTS can discover solutions that no single autoregressive trace would find because it explores multiple reasoning branches and backtracks from dead ends. The cost is much higher than best-of-N (tree search requires many more PRM evaluations), but for the hardest problems it achieves the highest accuracy.
+
+---
+
+## 7. Cost Implications: The Economics of Thinking
+
+### Token Counts in Practice
+
+Reasoning models produce dramatically more tokens than standard models. Here are typical token counts across different query types:
+
+<Benchmark
+  title="Token Generation by Query Type: Standard vs. Reasoning Models"
+  columns={["Query Type", "Standard Model Tokens", "Reasoning Model Tokens", "Multiplier"]}
+  rows={[
+    { values: ["Simple factual question", "50-100", "200-500", "3-5x"], highlight: false },
+    { values: ["Coding task (medium)", "200-500", "2,000-8,000", "10-15x"], highlight: false },
+    { values: ["Math word problem", "100-200", "3,000-15,000", "30-75x"], highlight: true },
+    { values: ["Competition math", "200-500", "10,000-50,000", "50-100x"], highlight: true },
+    { values: ["Complex proof", "500-1,000", "20,000-100,000+", "40-100x+"], highlight: true }
+  ]}
+  notes="Standard model = GPT-4 class. Reasoning model = o1/R1 class. Ranges reflect problem difficulty variance."
+/>
+
+For competition math, reasoning models generate 50-100x more tokens than standard models. At $0.01/1K output tokens, a single hard math query costs $0.10-$1.00 instead of $0.005.
+
+### Cost-Benefit Analysis
+
+When is the extra cost justified? The answer depends on the value of correctness.
+
+**High-value, correctness-critical tasks**: Code generation for production systems, medical diagnosis support, financial modeling, legal analysis. Here, a wrong answer might cost thousands of dollars or cause real harm. Spending $1 for a correct answer instead of $0.01 for a possibly-wrong answer is trivially worthwhile.
+
+**Medium-value, quality-sensitive tasks**: Academic research assistance, technical writing, complex data analysis. Reasoning helps but is not always essential. A good strategy: try the standard model first, and escalate to reasoning if the result seems uncertain.
+
+**Low-value, high-volume tasks**: Chatbot conversation, simple Q&A, classification, summarization. Reasoning models are overkill. The standard model is "good enough" and 50-100x cheaper per query.
+
+<PerfChart
+  title="Cost per Correct Answer (Accounting for Accuracy)"
+  unit="$/correct answer"
+  data={[
+    { label: "Standard (60% acc, $0.01)", value: 0.017, color: "blue", annotation: "Cheap but unreliable" },
+    { label: "Reasoning 1K CoT (80% acc)", value: 0.019, color: "blue", annotation: "Better accuracy" },
+    { label: "Reasoning 10K CoT (90% acc)", value: 0.11, color: "orange", annotation: "Good value" },
+    { label: "Reasoning + maj@16 (95% acc)", value: 1.05, color: "red", annotation: "Expensive but reliable" },
+    { label: "Reasoning + PRM@64 (98% acc)", value: 3.27, color: "red", annotation: "Maximum reliability" }
+  ]}
+  baseline={0}
+/>
+
+The cost per *correct* answer is what matters. If the standard model is only 60% accurate on a hard task, you need 1.67 attempts on average to get a correct answer, making the effective cost $0.017 per correct answer. The reasoning model at 90% accuracy costs $0.11 per correct answer -- 6.5x more, but for tasks where wrong answers have costs (debugging time, rework, errors in downstream systems), the reasoning model wins.
+
+### Amortization Strategies
+
+Several strategies can reduce the effective cost of reasoning:
+
+**Caching reasoning traces.** If the same (or similar) problems recur, cache the reasoning traces and reuse them. A math tutor application might see the same problem type thousands of times.
+
+**Distillation.** Train a smaller model on the reasoning traces of a larger model. DeepSeek demonstrated this with R1-distill models at 7B, 14B, and 32B parameters. These smaller models internalize some of the reasoning patterns, achieving 70-80% of the full R1's performance at 1/10 the cost.
+
+**Adaptive compute.** Do not reason on every query. Use a classifier or the model's own uncertainty to route easy queries to a standard model and hard queries to a reasoning model. This can reduce average cost by 5-10x while preserving accuracy on hard problems.
+
+<Callout type="tip" title="The Routing Optimization">
+  In production, the biggest cost savings come from *not reasoning when you don't need to*. A simple classifier that routes 80% of queries to a standard model and 20% to a reasoning model can achieve nearly the same average accuracy as reasoning on everything, at a fraction of the cost.
+</Callout>
+
+---
+
+## 8. Systems Impact: How Reasoning Changes Serving Infrastructure
+
+### KV Cache Dynamics
+
+Reasoning models fundamentally change KV cache requirements. A standard model generating 200 output tokens for a 2K-token prompt has a maximum sequence length of 2,200 tokens. A reasoning model generating 20,000 reasoning tokens plus 200 answer tokens for the same prompt has a maximum sequence length of 22,200 tokens -- 10x longer.
+
+For Llama 70B with GQA (8 KV heads), each token in the KV cache consumes:
+
+$$\text{KV per token} = 2 \times n_{\text{layers}} \times n_{\text{kv\_heads}} \times d_{\text{head}} \times \text{bytes} = 2 \times 80 \times 8 \times 128 \times 2 = 327{,}680 \text{ bytes} \approx 320 \text{ KB}$$
+
+For a 22,200-token sequence: $22{,}200 \times 320 \text{ KB} \approx 6.9 \text{ GB}$ per request. On an 80GB A100 with 35GB for model weights, the remaining 45GB supports only ~6 concurrent reasoning requests, compared to ~60 standard requests.
+
+<PerfChart
+  title="Concurrent Requests vs. Sequence Length (Llama 70B, A100 80GB)"
+  unit="concurrent requests"
+  data={[
+    { label: "Standard (2.2K seq)", value: 62, color: "green", annotation: "200 output tokens" },
+    { label: "Light reasoning (5K seq)", value: 27, color: "blue", annotation: "3K reasoning tokens" },
+    { label: "Medium reasoning (12K seq)", value: 11, color: "orange", annotation: "10K reasoning tokens" },
+    { label: "Heavy reasoning (22K seq)", value: 6, color: "red", annotation: "20K reasoning tokens" },
+    { label: "Maximum reasoning (52K seq)", value: 2, color: "red", annotation: "50K reasoning tokens" }
+  ]}
+  baseline={0}
+/>
+
+This massive reduction in concurrency directly impacts throughput and cost. A server that handles 60 standard requests concurrently might handle only 6 reasoning requests, reducing throughput by 10x.
+
+### Prefill Cost for Long Chains of Thought
+
+Reasoning models create a secondary problem: the reasoning tokens themselves become the "prompt" for subsequent attention computations. As the reasoning trace grows, each new token must attend to all previous reasoning tokens. The attention cost per new token scales linearly with the accumulated sequence length:
+
+$$\text{Attention cost for token } t = O(t \times d_{\text{model}})$$
+
+For a 50,000-token reasoning trace, the last token must attend to all 50,000 previous tokens. Cumulative attention cost over the full trace scales quadratically:
+
+$$\text{Total attention cost} = O\left(\sum_{t=1}^{T} t \times d_{\text{model}}\right) = O\left(\frac{T^2 \times d_{\text{model}}}{2}\right)$$
+
+This quadratic scaling in reasoning trace length is a significant computational cost that does not exist for standard short-output generation.
+
+<Callout type="warning" title="The Quadratic Attention Wall">
+  For a 50K-token reasoning trace, the cumulative attention cost is proportional to $50{,}000^2 / 2 = 1.25 \times 10^9$ -- roughly 1,000x the attention cost of a 1,600-token standard generation (where cumulative cost is $\sim 1.28 \times 10^6$). FlashAttention helps with the constant factor but does not change the quadratic scaling.
+</Callout>
+
+### Scheduling Variable-Length Generation
+
+Standard LLM serving systems like vLLM assume that generation lengths are somewhat predictable and bounded. Reasoning models violate both assumptions: the output length varies by 100x between easy and hard problems, and hard problems can generate 50,000+ tokens.
+
+This creates several scheduling challenges:
+
+**KV cache preallocation.** PagedAttention (vLLM) allocates KV cache in blocks on demand, which helps. But the total memory reserved for a reasoning request cannot be predicted in advance. If the system admits too many requests assuming they will all be short, a few heavy reasoning requests can exhaust memory and force preemption.
+
+**Latency SLOs.** With standard models, time-to-first-token (TTFT) and time-between-tokens (TBT) are the key SLOs. With reasoning models, there is a new metric: *time-to-answer* (TTA), which includes the entire reasoning phase. TTA for a heavy reasoning request might be 60+ seconds, compared to sub-second for standard generation.
+
+**Fairness and starvation.** A reasoning request that generates 50K tokens occupies its GPU slot for 100x longer than a standard request. Without careful scheduling, short requests can be starved as reasoning requests monopolize resources.
+
+### Optimizations for Reasoning Model Serving
+
+Several emerging techniques address the unique challenges of serving reasoning models:
+
+**Reasoning-aware scheduling.** Predict the reasoning difficulty of incoming queries (using a lightweight classifier or the first few generated tokens) and route them to appropriate pools. Easy queries go to high-concurrency standard serving, hard queries go to low-concurrency reasoning pools.
+
+**KV cache compression for reasoning traces.** The reasoning trace often contains significant redundancy (the model revisits similar concepts multiple times). Techniques like H2O (Heavy Hitter Oracle) and SnapKV can evict low-attention KV cache entries from the reasoning trace, reducing memory without significantly impacting generation quality.
+
+**Streaming verification.** Instead of generating the entire reasoning trace and then answering, periodically check intermediate results. If the model has already reached a high-confidence answer mid-trace, truncate the remaining reasoning to save tokens.
+
+**Chunked reasoning.** Split long reasoning traces into chunks, checkpoint the KV cache at chunk boundaries, and allow preemption between chunks. This enables better fairness without losing the reasoning context.
+
+<Benchmark
+  title="Serving Configuration Impact on Reasoning Workloads"
+  columns={["Configuration", "Throughput (tok/s)", "Avg TTA (s)", "P99 TTA (s)", "Memory Efficiency"]}
+  rows={[
+    { values: ["Standard serving (no adaptation)", "2,400", "12.3", "68.5", "Low (memory waste)"], highlight: false },
+    { values: ["+ KV cache compression (50%)", "2,200", "13.1", "42.3", "Medium"], highlight: false },
+    { values: ["+ Difficulty-based routing", "3,800", "8.7", "55.2", "Medium"], highlight: false },
+    { values: ["+ Streaming verification", "3,500", "6.2", "38.1", "Medium"], highlight: true },
+    { values: ["All optimizations", "4,100", "5.8", "31.4", "High"], highlight: true }
+  ]}
+  notes="Mixed workload: 60% standard queries, 30% light reasoning, 10% heavy reasoning. Llama 70B equivalent on 8xA100."
+/>
+
+The combined optimizations improve throughput by 1.7x and reduce P99 time-to-answer by 54%. The key insight is that serving reasoning models is not just "more of the same" -- it requires rethinking scheduling, memory management, and SLO definitions.
+
+---
+
+## 9. Where the Frontier Is Heading
+
+### Inference Compute as the New Scaling Axis
+
+The reasoning model paradigm suggests a new scaling law:
+
+$$\text{Performance} \sim f(\text{TrainCompute}) + g(\text{InferenceCompute})$$
+
+where $f$ and $g$ are both increasing but with different rates and saturation points. The optimal allocation between training and inference compute depends on:
+
+- **Deployment volume.** High-volume deployments amortize training cost over more queries, making training compute more attractive. Low-volume, high-value deployments favor inference compute.
+- **Task difficulty distribution.** If most queries are easy, invest in training (the base model handles them cheaply). If most queries are hard, invest in inference compute (reasoning helps more).
+- **Latency tolerance.** Real-time applications cannot afford 30-second reasoning times. Batch processing can.
+
+### Distillation as the Bridge
+
+The most practical near-term strategy is distillation: train small, fast models on the reasoning traces of large models. DeepSeek's R1-distill-7B achieves remarkable performance -- comparable to GPT-4 on many benchmarks -- at a fraction of the cost. The large reasoning model serves as a "teacher" that generates high-quality training data, and the small model learns to approximate the reasoning patterns.
+
+This creates a virtuous cycle: large reasoning models improve their reasoning through RL, their best traces are distilled into smaller models, and those smaller models serve production traffic at low cost. The large model's inference compute investment is amortized across the entire distillation process.
+
+### Emerging Architectures
+
+Several research directions aim to make inference-time compute more efficient:
+
+**Implicit reasoning.** Instead of generating explicit reasoning tokens, models could perform multi-step reasoning internally via recurrent mechanisms or loop-back attention layers. This would achieve the depth benefits of CoT without the token generation cost.
+
+**Adaptive depth.** Models that can dynamically adjust the number of transformer layers used per token, spending more layers on hard tokens and fewer on easy ones. This is a form of inference compute scaling that operates at the layer level rather than the token level.
+
+**Parallel reasoning.** Instead of sequential chain-of-thought, generate multiple reasoning branches in parallel (tree-of-thought) and merge their conclusions. This trades latency for throughput and can be more efficient on multi-GPU setups.
+
+<Callout type="tip" title="The Meta-Lesson">
+  The fundamental lesson of inference-time compute scaling is that generating the answer is not a fixed-cost operation -- it is a variable-cost operation where you can trade compute for quality. The systems, algorithms, and economic frameworks we have built around fixed-cost inference all need to be rethought. This is the most important shift in LLM deployment since the introduction of the transformer itself.
+</Callout>
+
+---
+
+## 10. Practical Recommendations
+
+For practitioners deciding how to incorporate reasoning models into their systems:
+
+1. **Start with routing.** Do not put every query through a reasoning model. Build a difficulty classifier and route only the hard queries (10-20%) to reasoning, keeping the rest on fast, cheap standard models.
+
+2. **Use distilled models first.** Before deploying full R1 or o1, try distilled reasoning models (7B-32B). They capture 70-80% of the reasoning quality at 1/10-1/50 the cost.
+
+3. **Set token budgets.** Cap the reasoning token budget based on query type. A math problem might get 16K tokens; a coding task might get 8K; a general question gets 1K. Unbounded reasoning wastes compute on easy problems.
+
+4. **Implement verification for high-stakes queries.** For queries where correctness matters, run best-of-N with N=4-8 and a PRM. The 2-4x cost increase yields significant accuracy improvements.
+
+5. **Plan for KV cache pressure.** Reasoning models need 5-20x more KV cache per request. If you are running vLLM or SGLang, configure larger block sizes and consider KV cache compression.
+
+6. **Monitor time-to-answer, not just time-per-token.** Reasoning model SLOs should track end-to-end TTA, not just TTFT/TBT. Users care about how long until they get their answer, including the thinking time.
+
+7. **Cache aggressively.** Reasoning traces for common problem types are highly cacheable. A semantic cache that matches similar (not identical) queries can reduce effective cost by 3-5x.
+
+The inference-time compute scaling paradigm is still in its early days. We are likely to see dramatic improvements in efficiency, quality, and cost over the next 2-3 years as the field matures. But the core insight -- that thinking is worth paying for -- is here to stay.

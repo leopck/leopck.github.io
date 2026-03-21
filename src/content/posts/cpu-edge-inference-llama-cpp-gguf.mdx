@@ -1,0 +1,505 @@
+---
+title: "CPU and Edge Inference: llama.cpp Internals, GGUF Format, and When CPU Actually Wins"
+author: "stanley-phoong"
+description: "An advanced deep-dive into CPU-based LLM inference: llama.cpp architecture and threading model, GGUF format internals, CPU quantization types (Q4_0 through Q8_0), SIMD exploitation on AVX2/AVX-512/NEON, Apple Silicon's unified memory advantage, cost analysis of CPU vs GPU, and hybrid CPU+GPU layer offloading."
+publishDate: 2025-03-21
+category: llm-inference
+tags: [cpu-inference, llama-cpp, gguf, edge, quantization, simd, apple-silicon]
+difficulty: advanced
+readingTime: 28
+series: "Inference Optimization Timeline"
+seriesOrder: 14
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+
+Not every inference workload needs -- or can afford -- a GPU. A single NVIDIA H100 costs $30,000+, and renting one runs $2-4 per hour. Meanwhile, every developer laptop, every Raspberry Pi, every cloud VM already has a CPU. The question is not whether CPU inference is possible -- it obviously is -- but whether it is *practical*: fast enough for real use, cheap enough to justify, and good enough in quality.
+
+The answer, increasingly, is yes -- for the right workloads. llama.cpp, Georgi Gerganov's C/C++ inference engine, routinely achieves 10-30 tokens per second for 7B parameter models on consumer laptops. Apple Silicon machines with unified memory can run 13B models at interactive speeds. The GGUF format enables aggressive quantization that compresses a 70B model from 140 GB to 35 GB, fitting in system RAM. And for cost-sensitive deployments, CPU inference at $0.05/hour beats GPU inference at $3/hour by 60x.
+
+This post covers the full stack: the architecture of llama.cpp, the GGUF format in detail, CPU-specific quantization methods, SIMD kernel implementation, Apple Silicon's unique advantages, the economics of CPU vs. GPU, and hybrid offloading strategies.
+
+---
+
+## 1. Why CPU Inference Matters
+
+### The Accessibility Argument
+
+As of 2025, the installed base of GPUs capable of running LLMs (NVIDIA RTX 3090+ or equivalent) is roughly 10-20 million units worldwide. The installed base of CPUs capable of running LLMs (any x86-64 or ARM processor with 16+ GB RAM) is over 2 billion. This two-orders-of-magnitude difference in availability makes CPU inference the default for most developers experimenting with LLMs locally.
+
+The use cases are diverse:
+
+- **Developer experimentation.** Try models locally before committing to GPU infrastructure.
+- **Privacy-sensitive applications.** Data never leaves the device. No API calls, no logging, no third-party data processing.
+- **Edge deployment.** Embedded systems, on-premises servers, IoT gateways with no GPU.
+- **Cost-sensitive production.** High-volume, low-latency-tolerance workloads where CPU VMs at $0.05/hr beat GPU instances at $3/hr.
+- **Offline operation.** Laptops on airplanes, field devices without connectivity, air-gapped environments.
+
+### The Performance Question
+
+The core challenge is that LLM decode is memory-bandwidth-bound, and CPUs have much less memory bandwidth than GPUs:
+
+<Benchmark
+  title="Memory Bandwidth: CPU vs. GPU"
+  columns={["Platform", "Memory Type", "Bandwidth", "Typical RAM", "Cost"]}
+  rows={[
+    { values: ["Intel i9-14900K", "DDR5-5600", "89 GB/s", "64 GB", "$600"], highlight: false },
+    { values: ["AMD Ryzen 9 7950X", "DDR5-5200", "83 GB/s", "64 GB", "$550"], highlight: false },
+    { values: ["Apple M3 Max", "LPDDR5", "400 GB/s", "128 GB", "$3,200"], highlight: true },
+    { values: ["NVIDIA RTX 4090", "GDDR6X", "1,008 GB/s", "24 GB", "$1,600"], highlight: false },
+    { values: ["NVIDIA A100 80GB", "HBM2e", "2,039 GB/s", "80 GB", "$15,000"], highlight: false },
+    { values: ["NVIDIA H100 80GB", "HBM3", "3,350 GB/s", "80 GB", "$30,000"], highlight: false }
+  ]}
+  notes="Bandwidth is theoretical peak. Effective bandwidth is typically 70-85% of peak. CPU bandwidth assumes dual-channel."
+/>
+
+An A100 has 23x the memory bandwidth of a typical desktop CPU. Since decode throughput is approximately:
+
+$$\text{Tokens/sec} \approx \frac{\text{Memory Bandwidth (GB/s)}}{\text{Model Size (GB)}}$$
+
+a 7B model in Q4 quantization (~3.5 GB) runs at roughly $89 / 3.5 \approx 25$ tokens/sec on a DDR5 desktop CPU, vs. $2{,}039 / 3.5 \approx 583$ tokens/sec on an A100. The GPU is 23x faster for the same model.
+
+But this comparison is misleading for two reasons: (1) the GPU costs 25x more, and (2) for single-user interactive use, 25 tokens/sec is perfectly usable while 583 tokens/sec is wasted capacity.
+
+<Callout type="perf" title="The Key CPU Inference Insight">
+  CPU inference is not about matching GPU speed. It is about achieving *sufficient* speed at a fraction of the cost. For single-user applications, 10-30 tokens/sec is comfortable. For batch processing, CPU throughput per dollar can match or beat GPU for small models.
+</Callout>
+
+---
+
+## 2. llama.cpp Architecture
+
+### Design Philosophy
+
+llama.cpp was created by Georgi Gerganov in March 2023 with a radical design choice: pure C/C++ with no external dependencies for the core inference engine. No PyTorch, no CUDA SDK, no Python. The entire inference pipeline -- model loading, tokenization, forward pass, sampling -- is implemented from scratch.
+
+This matters for CPU inference because:
+
+- **No framework overhead.** PyTorch adds significant overhead for small batch sizes: Python interpreter cost, tensor allocation, operator dispatch. For decode at batch size 1 (the common CPU case), this overhead can exceed the actual computation time.
+- **Custom quantization kernels.** llama.cpp implements quantization-aware matrix multiplication kernels hand-tuned for each SIMD instruction set. These kernels outperform generic BLAS libraries on quantized data.
+- **Minimal memory footprint.** No Python runtime, no CUDA context, no framework tensors. The process memory is dominated by the model weights and KV cache, not by framework bookkeeping.
+
+### Model Loading: mmap for Zero-Copy Access
+
+One of llama.cpp's most important optimizations is using `mmap` (memory-mapped file I/O) for model loading. Instead of reading the entire model file into a malloc'd buffer, llama.cpp maps the file directly into the process's virtual address space. The operating system's virtual memory system handles paging model data from disk into physical RAM on demand.
+
+The benefits are significant:
+
+**Instant startup.** The `mmap` call returns immediately -- it just sets up page table entries. The model is not loaded into RAM until the first access. For a 35 GB model, this reduces "load time" from 20-30 seconds (sequential read) to under 1 second.
+
+**Shared memory across processes.** If multiple llama.cpp instances load the same model file, the OS deduplicates the physical pages. Ten instances of a 35 GB model do not require 350 GB of RAM -- they share the same 35 GB of physical pages (plus per-instance KV cache).
+
+**Graceful degradation.** If the model is larger than available RAM, the OS pages portions to disk transparently. Performance degrades gradually (disk I/O is slow) rather than failing with an out-of-memory error. This enables experimentation with larger models than RAM would normally permit.
+
+<Callout type="info" title="mmap on Different Platforms">
+  On Linux/macOS, mmap is a first-class system call. On Windows, llama.cpp uses `CreateFileMapping`/`MapViewOfFile`, which provides equivalent functionality. The GGUF format is designed with mmap in mind -- tensors are stored in a layout that allows direct pointer arithmetic on the mapped region without copying or reformatting.
+</Callout>
+
+### Threading Model
+
+llama.cpp uses a thread pool for parallelizing the forward pass across CPU cores. The threading strategy differs between the two main compute patterns:
+
+**Matrix-vector multiplication (decode).** The weight matrix is partitioned row-wise across $T$ threads. Each thread computes a portion of the output vector independently. For a $(d_{\text{out}} \times d_{\text{in}})$ weight matrix with $T$ threads, each thread handles $d_{\text{out}} / T$ output rows. There is no inter-thread communication during the multiply -- only a barrier at the end.
+
+**Matrix-matrix multiplication (prefill/batch decode).** For larger batches, the computation is tiled in both the output and batch dimensions. Thread $i$ computes a tile of the output matrix, with tile sizes chosen to fit in L2 cache.
+
+The optimal thread count is not simply "number of cores." On modern CPUs with heterogeneous cores (Intel P-cores + E-cores, ARM big.LITTLE), using only the performance cores often yields better throughput than using all cores because the slow cores create stragglers at the synchronization barrier.
+
+<Benchmark
+  title="llama.cpp Thread Scaling (Llama 7B Q4_K_M, Intel i9-13900K)"
+  columns={["Threads", "P-cores Used", "E-cores Used", "Decode (tok/s)", "Prefill (tok/s)"]}
+  rows={[
+    { values: ["1", "1", "0", "5.2", "18"], highlight: false },
+    { values: ["4", "4", "0", "16.8", "62"], highlight: false },
+    { values: ["8", "8", "0", "27.3", "104"], highlight: true },
+    { values: ["12", "8", "4", "28.1", "112"], highlight: false },
+    { values: ["16", "8", "8", "26.5", "118"], highlight: false },
+    { values: ["24", "8", "16", "24.8", "125"], highlight: false }
+  ]}
+  notes="i9-13900K: 8 P-cores + 16 E-cores. Optimal decode at 8 threads (P-cores only). Adding E-cores helps prefill marginally but hurts decode due to synchronization stalls."
+/>
+
+The sweet spot for decode on this CPU is 8 threads (P-cores only). Adding E-cores actually *decreases* decode throughput because the barrier wait for slow E-cores exceeds the work they contribute. For prefill, which has more work per thread, E-cores provide marginal benefit.
+
+### The Forward Pass
+
+llama.cpp implements the standard transformer forward pass with quantization-aware kernels. For each layer, the sequence is:
+
+1. **RMSNorm** on the input (elementwise, trivially parallel).
+2. **QKV projection**: three quantized matrix-vector multiplies against the input.
+3. **RoPE** (rotary position embedding): in-place rotation of Q and K vectors.
+4. **Attention**: softmax(QK^T / sqrt(d)) * V, implemented as a fused kernel.
+5. **Output projection**: quantized matrix-vector multiply.
+6. **RMSNorm** on the residual.
+7. **FFN**: two quantized matrix-vector multiplies (gate + up projection, then down projection) with SiLU activation.
+
+The quantized matrix-vector multiply is the bottleneck -- it accounts for ~85% of forward pass time during decode. The quality of this kernel determines overall performance, which is why llama.cpp invests heavily in SIMD-optimized implementations.
+
+---
+
+## 3. The GGUF Format
+
+### Why GGUF Replaced GGML
+
+The original GGML format was a simple binary dump: a magic number, some hyperparameters, and tensor data. It had several limitations:
+
+- No metadata beyond basic hyperparameters.
+- No way to specify the tokenizer, chat template, or model architecture.
+- No versioning -- format changes broke backward compatibility.
+- Tensor data interleaved with header information, making mmap alignment difficult.
+
+GGUF (GGML Unified Format), introduced in August 2023, addresses all of these. It is a self-describing binary format with a structured header, arbitrary key-value metadata, and aligned tensor storage.
+
+### GGUF File Structure
+
+A GGUF file has three sections:
+
+**1. Header (fixed size).**
+
+```
+Offset  Size  Field
+0x00    4     Magic: "GGUF" (0x46475547)
+0x04    4     Version (currently 3)
+0x08    8     Number of tensors (uint64)
+0x10    8     Number of metadata key-value pairs (uint64)
+```
+
+**2. Metadata key-value pairs (variable size).** Each pair has a string key and a typed value. Common keys include:
+
+- `general.architecture` -- model family (e.g., "llama", "mistral", "phi")
+- `general.name` -- human-readable model name
+- `llama.context_length` -- maximum context window
+- `llama.embedding_length` -- hidden dimension
+- `llama.block_count` -- number of transformer layers
+- `llama.attention.head_count` -- number of attention heads
+- `llama.attention.head_count_kv` -- number of KV heads (for GQA)
+- `tokenizer.ggml.model` -- tokenizer type ("llama", "gpt2", etc.)
+- `tokenizer.ggml.tokens` -- full vocabulary as a string array
+
+This self-describing metadata means llama.cpp does not need external configuration files or separate tokenizer files. Everything needed to run the model is in a single GGUF file.
+
+**3. Tensor data (aligned, mmap-friendly).** Each tensor entry in the header specifies the tensor name, shape, quantization type, and byte offset within the file. The actual tensor data is stored contiguously at the end of the file, with each tensor aligned to a 32-byte or 64-byte boundary for SIMD access.
+
+<Callout type="info" title="The Alignment Requirement">
+  SIMD instructions (AVX2, AVX-512, NEON) require data to be aligned to specific boundaries -- 32 bytes for AVX2, 64 bytes for AVX-512. GGUF aligns tensor data accordingly, allowing llama.cpp to use aligned load instructions (`_mm256_load_si256` instead of `_mm256_loadu_si256`) which are faster on some processors.
+</Callout>
+
+### Converting Models to GGUF
+
+The standard conversion pipeline is:
+
+1. **Start with a HuggingFace model** (PyTorch `.safetensors` or `.bin` files).
+2. **Run `convert_hf_to_gguf.py`** to produce an FP16 GGUF file. This script reads the HuggingFace config, maps tensor names to GGUF conventions, converts the tokenizer, and writes the binary file.
+3. **Run `llama-quantize`** to quantize the FP16 GGUF to a specific quantization type (e.g., Q4_K_M, Q5_K_M, Q8_0).
+
+The quantization step is where the real size reduction happens. FP16 GGUF for a 7B model is ~14 GB. Q4_K_M reduces it to ~4.1 GB -- a 3.4x compression.
+
+---
+
+## 4. CPU Quantization Types
+
+### Why CPU Quantization Differs from GPU
+
+GPU quantization (GPTQ, AWQ, FP8) is designed for tensor cores -- fixed-function units that compute small matrix multiplies (e.g., 4x4 in INT8) in a single cycle. The quantization scheme must map to the tensor core's input format, which constrains the design space.
+
+CPU quantization targets SIMD units (AVX2, AVX-512, NEON), which are more flexible but less powerful. SIMD instructions operate on vector registers (256-bit for AVX2, 512-bit for AVX-512, 128-bit for NEON) and can perform arbitrary integer/float arithmetic. This flexibility allows CPU quantization schemes to use block-level scaling, non-uniform bit widths, and mixed-precision approaches that would not map efficiently to tensor cores.
+
+### The Quantization Types
+
+llama.cpp supports a family of quantization types. The naming convention is `Q{bits}_{variant}`:
+
+**Q4_0 (4-bit, simple).** The simplest quantization. Weights are grouped into blocks of 32 values. Each block has one FP16 scale factor. Each weight is stored as a 4-bit integer (0-15), dequantized as:
+
+$$w_i = (q_i - 8) \times \text{scale}$$
+
+Block size: $32 \times 0.5 + 2 = 18$ bytes for 32 weights = **4.5 bits per weight** (the scale overhead adds 0.5 bits).
+
+**Q4_K_M (4-bit, K-quant medium).** The "K-quants" are a more sophisticated scheme that uses super-blocks of 256 weights. Within each super-block, weights are grouped into sub-blocks of 32, each with its own scale and minimum value. The super-block has a shared FP16 super-scale. This two-level scaling reduces quantization error significantly:
+
+$$w_i = (\text{super\_scale} \times \text{sub\_scale}_j) \times q_i + (\text{super\_min} \times \text{sub\_min}_j)$$
+
+The "M" in Q4_K_M means "medium" -- a balanced quality/speed tradeoff. Q4_K_S ("small") uses less metadata for slightly faster dequantization. Higher quality per bit than Q4_0 at minimal speed cost.
+
+**Q5_K_M (5-bit, K-quant medium).** Same K-quant structure but with 5 bits per weight instead of 4. The extra bit provides noticeably better quality, especially for larger models where quantization error accumulates across layers.
+
+**Q8_0 (8-bit, simple).** Eight bits per weight with a per-block FP16 scale. Minimal quality loss -- typically within 0.1 perplexity points of FP16 -- but only 2x compression instead of 4x. Used when quality is paramount or as a baseline for comparison.
+
+<Benchmark
+  title="Quantization Type Comparison (Llama 3 8B, Perplexity on WikiText-2)"
+  columns={["Type", "Bits/Weight", "Model Size", "Perplexity", "Decode Speed (i9, tok/s)"]}
+  rows={[
+    { values: ["FP16", "16.0", "16.1 GB", "5.53", "4.8"], highlight: false },
+    { values: ["Q8_0", "8.5", "8.5 GB", "5.54", "10.2"], highlight: false },
+    { values: ["Q5_K_M", "5.7", "5.7 GB", "5.69", "16.8"], highlight: false },
+    { values: ["Q4_K_M", "4.8", "4.9 GB", "5.86", "20.1"], highlight: true },
+    { values: ["Q4_0", "4.5", "4.6 GB", "6.15", "22.3"], highlight: false },
+    { values: ["Q3_K_M", "3.9", "4.0 GB", "6.62", "23.8"], highlight: false },
+    { values: ["Q2_K", "3.4", "3.5 GB", "8.81", "25.1"], highlight: false }
+  ]}
+  notes="Perplexity: lower is better. Speed measured on Intel i9-13900K, 8 threads. Q4_K_M is generally considered the sweet spot."
+/>
+
+**Q4_K_M is the community standard** for good reason: it achieves only 0.33 perplexity points worse than FP16 (5.86 vs. 5.53) while being 3.3x smaller and 4.2x faster on CPU. The quality difference is imperceptible in most applications.
+
+<Callout type="tip" title="Choosing a Quantization Type">
+  **Q4_K_M**: Default choice for most use cases. Best quality-per-bit. **Q5_K_M**: When you have the RAM and want higher quality (code generation, technical writing). **Q8_0**: When quality is critical and size is secondary. **Q3_K_M / Q2_K**: When the model barely fits in RAM -- quality degrades noticeably, use only if necessary.
+</Callout>
+
+### Importance Matrix (imatrix) Quantization
+
+A recent advancement in llama.cpp quantization is importance-matrix-aware quantization. The insight: not all weights are equally important. Weights that are multiplied by high-magnitude activations contribute more to the output and should be quantized more carefully.
+
+The process:
+
+1. Run the FP16 model on a calibration dataset (typically a few hundred text samples).
+2. Record the squared magnitude of activations at each weight position: $I_{ij} = \mathbb{E}[x_j^2]$ where $x_j$ is the input to weight $w_{ij}$.
+3. During quantization, weight the quantization error by the importance matrix: minimize $\sum_{ij} I_{ij} (w_{ij} - \hat{w}_{ij})^2$ instead of uniform $\sum_{ij} (w_{ij} - \hat{w}_{ij})^2$.
+
+This produces measurably better quality at the same bit width -- typically 0.1-0.3 perplexity points improvement for Q4_K_M. The cost is a one-time calibration run.
+
+---
+
+## 5. SIMD Exploitation
+
+### The SIMD Landscape
+
+Modern CPUs provide SIMD (Single Instruction, Multiple Data) instruction sets that operate on wide vector registers:
+
+- **SSE4.2** (128-bit, 4x FP32 or 16x INT8): baseline for x86-64, available on all modern Intel/AMD CPUs.
+- **AVX2** (256-bit, 8x FP32 or 32x INT8): available since Intel Haswell (2013) and AMD Excavator (2015). The practical baseline for llama.cpp performance.
+- **AVX-512** (512-bit, 16x FP32 or 64x INT8): available on server CPUs (Intel Xeon, Ice Lake+) and recent consumer chips (Intel Alder Lake E-cores, AMD Zen 4+). Significant performance uplift but limited availability.
+- **ARM NEON** (128-bit, 4x FP32 or 16x INT8): available on all ARM processors including Apple Silicon, Raspberry Pi 4+, Qualcomm Snapdragon.
+
+llama.cpp detects the available instruction set at compile time (or runtime via CPUID) and dispatches to the optimal kernel implementation.
+
+### How the Quantized Dot Product Works
+
+The core operation in CPU LLM inference is the dot product between a quantized weight vector and an FP32 activation vector. For Q4_0 quantization with AVX2, the kernel does:
+
+1. **Load a block of 32 quantized weights** (16 bytes of 4-bit values + 2 bytes of FP16 scale = 18 bytes total) into registers.
+2. **Unpack the 4-bit values** into 8-bit integers using shift and mask operations. Two 4-bit values are packed into each byte, so unpacking a 16-byte vector of packed values produces two 16-byte vectors of 8-bit values.
+3. **Subtract the zero point** (8 for Q4_0) to get signed integers.
+4. **Multiply by activations** using `_mm256_maddubs_epi16` (multiply-add unsigned bytes to signed words), which computes 32 int8*int8 products and pairwise-accumulates into 16 int16 results in a single instruction.
+5. **Accumulate** into a running FP32 sum, converting through int32 intermediates.
+6. **Scale** the block sum by the FP16 scale factor.
+
+The critical insight is that the inner loop processes 32 weight-activation pairs per iteration, each iteration taking ~3-5 cycles on a modern CPU. For a 4096-dimensional vector, that is 128 iterations or ~400-640 cycles -- under 200 nanoseconds at 3 GHz.
+
+<PerfChart
+  title="Quantized Dot Product Throughput by SIMD Level"
+  unit="GOPS (billion ops/sec)"
+  data={[
+    { label: "Scalar (no SIMD)", value: 3.2, color: "red", annotation: "1 op/cycle" },
+    { label: "SSE4.2 (128-bit)", value: 12.8, color: "orange", annotation: "4x scalar" },
+    { label: "AVX2 (256-bit)", value: 38.4, color: "blue", annotation: "12x scalar" },
+    { label: "AVX-512 (512-bit)", value: 76.8, color: "green", annotation: "24x scalar" },
+    { label: "AVX-512 VNNI", value: 153.6, color: "green", annotation: "48x scalar" }
+  ]}
+  baseline={0}
+/>
+
+AVX-512 with VNNI (Vector Neural Network Instructions) provides 48x throughput over scalar code. VNNI adds `VPDPBUSD` -- a single instruction that computes 64 int8 multiply-accumulate operations -- which is essentially a mini tensor core in SIMD form.
+
+### ARM NEON Implementation
+
+ARM NEON operates on 128-bit registers but compensates with several advantages:
+
+- **Efficient 8-bit multiply-accumulate**: `SMLAL` (signed multiply-accumulate long) computes eight int8*int8 products in one instruction.
+- **Dot product instruction (SDOT/UDOT)**: Available on ARMv8.2+ (including Apple M1+), this computes four dot products of 4-element int8 vectors in a single instruction -- functionally similar to AVX-512 VNNI but in a 128-bit register.
+- **Lower power consumption**: ARM NEON operations consume significantly less power per operation than AVX-512, making them ideal for battery-powered devices.
+
+Apple Silicon M-series chips have particularly wide NEON implementations with high throughput, which partially explains their strong llama.cpp performance.
+
+---
+
+## 6. Apple Silicon: The Unified Memory Advantage
+
+### Why M-Series Is Uniquely Good for LLM Inference
+
+Apple Silicon has emerged as the best consumer platform for CPU-based LLM inference, and the reasons are architectural, not just marketing.
+
+**Unified Memory Architecture (UMA).** On discrete GPU systems, model weights live in GPU VRAM and must be transferred over PCIe for CPU access (or vice versa). On Apple Silicon, CPU and GPU share the same physical memory. There is no copy -- the GPU can read the same memory-mapped GGUF weights that the CPU loaded. This eliminates the single biggest bottleneck in hybrid CPU+GPU inference.
+
+**High memory bandwidth.** The M3 Max achieves 400 GB/s memory bandwidth -- 4.5x more than a DDR5 desktop CPU (89 GB/s) and approaching the RTX 4090's 1,008 GB/s. The M4 Ultra is expected to exceed 800 GB/s.
+
+**Large memory capacity.** The M3 Max supports up to 128 GB of unified memory. The M2 Ultra supports 192 GB. This is enough to hold a 70B model in Q4_K_M (~35 GB) with ample room for KV cache.
+
+**Metal GPU backend.** llama.cpp supports Apple's Metal API for running inference on the M-series GPU cores. The GPU cores share unified memory with the CPU, so there is zero data transfer cost. The M3 Max has a 40-core GPU with ~14.2 TFLOPS FP16 compute.
+
+<Benchmark
+  title="Apple Silicon LLM Inference Performance"
+  columns={["Platform", "Memory BW", "Model", "Quantization", "Decode (tok/s)", "Cost"]}
+  rows={[
+    { values: ["M2 MacBook Air (24GB)", "100 GB/s", "Llama 3 8B", "Q4_K_M", "14.2", "$1,200"], highlight: false },
+    { values: ["M3 Pro Mac (36GB)", "200 GB/s", "Llama 3 8B", "Q4_K_M", "27.8", "$2,000"], highlight: false },
+    { values: ["M3 Max Mac (64GB)", "400 GB/s", "Llama 3 8B", "Q4_K_M", "52.3", "$3,200"], highlight: true },
+    { values: ["M3 Max Mac (64GB)", "400 GB/s", "Llama 3 70B", "Q4_K_M", "11.6", "$3,200"], highlight: true },
+    { values: ["M2 Ultra Mac (192GB)", "800 GB/s", "Llama 3 70B", "Q4_K_M", "22.4", "$4,800"], highlight: true },
+    { values: ["RTX 4090 (24GB)", "1,008 GB/s", "Llama 3 8B", "GPTQ-4bit", "118.0", "$1,600 GPU"], highlight: false }
+  ]}
+  notes="Decode speed at batch size 1. Apple Silicon numbers use Metal backend. RTX 4090 number for reference. The M3 Max running 70B at 11.6 tok/s is remarkable for a laptop."
+/>
+
+The M3 Max running Llama 3 70B at 11.6 tokens/sec on a *laptop* is genuinely impressive. No x86 laptop comes close because no x86 laptop has 400 GB/s memory bandwidth. The RTX 4090 is faster in absolute terms but costs $1,600 for the GPU alone (plus a desktop chassis, PSU, motherboard, and CPU), and it cannot run 70B at all -- the 24 GB VRAM is insufficient for even a Q4 70B model (which requires ~35 GB).
+
+<Callout type="perf" title="Apple Silicon's Secret Weapon: Memory Capacity + Bandwidth">
+  The combination of high bandwidth (400+ GB/s) and large capacity (64-192 GB) in a laptop form factor is unique to Apple Silicon. x86 laptops have neither (DDR5 laptop bandwidth is ~50-75 GB/s, capacity tops out at 64 GB). Discrete GPUs have bandwidth but limited capacity (24 GB consumer, 80 GB enterprise). Apple Silicon occupies a sweet spot that is ideal for LLM inference.
+</Callout>
+
+### Metal Backend Details
+
+When using the Metal backend, llama.cpp offloads matrix multiplications to the M-series GPU cores. The GPU processes the quantized GEMV operations while the CPU handles attention, normalization, and sampling. Since both share unified memory, there is zero data transfer overhead between CPU and GPU computations.
+
+The Metal shaders implement the same quantized dot product as the NEON CPU kernels but leverage the GPU's massively parallel architecture. The M3 Max's 40-core GPU can process thousands of dot products simultaneously, achieving higher throughput than the 12-core CPU for large matrix operations.
+
+However, the Metal backend has limitations:
+
+- **Kernel launch overhead.** Each Metal dispatch has ~10-20 microseconds of overhead. For the many small operations in a transformer layer (norms, activations, attention), this overhead accumulates.
+- **No FlashAttention equivalent.** As of early 2025, the Metal backend uses a standard attention implementation without the memory-efficient tiling of FlashAttention. For long sequences, this limits performance.
+- **Driver maturity.** Apple's Metal Performance Shaders are less mature for AI workloads than CUDA. Performance improves with each macOS release but still lags CUDA's optimization depth.
+
+---
+
+## 7. When CPU Wins: The Cost Analysis
+
+### Cost Per Token
+
+The most important metric for deployment decisions is cost per token, which depends on utilization, hardware cost, and throughput.
+
+For a single-user, on-demand scenario:
+
+$$\text{Cost per token} = \frac{\text{Hardware cost per hour}}{\text{Tokens per second} \times 3600}$$
+
+<Benchmark
+  title="Cost Per Million Tokens: CPU vs. GPU (Single User, Llama 3 8B Q4)"
+  columns={["Platform", "$/hour", "Tok/s", "$/1M tokens", "Break-even vs. API"]}
+  rows={[
+    { values: ["CPU VM (c6i.2xlarge, 8 vCPU)", "$0.34", "12", "$7.87", "127K tok/day"], highlight: false },
+    { values: ["CPU VM (c7g.4xlarge, ARM)", "$0.58", "22", "$7.32", "118K tok/day"], highlight: false },
+    { values: ["Apple M3 Max (amortized)", "$0.18", "52", "$0.96", "15K tok/day"], highlight: true },
+    { values: ["RTX 4090 VM (g5.xlarge)", "$1.01", "118", "$2.38", "38K tok/day"], highlight: false },
+    { values: ["A100 80GB (p4d.24xlarge, 1 GPU)", "$3.45", "480", "$2.00", "32K tok/day"], highlight: false },
+    { values: ["OpenAI API (GPT-4o-mini)", "N/A", "N/A", "$0.60", "Baseline"], highlight: false }
+  ]}
+  notes="CPU VM: AWS on-demand pricing. Apple: amortized over 3 years, 8 hrs/day use. API: GPT-4o-mini output pricing. Break-even = daily tokens needed to be cheaper than API."
+/>
+
+Several insights emerge:
+
+1. **CPU VMs are expensive per token** because their throughput is low. A $0.34/hr CPU VM at 12 tok/s costs $7.87/M tokens -- 13x more than the API.
+
+2. **Apple Silicon is remarkably cost-effective** because the hardware cost is amortized and the throughput is high. At $0.96/M tokens, it beats the API by 1.6x (and there is no per-token charge -- the amortized cost is paid regardless of usage).
+
+3. **GPUs win on cost per token** in absolute terms due to superior throughput. But they require much higher utilization to justify the hourly cost.
+
+### Where CPU Wins: The Break-Even Analysis
+
+CPU inference wins over GPU in specific scenarios:
+
+**Scenario 1: Low volume, variable demand.** If you process fewer than ~50K tokens per day, a CPU VM is cheaper than a GPU VM because you are not paying $3.45/hr for idle GPU time. The CPU VM at $0.34/hr costs 10x less to sit idle.
+
+**Scenario 2: Many small models.** If you serve 10 different specialized 1B-3B models, each on its own CPU VM ($0.34/hr each = $3.40/hr total), this is cheaper than one A100 ($3.45/hr) and provides better isolation and fault tolerance.
+
+**Scenario 3: Privacy-constrained.** When data cannot leave the device (medical, legal, financial), CPU inference on a local machine has zero ongoing cost beyond electricity. The alternative -- running a GPU on-premises -- costs $30,000+ for the hardware.
+
+**Scenario 4: Long input, short output.** CPU prefill is slow but the cost is amortized over output tokens. If the prompt is 10,000 tokens and the output is 50 tokens, the prefill cost dominates and the per-output-token cost is high for both CPU and GPU. The *per-query* cost gap narrows.
+
+<PerfChart
+  title="Monthly Cost at Different Volumes (Llama 3 8B Q4)"
+  unit="$/month"
+  data={[
+    { label: "CPU @ 100K tok/day", value: 24, color: "green", annotation: "CPU wins" },
+    { label: "GPU @ 100K tok/day", value: 104, color: "red", annotation: "4.3x more expensive" },
+    { label: "CPU @ 1M tok/day", value: 245, color: "orange", annotation: "CPU competitive" },
+    { label: "GPU @ 1M tok/day", value: 104, color: "green", annotation: "GPU wins" },
+    { label: "CPU @ 10M tok/day", value: 2450, color: "red", annotation: "CPU loses badly" },
+    { label: "GPU @ 10M tok/day", value: 104, color: "green", annotation: "GPU wins 24x" }
+  ]}
+  baseline={0}
+/>
+
+The crossover is around 500K-1M tokens per day. Below that, CPU is cheaper (you need fewer hours running). Above that, GPU throughput dominance makes it much more cost-effective.
+
+<Callout type="warning" title="The Utilization Trap">
+  GPU cost analysis assumes the GPU is actively processing tokens during its paid hours. If your GPU instance sits idle 80% of the time waiting for requests, your effective cost per token is 5x higher than the theoretical rate. CPU instances are cheaper to leave idle, making them more forgiving of bursty workloads.
+</Callout>
+
+---
+
+## 8. Hybrid CPU+GPU: Layer Offloading
+
+### The Offloading Concept
+
+llama.cpp supports partial GPU offloading: some transformer layers run on the GPU while others run on the CPU. This enables running models that do not fit entirely in GPU VRAM by placing as many layers as possible on the GPU and the remainder on the CPU.
+
+For a 70B model with 80 layers, an RTX 4090 with 24 GB VRAM might hold 35-40 layers on the GPU while the remaining 40-45 layers run on the CPU. The command:
+
+```bash
+llama-server -m llama-70b-q4_k_m.gguf -ngl 35
+```
+
+offloads 35 layers to the GPU and runs the rest on the CPU.
+
+### The Bandwidth Bottleneck
+
+The performance of hybrid offloading depends entirely on the data transfer between CPU and GPU. After the GPU processes its layers, the intermediate activations (hidden states) must be transferred to the CPU over PCIe for the remaining layers, and then back to the GPU for the next token.
+
+For a 70B model with hidden dimension 8192:
+
+$$\text{Transfer per layer boundary} = 2 \times d_{\text{model}} \times \text{bytes} = 2 \times 8192 \times 2 = 32{,}768 \text{ bytes} \approx 32 \text{ KB}$$
+
+At PCIe 4.0 x16 bandwidth (32 GB/s theoretical, ~25 GB/s effective), transferring 32 KB takes ~1.3 microseconds. This is negligible -- the bottleneck is not the transfer size but the *latency* of crossing the PCIe bus (5-10 microseconds per transfer, dominated by DMA setup and synchronization).
+
+With two boundary crossings per token (GPU-to-CPU and CPU-to-GPU), the overhead is ~10-20 microseconds per token. At 30 tok/s, each token takes ~33 ms, so the PCIe overhead is under 0.1% -- completely negligible.
+
+<Benchmark
+  title="Hybrid Offloading Performance (Llama 3 70B Q4_K_M, RTX 4090 24GB)"
+  columns={["GPU Layers", "CPU Layers", "VRAM Used", "Decode (tok/s)", "Speedup vs. CPU-Only"]}
+  rows={[
+    { values: ["0 (CPU only)", "80", "0 GB", "3.1", "1.0x"], highlight: false },
+    { values: ["20", "60", "8.5 GB", "5.8", "1.9x"], highlight: false },
+    { values: ["35", "45", "15.2 GB", "8.4", "2.7x"], highlight: false },
+    { values: ["45", "35", "19.8 GB", "10.9", "3.5x"], highlight: true },
+    { values: ["55", "25", "23.1 GB", "13.2", "4.3x"], highlight: true },
+    { values: ["80 (GPU only)", "0", "35.2 GB", "N/A (OOM)", "N/A"], highlight: false }
+  ]}
+  notes="Intel i9-13900K + RTX 4090. The 70B Q4 model needs ~35 GB, exceeding 24 GB VRAM. Offloading 55/80 layers fits in VRAM and achieves 4.3x speedup over CPU-only."
+/>
+
+The hybrid approach achieves 13.2 tok/s with 55 layers on the GPU -- 4.3x faster than CPU-only and approaching the threshold of comfortable interactive use. The speedup is roughly proportional to the fraction of layers on the GPU, as expected.
+
+### When Offloading Is Not Worth It
+
+Offloading has diminishing returns when:
+
+1. **The model fits entirely on the GPU.** If the model fits in VRAM, offloading some layers to CPU only slows things down. Use `--ngl 999` (all layers on GPU).
+
+2. **Very few layers fit on the GPU.** If you can only offload 5-10 layers (e.g., an RTX 3060 with 12 GB trying to offload from a 70B model), the GPU processes such a small fraction of the model that the speedup is marginal (1.2-1.5x) and may not justify the GPU power consumption.
+
+3. **PCIe bandwidth is limited.** Older systems with PCIe 3.0 x8 or lower have half the bandwidth, doubling transfer overhead. This is still not the bottleneck for the hidden state transfer, but it matters for initial model loading if the GPU layers must be copied from system RAM.
+
+---
+
+## 9. Practical Recommendations
+
+For practitioners considering CPU inference:
+
+1. **Start with Q4_K_M.** It is the sweet spot for quality vs. speed vs. size. Only deviate if you have a specific reason (quality-critical: Q5_K_M or Q8_0; memory-constrained: Q3_K_M).
+
+2. **Match thread count to performance cores.** On Intel hybrid CPUs, set `--threads` to the P-core count, not the total core count. On AMD, use all cores. On Apple Silicon, use all performance cores.
+
+3. **Use mmap (default).** Do not disable mmap unless you have a specific reason. It provides instant startup and cross-process memory sharing.
+
+4. **Apple Silicon: use Metal.** Always enable the Metal backend (`--ngl 999`) on Apple Silicon. The unified memory architecture means GPU offloading has zero data transfer cost and strictly improves performance.
+
+5. **x86 + discrete GPU: offload as many layers as fit.** For RTX 3090/4090, set `--ngl` to the maximum that fits in VRAM. Use `nvidia-smi` to check remaining VRAM after loading.
+
+6. **For serving: consider llama.cpp's built-in server.** `llama-server` provides an OpenAI-compatible API with continuous batching, slot management, and concurrent request handling -- suitable for light production use.
+
+7. **Monitor token speed, not just peak.** CPU inference speed varies with sequence length (longer sequences slow attention) and quantization type. Benchmark with your actual prompt lengths, not just short test prompts.
+
+8. **Use importance matrix quantization for quality-sensitive deployments.** The one-time calibration cost is negligible compared to the quality improvement it provides, especially at Q3 and Q4 bit widths.
+
+CPU inference is not a consolation prize -- it is a legitimate deployment strategy for the right workloads. As models get more efficient (smaller architectures, better distillation) and hardware improves (DDR5 bandwidth, wider SIMD, Apple Silicon generations), the performance gap narrows. The 7B model you run locally today at 25 tok/s may be functionally equivalent to the 70B model you needed a GPU cluster for two years ago.

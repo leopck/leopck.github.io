@@ -1,0 +1,556 @@
+---
+title: "Constrained Generation: FSM-Based Decoding, Outlines, and Grammar-Guided LLM Output"
+author: "stanley-phoong"
+description: "A thorough technical analysis of constrained decoding for LLMs: token-level logit masking, finite state machine compilation from regex and JSON schemas, context-free grammar support via pushdown automata, the Outlines and SGLang grammar engines, performance overhead analysis, interaction with speculative decoding, and production deployment patterns."
+publishDate: 2025-03-21
+category: llm-inference
+tags: [constrained-decoding, structured-output, fsm, grammar, json, outlines, sglang]
+difficulty: advanced
+readingTime: 28
+series: "Inference Optimization Timeline"
+seriesOrder: 11
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import CodeCompare from '@/components/mdx/CodeCompare.astro';
+
+Large language models generate text one token at a time by sampling from a probability distribution over the entire vocabulary. This is fine for conversational output, but modern applications need more: valid JSON for API responses, syntactically correct SQL for database queries, well-formed function calls for tool use. The default strategy -- generate freely and hope the model follows your format instructions, retrying on failure -- is fragile, expensive, and fundamentally at odds with how we build reliable systems.
+
+Constrained decoding solves this by intervening at the logit level: at every generation step, before sampling, we mask out tokens that would lead to invalid output. The model can only produce tokens that are consistent with a target format. The result is guaranteed-valid structured output with zero retries and minimal overhead.
+
+This post covers the full landscape: the mathematical foundation of token-level constraining, finite state machine compilation for regular languages, pushdown automata for context-free grammars, the Outlines and SGLang implementations, performance overhead analysis, the hard problem of combining constraints with speculative decoding, and production deployment patterns from OpenAI function calling to open-source grammar engines.
+
+---
+
+## 1. The Problem: LLMs Generate Text, Applications Need Structure
+
+Consider a function-calling scenario. Your application sends a prompt like:
+
+```
+Extract the user's name and age from the following text and return JSON.
+Text: "My name is Alice and I am 30 years old."
+Return format: {"name": string, "age": number}
+```
+
+A well-aligned model will *usually* return `{"name": "Alice", "age": 30}`. But "usually" is not "always." In production, you will encounter:
+
+- Extra text before or after the JSON: `"Sure! Here is the JSON: {"name": "Alice", "age": 30}"`
+- Missing closing braces: `{"name": "Alice", "age": 30`
+- Wrong types: `{"name": "Alice", "age": "thirty"}`
+- Hallucinated extra fields: `{"name": "Alice", "age": 30, "city": "NYC"}`
+- Malformed escaping: `{"name": "Alice\'s friend", "age": 30}`
+
+The naive fix is a retry loop: generate, parse, retry if invalid. This approach has several problems.
+
+<Callout type="warning" title="The Cost of Retry-Based Validation">
+  At 5% failure rate with up to 3 retries, the expected token cost is $1 + 0.05 + 0.0025 \approx 1.05x$ -- seemingly modest. But failure rates increase with schema complexity (nested objects, enums, arrays with constraints). For complex schemas, failure rates of 20-40% are common even with strong models, and each retry burns the full prompt tokens again. Worse, retries add unpredictable latency spikes that break SLA guarantees.
+</Callout>
+
+### What We Want Instead
+
+The ideal solution has four properties:
+
+1. **Guaranteed validity**: Every generated output parses correctly against the target schema. Not "usually" -- every single time.
+2. **Zero retries**: First generation attempt always succeeds.
+3. **Minimal overhead**: The constraining mechanism adds negligible latency to each decoding step.
+4. **Preserved quality**: The model's token choices are as good as unconstrained generation, within the space of valid outputs.
+
+Constrained decoding achieves all four. The mechanism is straightforward: at every decoding step, before the softmax and sampling, set the logits of all invalid tokens to $-\infty$. Only tokens that continue a valid output survive.
+
+---
+
+## 2. Token-Level Constrained Decoding: The Foundation
+
+### The Logit Masking Mechanism
+
+At each generation step $t$, the model produces a logit vector $\ell_t \in \mathbb{R}^{|V|}$ over the vocabulary $V$. Standard sampling computes:
+
+$$p_t(v) = \frac{\exp(\ell_t(v) / T)}{\sum_{v' \in V} \exp(\ell_t(v') / T)}$$
+
+for temperature $T$. In constrained decoding, we define a set of **allowed tokens** $A_t \subseteq V$ based on the constraint state, and modify the logits:
+
+$$\tilde{\ell}_t(v) = \begin{cases} \ell_t(v) & \text{if } v \in A_t \\ -\infty & \text{if } v \notin A_t \end{cases}$$
+
+After masking, we compute probabilities over the modified logits:
+
+$$\tilde{p}_t(v) = \frac{\exp(\tilde{\ell}_t(v) / T)}{\sum_{v' \in A_t} \exp(\ell_t(v') / T)}$$
+
+This is equivalent to **renormalizing** the original distribution restricted to $A_t$. The model's relative preferences among valid tokens are preserved exactly. If the model preferred token $a$ over token $b$ (both valid), it still prefers $a$ over $b$ by the same ratio.
+
+<Callout type="info" title="Why Logit Masking Preserves Quality">
+  Logit masking is not "forcing" the model to say something it does not want to say. It is removing options that violate the constraint, then letting the model choose freely among the remaining options. The conditional distribution $p(v | v \in A_t)$ is the mathematically correct way to sample from the model given the constraint. This is identical to what you would get if you could somehow retrain the model to never produce invalid outputs -- without the retraining cost.
+</Callout>
+
+### The Challenge: Computing $A_t$ Efficiently
+
+The hard part is computing the allowed token set $A_t$ at every step. For a vocabulary of 32,000-128,000 tokens, we need to determine which tokens can legally appear next, given the tokens generated so far and the target format.
+
+Naively checking every token against the constraint at every step would work but scale poorly. The key insight that makes constrained decoding practical is **precomputation**: compile the constraint into a state machine *before* generation begins, then use the machine's current state to look up $A_t$ in $O(1)$ time.
+
+---
+
+## 3. The FSM Approach: Regular Languages and Regex Constraints
+
+The Outlines library, introduced by Willard and Louf (2023), pioneered the FSM approach to constrained decoding. The idea is elegant: compile a regex (or JSON schema) into a deterministic finite automaton (DFA), precompute which vocabulary tokens are valid transitions from each state, and use this precomputed index at inference time.
+
+### Step 1: Compile the Constraint to a DFA
+
+A regular expression defines a regular language -- the set of all strings that match the pattern. Every regular language is recognized by a DFA: a tuple $(Q, \Sigma, \delta, q_0, F)$ where $Q$ is a finite set of states, $\Sigma$ is the alphabet (characters), $\delta : Q \times \Sigma \to Q$ is the transition function, $q_0$ is the initial state, and $F \subseteq Q$ is the set of accepting states.
+
+For a JSON string like `{"name": "...", "age": \d+}`, the DFA tracks the parser state: are we inside a key, inside a string value, expecting a colon, inside a number, etc.
+
+### Step 2: Build the Token-to-State Index
+
+This is where things get interesting. LLM tokens are not single characters -- they are substrings of varying length. A single token might be `"name"` (5 characters), `":` (2 characters), or even `{"` (2 characters). We need to map each vocabulary token to the DFA transitions it would cause.
+
+For each DFA state $q$ and each vocabulary token $t = c_1 c_2 \ldots c_k$:
+
+1. Starting from $q$, simulate the DFA on the character sequence $c_1, c_2, \ldots, c_k$.
+2. If the DFA reaches a valid state $q'$ without getting stuck, then token $t$ is a valid transition from $q$ to $q'$.
+3. If the DFA gets stuck (no valid transition for some $c_i$), then token $t$ is invalid from state $q$.
+
+We precompute this for all (state, token) pairs and store it as a mapping: `state -> set of valid tokens`.
+
+<Callout type="perf" title="Precomputation Cost">
+  For a vocabulary of $|V|$ tokens and a DFA with $|Q|$ states, the precomputation iterates over all $|Q| \times |V|$ pairs. With $|V| = 32{,}000$ and $|Q| = 50$ (a typical JSON schema DFA), that is 1.6 million pairs. Each pair requires simulating a short character sequence through the DFA. In practice, this takes 50-200ms -- a one-time cost amortized over all generation steps.
+</Callout>
+
+### Step 3: Inference-Time Masking
+
+At each generation step:
+
+1. Look up the current DFA state $q_t$.
+2. Retrieve the precomputed set $A_t = \text{valid\_tokens}[q_t]$.
+3. Apply the logit mask.
+4. Sample a token $v$ from the masked distribution.
+5. Advance the DFA state: $q_{t+1} = \text{next\_state}[q_t][v]$.
+
+The per-step cost is one hash table lookup and one bitmask application. The bitmask is a boolean vector of length $|V|$ indicating which tokens are valid. Applying it to the logit tensor is a single elementwise operation -- trivially fast on a GPU.
+
+### The Outlines Implementation
+
+Outlines implements this pipeline with several optimizations.
+
+<CodeCompare
+  beforeTitle="Unconstrained Generation"
+  afterTitle="FSM-Constrained Generation (Outlines)"
+>
+  <Fragment slot="before">
+```python
+# Standard generation: sample from full vocab
+import torch
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained("...")
+input_ids = tokenizer.encode(prompt)
+
+for step in range(max_tokens):
+    logits = model(input_ids).logits[:, -1, :]
+    # Sample from full vocabulary
+    token = torch.multinomial(
+        torch.softmax(logits, dim=-1), 1
+    )
+    input_ids = torch.cat([input_ids, token], dim=-1)
+    # Hope the output is valid JSON...
+    # If not, retry entire generation
+```
+  </Fragment>
+  <Fragment slot="after">
+```python
+# Outlines: compile schema, mask invalid tokens
+import outlines
+
+model = outlines.models.transformers("...")
+
+# One-time: compile JSON schema to FSM
+schema = '{"name": "string", "age": "integer"}'
+generator = outlines.generate.json(model, schema)
+
+# Each step: FSM masks invalid tokens
+# Only valid continuations survive softmax
+result = generator(prompt)
+# result is ALWAYS valid JSON matching schema
+# Zero retries needed
+```
+  </Fragment>
+</CodeCompare>
+
+Internally, Outlines converts JSON schemas to regex patterns (using the `jsonschema` to regex compilation), then compiles the regex to a DFA using the `interegular` library. The token-to-state index is built by iterating over the vocabulary and simulating each token through the DFA from each state.
+
+### Handling Multi-Token Transitions
+
+A subtle complication: some valid strings may require the DFA to "partially" consume a token. Consider a DFA state expecting a digit, and a vocabulary token `"30}"`. The first two characters (`30`) are valid digits, but the `}` is a different transition. Outlines handles this by tracking **partial** token matches and splitting the DFA state to account for tokens that span multiple DFA transitions.
+
+---
+
+## 4. The CFG Approach: Context-Free Grammars for Nested Structures
+
+Regular expressions handle many common formats, but they cannot express **recursive** structures. JSON is inherently recursive (objects can contain objects), and SQL has nested subqueries. These require context-free grammars (CFGs).
+
+### Why Regex Falls Short
+
+Consider validating nested JSON:
+
+```
+{"users": [{"name": "Alice", "friends": [{"name": "Bob"}]}]}
+```
+
+A regex cannot count matching braces and brackets to arbitrary depth. Regular languages, by definition, cannot match $a^n b^n$ -- and balanced braces are exactly this kind of language. You can write a regex for JSON nested to depth 3, or depth 5, but not to arbitrary depth.
+
+### Pushdown Automata
+
+Where DFAs recognize regular languages, **pushdown automata** (PDAs) recognize context-free languages. A PDA extends a DFA with a stack: it can push symbols onto the stack and pop them to decide transitions. The stack provides the memory needed to count matching delimiters.
+
+For JSON, the PDA's stack tracks the nesting structure:
+
+- Opening `{` pushes `OBJECT` onto the stack.
+- Opening `[` pushes `ARRAY` onto the stack.
+- Closing `}` pops and checks for `OBJECT`.
+- Closing `]` pops and checks for `ARRAY`.
+
+At any point during generation, the stack tells us exactly what closing delimiters are expected and in what order.
+
+### llama.cpp GBNF Format
+
+The llama.cpp project introduced **GBNF** (GGML BNF), a grammar specification format for constrained decoding. GBNF grammars are context-free grammars written in a BNF-like syntax:
+
+```
+root        ::= "{" ws members ws "}"
+members     ::= pair ("," ws pair)*
+pair        ::= ws string ws ":" ws value
+value       ::= string | number | "true" | "false" | "null" | object | array
+object      ::= "{" ws members? ws "}"
+array       ::= "[" ws values? ws "]"
+values      ::= value ("," ws value)*
+string      ::= "\"" chars "\""
+chars       ::= char*
+char        ::= [^"\\] | "\\" escape
+escape      ::= ["\\nrt/bfu]
+number      ::= "-"? digits ("." digits)? ([eE] [+-]? digits)?
+digits      ::= [0-9]+
+ws          ::= [ \t\n]*
+```
+
+At each generation step, llama.cpp maintains a stack of grammar states (the PDA configuration) and determines which tokens can legally extend the current partial parse.
+
+### SGLang's Grammar Engine
+
+SGLang takes a more performance-oriented approach. Rather than interpreting the grammar at each step, SGLang compiles the grammar into an **efficient jump-forward table** that handles multi-token lookahead. The key optimizations:
+
+1. **Grammar caching**: Compiled grammar states are cached and reused across requests with the same schema.
+2. **Jump-forward decoding**: When the grammar dictates that only a single continuation is possible (e.g., after `"name":` the next tokens must be `"` to start a string), SGLang inserts those tokens without running the model. This saves forward passes.
+3. **Compressed state representation**: Grammar states are hashed and deduplicated, reducing memory usage for complex grammars.
+
+<Callout type="tip" title="Jump-Forward Decoding">
+  When the grammar leaves only one valid token (or a deterministic sequence of tokens), SGLang inserts them directly without a model forward pass. For structured JSON with many fixed keys and delimiters, this can skip 30-50% of decoding steps entirely. A JSON object with 5 fixed keys might need only 40 model forward passes instead of 80, because the key names and structural tokens are inserted for free.
+</Callout>
+
+<PerfChart
+  title="Decoding Steps Saved by Jump-Forward (JSON Generation)"
+  unit="%"
+  data={[
+    { label: "Simple key-value (3 fields)", value: 35, color: "blue" },
+    { label: "Nested object (2 levels)", value: 42, color: "blue" },
+    { label: "Array of objects", value: 38, color: "blue" },
+    { label: "Complex schema (10 fields)", value: 51, color: "green" },
+    { label: "Enum-heavy schema", value: 62, color: "green" },
+    { label: "Free-form string fields", value: 8, color: "orange" }
+  ]}
+/>
+
+Note the last entry: when the schema contains mostly free-form string fields, there are few deterministic tokens to insert, and jump-forward provides little benefit. The optimization is most effective for schemas with many fixed structural elements.
+
+---
+
+## 5. Performance Analysis: How Much Does Constraining Cost?
+
+Constrained decoding adds overhead at two points: one-time compilation and per-step masking. Let us quantify both.
+
+### Grammar/FSM Compilation
+
+Compilation converts the schema into a state machine and precomputes the token validity index.
+
+<Benchmark
+  title="Compilation Time by Schema Complexity"
+  columns={["Schema Type", "DFA/PDA States", "Vocabulary Size", "Compilation Time", "Index Memory"]}
+  rows={[
+    { values: ["Simple regex (email)", "12", "32,000", "15 ms", "1.5 MB"], highlight: false },
+    { values: ["JSON (3 fields, flat)", "45", "32,000", "65 ms", "5.8 MB"], highlight: false },
+    { values: ["JSON (nested, 2 levels)", "120", "32,000", "180 ms", "15.4 MB"], highlight: false },
+    { values: ["JSON (complex, 10 fields)", "280", "32,000", "420 ms", "36 MB"], highlight: true },
+    { values: ["SQL SELECT grammar", "350", "32,000", "580 ms", "45 MB"], highlight: true },
+    { values: ["JSON (complex, 128k vocab)", "280", "128,000", "1,650 ms", "144 MB"], highlight: true }
+  ]}
+  notes="Compilation is a one-time cost. With caching, subsequent requests with the same schema pay zero compilation overhead. The 128k vocabulary row shows that larger vocabularies increase compilation time roughly linearly."
+/>
+
+Two observations. First, compilation time scales linearly with both the number of states and vocabulary size. For a 128k-token vocabulary (common with newer tokenizers like Llama 3's), compilation for complex schemas can exceed one second. Second, the precomputed index consumes non-trivial memory. At 280 states and 128k vocabulary, storing a bit per (state, token) pair requires $280 \times 128{,}000 / 8 \approx 4.5$ MB just for the bitmask, but the full index with state transitions is much larger.
+
+### Per-Step Masking Overhead
+
+The per-step cost is the time to look up the current state's valid token set and apply the mask to the logit tensor.
+
+<PerfChart
+  title="Per-Step Masking Overhead (A100 GPU)"
+  unit="ms"
+  data={[
+    { label: "Model forward pass (7B)", value: 12.5, color: "blue" },
+    { label: "Model forward pass (70B)", value: 68.0, color: "blue" },
+    { label: "FSM mask (32k vocab)", value: 0.08, color: "green", annotation: "0.6% of 7B step" },
+    { label: "FSM mask (128k vocab)", value: 0.22, color: "green", annotation: "0.3% of 70B step" },
+    { label: "CFG mask (simple)", value: 0.15, color: "green" },
+    { label: "CFG mask (complex)", value: 0.45, color: "orange", annotation: "3.6% of 7B step" }
+  ]}
+/>
+
+The masking overhead is negligible for FSM constraints and small even for complex CFG constraints. The cost is dominated by the bitmask-to-logit application, which is an elementwise GPU operation over the vocabulary dimension.
+
+### End-to-End Impact
+
+Putting it all together: what is the total latency impact of constrained decoding on a real workload?
+
+<Benchmark
+  title="End-to-End Constrained Decoding Overhead (Llama 3 8B, A100)"
+  columns={["Configuration", "Time to First Token (ms)", "Total Generation Time (ms)", "Output Tokens", "Overhead vs. Unconstrained"]}
+  rows={[
+    { values: ["Unconstrained", "45", "1,250", "100", "baseline"], highlight: false },
+    { values: ["Regex constraint", "62", "1,258", "100", "1.0%"], highlight: false },
+    { values: ["JSON (flat, 5 fields)", "115", "1,275", "85*", "2.0%"], highlight: false },
+    { values: ["JSON (nested)", "230", "1,310", "92*", "4.8%"], highlight: true },
+    { values: ["JSON + jump-forward", "230", "980", "92*", "-21.6%"], highlight: true },
+    { values: ["SQL grammar", "625", "1,340", "95", "7.2%"], highlight: false }
+  ]}
+  notes="*Fewer output tokens because structural tokens are deterministic. Jump-forward skips model forward passes for deterministic tokens, actually reducing total generation time. First-token latency increase is due to grammar compilation (amortized to zero with caching)."
+/>
+
+<Callout type="perf" title="Jump-Forward Makes Constraints Free (or Negative Cost)">
+  With SGLang's jump-forward optimization, constrained JSON generation can be **faster** than unconstrained generation. Deterministic structural tokens skip the model forward pass entirely. For a schema-heavy output where 40% of tokens are deterministic, you save 40% of forward passes. The grammar compilation overhead is amortized to zero after the first request.
+</Callout>
+
+The key takeaway: for production workloads with schema caching, constrained decoding adds 1-5% overhead for the constraining itself, but jump-forward decoding can more than offset this cost. The net impact is often **negative** -- constrained generation is faster than unconstrained.
+
+---
+
+## 6. Interaction with Speculative Decoding
+
+Speculative decoding (covered in Part 7 of this series) generates $K$ draft tokens with a small model, then verifies them in a single forward pass of the large model. Combining this with constrained decoding creates a subtle but important interaction.
+
+### The Problem
+
+In standard speculative decoding, the draft model generates freely. If we layer on constraints, several things can go wrong:
+
+1. **Draft tokens may be invalid**: The draft model does not know about the constraint. It might propose tokens that the constraint would reject, wasting draft computation.
+2. **Verification mask interaction**: The target model's verification step must apply the constraint mask, but the constraint state depends on which draft tokens are accepted.
+3. **Sequential state dependency**: The constraint FSM/PDA state after token $t$ depends on token $t$. You cannot compute the constraint state for token $t+1$ until you know what token $t$ is. This conflicts with the parallel nature of speculative verification.
+
+### Solution 1: Constrained Draft Model
+
+The simplest approach: apply the same constraint to the draft model. At each draft step, mask the draft model's logits using the constraint's current state. This guarantees that all $K$ draft tokens are valid, and the target model's verification can proceed normally.
+
+The downside: constraining the draft model adds per-step overhead to the draft phase. Since the draft model is much smaller (the whole point of speculation is that the draft is cheap), the relative overhead is larger.
+
+### Solution 2: Verify-Then-Constrain
+
+A more efficient approach: let the draft model generate unconstrained, then during verification:
+
+1. Run the target model's forward pass on all $K$ draft tokens (unchanged).
+2. Apply the constraint mask to each verification position **sequentially**, from left to right.
+3. If a draft token at position $i$ is invalid according to the constraint, reject it and all subsequent tokens. Sample a valid replacement from the constrained target distribution at position $i$.
+
+This avoids slowing down the draft model but may lead to lower acceptance rates if the draft model frequently proposes invalid tokens.
+
+### Solution 3: Grammar-Aware Tree Verification
+
+The most sophisticated approach, used in some SGLang configurations: maintain the constraint state as part of the token tree during tree-structured speculative decoding. Each branch in the token tree carries its own constraint state. During verification, only branches consistent with the constraint survive.
+
+<CodeCompare
+  beforeTitle="Naive: Constrain Draft (Slower Drafting)"
+  afterTitle="Optimized: Verify-Then-Constrain"
+>
+  <Fragment slot="before">
+```python
+# Apply constraint to draft model
+# Slower: mask overhead on every draft step
+for i in range(K):
+    draft_logits = draft_model(draft_tokens)
+    # Mask invalid tokens in draft
+    mask = constraint.get_valid_mask(state)
+    draft_logits[~mask] = -float('inf')
+    draft_token = sample(draft_logits)
+    state = constraint.advance(state, draft_token)
+    draft_tokens.append(draft_token)
+
+# Verify with target model (also constrained)
+target_logits = target_model(draft_tokens)
+# Standard rejection sampling
+```
+  </Fragment>
+  <Fragment slot="after">
+```python
+# Let draft model generate freely
+for i in range(K):
+    draft_logits = draft_model(draft_tokens)
+    # No masking -- draft runs at full speed
+    draft_token = sample(draft_logits)
+    draft_tokens.append(draft_token)
+
+# Verify with target model + constraint
+target_logits = target_model(draft_tokens)
+state = constraint.current_state
+for i in range(K):
+    mask = constraint.get_valid_mask(state)
+    if not mask[draft_tokens[i]]:
+        # Reject this and all later tokens
+        corrected = sample(target_logits[i], mask)
+        break
+    state = constraint.advance(state, draft_tokens[i])
+```
+  </Fragment>
+</CodeCompare>
+
+In practice, the verify-then-constrain approach works well because well-aligned models already produce valid structured output most of the time. The draft model, even without constraints, proposes valid tokens 80-95% of the time for well-prompted JSON generation, so the acceptance rate penalty is small.
+
+---
+
+## 7. Structured Output in Production
+
+Constrained decoding has moved from academic novelty to production standard. Here is how the major providers and open-source systems implement it.
+
+### OpenAI Function Calling and Structured Outputs
+
+OpenAI's function calling API (2023) and structured outputs mode (2024) guarantee valid JSON matching a user-provided schema. Their implementation uses a constrained decoding approach, though the exact details are proprietary. Key properties:
+
+- **JSON Schema input**: Users provide a standard JSON Schema, including support for `$ref`, `anyOf`, `enum`, and recursive types.
+- **Guaranteed validity**: The API guarantees that the output parses as valid JSON matching the schema. The documentation explicitly states this is achieved through constrained decoding, not post-processing.
+- **First-request latency**: There is a compilation step on the first request with a new schema, visible as slightly higher latency. Subsequent requests with the same schema are faster -- consistent with precomputed FSM/grammar caching.
+
+### Anthropic Tool Use
+
+Anthropic's tool use system takes a different approach. Rather than constrained decoding at the token level, the model is trained to produce valid tool-call JSON as part of its alignment training. This means:
+
+- Output is *usually* valid but not strictly guaranteed by a decoding constraint.
+- The model handles edge cases (escaping, nested structures) through training rather than runtime enforcement.
+- No compilation latency on novel schemas.
+
+### Open-Source Approaches
+
+The open-source ecosystem offers several constrained decoding implementations.
+
+<Benchmark
+  title="Open-Source Constrained Decoding Frameworks"
+  columns={["Framework", "Constraint Types", "Engine", "Speculative Compat.", "Key Feature"]}
+  rows={[
+    { values: ["Outlines", "Regex, JSON Schema", "FSM (interegular)", "Limited", "First FSM-based approach"], highlight: false },
+    { values: ["SGLang", "Regex, JSON, CFG", "Jump-forward FSM", "Tree-aware", "Jump-forward decoding"], highlight: true },
+    { values: ["llama.cpp (GBNF)", "Full CFG", "PDA", "No", "Custom BNF grammar format"], highlight: false },
+    { values: ["vLLM (guided)", "Regex, JSON", "Outlines backend", "Partial", "Integrated with PagedAttention"], highlight: false },
+    { values: ["guidance", "Regex, CFG, Python", "Hybrid", "No", "Interleaved code + generation"], highlight: false },
+    { values: ["XGrammar", "JSON, Regex, CFG", "Pushdown automaton", "Yes", "Persistent stack for efficiency"], highlight: true }
+  ]}
+  notes="Speculative compatibility indicates whether the framework can combine constrained decoding with speculative decoding without fundamental conflicts."
+/>
+
+### XGrammar: The Next Generation
+
+XGrammar, developed as part of the MLC-LLM ecosystem, represents the current state of the art. Key innovations:
+
+1. **Persistent pushdown automaton**: Rather than recomputing the PDA state from scratch, XGrammar maintains a persistent stack that is incrementally updated. This reduces per-step grammar evaluation cost.
+2. **Adaptive token mask precomputation**: XGrammar splits the vocabulary into "context-independent" tokens (always valid or always invalid regardless of grammar state) and "context-dependent" tokens that need per-step evaluation. Only the context-dependent tokens (typically 5-15% of the vocabulary) are checked at each step.
+3. **Vocabulary-aware grammar compilation**: The grammar is compiled with knowledge of the specific tokenizer, handling multi-character tokens correctly from the start.
+
+The result is per-step overhead under 0.1ms even for complex grammars -- effectively zero compared to the model forward pass.
+
+---
+
+## 8. When NOT to Constrain
+
+Constrained decoding is powerful, but it is not universally appropriate. There are scenarios where constraints hurt more than they help.
+
+### Free-Form Creative Text
+
+If the output is a creative essay, poem, or conversational response, there is no target format to constrain against. Applying a constraint here would either be vacuous (accept everything) or actively harmful (restricting the model's creative options).
+
+### When the Model Is Well-Calibrated
+
+For simple formats that the model handles reliably (e.g., "respond with yes or no"), the overhead of compiling a constraint may not be worth it. If the failure rate is 0.01% and the cost of a retry is low, constrained decoding solves a problem that barely exists.
+
+<Callout type="info" title="Rule of Thumb">
+  Use constrained decoding when: (1) the output must be machine-parsed, (2) the schema is complex enough that failure rates exceed 1-2%, or (3) retries are expensive (long prompts, strict latency SLAs, high request volume). Skip it when the output is human-consumed free-form text or when the model already achieves &gt;99.5% format compliance.
+</Callout>
+
+### Constraint-Model Mismatch
+
+If the constraint is too tight and the model's "natural" output distribution places most probability mass on tokens the constraint rejects, the constrained distribution becomes distorted. The model is forced to choose from low-probability tokens, which can produce semantically poor output even though it is syntactically valid.
+
+Example: constraining a model to output a SQL query when the model has weak SQL capabilities. The syntactically valid query `SELECT * FROM users WHERE name = name` satisfies the grammar but is semantically meaningless. The constraint guarantees syntax, not semantics.
+
+### Large Vocabulary Challenges
+
+With very large vocabularies (128k+ tokens), the precomputation index grows accordingly. For complex grammars with hundreds of states, this can mean hundreds of megabytes of index data per schema. In multi-tenant environments serving many different schemas, memory management for these indices becomes a real concern.
+
+---
+
+## 9. The Broader Picture: Structured Generation as a Systems Problem
+
+Constrained decoding is not just a decoding trick -- it is a **systems-level** optimization that changes how applications interact with language models.
+
+### The Constraint as an Interface Contract
+
+In traditional software, functions have typed signatures. A function declared to return `int` will always return `int`. LLMs, as traditionally used, have no such contract -- they return `str`, and the caller must parse and validate. Constrained decoding restores the typed interface: the generator function is declared to return a specific schema, and it always does.
+
+This changes the application architecture. Instead of:
+
+```
+LLM -> raw text -> regex/parse -> validate -> retry loop -> structured data
+```
+
+You get:
+
+```
+LLM + constraint -> structured data
+```
+
+The parsing, validation, and retry logic disappear entirely. Error handling moves from the application layer to the generation layer.
+
+### Integration with Serving Infrastructure
+
+In production serving systems like vLLM and SGLang, constrained decoding interacts with several other optimizations:
+
+- **Continuous batching**: Different requests in the same batch may have different constraints. The serving system must track per-request constraint state independently.
+- **KV cache management**: Jump-forward tokens skip the model forward pass but still need KV cache entries. These entries must be computed (usually via a "fake" prefill step for the inserted tokens).
+- **Prefix caching**: If two requests share the same prompt prefix but have different schemas, their constraint states diverge even though their KV caches could be shared up to the divergence point.
+
+### Where Things Are Heading
+
+The trend is clear: structured output is becoming a standard capability, not an optional add-on. The key developments to watch:
+
+1. **Grammar compilation into model weights**: Rather than runtime constraint enforcement, train models that inherently produce valid structured output for declared schemas. This is the direction of Anthropic's tool use approach, and it may eventually make runtime constraints unnecessary for common formats.
+2. **Constraint-aware training**: Fine-tune models specifically for constrained decoding, so their natural distribution aligns with the constraint. This reduces the distribution distortion from masking.
+3. **Hardware-accelerated masking**: As vocabulary sizes grow, the masking operation may benefit from dedicated hardware support or more efficient GPU kernels.
+4. **Unified grammar engines**: Converging on a single, highly optimized grammar engine that all serving systems share, rather than each framework reimplementing constraint support.
+
+---
+
+## 10. Summary
+
+Constrained decoding transforms LLM output from "probably correct text" to "guaranteed valid structured data." The mechanism is mathematically clean (logit masking preserves the conditional distribution), computationally cheap (1-5% overhead, often negative with jump-forward), and practically essential for applications that need machine-parseable output.
+
+<Benchmark
+  title="Constrained Decoding: Key Numbers to Remember"
+  columns={["Metric", "FSM (Regex/JSON)", "CFG (Nested JSON/SQL)"]}
+  rows={[
+    { values: ["Compilation time (first request)", "15-200 ms", "200-600 ms"], highlight: false },
+    { values: ["Per-step masking overhead", "0.05-0.2 ms", "0.1-0.5 ms"], highlight: false },
+    { values: ["Total generation overhead", "1-2%", "3-7%"], highlight: false },
+    { values: ["With jump-forward", "-10 to -25%", "-5 to -15%"], highlight: true },
+    { values: ["Output validity guarantee", "100%", "100%"], highlight: true },
+    { values: ["Retry rate", "0%", "0%"], highlight: true }
+  ]}
+  notes="Jump-forward percentages are negative because they reduce total generation time compared to unconstrained decoding."
+/>
+
+The practical recommendation: if your application consumes LLM output programmatically, use constrained decoding. The overhead is negligible, the guarantee is absolute, and the engineering simplification -- eliminating retry loops, validation code, and format-related error handling -- is substantial. The Outlines and SGLang implementations are mature enough for production use, and the major API providers have already made structured output a first-class feature.
+
+In the next part of this series, we will examine a more fundamental rethinking of the language model architecture itself: state space models and the Mamba architecture, which replace attention entirely with a mechanism that achieves O(n) complexity in sequence length.

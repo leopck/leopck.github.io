@@ -173,9 +173,23 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"building-a-transformer-from-scratch-putting-it-all-together.mdx": {
+	id: "building-a-transformer-from-scratch-putting-it-all-together.mdx";
+  slug: "building-a-transformer-from-scratch-putting-it-all-together";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "compute-communication-overlap-distributed-training.mdx": {
 	id: "compute-communication-overlap-distributed-training.mdx";
   slug: "compute-communication-overlap-distributed-training";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"constrained-structured-generation-fsm-grammars.mdx": {
+	id: "constrained-structured-generation-fsm-grammars.mdx";
+  slug: "constrained-structured-generation-fsm-grammars";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -204,6 +218,13 @@ declare module 'astro:content' {
 "cpu-cache-hierarchy-2019.mdx": {
 	id: "cpu-cache-hierarchy-2019.mdx";
   slug: "cpu-cache-hierarchy-2019";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"cpu-edge-inference-llama-cpp-gguf.mdx": {
+	id: "cpu-edge-inference-llama-cpp-gguf.mdx";
+  slug: "cpu-edge-inference-llama-cpp-gguf";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -285,6 +306,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"embedding-layers-llm-geometry.mdx": {
+	id: "embedding-layers-llm-geometry.mdx";
+  slug: "embedding-layers-llm-geometry";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "esp32-adc-performance-optimization-2019.mdx": {
 	id: "esp32-adc-performance-optimization-2019.mdx";
   slug: "esp32-adc-performance-optimization-2019";
@@ -348,6 +376,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"ffn-swiglu-gated-networks-key-value-memory.mdx": {
+	id: "ffn-swiglu-gated-networks-key-value-memory.mdx";
+  slug: "ffn-swiglu-gated-networks-key-value-memory";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "flashattention-memory-hierarchy.mdx": {
 	id: "flashattention-memory-hierarchy.mdx";
   slug: "flashattention-memory-hierarchy";
@@ -404,6 +439,20 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"inference-cost-economics-tokens-per-dollar.mdx": {
+	id: "inference-cost-economics-tokens-per-dollar.mdx";
+  slug: "inference-cost-economics-tokens-per-dollar";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"inference-time-compute-scaling-chain-of-thought.mdx": {
+	id: "inference-time-compute-scaling-chain-of-thought.mdx";
+  slug: "inference-time-compute-scaling-chain-of-thought";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "kv-cache-optimization-llm-2019.mdx": {
 	id: "kv-cache-optimization-llm-2019.mdx";
   slug: "kv-cache-optimization-llm-2019";
@@ -435,6 +484,27 @@ declare module 'astro:content' {
 "llm-serving-engine-comparison.mdx": {
 	id: "llm-serving-engine-comparison.mdx";
   slug: "llm-serving-engine-comparison";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"lora-qlora-multi-adapter-serving.mdx": {
+	id: "lora-qlora-multi-adapter-serving.mdx";
+  slug: "lora-qlora-multi-adapter-serving";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"loss-function-cross-entropy-teacher-forcing.mdx": {
+	id: "loss-function-cross-entropy-teacher-forcing.mdx";
+  slug: "loss-function-cross-entropy-teacher-forcing";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"mamba-state-space-models-linear-attention.mdx": {
+	id: "mamba-state-space-models-linear-attention.mdx";
+  slug: "mamba-state-space-models-linear-attention";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -488,6 +558,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"normalization-layernorm-rmsnorm-training-stability.mdx": {
+	id: "normalization-layernorm-rmsnorm-training-stability.mdx";
+  slug: "normalization-layernorm-rmsnorm-training-stability";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "nvidia-nccl-performance-tuning-multi-gpu-training-2020.mdx": {
 	id: "nvidia-nccl-performance-tuning-multi-gpu-training-2020.mdx";
   slug: "nvidia-nccl-performance-tuning-multi-gpu-training-2020";
@@ -509,6 +586,20 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"output-head-unembedding-logit-computation.mdx": {
+	id: "output-head-unembedding-logit-computation.mdx";
+  slug: "output-head-unembedding-logit-computation";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"prefix-caching-radixattention-cache-hierarchies.mdx": {
+	id: "prefix-caching-radixattention-cache-hierarchies.mdx";
+  slug: "prefix-caching-radixattention-cache-hierarchies";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "quantization-llm-performance-2019.mdx": {
 	id: "quantization-llm-performance-2019.mdx";
   slug: "quantization-llm-performance-2019";
@@ -523,6 +614,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"residual-connections-skip-paths-gradient-flow.mdx": {
+	id: "residual-connections-skip-paths-gradient-flow.mdx";
+  slug: "residual-connections-skip-paths-gradient-flow";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "roofline-gpu-kernel-optimization-2020.mdx": {
 	id: "roofline-gpu-kernel-optimization-2020.mdx";
   slug: "roofline-gpu-kernel-optimization-2020";
@@ -533,6 +631,13 @@ declare module 'astro:content' {
 "simd-optimization-basics-2019.mdx": {
 	id: "simd-optimization-basics-2019.mdx";
   slug: "simd-optimization-basics-2019";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"softmax-numerics-temperature-stability.mdx": {
+	id: "softmax-numerics-temperature-stability.mdx";
+  slug: "softmax-numerics-temperature-stability";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -589,6 +694,13 @@ declare module 'astro:content' {
 "tensorrt-optimization-llm-inference-2019.mdx": {
 	id: "tensorrt-optimization-llm-inference-2019.mdx";
   slug: "tensorrt-optimization-llm-inference-2019";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"tokenization-bpe-from-first-principles.mdx": {
+	id: "tokenization-bpe-from-first-principles.mdx";
+  slug: "tokenization-bpe-from-first-principles";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">

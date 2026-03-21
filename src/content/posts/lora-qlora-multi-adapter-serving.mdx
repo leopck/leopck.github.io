@@ -1,0 +1,639 @@
+---
+title: "LoRA and QLoRA for Serving: Multi-Adapter Inference, S-LoRA, and When to Merge"
+author: "stanley-phoong"
+description: "A deep technical treatment of LoRA and QLoRA in the serving context: the low-rank adaptation math, QLoRA's 4-bit quantization for memory efficiency, the multi-adapter serving challenge at scale, S-LoRA's unified paging and batching architecture, adapter merging tradeoffs, rank selection analysis, and production patterns for serving thousands of personalized adapters on shared GPU fleets."
+publishDate: 2025-03-21
+category: llm-inference
+tags: [lora, qlora, adapter, s-lora, multi-adapter, fine-tuning, serving]
+difficulty: advanced
+readingTime: 28
+series: "Inference Optimization Timeline"
+seriesOrder: 9
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import MemoryLayout from '@/components/mdx/MemoryLayout.astro';
+
+Fine-tuning gives each customer a model that speaks their language, follows their conventions, and produces output tailored to their domain. But the economics of serving fine-tuned models are brutal. If you have 1,000 customers, each with their own fine-tuned 70B model, you need 1,000 copies of the model weights -- roughly 35 PB of GPU memory at FP16. That is absurd. Nobody does this.
+
+LoRA (Low-Rank Adaptation) changes the equation entirely. Instead of modifying all 70 billion parameters, LoRA trains a tiny adapter -- a pair of low-rank matrices -- that modifies the model's behavior while leaving the base weights untouched. The adapter for a 70B model might be 50-200 MB instead of 140 GB. One thousand adapters fit in 50-200 GB of storage, not 140 TB. But serving these adapters efficiently at inference time introduces a new set of systems challenges that are distinct from the training problem.
+
+This post covers the full serving story: the LoRA math and why low-rank works, QLoRA's memory optimization, the multi-adapter serving challenge, S-LoRA's architecture for serving thousands of adapters, when to merge adapters into the base model, rank selection tradeoffs, vLLM and SGLang multi-LoRA support, and production deployment patterns.
+
+---
+
+## 1. LoRA: Low-Rank Adaptation
+
+### The Core Math
+
+Standard fine-tuning updates the full weight matrix $W \in \mathbb{R}^{d \times d}$ (or $d \times k$ for non-square layers). LoRA constrains the update to a low-rank decomposition:
+
+$$W' = W + \Delta W = W + BA$$
+
+where $B \in \mathbb{R}^{d \times r}$ and $A \in \mathbb{R}^{r \times d}$, with rank $r \ll d$. Only $A$ and $B$ are trained; $W$ is frozen.
+
+The parameter count comparison is dramatic. For a weight matrix in Llama-70B with $d = 8192$:
+
+- **Full fine-tuning**: $d \times d = 8192^2 = 67{,}108{,}864$ parameters per matrix
+- **LoRA with $r = 16$**: $(d \times r) + (r \times d) = 2 \times 8192 \times 16 = 262{,}144$ parameters per matrix
+
+That is a **256x reduction** in trainable parameters per adapted layer. Across the full model with LoRA applied to the QKV and output projection matrices in each attention layer:
+
+$$\text{LoRA parameters} = 4 \times 2 \times d \times r \times L$$
+
+For Llama-70B ($d = 8192$, $L = 80$ layers, $r = 16$):
+
+$$\text{LoRA parameters} = 4 \times 2 \times 8192 \times 16 \times 80 = 83{,}886{,}080 \approx 84\text{M parameters}$$
+
+At FP16, that is ~168 MB per adapter, compared to ~140 GB for the full model. You can store 833 adapters in the same memory as one full model copy.
+
+<Benchmark
+  title="Parameter and Memory Comparison: Full Fine-Tune vs. LoRA"
+  columns={["Method", "Trainable Params", "Adapter Size (FP16)", "Adapters per 140 GB", "Training Memory"]}
+  rows={[
+    { values: ["Full fine-tune (70B)", "70B", "140 GB", "1", "~280 GB (AdamW states)"], highlight: false },
+    { values: ["LoRA r=4 (70B)", "21M", "42 MB", "3,333", "~42 GB"], highlight: false },
+    { values: ["LoRA r=16 (70B)", "84M", "168 MB", "833", "~44 GB"], highlight: true },
+    { values: ["LoRA r=64 (70B)", "336M", "672 MB", "208", "~50 GB"], highlight: false },
+    { values: ["LoRA r=256 (70B)", "1.34B", "2.68 GB", "52", "~65 GB"], highlight: false },
+  ]}
+  notes="Adapter size = trainable parameters x 2 bytes (FP16). Training memory includes base model (FP16) + optimizer states for LoRA params only."
+/>
+
+### Why Low-Rank Works: The Intrinsic Dimensionality Hypothesis
+
+LoRA's effectiveness seems surprising. How can a rank-16 update -- which can only express a 16-dimensional subspace of changes -- capture the difference between a general-purpose model and a domain-specific one?
+
+The answer lies in a key empirical observation: **the weight updates during fine-tuning occupy a low-dimensional subspace**. Aghajanyan et al. (2020) demonstrated that pre-trained language models have a low "intrinsic dimensionality" -- the optimization landscape for fine-tuning is effectively much lower-dimensional than the parameter count suggests.
+
+Concretely, if you take the full fine-tuning update $\Delta W_{\text{full}} = W_{\text{fine-tuned}} - W_{\text{pre-trained}}$ and compute its singular value decomposition:
+
+$$\Delta W_{\text{full}} = U \Sigma V^T$$
+
+The singular values $\sigma_1 \geq \sigma_2 \geq \ldots \geq \sigma_d$ decay rapidly. The top 16-64 singular values capture 90-99% of the total variance (measured by $\sum_i \sigma_i^2$). The fine-tuning update is empirically low-rank.
+
+This means $BA$ with $r = 16$ can approximate $\Delta W_{\text{full}}$ well. The training process finds the rank-$r$ approximation that best fits the task, without needing to explicitly compute the SVD of the full update.
+
+<Callout type="info" title="Initialization Matters">
+  LoRA initializes $A$ with a random Gaussian and $B$ with zeros, so that $\Delta W = BA = 0$ at the start of training. This ensures the adapted model begins identical to the base model and gradually learns the task-specific update. The scaling factor $\alpha / r$ controls the magnitude of the update, where $\alpha$ is a hyperparameter (typically set equal to $r$ or $2r$).
+</Callout>
+
+### LoRA During Inference: The Compute Cost
+
+During inference, the adapted forward pass for a linear layer becomes:
+
+$$y = W'x = (W + BA)x = Wx + BAx$$
+
+The extra compute for the LoRA adapter is:
+
+1. $Ax$: matrix-vector multiply, $r \times d$ matrix times $d$-vector = $O(rd)$ FLOPs
+2. $B(Ax)$: matrix-vector multiply, $d \times r$ matrix times $r$-vector = $O(dr)$ FLOPs
+
+Total extra: $2rd$ FLOPs per token per adapted layer. For $r = 16$ and $d = 8192$:
+
+$$\text{Extra FLOPs per layer} = 2 \times 16 \times 8192 = 262{,}144$$
+
+Compare this to the base layer cost of $2d^2 = 2 \times 8192^2 = 134{,}217{,}728$ FLOPs. The LoRA overhead is:
+
+$$\frac{2rd}{2d^2} = \frac{r}{d} = \frac{16}{8192} = 0.2\%$$
+
+<PerfChart
+  title="LoRA Inference Overhead by Rank (Llama-70B, per layer)"
+  unit="% extra FLOPs"
+  data={[
+    { label: "r=4", value: 0.05, color: "green", annotation: "Negligible" },
+    { label: "r=16", value: 0.2, color: "green", annotation: "Negligible" },
+    { label: "r=64", value: 0.8, color: "blue", annotation: "Minimal" },
+    { label: "r=128", value: 1.6, color: "blue", annotation: "Small" },
+    { label: "r=256", value: 3.1, color: "orange", annotation: "Noticeable" },
+    { label: "r=512", value: 6.3, color: "orange", annotation: "Significant" },
+  ]}
+/>
+
+At rank 16, the LoRA overhead is less than a rounding error in wall-clock time. Even at rank 256, the overhead is only 3.1% -- well within the noise of other system-level variations. This is what makes LoRA practical for serving: the compute cost of personalization is nearly zero.
+
+---
+
+## 2. QLoRA: Quantized Base + Full-Precision Adapters
+
+QLoRA (Dettmers et al., 2023) extends LoRA by quantizing the base model to 4-bit precision while keeping the LoRA adapters in FP16 (or BFloat16). This drastically reduces the memory required for the base model, enabling fine-tuning and serving of larger models on fewer GPUs.
+
+### Memory Arithmetic
+
+For Llama-70B:
+
+- **FP16 base model**: 70B parameters x 2 bytes = **140 GB**
+- **4-bit quantized base (NF4)**: 70B parameters x 0.5 bytes = **35 GB**
+- **LoRA adapters (FP16, r=16)**: ~84M parameters x 2 bytes = **~168 MB**
+- **Total QLoRA serving**: 35 GB + 168 MB = **~35.2 GB**
+
+This fits on a single A100-80GB with 45 GB remaining for KV cache and prefix caching -- versus 140 GB for the FP16 model which requires at least 2 GPUs.
+
+<MemoryLayout
+  title="GPU Memory Layout: QLoRA Serving (Llama-70B, A100-80GB)"
+  regions={[
+    { start: "0x0000", end: "0x2300", name: "4-bit Base Model (NF4)", size: "35 GB", color: "blue", notes: "70B parameters in NormalFloat4 quantization" },
+    { start: "0x2300", end: "0x2310", name: "LoRA Adapters (FP16)", size: "168 MB", color: "green", notes: "Active adapter, r=16, applied to QKV+O projections" },
+    { start: "0x2310", end: "0x2400", name: "Adapter Pool (hot)", size: "1-5 GB", color: "cyan", notes: "Next most popular adapters, ready for swapping" },
+    { start: "0x2400", end: "0x5000", name: "KV Cache + Prefix Cache", size: "~40 GB", color: "orange", notes: "Active request KV storage + cached prefixes" },
+    { start: "0x5000", end: "0x5000", name: "Remaining", size: "~3 GB", color: "gray", notes: "CUDA overhead, activations, scheduling buffers" }
+  ]}
+/>
+
+### NF4 Quantization
+
+QLoRA uses **NormalFloat4 (NF4)** quantization, which is information-theoretically optimal for normally distributed weights. The key insight is that pre-trained neural network weights are approximately normally distributed, so a uniform quantization grid wastes precision in the tails. NF4 spaces quantization levels according to the normal distribution's quantiles, placing more levels near zero (where most weights cluster) and fewer in the tails.
+
+The quantization process:
+
+1. **Normalize**: divide weights by their absmax value within a block (typically 64 elements)
+2. **Map**: find the nearest NF4 quantization level (16 levels for 4-bit)
+3. **Store**: 4 bits per weight + one FP32 absmax scale per block
+
+The block-wise scaling adds overhead: one FP32 (4 bytes) per 64 weights = 0.0625 bytes/weight extra. Total storage per weight: 0.5 + 0.0625 = 0.5625 bytes. For 70B parameters: ~39.4 GB. In practice, QLoRA also uses "double quantization" (quantizing the block scales themselves to FP8), reducing the overhead further.
+
+### QLoRA Inference Quality
+
+The quality impact of 4-bit quantization depends on the task and the model size. Larger models are more robust to quantization because each individual weight contributes less to the output.
+
+<Benchmark
+  title="Quality Impact: FP16 vs. QLoRA 4-bit (Llama-70B)"
+  columns={["Benchmark", "FP16 Base", "4-bit NF4 Base", "FP16 + LoRA r=16", "4-bit + LoRA r=16"]}
+  rows={[
+    { values: ["MMLU (5-shot)", "68.9", "68.2 (-0.7)", "72.1", "71.5 (-0.6)"], highlight: false },
+    { values: ["HellaSwag", "87.3", "86.8 (-0.5)", "88.5", "88.0 (-0.5)"], highlight: false },
+    { values: ["HumanEval", "32.9", "31.4 (-1.5)", "42.1", "40.8 (-1.3)"], highlight: false },
+    { values: ["GSM8K", "56.8", "54.2 (-2.6)", "64.3", "62.1 (-2.2)"], highlight: true },
+    { values: ["Average degradation", "-", "-1.3%", "-", "-1.2%"], highlight: true },
+  ]}
+  notes="LoRA fine-tuned on domain-specific data. Quality loss is relative to FP16 counterpart."
+/>
+
+The average quality degradation from 4-bit quantization is ~1.3%, which is acceptable for most production use cases. For tasks requiring maximum quality (e.g., medical or legal applications), FP16 serving may still be preferred, at the cost of 4x more GPU memory.
+
+<Callout type="perf" title="The QLoRA Sweet Spot">
+  QLoRA's biggest impact is on **total cost of ownership**: serving a 70B model on 1 GPU instead of 2-4 GPUs cuts hardware costs by 50-75%. The 1-2% quality degradation from 4-bit quantization is a cheap price for halving your GPU fleet. For most production workloads, QLoRA dominates FP16 on cost-per-quality.
+</Callout>
+
+---
+
+## 3. The Multi-Adapter Serving Challenge
+
+The LoRA story so far is clean: tiny adapters, negligible compute overhead, massive memory savings. But production deployments introduce a systems problem that pure math cannot solve.
+
+### The Problem: 1,000 Customers, 1,000 Adapters
+
+Consider an enterprise LLM platform serving 1,000 customers. Each customer has fine-tuned a LoRA adapter for their domain: legal documents, medical records, financial reports, customer support, code generation, and so on. Each request arrives with a customer ID that maps to a specific adapter.
+
+**Approach 1: Merge each adapter into a separate base model copy.**
+
+$W'_i = W + B_i A_i$ for customer $i$. Now you have 1,000 copies of the 70B model, each slightly different. At FP16, that is 1,000 x 140 GB = 140 TB of model weights. You need ~1,750 A100-80GB GPUs just for model weights, even before KV cache. This is economically absurd.
+
+**Approach 2: Load/unload adapters per request.**
+
+Keep one base model and swap LoRA adapters for each request. But adapter swapping requires copying 168 MB from CPU to GPU memory per swap. At PCIe 4.0 (32 GB/s), that is ~5 ms per swap. If consecutive requests use different adapters, you spend 5 ms swapping for every request. At 1,000 QPS, that is 5 seconds of PCIe bandwidth consumed per second -- the bus is saturated, and you add 5 ms to every request's latency.
+
+**Approach 3: Keep all adapters in GPU memory.**
+
+1,000 adapters x 168 MB = 168 GB. That does not fit in one A100-80GB, or even two. You need at least 3 GPUs just for adapter storage, plus GPUs for the base model and KV cache.
+
+None of these approaches scale. We need something better.
+
+<PerfChart
+  title="Adapter Management Overhead per Request"
+  unit="ms"
+  data={[
+    { label: "Pre-merged (zero overhead)", value: 0, color: "green", annotation: "But 140 TB total" },
+    { label: "Swap from GPU pool", value: 0.1, color: "green", annotation: "If adapter is in GPU" },
+    { label: "Swap from CPU DRAM", value: 5, color: "orange", annotation: "PCIe 4.0 transfer" },
+    { label: "Swap from SSD", value: 25, color: "red", annotation: "NVMe load" },
+  ]}
+/>
+
+---
+
+## 4. S-LoRA: Scalable Multi-Adapter Serving
+
+S-LoRA (Sheng et al., 2023) solves the multi-adapter serving problem with three key innovations: a shared base model, unified paging for adapter memory, and adapter-aware batching.
+
+### Architecture Overview
+
+S-LoRA maintains a **single copy of the base model** in GPU HBM and stores adapters in a **memory pool** that spans GPU and CPU memory. The key ideas:
+
+1. **Shared base model**: all requests, regardless of adapter, share the same base model weights. The forward pass through $W$ is identical; only the $BAx$ addend differs per adapter.
+
+2. **Adapter memory pool**: adapters are stored in a paged memory pool, similar to how PagedAttention manages KV cache. Hot adapters (frequently used) reside in GPU memory. Cold adapters are in CPU DRAM or SSD. The system dynamically promotes and demotes adapters based on access patterns.
+
+3. **Unified paging**: both KV cache blocks and adapter weight blocks are managed by the same paging system. This allows the scheduler to make global decisions about memory allocation: if a popular adapter is consuming GPU memory, it may be worth evicting some KV cache entries to keep the adapter hot.
+
+```python
+class SLoRAServer:
+    def __init__(self, base_model, gpu_memory_budget, cpu_memory_budget):
+        self.base_model = base_model  # Single copy, shared across all requests
+        self.adapter_pool = AdapterPool(
+            gpu_budget=gpu_memory_budget * 0.15,  # 15% for adapters
+            cpu_budget=cpu_memory_budget * 0.5,
+        )
+        self.kv_pool = KVCachePool(
+            gpu_budget=gpu_memory_budget * 0.55,  # 55% for KV cache
+        )
+        # Remaining 30% for base model weights + CUDA overhead
+
+    def serve_request(self, request):
+        adapter_id = request.adapter_id
+
+        # Ensure adapter is in GPU memory
+        adapter = self.adapter_pool.get_or_promote(adapter_id)
+
+        # Allocate KV cache for this request
+        kv_blocks = self.kv_pool.allocate(request.max_seq_len)
+
+        # Forward pass: base model + adapter
+        output = self.forward_with_adapter(request.tokens, adapter, kv_blocks)
+        return output
+```
+
+### Batched Multi-Adapter Forward Pass
+
+The most technically interesting aspect of S-LoRA is how it handles **batched inference with multiple adapters**. In a continuous batching system, a single decode iteration may process 32 requests, each potentially using a different adapter.
+
+The naive approach: run the base model forward pass for all 32 requests, then run 32 separate adapter forward passes (one per request). This is inefficient because each adapter forward pass is a tiny matrix operation that cannot saturate the GPU.
+
+S-LoRA's approach: **batch the adapter computations using custom CUDA kernels**.
+
+For a batch of $N$ requests with adapters $\{(B_1, A_1), (B_2, A_2), \ldots, (B_N, A_N)\}$, the computation is:
+
+$$y_i = Wx_i + B_i A_i x_i \quad \text{for } i = 1, \ldots, N$$
+
+The base computation $Wx_i$ is a standard batched GEMM. The adapter computation $B_i A_i x_i$ requires a **grouped GEMM** (also called batched GEMM with variable matrices), where each element in the batch uses a different set of A and B matrices.
+
+```python
+def batched_adapter_forward(x_batch, base_weight, adapters, adapter_indices):
+    """Efficient batched forward pass with multiple LoRA adapters.
+
+    x_batch: [batch_size, d_in] - input activations
+    base_weight: [d_out, d_in] - shared base model weight
+    adapters: dict mapping adapter_id -> (B, A) matrices
+    adapter_indices: [batch_size] - which adapter each request uses
+    """
+    # Step 1: Base computation (single batched GEMM, shared across all requests)
+    base_output = x_batch @ base_weight.T  # [batch_size, d_out]
+
+    # Step 2: Group requests by adapter for efficient batched computation
+    grouped = defaultdict(list)
+    for i, adapter_id in enumerate(adapter_indices):
+        grouped[adapter_id].append(i)
+
+    # Step 3: Compute adapter contributions per group
+    adapter_output = torch.zeros_like(base_output)
+    for adapter_id, indices in grouped.items():
+        B, A = adapters[adapter_id]
+        x_group = x_batch[indices]  # [group_size, d_in]
+
+        # Two small GEMMs per adapter group
+        hidden = x_group @ A.T     # [group_size, r]
+        delta = hidden @ B.T       # [group_size, d_out]
+        adapter_output[indices] = delta
+
+    return base_output + adapter_output
+```
+
+In practice, S-LoRA uses CUDA kernels that fuse the grouped operations and use shared memory to avoid redundant data movement. The key optimization is that requests using the **same adapter** within a batch can share the adapter weight loads, amortizing the memory traffic.
+
+### Adapter-Aware Scheduling
+
+The scheduler in S-LoRA prioritizes batching requests that use the same adapter together. This maximizes adapter weight reuse within a batch and minimizes the number of adapter swaps.
+
+<Benchmark
+  title="S-LoRA Throughput by Number of Active Adapters (Llama-70B, A100-80GB)"
+  columns={["Active Adapters", "Throughput (req/s)", "Avg Adapter Swap Time", "GPU Memory for Adapters", "Base Model Overhead"]}
+  rows={[
+    { values: ["1 (single adapter)", "580", "0 ms", "168 MB", "0%"], highlight: false },
+    { values: ["10", "560", "0.1 ms", "1.7 GB", "~1%"], highlight: false },
+    { values: ["100", "510", "0.5 ms", "3.2 GB (pool) + CPU", "~3%"], highlight: false },
+    { values: ["1,000", "440", "1.2 ms", "5 GB (pool) + CPU", "~8%"], highlight: true },
+    { values: ["10,000", "350", "2.8 ms", "5 GB (pool) + CPU", "~15%"], highlight: false },
+  ]}
+  notes="r=16 adapters. Adapter pool holds ~30 adapters in GPU, rest in CPU DRAM. Throughput includes adapter swap overhead."
+/>
+
+With 1,000 active adapters, S-LoRA maintains 76% of the single-adapter throughput. The overhead comes from adapter swapping (moving adapters between CPU and GPU) and reduced batching efficiency (smaller groups of same-adapter requests in each batch).
+
+<Callout type="info" title="The Zipf Distribution Helps">
+  In practice, adapter access patterns follow a Zipf distribution: a few adapters are extremely popular (large enterprise customers), while most adapters are accessed rarely. This means the adapter pool in GPU memory (sized for ~30 adapters) captures the vast majority of traffic. If the top 30 adapters handle 80% of requests, only 20% of requests incur adapter swap overhead.
+</Callout>
+
+---
+
+## 5. Adapter Merging: When and How
+
+If a single adapter serves all traffic (or a large fraction of it), you can **merge** the adapter into the base model, eliminating the adapter overhead entirely.
+
+### The Merge Operation
+
+Merging is a simple addition:
+
+$$W'_{\text{merged}} = W + \frac{\alpha}{r} BA$$
+
+where $\alpha$ is the LoRA scaling factor. After merging, the model has no adapter -- it is a standard model with modified weights. The forward pass is exactly $y = W'x$, with zero adapter overhead.
+
+```python
+def merge_adapter(base_weight: torch.Tensor, lora_A: torch.Tensor,
+                  lora_B: torch.Tensor, alpha: float, rank: int) -> torch.Tensor:
+    """Merge a LoRA adapter into the base weight matrix.
+
+    Returns the merged weight with the adapter baked in.
+    """
+    scaling = alpha / rank
+    merged = base_weight + scaling * (lora_B @ lora_A)
+    return merged
+
+def unmerge_adapter(merged_weight: torch.Tensor, lora_A: torch.Tensor,
+                    lora_B: torch.Tensor, alpha: float, rank: int) -> torch.Tensor:
+    """Reverse the merge to recover the base weight.
+
+    Useful for switching between merged and unmerged modes.
+    """
+    scaling = alpha / rank
+    base = merged_weight - scaling * (lora_B @ lora_A)
+    return base
+```
+
+### When to Merge
+
+**Merge when:**
+- A single adapter handles 100% of traffic (single-tenant deployment)
+- The adapter is stable and will not be updated frequently
+- You need maximum throughput with zero adapter overhead
+- The deployment is latency-sensitive and even 0.2% overhead matters
+
+**Keep separate when:**
+- Multiple adapters serve different customers (multi-tenant)
+- Adapters are updated frequently (daily or weekly retraining)
+- You need to A/B test adapter versions
+- You want to share the base model across adapters for memory efficiency
+
+### The Hybrid Approach
+
+Production systems often use a hybrid: merge the most popular adapter into the base model and keep other adapters separate. This gives zero overhead for the majority of traffic while maintaining flexibility for the long tail.
+
+<Benchmark
+  title="Merge vs. Separate: Serving Performance (Llama-70B, A100-80GB)"
+  columns={["Configuration", "Throughput (req/s)", "Latency Overhead", "Memory Usage", "Flexibility"]}
+  rows={[
+    { values: ["Merged (single adapter)", "610", "0%", "140 GB (FP16)", "None -- one model"], highlight: false },
+    { values: ["Separate (single adapter, GPU)", "595", "~0.2%", "140 GB + 168 MB", "Can swap adapters"], highlight: false },
+    { values: ["Merged primary + 10 separate", "580", "~1% (10% of requests)", "140 GB + 1.7 GB", "Good balance"], highlight: true },
+    { values: ["All separate (1,000 adapters)", "440", "~8%", "35 GB + 5 GB pool", "Maximum flexibility"], highlight: false },
+  ]}
+  notes="The 'merged primary' row assumes 90% of traffic uses the merged adapter. 4-bit base model used for the 1,000-adapter case."
+/>
+
+The "merged primary + separate secondaries" configuration achieves 95% of merged throughput while retaining the ability to serve multiple adapters. This is the pattern most production systems converge on.
+
+---
+
+## 6. LoRA Rank Tradeoffs
+
+The rank $r$ is the single most important hyperparameter in LoRA. It controls the capacity of the adapter (how much the model can change), the memory footprint, and the inference overhead.
+
+### Quality vs. Rank
+
+Higher rank allows the adapter to capture more complex modifications, but with diminishing returns. The relationship between rank and quality follows a log-like curve: doubling the rank from 4 to 8 gives a significant quality boost, but doubling from 64 to 128 gives a marginal one.
+
+<PerfChart
+  title="Task Quality vs. LoRA Rank (Llama-70B, domain-specific fine-tuning)"
+  unit="% accuracy"
+  data={[
+    { label: "r=1", value: 68, color: "red", annotation: "Underfitting" },
+    { label: "r=4", value: 78, color: "orange", annotation: "Acceptable" },
+    { label: "r=8", value: 83, color: "blue", annotation: "Good" },
+    { label: "r=16", value: 86, color: "green", annotation: "Strong" },
+    { label: "r=32", value: 87, color: "green", annotation: "Diminishing returns" },
+    { label: "r=64", value: 88, color: "green", annotation: "Near ceiling" },
+    { label: "r=128", value: 88, color: "green", annotation: "Marginal gain" },
+  ]}
+/>
+
+The "knee" of the curve is typically between $r = 8$ and $r = 32$, depending on the task complexity:
+
+- **Simple style adaptation** (tone, formatting): $r = 4$-$8$ is sufficient
+- **Domain knowledge injection** (medical, legal, financial): $r = 16$-$32$ is typical
+- **Complex task adaptation** (code generation, math reasoning): $r = 32$-$64$ may be needed
+- **Near full fine-tuning quality**: $r = 128$-$256$, but at this point, consider full fine-tuning
+
+### Serving Cost vs. Rank
+
+The serving cost of LoRA is dominated by memory, not compute. The compute overhead is negligible at any practical rank. But the memory cost scales linearly:
+
+<Benchmark
+  title="LoRA Rank: Quality, Memory, and Serving Tradeoffs (Llama-70B)"
+  columns={["Rank", "Adapter Size (FP16)", "Adapters in 10 GB GPU Pool", "Compute Overhead", "Typical Quality"]}
+  rows={[
+    { values: ["r=4", "42 MB", "238", "0.05%", "Style/tone only"], highlight: false },
+    { values: ["r=8", "84 MB", "119", "0.1%", "Acceptable"], highlight: false },
+    { values: ["r=16", "168 MB", "59", "0.2%", "Good (common choice)"], highlight: true },
+    { values: ["r=32", "336 MB", "29", "0.4%", "Strong"], highlight: false },
+    { values: ["r=64", "672 MB", "14", "0.8%", "Near full FT"], highlight: false },
+    { values: ["r=128", "1.34 GB", "7", "1.6%", "Diminishing returns"], highlight: false },
+  ]}
+  notes="Adapter pool of 10 GB on GPU. Higher rank = fewer adapters cached on GPU = more swapping."
+/>
+
+The practical implication: at $r = 16$, you can keep 59 adapters hot in a 10 GB GPU pool. At $r = 64$, only 14 fit. If you have 1,000 adapters with Zipfian access patterns, the top 59 adapters (at $r = 16$) might cover 90% of traffic, while the top 14 adapters (at $r = 64$) might cover only 60%. This means higher rank not only costs more memory but also increases the adapter swap rate, compounding the overhead.
+
+<Callout type="tip" title="Rank Selection Heuristic">
+  Start with $r = 16$. Train for your target task and evaluate. If quality is insufficient, double to $r = 32$. If quality at $r = 16$ matches $r = 32$ within noise, drop to $r = 8$. The goal is the lowest rank that meets your quality bar -- every halving of rank doubles the number of adapters you can cache.
+</Callout>
+
+### Rank and Quantization Interaction
+
+An interesting tradeoff emerges when combining QLoRA (4-bit base) with different LoRA ranks. The quality loss from 4-bit quantization can be partially recovered by increasing the LoRA rank:
+
+$$\text{Quality}(4\text{-bit}, r=32) \approx \text{Quality}(16\text{-bit}, r=16)$$
+
+This suggests a strategy: use aggressive base model quantization (4-bit) with a higher LoRA rank ($r = 32$) instead of milder quantization (8-bit) with a lower rank ($r = 16$). The 4-bit + $r = 32$ configuration uses less total memory while achieving comparable quality.
+
+---
+
+## 7. vLLM and SGLang Multi-LoRA Support
+
+Both major serving frameworks now support multi-LoRA inference, though with different architectures and performance characteristics.
+
+### vLLM Multi-LoRA
+
+vLLM supports multi-LoRA serving through its `--enable-lora` flag. The key design choices:
+
+- **Adapter storage**: adapters are stored in CPU memory and loaded to GPU on demand
+- **Max concurrent adapters**: configurable via `--max-loras` (how many can be active on GPU simultaneously)
+- **LoRA request routing**: the OpenAI-compatible API accepts a `model` parameter that maps to a specific adapter
+- **Batching**: requests with different adapters can share a batch, but the adapter forward pass is serialized per-adapter group
+
+```bash
+# vLLM multi-LoRA serving
+python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Llama-2-70b-hf \
+    --enable-lora \
+    --lora-modules customer-a=./adapters/customer_a \
+                   customer-b=./adapters/customer_b \
+                   customer-c=./adapters/customer_c \
+    --max-loras 4 \
+    --max-lora-rank 64 \
+    --max-cpu-loras 100
+```
+
+The `--max-loras` parameter controls GPU-resident adapter slots. With `max-loras=4`, up to 4 adapters reside in GPU memory simultaneously. Requests for a fifth adapter trigger an eviction (LRU) and a CPU-to-GPU transfer.
+
+### SGLang Multi-LoRA
+
+SGLang's multi-LoRA support integrates with its RadixAttention prefix caching. The combination is powerful: the system can cache the base model's KV for a shared system prompt and apply different adapters to different requests, sharing the prefill work but personalizing the output.
+
+SGLang uses a similar adapter pool design but benefits from its more aggressive scheduling and memory management.
+
+### Performance Comparison
+
+<Benchmark
+  title="Multi-LoRA Serving: vLLM vs. SGLang (Llama-70B, A100-80GB)"
+  columns={["Scenario", "vLLM Throughput", "SGLang Throughput", "vLLM TTFT", "SGLang TTFT"]}
+  rows={[
+    { values: ["Single adapter", "580 req/s", "610 req/s", "12 ms", "10 ms"], highlight: false },
+    { values: ["10 adapters (uniform)", "520 req/s", "555 req/s", "18 ms", "15 ms"], highlight: false },
+    { values: ["100 adapters (Zipf)", "440 req/s", "490 req/s", "25 ms", "20 ms"], highlight: true },
+    { values: ["1,000 adapters (Zipf)", "350 req/s", "400 req/s", "38 ms", "30 ms"], highlight: false },
+  ]}
+  notes="r=16, 4-bit base model, ShareGPT conversation distribution. Zipf access pattern with alpha=1.0."
+/>
+
+SGLang consistently outperforms vLLM in multi-LoRA scenarios, primarily due to better scheduling and the interaction between RadixAttention prefix caching and adapter management. The gap widens with more adapters because SGLang's scheduler is more effective at grouping same-adapter requests.
+
+---
+
+## 8. Production Patterns
+
+### Pattern 1: Single Base + Thousands of Customer Adapters
+
+This is the most common enterprise pattern. A single base model (typically 4-bit quantized) serves all customers. Each customer has a LoRA adapter stored on SSD. The adapter pool in GPU memory holds the top 20-50 adapters, covering 80-95% of traffic.
+
+**Architecture:**
+- 4-bit base model on GPU (~35 GB for 70B)
+- GPU adapter pool: 5-10 GB (30-60 adapters at $r = 16$)
+- CPU adapter pool: 32-64 GB (hundreds of adapters)
+- SSD adapter storage: 1+ TB (all adapters)
+- KV cache + prefix cache: remaining GPU memory
+
+**Request flow:**
+1. Request arrives with customer ID
+2. Router checks cache-aware registry for adapter location
+3. If adapter is on GPU: proceed directly to inference
+4. If adapter is on CPU: promote to GPU (5 ms), then inference
+5. If adapter is on SSD: load to CPU then GPU (25-50 ms), then inference
+
+<PerfChart
+  title="Request Latency by Adapter Cache Tier"
+  unit="ms"
+  data={[
+    { label: "GPU hit (top 30)", value: 12, color: "green", annotation: "~85% of requests" },
+    { label: "CPU hit (top 200)", value: 18, color: "blue", annotation: "~12% of requests" },
+    { label: "SSD load (cold)", value: 55, color: "orange", annotation: "~3% of requests" },
+  ]}
+/>
+
+### Pattern 2: Merged Primary + Adapter Overrides
+
+For platforms where 80%+ of traffic uses a single "default" model, merge the primary adapter into the base weights and keep specialty adapters separate.
+
+**Architecture:**
+- Merged base model (FP16, primary adapter baked in): 140 GB across 2 GPUs
+- Separate specialty adapters: 10-50 in GPU pool
+- Default traffic: zero adapter overhead
+- Specialty traffic: minimal LoRA overhead
+
+This is particularly effective for platforms that have a strong default model but allow premium customers to customize.
+
+### Pattern 3: Adapter Version Management
+
+Adapters are retrained regularly (weekly or monthly) as customer data accumulates. The serving system must handle adapter version transitions:
+
+```python
+class AdapterVersionManager:
+    def __init__(self):
+        self.active_versions: Dict[str, str] = {}  # customer_id -> version_id
+        self.adapter_store: Dict[str, Dict[str, LoRAWeights]] = {}  # customer_id -> {version_id -> weights}
+
+    def deploy_new_version(self, customer_id: str, version_id: str,
+                           weights: LoRAWeights, rollout_pct: float = 0.1):
+        """Gradual rollout of a new adapter version."""
+        self.adapter_store[customer_id][version_id] = weights
+
+        # Route rollout_pct of traffic to new version
+        # Remaining traffic continues with current version
+        self.rollout_config[customer_id] = {
+            'new_version': version_id,
+            'rollout_pct': rollout_pct,
+        }
+
+    def get_adapter(self, customer_id: str, request_id: str) -> LoRAWeights:
+        """Get the adapter for a request, respecting rollout configuration."""
+        if customer_id in self.rollout_config:
+            config = self.rollout_config[customer_id]
+            if hash(request_id) % 100 < config['rollout_pct'] * 100:
+                return self.adapter_store[customer_id][config['new_version']]
+
+        active_version = self.active_versions[customer_id]
+        return self.adapter_store[customer_id][active_version]
+```
+
+Gradual rollout ensures that a bad adapter does not immediately affect all traffic. The system monitors quality metrics during rollout and can automatically roll back if metrics degrade.
+
+### Pattern 4: Adapter Composition
+
+Some advanced deployments compose multiple adapters for a single request. For example, a customer might have a "domain" adapter (trained on their data) and a "style" adapter (trained for their preferred output format). The composed forward pass is:
+
+$$y = Wx + B_{\text{domain}} A_{\text{domain}} x + B_{\text{style}} A_{\text{style}} x$$
+
+This is mathematically equivalent to having a single adapter with $B = [B_{\text{domain}}, B_{\text{style}}]$ and $A = [A_{\text{domain}}^T, A_{\text{style}}^T]^T$, but it avoids retraining when either component changes. The serving overhead is doubled (two adapter forward passes per layer), but at $r = 16$ the overhead goes from 0.2% to 0.4% -- still negligible.
+
+<Callout type="warning" title="Adapter Composition Is Not Guaranteed to Work">
+  Composing independently trained adapters can produce unpredictable results. The combined update $B_1 A_1 + B_2 A_2$ may not be equivalent to an adapter trained on the union of both datasets. In practice, composition works well when the adapters are "orthogonal" (modifying different aspects of behavior) but poorly when they conflict (both trying to change the same output distribution). Always validate composed adapters on evaluation data before deployment.
+</Callout>
+
+---
+
+## 9. Cost Analysis: Multi-Adapter vs. Multi-Model
+
+To close the loop, let us compare the total cost of serving 1,000 customers with personalized models.
+
+<Benchmark
+  title="Cost Comparison: 1,000 Personalized Models (Llama-70B, 1,000 QPS Total)"
+  columns={["Approach", "GPUs Required", "Monthly Cost (A100)", "TTFT P50", "Flexibility"]}
+  rows={[
+    { values: ["1,000 separate full models", "1,750+ A100s", "$3,500,000+", "10 ms", "Maximum"], highlight: false },
+    { values: ["S-LoRA (4-bit base, r=16)", "4 A100s", "$8,000", "20 ms", "High"], highlight: true },
+    { values: ["S-LoRA (FP16 base, r=16)", "8 A100s", "$16,000", "15 ms", "High"], highlight: false },
+    { values: ["10 merged models (top 10 customers)", "20 A100s", "$40,000", "10 ms", "Low"], highlight: false },
+    { values: ["Merged primary + S-LoRA for rest", "6 A100s", "$12,000", "12 ms (P50)", "Good"], highlight: true },
+  ]}
+  notes="A100-80GB at ~$2/hr list price. 1,000 QPS distributed across adapters with Zipf access pattern."
+/>
+
+The S-LoRA approach is **437x cheaper** than deploying separate models. Even accounting for the slight TTFT increase and the engineering complexity, the economics are overwhelming. Multi-adapter serving with LoRA is the only practical way to offer personalized LLM models at scale.
+
+The "merged primary + S-LoRA" hybrid offers the best balance for most production deployments: near-optimal latency for the majority of traffic (the merged primary adapter) with full flexibility for the long tail (S-LoRA for the remaining 5-20% of requests using specialty adapters).
+
+---
+
+## Conclusion
+
+LoRA transforms the economics of personalized LLM serving. The math is clean -- a rank-16 update adds 0.2% compute overhead while capturing the vast majority of task-specific behavior. QLoRA extends this further by quantizing the shared base model to 4-bit, fitting a 70B model on a single GPU. S-LoRA solves the systems challenge of serving thousands of adapters efficiently, using unified paging and adapter-aware batching to maintain high throughput even with extreme adapter diversity.
+
+The key decisions for production deployment are:
+
+1. **Rank selection**: start at $r = 16$, go lower if quality allows, higher only if needed
+2. **Base quantization**: use 4-bit (QLoRA) unless your quality bar demands FP16
+3. **Merge vs. separate**: merge the primary adapter if one dominates; keep separate for multi-tenant
+4. **Cache hierarchy**: size the GPU adapter pool for the top 30-50 adapters; use CPU DRAM for the next few hundred
+5. **Routing**: use adapter-aware routing to maximize GPU adapter cache hits
+
+The next post in this series moves from model-level optimization to system architecture: disaggregated prefill-decode serving, where we split the inference pipeline across dedicated hardware pools.

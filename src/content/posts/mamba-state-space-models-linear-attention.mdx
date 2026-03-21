@@ -1,0 +1,565 @@
+---
+title: "Mamba and State Space Models: The O(n) Alternative to Attention"
+author: "stanley-phoong"
+description: "An expert deep dive into state space models as an alternative to attention: from the O(n^2) attention bottleneck through linear attention's kernel trick, S4's HiPPO matrix, Mamba's selective state spaces with input-dependent parameters, hardware-efficient parallel scan implementations, and the emerging hybrid architectures that combine attention with SSM layers."
+publishDate: 2025-03-21
+category: transformers
+tags: [mamba, ssm, state-space, linear-attention, s4, selective-ssm]
+difficulty: expert
+readingTime: 32
+series: "Inference Optimization Timeline"
+seriesOrder: 12
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import CodeCompare from '@/components/mdx/CodeCompare.astro';
+
+Attention is the most successful sequence modeling mechanism in the history of deep learning. It is also $O(n^2)$ in sequence length. For a 1-million-token context window, the attention matrix alone contains $10^{12}$ entries -- one trillion floating-point values that must be computed, stored (or streamed), and multiplied against. FlashAttention reduces the memory traffic, but the compute remains quadratic. At some point, the question becomes inescapable: can we build a sequence model that is $O(n)$ and still competitive with attention for language?
+
+State space models (SSMs) are the most serious attempt at answering yes. The lineage runs from classical control theory through the S4 architecture's HiPPO matrix to Mamba's selective state spaces, which finally made SSMs competitive with transformers on language modeling. This post traces the full arc: why attention is quadratic, why the obvious fix (linear attention) degrades quality, how continuous-time state space models offer a different path, what Mamba's input-dependent parameterization changes, why the parallel scan is GPU-friendly, where SSMs still fall short, and how hybrid architectures try to get the best of both worlds.
+
+---
+
+## 1. Why Attention Is $O(n^2)$ and Why It Matters
+
+### The Quadratic Bottleneck
+
+Standard scaled dot-product attention computes:
+
+$$\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right) V$$
+
+where $Q, K \in \mathbb{R}^{n \times d}$ and $V \in \mathbb{R}^{n \times d}$. The matrix product $QK^T$ produces an $n \times n$ matrix. Computing it requires $O(n^2 d)$ FLOPs. Multiplying the resulting attention weights by $V$ costs another $O(n^2 d)$ FLOPs. Total: $O(n^2 d)$ per head, per layer.
+
+For a single attention head with $d = 128$:
+
+<Benchmark
+  title="Attention FLOPs by Sequence Length (Single Head, d=128)"
+  columns={["Sequence Length (n)", "QK^T FLOPs", "Softmax + AV FLOPs", "Total FLOPs", "Relative to n=1K"]}
+  rows={[
+    { values: ["1,024", "2.68e8", "2.68e8", "5.37e8", "1x"], highlight: false },
+    { values: ["4,096", "4.29e9", "4.29e9", "8.59e9", "16x"], highlight: false },
+    { values: ["16,384", "6.87e10", "6.87e10", "1.37e11", "256x"], highlight: false },
+    { values: ["65,536", "1.10e12", "1.10e12", "2.20e12", "4,096x"], highlight: true },
+    { values: ["1,048,576", "2.81e14", "2.81e14", "5.63e14", "1,048,576x"], highlight: true }
+  ]}
+  notes="FLOPs scale as n^2. Going from 1K to 1M tokens increases compute by a factor of one million. This is per head, per layer -- multiply by num_heads * num_layers for the full model."
+/>
+
+With 32 heads and 80 layers, a 1M-token forward pass requires $5.63 \times 10^{14} \times 32 \times 80 \approx 1.44 \times 10^{18}$ FLOPs for attention alone. An H100 at 990 TFLOPS would need over 1,400 seconds -- just for attention, ignoring FFN layers. This is not practically viable without sparse attention, sliding windows, or a fundamentally different architecture.
+
+<Callout type="perf" title="The Scaling Wall">
+  Attention compute grows quadratically. GPU FLOPS grow roughly 2x per hardware generation (every 2 years). To double the context length at constant latency, you need 4x the compute -- two hardware generations. At this rate, going from 128K tokens to 1M tokens requires 64x more compute for attention alone. Hardware improvements alone cannot bridge this gap.
+</Callout>
+
+### The Memory Problem at Inference
+
+During autoregressive generation, each new token must attend to all previous tokens. The KV cache grows linearly with sequence length, and each decode step's attention computation grows linearly too (it is computing one row of the $n \times n$ matrix). But the KV cache memory is the binding constraint: for a 70B model at FP16, the KV cache for a 1M-token context is approximately:
+
+$$\text{KV cache} = 2 \times n_{\text{layers}} \times n_{\text{heads}} \times d_{\text{head}} \times n_{\text{tokens}} \times 2 \text{ bytes}$$
+
+$$= 2 \times 80 \times 8 \times 128 \times 1{,}000{,}000 \times 2 \approx 328 \text{ GB}$$
+
+This exceeds the memory of any single GPU. Even with GQA (8 KV heads instead of 32), it is still 82 GB -- more than an 80GB A100 can hold alongside model weights.
+
+An $O(n)$ model that maintains a **fixed-size** state regardless of sequence length would solve both problems: linear compute for processing and constant memory per token at inference.
+
+---
+
+## 2. Linear Attention: The First Attempt at $O(n)$
+
+### The Kernel Trick
+
+The most direct route to $O(n)$ attention is to remove the softmax. Standard attention can be written as:
+
+$$\text{Attn}(Q, K, V)_i = \frac{\sum_{j=1}^{n} \exp(q_i^T k_j / \sqrt{d}) \cdot v_j}{\sum_{j=1}^{n} \exp(q_i^T k_j / \sqrt{d})}$$
+
+The $\exp$ and normalization (softmax) are what force us to compute all $n^2$ pairwise scores before we can normalize. If we replace $\exp(q_i^T k_j / \sqrt{d})$ with a kernel function $\phi(q_i)^T \phi(k_j)$ that decomposes as an inner product of feature maps, we get:
+
+$$\text{LinearAttn}(Q, K, V)_i = \frac{\phi(q_i)^T \sum_{j=1}^{n} \phi(k_j) v_j^T}{\phi(q_i)^T \sum_{j=1}^{n} \phi(k_j)}$$
+
+The key insight is **associativity**. Instead of computing the $n \times n$ attention matrix, we can first compute $S = \sum_{j=1}^{n} \phi(k_j) v_j^T$, which is a $d' \times d$ matrix (where $d'$ is the feature map dimension). Then for each query $i$, the output is $\phi(q_i)^T S$, which is $O(d' d)$ per query. Total cost: $O(n d' d)$ -- linear in $n$.
+
+<CodeCompare
+  beforeTitle="Standard Attention: O(n^2 d)"
+  afterTitle="Linear Attention: O(n d'^2)"
+>
+  <Fragment slot="before">
+```python
+# Standard attention
+# 1. Compute n x n attention matrix
+scores = Q @ K.T / sqrt(d)     # O(n^2 d)
+weights = softmax(scores)       # O(n^2)
+output = weights @ V            # O(n^2 d)
+# Total: O(n^2 d) -- quadratic in n
+
+# Cannot reorder: softmax breaks associativity
+# Must materialize the full n x n matrix
+```
+  </Fragment>
+  <Fragment slot="after">
+```python
+# Linear attention (kernel trick)
+# 1. Apply feature map
+Q_phi = phi(Q)  # n x d'
+K_phi = phi(K)  # n x d'
+
+# 2. Compute KV summary FIRST (associativity!)
+S = K_phi.T @ V           # d' x d -- independent of n
+Z = K_phi.sum(dim=0)      # d'     -- independent of n
+
+# 3. Compute output per query
+output = (Q_phi @ S) / (Q_phi @ Z)  # O(n d' d)
+# Total: O(n d' d) -- linear in n
+```
+  </Fragment>
+</CodeCompare>
+
+### Why Linear Attention Degrades
+
+On paper, linear attention is the perfect solution: same expressiveness class, $O(n)$ compute, $O(1)$ state at inference (just maintain $S$ and $Z$ as running sums). In practice, it produces significantly worse language models.
+
+The problem is the **softmax**. Softmax does two critical things:
+
+1. **Sparsification**: It concentrates attention weights on a few relevant tokens. The $\exp$ function amplifies differences -- tokens with slightly higher scores get exponentially more weight.
+2. **Normalization with interaction**: The denominator depends on all scores, creating global competition among keys. Each key's attention weight depends on every other key.
+
+Without softmax, the attention weights are "flat." The model cannot sharply focus on specific tokens. For language modeling, this means the model struggles with:
+
+- **Copying**: "Repeat the word in quotes: 'elephant'" requires sharp attention to a specific position.
+- **Retrieval**: "What was the name mentioned in paragraph 3?" requires attending to a specific context span.
+- **In-context learning**: Few-shot learning requires attending to the specific examples and their answers.
+
+<PerfChart
+  title="Perplexity Gap: Linear Attention vs. Standard Attention (WikiText-103)"
+  unit="perplexity"
+  data={[
+    { label: "Standard Attention (baseline)", value: 18.3, color: "green" },
+    { label: "Linear Attention (ELU kernel)", value: 24.7, color: "red", annotation: "+35%" },
+    { label: "Linear Attention (ReLU kernel)", value: 26.1, color: "red", annotation: "+43%" },
+    { label: "Performer (FAVOR+)", value: 23.5, color: "orange", annotation: "+28%" },
+    { label: "cosFormer", value: 21.8, color: "orange", annotation: "+19%" },
+    { label: "Mamba (SSM, for reference)", value: 18.1, color: "green", annotation: "-1%" }
+  ]}
+/>
+
+The perplexity gap of 20-40% for linear attention variants is too large for practical deployment. Numerous papers tried to close this gap with better feature maps ($\text{ELU}(x) + 1$, random Fourier features, etc.), but none achieved parity with softmax attention on language benchmarks. The gap is not in the feature map -- it is in the fundamental inability to compute a sharp, context-dependent reweighting without the nonlinear softmax.
+
+This is what motivated the SSM approach: rather than trying to linearize attention, start from a completely different mathematical framework.
+
+---
+
+## 3. State Space Models: The Continuous-Time Perspective
+
+### From Attention to Recurrence
+
+Attention processes a sequence by letting every position interact with every other position. Recurrence processes a sequence by maintaining a hidden state that is updated at each step. The classical RNN is:
+
+$$h_t = f(h_{t-1}, x_t), \quad y_t = g(h_t)$$
+
+RNNs are $O(n)$ in sequence length and use $O(1)$ memory at inference -- exactly what we want. But vanilla RNNs (and LSTMs, GRUs) fail to model long-range dependencies due to vanishing/exploding gradients, and they cannot be parallelized during training because each step depends on the previous one.
+
+State space models start from a different place: **continuous-time linear dynamical systems**, borrowed from control theory.
+
+### The Continuous-Time State Space
+
+A linear time-invariant (LTI) system is defined by:
+
+$$h'(t) = Ah(t) + Bx(t)$$
+$$y(t) = Ch(t) + Dx(t)$$
+
+where $h(t) \in \mathbb{R}^N$ is the hidden state, $x(t)$ is the input signal, $y(t)$ is the output, and $A \in \mathbb{R}^{N \times N}$, $B \in \mathbb{R}^{N \times 1}$, $C \in \mathbb{R}^{1 \times N}$, $D \in \mathbb{R}$ are the system matrices.
+
+This is a linear ODE. Given an input signal $x(t)$, the state evolves continuously, and the output is a linear function of the state. The key property: because the system is linear, it can be solved analytically and admits a **convolution representation**.
+
+### Discretization
+
+To process discrete sequences (like token embeddings), we discretize the continuous system using a step size $\Delta$. The zero-order hold (ZOH) discretization gives:
+
+$$\bar{A} = \exp(\Delta A)$$
+$$\bar{B} = (\Delta A)^{-1}(\exp(\Delta A) - I) \cdot \Delta B$$
+
+The discrete-time system is then:
+
+$$h_k = \bar{A} h_{k-1} + \bar{B} x_k$$
+$$y_k = C h_k + D x_k$$
+
+This is a linear recurrence. At inference, we process tokens one at a time, updating the hidden state with a single matrix-vector multiply -- $O(N)$ per step, $O(1)$ memory. During training, because the system is linear, we can unroll it as a **convolution** and compute all outputs in parallel.
+
+### The Dual View: Recurrence and Convolution
+
+The linear recurrence $h_k = \bar{A} h_{k-1} + \bar{B} x_k$ can be unrolled:
+
+$$h_k = \bar{A}^k h_0 + \sum_{j=0}^{k-1} \bar{A}^{k-1-j} \bar{B} x_j$$
+
+The output $y_k = C h_k$ is a convolution of the input sequence with the kernel:
+
+$$K = (C\bar{B}, C\bar{A}\bar{B}, C\bar{A}^2\bar{B}, \ldots, C\bar{A}^{n-1}\bar{B})$$
+
+During training, we can compute this convolution using FFT in $O(n \log n)$ time. During inference, we use the recurrence in $O(n)$ time with $O(N)$ state.
+
+<Callout type="info" title="The Dual Computation Mode">
+  SSMs have two computation modes: (1) **Recurrence mode** for inference -- process one token at a time, update state, $O(1)$ per step, $O(N)$ memory. (2) **Convolution mode** for training -- compute the full kernel $K$, convolve with the input using FFT, $O(n \log n)$ time, fully parallelizable. This dual mode is the fundamental advantage over RNNs, which can only compute sequentially.
+</Callout>
+
+---
+
+## 4. S4: The HiPPO Matrix and Structured State Spaces
+
+The generic linear SSM described above does not work well out of the box. The matrix $A$ is the critical component, and a random $A$ matrix leads to either exploding states (eigenvalues outside the unit circle) or rapid forgetting (eigenvalues too close to zero). The S4 architecture (Gu et al., 2022) solved this with two key ideas: the HiPPO matrix and structured parameterization.
+
+### The HiPPO Framework
+
+HiPPO (High-order Polynomial Projection Operator) provides a principled initialization for $A$ that optimally compresses the history of the input signal into the hidden state. The idea is to choose $A$ such that the hidden state $h(t)$ maintains a polynomial approximation of the input history.
+
+Specifically, the HiPPO-LegS matrix defines:
+
+$$A_{nk} = -\begin{cases} (2n+1)^{1/2}(2k+1)^{1/2} & \text{if } n > k \\ n + 1 & \text{if } n = k \\ 0 & \text{if } n < k \end{cases}$$
+
+This specific matrix has the property that the hidden state $h(t)$ at time $t$ contains the coefficients of the Legendre polynomial expansion of the input signal over $[0, t]$. In other words, the state is an **optimal compressed representation** of the entire history, in the sense of minimizing the $L^2$ error of the polynomial approximation.
+
+### Why HiPPO Matters
+
+The HiPPO initialization solves the long-range dependency problem that plagued RNNs. With a random $A$ matrix, the state quickly forgets old inputs (exponential decay). With the HiPPO matrix, the state retains information about the entire history with graceful degradation -- recent inputs are represented with higher precision than distant ones, but nothing is completely lost.
+
+On the Long Range Arena benchmark (tasks requiring dependencies over 1K-16K steps), S4 with HiPPO initialization achieved dramatic improvements over transformers:
+
+<PerfChart
+  title="Long Range Arena Accuracy (Higher is Better)"
+  unit="% accuracy"
+  data={[
+    { label: "Transformer", value: 61.4, color: "red" },
+    { label: "Performer", value: 51.2, color: "red" },
+    { label: "LSTM", value: 50.6, color: "red" },
+    { label: "S4 (HiPPO)", value: 86.1, color: "green", annotation: "+24.7 pts" },
+    { label: "S4 (random A)", value: 58.3, color: "orange" },
+    { label: "Mamba", value: 87.4, color: "green" }
+  ]}
+/>
+
+The gap between S4 with HiPPO and S4 with random $A$ (+27.8 points) demonstrates that the initialization is doing most of the work. The HiPPO matrix gives the model a principled inductive bias for remembering long-range history.
+
+### The S4 Architecture
+
+S4 stacks multiple SSM layers, each with its own $(A, B, C, D)$ parameters. The architecture processes each channel of the input independently (like a depthwise convolution), then mixes channels with a linear projection. The full block is:
+
+1. Linear projection: input $\to$ expanded dimension
+2. SSM layer: process each channel with independent state space dynamics
+3. Nonlinear activation (GELU)
+4. Linear projection: expanded dimension $\to$ output dimension
+5. Residual connection
+
+During training, the SSM layer uses the convolution mode (FFT-based), making the entire model parallelizable. During inference, it switches to recurrence mode.
+
+<Callout type="warning" title="S4's Limitation for Language">
+  S4 excels on continuous signal tasks (audio, time series, long-range classification) but underperforms transformers on language modeling. The reason: S4's parameters $(A, B, C, D)$ are **input-independent**. The same dynamics process every token identically, regardless of content. Language requires content-based routing -- attending to semantically relevant tokens, not just recently proximate ones. This is exactly what attention's softmax achieves, and what S4 lacks.
+</Callout>
+
+---
+
+## 5. Mamba: Selective State Spaces
+
+Mamba (Gu and Dao, 2023) is the architecture that finally made SSMs competitive with transformers for language modeling. The key insight is deceptively simple: make the SSM parameters **depend on the input**.
+
+### The Selection Mechanism
+
+In S4, the matrices $B$, $C$, and the step size $\Delta$ are learned parameters that remain fixed during inference. Every input token is processed by the same dynamics. Mamba makes them functions of the input:
+
+$$B_t = \text{Linear}_B(x_t) \in \mathbb{R}^N$$
+$$C_t = \text{Linear}_C(x_t) \in \mathbb{R}^N$$
+$$\Delta_t = \text{softplus}(\text{Linear}_\Delta(x_t)) \in \mathbb{R}$$
+
+where $x_t$ is the input at position $t$. The discretized dynamics become:
+
+$$\bar{A}_t = \exp(\Delta_t A)$$
+$$\bar{B}_t = (\Delta_t A)^{-1}(\exp(\Delta_t A) - I) \cdot \Delta_t B_t$$
+$$h_t = \bar{A}_t h_{t-1} + \bar{B}_t x_t$$
+$$y_t = C_t h_t$$
+
+This is no longer a linear time-invariant system. The matrices change at every step based on the input. This means:
+
+1. **Content-based selection**: The model can selectively incorporate or ignore information based on what the current token is. When processing the word "elephant" in the context of a copying task, $\Delta_t$ can be large (updating the state significantly). When processing filler words, $\Delta_t$ can be small (preserving the existing state).
+
+2. **Input-dependent gating**: The $B_t$ and $C_t$ matrices control what goes into the state and what comes out, respectively. By making them input-dependent, the model can learn to write specific information to the state and read it back based on context.
+
+### Why Selection Closes the Gap
+
+The input-dependent parameterization solves the exact problem that made S4 weak at language: the inability to perform content-based reasoning. Consider a synthetic copying task:
+
+```
+Input:  a b c d [COPY] _ _ _ _
+Output: _ _ _ _ [COPY] a b c d
+```
+
+With fixed SSM parameters (S4), the model processes `a`, `b`, `c`, `d` the same way it processes `[COPY]` and the padding tokens. It has no way to "decide" to store the specific values of `a b c d` and retrieve them later.
+
+With Mamba's input-dependent $B_t$, the model can learn:
+- When $x_t$ is a content token (a, b, c, d): set $B_t$ to write the token value into the state (large $\Delta_t$, aligned $B_t$).
+- When $x_t$ is a padding token: set $B_t \approx 0$, leaving the state unchanged (small $\Delta_t$).
+- When $x_t$ is `[COPY]`: set $C_t$ to start reading from the state.
+
+This is analogous to what attention achieves: selectively aggregating information based on content. The mechanism is different (state update vs. pairwise comparison), but the functional capability is similar.
+
+<Benchmark
+  title="Language Modeling Perplexity: Mamba vs. Transformer (Matched Parameters)"
+  columns={["Model", "Parameters", "Tokens Trained", "Pile Perplexity", "LAMBADA Acc.", "HellaSwag Acc."]}
+  rows={[
+    { values: ["Transformer (GPT-3 arch.)", "125M", "300B", "29.6", "38.4%", "33.7%"], highlight: false },
+    { values: ["Mamba-130M", "130M", "300B", "29.1", "40.1%", "35.3%"], highlight: true },
+    { values: ["Transformer (GPT-3 arch.)", "1.3B", "300B", "14.5", "63.2%", "52.1%"], highlight: false },
+    { values: ["Mamba-1.4B", "1.4B", "300B", "14.2", "64.5%", "53.6%"], highlight: true },
+    { values: ["Transformer (GPT-3 arch.)", "2.8B", "300B", "12.4", "67.8%", "59.2%"], highlight: false },
+    { values: ["Mamba-2.8B", "2.8B", "300B", "12.0", "69.2%", "60.4%"], highlight: true }
+  ]}
+  notes="At matched parameter count and training data, Mamba consistently matches or slightly outperforms transformers on standard language benchmarks. The gap is small but consistent, and it grows with model size."
+/>
+
+---
+
+## 6. The Hardware Story: Making Scans GPU-Friendly
+
+Mamba's input-dependent parameterization means the convolution trick from S4 no longer works (the system is time-varying, so there is no fixed convolution kernel). The recurrence must be computed directly. But a naive sequential recurrence is slow on GPUs -- it cannot utilize the massive parallelism.
+
+### The Parallel Prefix Scan
+
+The key algorithmic tool is the **parallel prefix scan** (also called parallel scan or Blelloch scan). Given a sequence of operations $h_t = a_t h_{t-1} + b_t$ (which is Mamba's recurrence with $a_t = \bar{A}_t$ and $b_t = \bar{B}_t x_t$), the parallel scan computes all $h_1, h_2, \ldots, h_n$ in $O(\log n)$ parallel steps using $O(n)$ total work.
+
+The insight: the recurrence $h_t = a_t h_{t-1} + b_t$ is an associative operation. Define the binary operation $\otimes$ on tuples $(a, b)$ as:
+
+$$(a_2, b_2) \otimes (a_1, b_1) = (a_2 a_1, \; a_2 b_1 + b_2)$$
+
+Then the composition of two consecutive recurrence steps is:
+
+$$h_t = a_t (a_{t-1} h_{t-2} + b_{t-1}) + b_t = (a_t a_{t-1}) h_{t-2} + (a_t b_{t-1} + b_t)$$
+
+which matches the $\otimes$ definition. Because $\otimes$ is associative, we can compute the prefix scan (cumulative application of $\otimes$) using a parallel tree reduction in $O(\log n)$ steps.
+
+### The Fused SRAM Kernel
+
+The parallel scan gives us $O(n \log n)$ parallel time (the $\log n$ factor comes from the tree depth). But for Mamba's practical performance, the raw algorithmic complexity matters less than the memory access pattern.
+
+Gu and Dao implemented Mamba's core computation as a **fused CUDA kernel** that keeps the entire state evolution in GPU SRAM (shared memory), avoiding HBM round-trips for intermediate states. The kernel:
+
+1. Loads a chunk of the input sequence into SRAM.
+2. Computes the discretized $\bar{A}_t$, $\bar{B}_t$ for each position in the chunk (input-dependent computation).
+3. Runs the parallel scan within the chunk, keeping all intermediate states in SRAM.
+4. Writes only the final output to HBM.
+
+This is conceptually similar to FlashAttention's tiling strategy: keep the hot intermediate data in fast on-chip memory, minimize traffic to slow HBM. The difference is that Mamba's intermediate data is the hidden state sequence, not an attention matrix.
+
+<PerfChart
+  title="Throughput: Mamba vs. Transformer (A100, Sequence Length Sweep)"
+  unit="tokens/sec (thousands)"
+  data={[
+    { label: "Transformer 1.3B (n=2K)", value: 48.2, color: "blue" },
+    { label: "Mamba 1.4B (n=2K)", value: 52.1, color: "green", annotation: "+8%" },
+    { label: "Transformer 1.3B (n=8K)", value: 13.6, color: "blue" },
+    { label: "Mamba 1.4B (n=8K)", value: 45.8, color: "green", annotation: "+237%" },
+    { label: "Transformer 1.3B (n=32K)", value: 2.1, color: "red" },
+    { label: "Mamba 1.4B (n=32K)", value: 38.4, color: "green", annotation: "+1729%" },
+    { label: "Transformer 1.3B (n=128K)", value: 0.0, color: "red", annotation: "OOM" },
+    { label: "Mamba 1.4B (n=128K)", value: 31.2, color: "green", annotation: "feasible" }
+  ]}
+/>
+
+The throughput advantage of Mamba grows dramatically with sequence length. At 2K tokens, Mamba is only ~8% faster (the overhead of attention is small at short sequences). At 32K tokens, Mamba is 17x faster. At 128K tokens, the transformer runs out of memory while Mamba continues to operate.
+
+### Inference-Time Efficiency
+
+At inference time, Mamba's advantage is even more dramatic. A transformer must read the entire KV cache at each decode step -- $O(n)$ memory access per token, growing with context length. Mamba maintains a fixed-size state (typically 16-64 floats per channel) that is updated with a constant amount of work per token, regardless of how long the context is.
+
+<Benchmark
+  title="Per-Token Decode Cost: Mamba vs. Transformer (70B-scale)"
+  columns={["Context Length", "Transformer Decode (ms/tok)", "Mamba Decode (ms/tok)", "Transformer KV Cache", "Mamba State Size"]}
+  rows={[
+    { values: ["1K", "35", "32", "1.3 GB", "16 MB"], highlight: false },
+    { values: ["4K", "38", "32", "5.2 GB", "16 MB"], highlight: false },
+    { values: ["16K", "52", "32", "20.8 GB", "16 MB"], highlight: true },
+    { values: ["64K", "105", "32", "83.2 GB", "16 MB"], highlight: true },
+    { values: ["256K", "OOM", "32", "332 GB", "16 MB"], highlight: true }
+  ]}
+  notes="Mamba decode time is constant regardless of context length. Transformer decode time grows linearly with context due to KV cache reads. Mamba state size is fixed at ~16 MB regardless of sequence length."
+/>
+
+<Callout type="perf" title="Constant-Time Decoding">
+  Mamba's per-token decode cost is **constant** regardless of context length. The hidden state is a fixed-size vector (e.g., state dimension $N = 16$ with expansion factor 2 and model dimension 4096 gives $16 \times 2 \times 4096 \times 2 = 256$ KB per layer). This is fundamentally different from attention, where the KV cache grows without bound. For long-context applications, this is transformative: a 1M-token conversation costs the same per token as a 100-token conversation.
+</Callout>
+
+---
+
+## 7. Mamba vs. Transformer: Strengths and Weaknesses
+
+Mamba is not a strict upgrade over transformers. Each architecture has regimes where it excels and regimes where it struggles.
+
+### Where Mamba Wins
+
+1. **Long sequences**: $O(n)$ compute and constant memory make Mamba practical for sequence lengths where attention is infeasible.
+2. **Autoregressive generation speed**: Constant per-token decode cost means generation speed does not degrade with context length.
+3. **Memory efficiency**: No KV cache means more memory available for batching, enabling higher throughput.
+4. **Continuous signals**: Audio, time series, DNA sequences -- domains where the long-range structure is smooth and continuous, matching SSM's continuous-time inductive bias.
+
+### Where Attention Wins
+
+1. **In-context learning**: Transformers excel at few-shot in-context learning because attention can directly copy patterns from examples. Mamba must compress all context into the fixed-size state, losing fine-grained information.
+
+2. **Exact retrieval**: "What was the 5th word in the 3rd paragraph?" requires attending to a specific position. Attention can do this with a sharp attention weight. Mamba's compressed state loses positional specificity.
+
+3. **Copying and matching**: Tasks that require comparing or copying specific subsequences are hard for SSMs. The information must pass through the state bottleneck.
+
+<PerfChart
+  title="In-Context Learning: Mamba vs. Transformer (5-Shot Accuracy)"
+  unit="% accuracy"
+  data={[
+    { label: "Transformer - MMLU", value: 46.2, color: "blue" },
+    { label: "Mamba - MMLU", value: 44.1, color: "orange", annotation: "-2.1 pts" },
+    { label: "Transformer - Copy (len=64)", value: 99.8, color: "blue" },
+    { label: "Mamba - Copy (len=64)", value: 72.4, color: "red", annotation: "-27.4 pts" },
+    { label: "Transformer - Retrieval", value: 95.3, color: "blue" },
+    { label: "Mamba - Retrieval", value: 61.8, color: "red", annotation: "-33.5 pts" }
+  ]}
+/>
+
+The pattern is clear: on aggregate benchmarks (MMLU), the gap is small. On tasks that specifically require precise in-context retrieval or copying, the gap is large. This reflects the fundamental difference: attention maintains access to every past token, while Mamba compresses the past into a fixed-size state.
+
+### The Information Bottleneck
+
+The core limitation of SSMs can be understood as an **information bottleneck**. At any point during processing, the model's "memory" of the past is entirely contained in the hidden state $h_t \in \mathbb{R}^N$. If the state dimension is $N = 16$ (Mamba's default), then the model can store at most $16 \times 32 = 512$ bits of information about an arbitrarily long past (at 32-bit precision).
+
+Attention, by contrast, stores the full KV cache -- every past token's key and value vectors. For a 1K-token context with $d = 128$, that is $1000 \times 128 \times 2 \times 32 = 8.2$ million bits. The information capacity is three orders of magnitude larger.
+
+<Callout type="warning" title="The State Dimension Trade-off">
+  Increasing Mamba's state dimension $N$ reduces the information bottleneck but increases per-step compute ($O(N)$ for the state update, $O(N^2)$ for the $\bar{A}_t$ multiplication if $A$ is dense). Mamba uses a diagonal $A$ matrix to keep the state update $O(N)$, but the information capacity is still limited by $N$. There is no free lunch: $O(n)$ compute fundamentally trades away the ability to store $O(n)$ information about the past.
+</Callout>
+
+---
+
+## 8. Hybrid Architectures: The Best of Both Worlds
+
+Given that attention excels at precise retrieval and SSMs excel at efficient long-range processing, the natural question is: can we combine them?
+
+### Jamba: Interleaving Attention and Mamba
+
+AI21 Labs' Jamba (2024) is the first large-scale hybrid architecture. The design is straightforward: alternate between Mamba layers and attention layers in the model's depth.
+
+A 52B-parameter Jamba model uses:
+- **Mamba layers**: For the majority of the layers (approximately 6 out of every 8 layers). These handle the bulk of sequence processing efficiently.
+- **Attention layers**: Interspersed every few layers (approximately 2 out of every 8). These provide the precise retrieval capability that Mamba lacks.
+- **MoE (Mixture of Experts)**: In the FFN layers, for parameter efficiency.
+
+The attention layers maintain a KV cache, but because there are far fewer attention layers than in a pure transformer, the KV cache is proportionally smaller.
+
+<Benchmark
+  title="KV Cache Size: Pure Transformer vs. Jamba (52B Parameter Class)"
+  columns={["Architecture", "Attention Layers", "KV Cache (64K context)", "KV Cache (256K context)", "Relative Size"]}
+  rows={[
+    { values: ["Pure Transformer (52B)", "80", "83.2 GB", "332.8 GB", "1.0x"], highlight: false },
+    { values: ["Jamba (52B)", "20 (of 80)", "20.8 GB", "83.2 GB", "0.25x"], highlight: true },
+    { values: ["Pure Mamba (52B equiv.)", "0", "0.016 GB", "0.016 GB", "~0x"], highlight: false }
+  ]}
+  notes="Jamba's KV cache is 4x smaller than a pure transformer because only 25% of layers use attention. Pure Mamba has essentially zero KV cache (just the fixed-size SSM state)."
+/>
+
+### Mamba-2: Structured State Space Duality
+
+Mamba-2 (Dao and Gu, 2024) takes a more theoretical approach to the hybrid question. The key result is the **State Space Duality (SSD)** framework, which shows that structured SSMs and structured attention are mathematically equivalent under certain conditions.
+
+Specifically, Mamba-2 shows that an SSM with a specific structure on the $A$ matrix (diagonal, with a particular scalar structure) computes the same function as a form of linear attention with a specific causal mask. This duality means:
+
+1. **Unified implementation**: The same computation can be performed either as a recurrence (SSM mode) or as a matrix multiplication (attention-like mode). The implementation can choose the faster option based on sequence length and hardware.
+2. **Hybrid within a single layer**: Rather than alternating SSM and attention layers, a single layer can smoothly interpolate between SSM-like and attention-like computation.
+
+Mamba-2's practical improvements:
+- 2-8x faster training throughput than Mamba-1 (because the SSD formulation enables larger matrix multiplications that better utilize tensor cores).
+- Slightly better perplexity at matched compute budget.
+- Simpler implementation (the core operation reduces to a structured matrix multiply).
+
+### Other Hybrid Approaches
+
+The hybrid design space is rapidly expanding:
+
+- **Griffin** (Google DeepMind, 2024): Uses a gated linear recurrence (simpler than Mamba's SSM) with local attention (sliding window). Achieves strong results with a clean, simple design.
+- **RWKV** (Bo Peng et al., 2023-2024): A linear attention variant with channel-wise gating. Not technically an SSM, but shares the $O(n)$ property and constant inference memory. RWKV-6 uses a data-dependent linear recurrence similar to Mamba's selection mechanism.
+- **StripedHyena** (Together AI, 2023): Alternates between gated convolution layers and attention layers. Designed for maximum hardware efficiency.
+- **Zamba** (Zyphra, 2024): Shared attention layers across the depth, with Mamba blocks between them. Reduces attention parameter count while maintaining retrieval capability.
+
+<PerfChart
+  title="MMLU Accuracy vs. Inference Throughput (7B-class Models)"
+  unit=""
+  data={[
+    { label: "Llama 2 7B (Transformer)", value: 46.8, color: "blue", annotation: "1.0x speed" },
+    { label: "Mamba 7B", value: 44.1, color: "orange", annotation: "1.8x speed" },
+    { label: "Jamba 7B-equivalent", value: 46.2, color: "green", annotation: "1.5x speed" },
+    { label: "RWKV-6 7B", value: 43.5, color: "orange", annotation: "1.7x speed" },
+    { label: "Griffin 7B", value: 45.8, color: "green", annotation: "1.6x speed" },
+    { label: "Mamba-2 7B", value: 45.5, color: "green", annotation: "2.1x speed" }
+  ]}
+/>
+
+The trend is clear: hybrids with a small number of attention layers achieve quality close to pure transformers while retaining most of the speed advantage of pure SSMs. The sweet spot appears to be 10-25% attention layers, giving a 3-5x reduction in KV cache and 1.3-1.8x inference speedup with minimal quality loss.
+
+---
+
+## 9. Where Things Stand in 2025
+
+### The Current Landscape
+
+As of early 2025, the state of SSMs and hybrid architectures can be summarized as follows:
+
+**Frontier LLMs are still transformers.** GPT-4, Claude 3.5, Gemini 1.5, and Llama 3.1 are all attention-based. FlashAttention, GQA, and various KV cache optimizations have pushed the practical limits of attention far enough to support 128K-1M token context windows. The quality advantage of attention on in-context learning tasks -- the capability that matters most for frontier model performance -- has kept the industry on the transformer path.
+
+**Mamba and hybrids are gaining traction for specific use cases.** Domains where the SSM advantages are decisive:
+
+- **DNA/protein modeling**: Sequences of millions of bases where long-range dependencies matter and exact retrieval is less important. Models like Evo (2.7B parameters, 131K context on DNA) use SSM architectures.
+- **Audio processing**: Continuous signals where the continuous-time inductive bias of SSMs is a natural fit.
+- **Edge/mobile deployment**: The constant memory footprint makes SSMs attractive for resource-constrained inference.
+- **Long-context generation**: Applications that primarily generate long sequences (e.g., long-form writing) where the generation speed advantage is most valuable.
+
+**Hybrid architectures are the emerging consensus for the next generation.** Several groups are training large-scale hybrid models. The design philosophy: use attention for the capabilities that need it (retrieval, copying, in-context learning), use SSMs for the efficient bulk processing of long sequences, and minimize the attention footprint to reduce memory and compute costs.
+
+<Benchmark
+  title="Architecture Comparison Summary (7B-Class Models)"
+  columns={["Property", "Pure Transformer", "Pure Mamba", "Hybrid (75% SSM + 25% Attn)"]}
+  rows={[
+    { values: ["Training compute", "O(n^2 d) attention", "O(n d N) scan", "O(n^2 d) for attn layers, O(n d N) for SSM layers"], highlight: false },
+    { values: ["Inference memory", "KV cache grows O(n)", "Fixed state O(N)", "Reduced KV cache (25% of layers)"], highlight: false },
+    { values: ["Per-token decode cost", "O(n) at length n", "O(1)", "~O(n/4) with 25% attn"], highlight: true },
+    { values: ["In-context learning", "Excellent", "Weak", "Good (from attn layers)"], highlight: true },
+    { values: ["Long-range modeling", "Good with FlashAttn", "Excellent", "Excellent"], highlight: false },
+    { values: ["Exact retrieval", "Excellent", "Poor", "Good (from attn layers)"], highlight: true },
+    { values: ["1M token context", "Requires multi-GPU", "Single GPU feasible", "Significantly reduced KV cache"], highlight: true },
+    { values: ["Hardware efficiency", "Good (mature ecosystem)", "Good (fused scan kernel)", "Moderate (two code paths)"], highlight: false }
+  ]}
+  notes="Hybrid architectures trade a small amount of quality and implementation complexity for significant memory and compute savings. The 75/25 SSM/attention split is representative; the optimal ratio is still being explored."
+/>
+
+### Open Questions
+
+Several fundamental questions remain unresolved:
+
+1. **Scaling laws for hybrids**: Do hybrid architectures have the same scaling exponents as pure transformers? Early evidence suggests yes (Jamba scales predictably), but we do not yet have Chinchilla-scale compute-optimal experiments for hybrids.
+
+2. **The right state dimension**: Mamba-1 uses $N = 16$, Mamba-2 uses larger values. How should $N$ scale with model size and context length? The information-theoretic limits of the compressed state are not fully understood.
+
+3. **Distillation from attention to SSM**: Can we train a transformer and distill into a hybrid, getting the best training signal from attention while deploying the efficient SSM? Early results from Zyphra and others suggest this works, but the quality gap from distillation is nonzero.
+
+4. **Hardware co-design**: Current GPUs are optimized for matrix multiplications (attention). Specialized hardware for parallel scans (SSMs) could shift the efficiency comparison. Groq's LPU and other novel architectures may favor recurrent models.
+
+5. **Beyond language**: For multimodal models processing images, audio, and text together, the optimal mix of attention and SSM may be different for each modality. Images may benefit from full attention (spatial relationships), while audio may be best served by SSMs (temporal dynamics).
+
+---
+
+## 10. Summary: The $O(n)$ Alternative Is Real, With Caveats
+
+State space models, and Mamba in particular, have demonstrated that $O(n)$ sequence modeling is not just a theoretical possibility but a practical one. The progression from S4's continuous-time formulation and HiPPO initialization through Mamba's input-dependent parameterization to Mamba-2's state-space duality represents a coherent line of research that has produced models genuinely competitive with transformers on language benchmarks.
+
+The key ideas to take away:
+
+- **Linear attention** removes the softmax to achieve $O(n)$, but the quality degradation is too severe for language modeling. The softmax is doing more work than it appears.
+- **S4** uses continuous-time state space dynamics with the HiPPO matrix to model long-range dependencies, but its fixed parameters prevent content-based reasoning.
+- **Mamba** makes the SSM parameters input-dependent, enabling content-based selection that closes the gap with attention. The parallel scan makes this GPU-efficient.
+- **Hybrid architectures** combine a few attention layers (for retrieval and in-context learning) with many SSM layers (for efficient processing), achieving near-transformer quality with significantly reduced memory and compute for long sequences.
+
+The transformer is not going away. Its ecosystem is vast, its scaling properties are well-understood, and its capabilities on the tasks that matter most for frontier AI -- in-context learning, complex reasoning, precise retrieval -- remain unmatched. But the pure-attention architecture is likely not the endpoint. The future probably involves models that use attention surgically, where it provides the most value, and efficient linear-time mechanisms for the bulk of sequence processing. Mamba and its descendants are the leading candidates for the efficient half of that equation.
+
+This concludes the Inference Optimization Timeline series. From KV cache optimization through continuous batching, speculative decoding, disaggregated serving, constrained generation, and now alternative architectures -- the theme throughout has been the same: understanding the hardware-software interface, identifying the true bottleneck, and restructuring computation to match what the hardware can deliver.
