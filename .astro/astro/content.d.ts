@@ -572,6 +572,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"inference-timeline-attention-kernel-comparison.mdx": {
+	id: "inference-timeline-attention-kernel-comparison.mdx";
+  slug: "inference-timeline-attention-kernel-comparison";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "inference-timeline-batched-gemm-throughput.mdx": {
 	id: "inference-timeline-batched-gemm-throughput.mdx";
   slug: "inference-timeline-batched-gemm-throughput";
@@ -978,6 +985,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"transformer-anatomy-ddp-gradient-sync.mdx": {
+	id: "transformer-anatomy-ddp-gradient-sync.mdx";
+  slug: "transformer-anatomy-ddp-gradient-sync";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "transformer-anatomy-gradient-flow-backprop.mdx": {
 	id: "transformer-anatomy-gradient-flow-backprop.mdx";
   slug: "transformer-anatomy-gradient-flow-backprop";
@@ -999,9 +1013,23 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"transformer-anatomy-mixture-of-depths.mdx": {
+	id: "transformer-anatomy-mixture-of-depths.mdx";
+  slug: "transformer-anatomy-mixture-of-depths";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "transformer-anatomy-model-merging-ties-dare.mdx": {
 	id: "transformer-anatomy-model-merging-ties-dare.mdx";
   slug: "transformer-anatomy-model-merging-ties-dare";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"transformer-anatomy-multi-token-prediction-heads.mdx": {
+	id: "transformer-anatomy-multi-token-prediction-heads.mdx";
+  slug: "transformer-anatomy-multi-token-prediction-heads";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
