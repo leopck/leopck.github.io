@@ -642,6 +642,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"nvidia-dynamo-kvbm-multi-tier-offloading.mdx": {
+	id: "nvidia-dynamo-kvbm-multi-tier-offloading.mdx";
+  slug: "nvidia-dynamo-kvbm-multi-tier-offloading";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "nvidia-dynamo-modelexpress-nixl-cold-start.mdx": {
 	id: "nvidia-dynamo-modelexpress-nixl-cold-start.mdx";
   slug: "nvidia-dynamo-modelexpress-nixl-cold-start";

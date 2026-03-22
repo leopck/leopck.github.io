@@ -1,0 +1,252 @@
+---
+title: "NVIDIA Dynamo Part 4: KVBM — Multi-Tier KV Cache Offloading Across GPU, CPU, SSD, and Remote"
+author: "stanley-phoong"
+description: "How Dynamo's KV Block Manager extends PagedAttention to a cluster-wide multi-tier cache hierarchy. Implementation of the offloading decision algorithm, async DMA pipelines, and the eviction policy that balances hit rate against transfer latency."
+publishDate: 2025-03-22
+category: llm-inference
+tags: [dynamo, kvbm, kv-cache, offloading, multi-tier, gpu-cpu-ssd, memory-hierarchy]
+difficulty: expert
+readingTime: 32
+draft: false
+featured: false
+series: "NVIDIA Dynamo & llm-d"
+seriesOrder: 4
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+import MemoryLayout from '@/components/mdx/MemoryLayout.astro';
+
+vLLM's block manager operates within a single GPU: blocks live in HBM or get swapped to CPU DRAM. Dynamo's KV Block Manager (KVBM) extends this to a **four-tier hierarchy** spanning the entire cluster. A KV cache block can reside in GPU HBM, CPU DRAM, NVMe SSD, or on a remote GPU — and KVBM decides where each block should live based on access recency, transfer cost, and capacity constraints.
+
+## The Four-Tier Architecture
+
+<MemoryLayout
+  title="KVBM Tier Hierarchy"
+  layout={[
+    { name: "Tier 0: GPU HBM", power: "80 GB per GPU, 3.35 TB/s bandwidth", state: "Active sequences, hot cache. Access: 0.3 us", color: "#10b981" },
+    { name: "Tier 1: CPU DRAM", power: "512 GB - 2 TB per node, 50 GB/s via PCIe", state: "Recently preempted, warm cache. Access: 20 us", color: "#3b82f6" },
+    { name: "Tier 2: NVMe SSD", power: "4-16 TB per node, 7 GB/s", state: "Long-idle sequences, cold cache. Access: 143 us", color: "#f59e0b" },
+    { name: "Tier 3: Remote GPU (NVLink/IB)", power: "Cluster-wide pool, 25-900 GB/s", state: "Cross-GPU cache sharing. Access: 1.5-80 us", color: "#a371f7" },
+  ]}
+/>
+
+### Block Size and Transfer Math
+
+Each KV cache block holds $B_s$ tokens (default 16). For Llama 70B with GQA-8:
+
+$$\text{block\_bytes} = B_s \times 2 \times n_{\text{layers}} \times n_{\text{kv\_heads}} \times d_{\text{head}} \times \text{dtype\_bytes}$$
+
+$$= 16 \times 2 \times 80 \times 8 \times 128 \times 2 = 5{,}242{,}880 \text{ bytes} = 5.24 \text{ MB}$$
+
+<Benchmark
+  title="Block Transfer Latency by Tier"
+  columns={["Transfer Path", "Bandwidth", "5.24 MB Block", "Decision Threshold"]}
+  rows={[
+    { values: ["HBM read (local)", "3,350 GB/s", "1.6 us", "Always fastest"], highlight: true },
+    { values: ["HBM to CPU DRAM", "28 GB/s (PCIe Gen5)", "187 us", "If idle for 100+ iterations"], highlight: false },
+    { values: ["CPU DRAM to HBM (restore)", "28 GB/s", "187 us", "Request resumes"], highlight: false },
+    { values: ["CPU to NVMe SSD", "7 GB/s", "749 us", "If idle for 1000+ iterations"], highlight: false },
+    { values: ["NVMe to CPU to HBM", "7 GB/s + 28 GB/s", "936 us total", "Cold restore path"], highlight: false },
+    { values: ["Remote GPU via NVLink", "900 GB/s", "5.8 us", "Cross-GPU cache hit"], highlight: true },
+    { values: ["Remote GPU via IB NDR", "50 GB/s", "105 us", "Cross-node cache hit"], highlight: false },
+  ]}
+/>
+
+## The KVBM Implementation
+
+```python
+from enum import Enum
+from dataclasses import dataclass, field
+from collections import OrderedDict
+import asyncio
+
+class Tier(Enum):
+    GPU_HBM = 0
+    CPU_DRAM = 1
+    NVME_SSD = 2
+    REMOTE_GPU = 3
+
+@dataclass
+class KVBlock:
+    block_id: int
+    tier: Tier
+    physical_addr: int        # Memory address in current tier
+    sequence_id: int
+    block_index: int          # Position within the sequence
+    ref_count: int = 1
+    last_access_iter: int = 0 # Iteration when last accessed
+
+class KVBM:
+    """Multi-tier KV Block Manager for Dynamo."""
+
+    def __init__(
+        self,
+        gpu_capacity_blocks: int,
+        cpu_capacity_blocks: int,
+        ssd_capacity_blocks: int,
+        gpu_watermark: float = 0.90,  # Trigger offload at 90%
+    ):
+        self.gpu_capacity = gpu_capacity_blocks
+        self.cpu_capacity = cpu_capacity_blocks
+        self.ssd_capacity = ssd_capacity_blocks
+        self.watermark = gpu_watermark
+
+        # Per-tier block storage (LRU order)
+        self.gpu_blocks = OrderedDict()  # block_id -> KVBlock
+        self.cpu_blocks = OrderedDict()
+        self.ssd_blocks = OrderedDict()
+
+        # Free lists
+        self.gpu_free = list(range(gpu_capacity_blocks))
+        self.cpu_free = list(range(cpu_capacity_blocks))
+        self.ssd_free = list(range(ssd_capacity_blocks))
+
+        self.current_iter = 0
+
+    def allocate(self, sequence_id, num_blocks):
+        """Allocate GPU blocks for a new sequence."""
+        if len(self.gpu_free) < num_blocks:
+            self._offload_to_cpu(num_blocks - len(self.gpu_free))
+
+        allocated = []
+        for i in range(num_blocks):
+            block_id = self.gpu_free.pop()
+            block = KVBlock(
+                block_id=block_id,
+                tier=Tier.GPU_HBM,
+                physical_addr=block_id * BLOCK_SIZE_BYTES,
+                sequence_id=sequence_id,
+                block_index=i,
+                last_access_iter=self.current_iter,
+            )
+            self.gpu_blocks[block_id] = block
+            allocated.append(block)
+        return allocated
+
+    def access(self, block_id):
+        """Mark block as accessed (update LRU position)."""
+        if block_id in self.gpu_blocks:
+            self.gpu_blocks.move_to_end(block_id)
+            self.gpu_blocks[block_id].last_access_iter = self.current_iter
+
+    def _offload_to_cpu(self, num_blocks):
+        """Offload LRU GPU blocks to CPU DRAM."""
+        for _ in range(num_blocks):
+            if not self.gpu_blocks:
+                break
+            # Evict least recently used GPU block
+            block_id, block = self.gpu_blocks.popitem(last=False)
+
+            if len(self.cpu_free) == 0:
+                self._offload_to_ssd(1)  # Cascade to SSD
+
+            cpu_slot = self.cpu_free.pop()
+            block.tier = Tier.CPU_DRAM
+            block.physical_addr = cpu_slot * BLOCK_SIZE_BYTES
+            self.cpu_blocks[block_id] = block
+            self.gpu_free.append(block_id)
+
+            # Initiate async DMA: GPU HBM -> CPU DRAM
+            # cuda.memcpy_async(dst=cpu_addr, src=gpu_addr, size=BLOCK_SIZE_BYTES)
+
+    def _offload_to_ssd(self, num_blocks):
+        """Offload LRU CPU blocks to NVMe SSD."""
+        for _ in range(num_blocks):
+            if not self.cpu_blocks:
+                break
+            block_id, block = self.cpu_blocks.popitem(last=False)
+            ssd_slot = self.ssd_free.pop()
+            block.tier = Tier.NVME_SSD
+            block.physical_addr = ssd_slot * BLOCK_SIZE_BYTES
+            self.ssd_blocks[block_id] = block
+            self.cpu_free.append(block_id)
+
+    def restore_to_gpu(self, block_id):
+        """Bring an offloaded block back to GPU HBM."""
+        if block_id in self.cpu_blocks:
+            block = self.cpu_blocks.pop(block_id)
+            # Transfer: CPU -> GPU (187 us for 5.24 MB)
+        elif block_id in self.ssd_blocks:
+            block = self.ssd_blocks.pop(block_id)
+            # Transfer: SSD -> CPU -> GPU (936 us total)
+        else:
+            raise KeyError(f"Block {block_id} not found in any tier")
+
+        if len(self.gpu_free) == 0:
+            self._offload_to_cpu(1)
+
+        gpu_slot = self.gpu_free.pop()
+        block.tier = Tier.GPU_HBM
+        block.physical_addr = gpu_slot * BLOCK_SIZE_BYTES
+        block.last_access_iter = self.current_iter
+        self.gpu_blocks[block_id] = block
+        return block
+
+    def check_watermark(self):
+        """Proactively offload if GPU occupancy exceeds watermark."""
+        occupancy = 1.0 - len(self.gpu_free) / self.gpu_capacity
+        if occupancy > self.watermark:
+            excess = int((occupancy - self.watermark) * self.gpu_capacity) + 1
+            self._offload_to_cpu(excess)
+
+    def step(self):
+        """Called each iteration. Check watermarks, update counters."""
+        self.current_iter += 1
+        self.check_watermark()
+```
+
+<Callout type="perf" title="The 90% Watermark">
+The watermark threshold (90%) reserves 10% of GPU blocks as headroom for incoming requests. Without it, every new request would trigger synchronous offloading — blocking the forward pass while blocks transfer to CPU. With the watermark, proactive offloading happens asynchronously between iterations, ensuring blocks are already available when needed.
+</Callout>
+
+## Async DMA Pipeline
+
+Offloading must not block inference. KVBM uses dedicated CUDA streams for transfers:
+
+```python
+# Dedicated streams for tier transfers
+offload_stream = torch.cuda.Stream()   # GPU -> CPU
+restore_stream = torch.cuda.Stream()   # CPU -> GPU
+ssd_stream = torch.cuda.Stream()       # CPU <-> SSD
+
+def async_offload(gpu_addr, cpu_addr, size):
+    with torch.cuda.stream(offload_stream):
+        # Non-blocking GPU -> CPU transfer
+        torch.cuda.memcpy_async(cpu_addr, gpu_addr, size,
+                                 kind="device_to_host")
+        # Record event for completion tracking
+        return offload_stream.record_event()
+
+def async_restore(cpu_addr, gpu_addr, size):
+    with torch.cuda.stream(restore_stream):
+        torch.cuda.memcpy_async(gpu_addr, cpu_addr, size,
+                                 kind="host_to_device")
+        return restore_stream.record_event()
+```
+
+The key: offloading runs on `offload_stream` while inference runs on the default stream. They execute concurrently. The scheduler ensures that a block being offloaded is not accessed until the transfer completes (tracked via CUDA events).
+
+## Reviewer Agent Validation
+
+**Challenge**: Using only this post, write a function that computes how many blocks can fit in each tier for a given GPU (80GB HBM, 1TB CPU DRAM, 8TB NVMe), given the Llama 70B block size of 5.24 MB.
+
+Expected:
+
+```python
+def tier_capacities(block_size_mb=5.24):
+    gpu_blocks = int(80 * 1024 / block_size_mb * 0.65)  # 65% for KV cache
+    cpu_blocks = int(1024 * 1024 / block_size_mb)
+    ssd_blocks = int(8 * 1024 * 1024 / block_size_mb)
+    return {
+        "gpu": gpu_blocks,    # ~10,137 blocks
+        "cpu": cpu_blocks,    # ~200,305 blocks
+        "ssd": ssd_blocks,    # ~1,602,443 blocks
+        "gpu_tokens": gpu_blocks * 16,     # ~162K tokens
+        "cpu_tokens": cpu_blocks * 16,     # ~3.2M tokens
+        "ssd_tokens": ssd_blocks * 16,     # ~25.6M tokens
+    }
+```
+
+If the Reviewer Agent computes these numbers correctly, the block size derivation and tier capacities were explained precisely enough.
