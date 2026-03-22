@@ -1356,6 +1356,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"transformer-anatomy-tensor-parallelism-implementation.mdx": {
+	id: "transformer-anatomy-tensor-parallelism-implementation.mdx";
+  slug: "transformer-anatomy-tensor-parallelism-implementation";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "transformer-anatomy-training-loop.mdx": {
 	id: "transformer-anatomy-training-loop.mdx";
   slug: "transformer-anatomy-training-loop";
