@@ -285,6 +285,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"dataset-frontier-contamination-detection.mdx": {
+	id: "dataset-frontier-contamination-detection.mdx";
+  slug: "dataset-frontier-contamination-detection";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "dataset-frontier-curation-dclm-fineweb.mdx": {
 	id: "dataset-frontier-curation-dclm-fineweb.mdx";
   slug: "dataset-frontier-curation-dclm-fineweb";
@@ -306,6 +313,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"dataset-frontier-data-scaling-how-much.mdx": {
+	id: "dataset-frontier-data-scaling-how-much.mdx";
+  slug: "dataset-frontier-data-scaling-how-much";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "dataset-frontier-data-scaling-law-how-much.mdx": {
 	id: "dataset-frontier-data-scaling-law-how-much.mdx";
   slug: "dataset-frontier-data-scaling-law-how-much";
@@ -320,9 +334,23 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"dataset-frontier-html-to-clean-pipeline.mdx": {
+	id: "dataset-frontier-html-to-clean-pipeline.mdx";
+  slug: "dataset-frontier-html-to-clean-pipeline";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "dataset-frontier-instruction-tuning-data.mdx": {
 	id: "dataset-frontier-instruction-tuning-data.mdx";
   slug: "dataset-frontier-instruction-tuning-data";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"dataset-frontier-instruction-tuning-quality.mdx": {
+	id: "dataset-frontier-instruction-tuning-quality.mdx";
+  slug: "dataset-frontier-instruction-tuning-quality";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -495,6 +523,20 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"frontier-research-hallucination-mitigation.mdx": {
+	id: "frontier-research-hallucination-mitigation.mdx";
+  slug: "frontier-research-hallucination-mitigation";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"frontier-research-interpretability-mechanistic.mdx": {
+	id: "frontier-research-interpretability-mechanistic.mdx";
+  slug: "frontier-research-interpretability-mechanistic";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "frontier-research-lightning-attention-linear-scaling.mdx": {
 	id: "frontier-research-lightning-attention-linear-scaling.mdx";
   slug: "frontier-research-lightning-attention-linear-scaling";
@@ -540,6 +582,13 @@ declare module 'astro:content' {
 "frontier-research-reward-model-engineering.mdx": {
 	id: "frontier-research-reward-model-engineering.mdx";
   slug: "frontier-research-reward-model-engineering";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"frontier-research-self-improving-systems.mdx": {
+	id: "frontier-research-self-improving-systems.mdx";
+  slug: "frontier-research-self-improving-systems";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -649,6 +698,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"inference-timeline-distributed-inference-tp-pp.mdx": {
+	id: "inference-timeline-distributed-inference-tp-pp.mdx";
+  slug: "inference-timeline-distributed-inference-tp-pp";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "inference-timeline-dynamic-batching-orca-sarathi.mdx": {
 	id: "inference-timeline-dynamic-batching-orca-sarathi.mdx";
   slug: "inference-timeline-dynamic-batching-orca-sarathi";
@@ -680,6 +736,13 @@ declare module 'astro:content' {
 "inference-timeline-kernel-autotuning-compile.mdx": {
 	id: "inference-timeline-kernel-autotuning-compile.mdx";
   slug: "inference-timeline-kernel-autotuning-compile";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"inference-timeline-kv-compression-eviction.mdx": {
+	id: "inference-timeline-kv-compression-eviction.mdx";
+  slug: "inference-timeline-kv-compression-eviction";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -726,6 +789,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"inference-timeline-serving-benchmarking-methodology.mdx": {
+	id: "inference-timeline-serving-benchmarking-methodology.mdx";
+  slug: "inference-timeline-serving-benchmarking-methodology";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "inference-timeline-speculative-decoding-v2.mdx": {
 	id: "inference-timeline-speculative-decoding-v2.mdx";
   slug: "inference-timeline-speculative-decoding-v2";
@@ -750,6 +820,13 @@ declare module 'astro:content' {
 "inference-timeline-vlm-serving-vit-paging.mdx": {
 	id: "inference-timeline-vlm-serving-vit-paging.mdx";
   slug: "inference-timeline-vlm-serving-vit-paging";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"inference-timeline-vlm-video-audio-serving.mdx": {
+	id: "inference-timeline-vlm-video-audio-serving.mdx";
+  slug: "inference-timeline-vlm-video-audio-serving";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -908,6 +985,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"nvidia-dynamo-cost-optimizer-spot-burst.mdx": {
+	id: "nvidia-dynamo-cost-optimizer-spot-burst.mdx";
+  slug: "nvidia-dynamo-cost-optimizer-spot-burst";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "nvidia-dynamo-fault-tolerance-canary-health.mdx": {
 	id: "nvidia-dynamo-fault-tolerance-canary-health.mdx";
   slug: "nvidia-dynamo-fault-tolerance-canary-health";
@@ -936,6 +1020,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"nvidia-dynamo-mini-router-implementation.mdx": {
+	id: "nvidia-dynamo-mini-router-implementation.mdx";
+  slug: "nvidia-dynamo-mini-router-implementation";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "nvidia-dynamo-modelexpress-nixl-cold-start.mdx": {
 	id: "nvidia-dynamo-modelexpress-nixl-cold-start.mdx";
   slug: "nvidia-dynamo-modelexpress-nixl-cold-start";
@@ -946,6 +1037,13 @@ declare module 'astro:content' {
 "nvidia-dynamo-moe-expert-routing.mdx": {
 	id: "nvidia-dynamo-moe-expert-routing.mdx";
   slug: "nvidia-dynamo-moe-expert-routing";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"nvidia-dynamo-multimodal-video-routing.mdx": {
+	id: "nvidia-dynamo-multimodal-video-routing.mdx";
+  slug: "nvidia-dynamo-multimodal-video-routing";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -967,6 +1065,13 @@ declare module 'astro:content' {
 "nvidia-dynamo-planner-grove-gang-scheduling.mdx": {
 	id: "nvidia-dynamo-planner-grove-gang-scheduling.mdx";
   slug: "nvidia-dynamo-planner-grove-gang-scheduling";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"nvidia-dynamo-vs-sglang-router.mdx": {
+	id: "nvidia-dynamo-vs-sglang-router.mdx";
+  slug: "nvidia-dynamo-vs-sglang-router";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -1125,6 +1230,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"transformer-anatomy-data-loading-packing-padding.mdx": {
+	id: "transformer-anatomy-data-loading-packing-padding.mdx";
+  slug: "transformer-anatomy-data-loading-packing-padding";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "transformer-anatomy-ddp-gradient-sync.mdx": {
 	id: "transformer-anatomy-ddp-gradient-sync.mdx";
   slug: "transformer-anatomy-ddp-gradient-sync";
@@ -1160,6 +1272,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"transformer-anatomy-mixed-precision-training-details.mdx": {
+	id: "transformer-anatomy-mixed-precision-training-details.mdx";
+  slug: "transformer-anatomy-mixed-precision-training-details";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "transformer-anatomy-mixture-of-depths.mdx": {
 	id: "transformer-anatomy-mixture-of-depths.mdx";
   slug: "transformer-anatomy-mixture-of-depths";
@@ -1181,6 +1300,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"transformer-anatomy-pruning-sparsegpt-wanda.mdx": {
+	id: "transformer-anatomy-pruning-sparsegpt-wanda.mdx";
+  slug: "transformer-anatomy-pruning-sparsegpt-wanda";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "transformer-anatomy-rotary-position-complete-derivation.mdx": {
 	id: "transformer-anatomy-rotary-position-complete-derivation.mdx";
   slug: "transformer-anatomy-rotary-position-complete-derivation";
@@ -1198,6 +1324,13 @@ declare module 'astro:content' {
 "transformer-anatomy-training-loop.mdx": {
 	id: "transformer-anatomy-training-loop.mdx";
   slug: "transformer-anatomy-training-loop";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"transformer-anatomy-transformer-2026-whats-next.mdx": {
+	id: "transformer-anatomy-transformer-2026-whats-next.mdx";
+  slug: "transformer-anatomy-transformer-2026-whats-next";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">

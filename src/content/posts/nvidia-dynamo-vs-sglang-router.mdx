@@ -1,0 +1,782 @@
+---
+title: "Dynamo vs SGLang Router: Architectural Comparison and Integration Patterns"
+author: "stanley-phoong"
+description: "SGLang's RadixAttention-based routing vs Dynamo's KV-aware routing. Single-node optimization vs multi-node orchestration. How they can work together: Dynamo for cluster orchestration, SGLang as the per-node engine."
+publishDate: 2025-03-22
+category: llm-inference
+tags: [dynamo, sglang, routing, radix-attention, kv-cache, comparison, integration]
+difficulty: expert
+readingTime: 30
+draft: false
+featured: false
+series: "NVIDIA Dynamo & llm-d"
+seriesOrder: 12
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+
+SGLang and Dynamo both optimize LLM serving by exploiting KV cache locality, but they operate at fundamentally different scales. SGLang optimizes within a single node: its RadixAttention uses a radix tree to share KV cache across requests with common prefixes, achieving near-perfect prefix cache hit rates. Dynamo optimizes across a cluster: its KV-aware router directs requests to the node that already has the relevant KV cache blocks, avoiding redundant prefill across the cluster.
+
+These are complementary, not competing. The optimal architecture uses Dynamo for cluster-level routing and SGLang as the per-node inference engine. This post compares their architectures, analyzes where each excels, and shows how to integrate them.
+
+---
+
+## 1. Architectural Overview
+
+### SGLang: Single-Node Optimizer
+
+SGLang's core innovation is RadixAttention -- a radix tree data structure that indexes all cached KV data by token prefix:
+
+```python
+# SGLang RadixTree conceptual structure
+class RadixTreeNode:
+    """Node in the radix tree. Each node represents a cached prefix."""
+    def __init__(self):
+        self.children = {}         # token_id -> child RadixTreeNode
+        self.kv_cache_block_id = None  # Physical block containing KV data
+        self.ref_count = 0          # Number of sequences using this prefix
+        self.last_access_time = 0   # For eviction ordering
+
+class RadixTree:
+    """Radix tree for KV cache prefix sharing."""
+    def __init__(self):
+        self.root = RadixTreeNode()
+
+    def insert(self, token_ids, block_ids):
+        """Insert a sequence of tokens with their KV cache blocks."""
+        node = self.root
+        for i, token in enumerate(token_ids):
+            if token not in node.children:
+                node.children[token] = RadixTreeNode()
+            node = node.children[token]
+            node.kv_cache_block_id = block_ids[i // BLOCK_SIZE]
+            node.ref_count += 1
+
+    def match_prefix(self, token_ids):
+        """Find the longest cached prefix for a token sequence."""
+        node = self.root
+        matched = 0
+        for token in token_ids:
+            if token in node.children:
+                node = node.children[token]
+                matched += 1
+            else:
+                break
+        return matched, node
+```
+
+When a new request arrives, SGLang walks the radix tree to find the longest cached prefix. If a previous request shared the same system prompt + few-shot examples, the KV cache for those tokens is already computed and can be reused:
+
+```python
+def schedule_request(request, radix_tree):
+    """Schedule a request using RadixAttention."""
+    # Find cached prefix
+    matched_len, node = radix_tree.match_prefix(request.prompt_tokens)
+
+    # Only prefill the uncached suffix
+    uncached_tokens = request.prompt_tokens[matched_len:]
+
+    return {
+        'cached_prefix_len': matched_len,
+        'uncached_tokens': uncached_tokens,
+        'prefill_savings': matched_len / len(request.prompt_tokens),
+    }
+```
+
+### Dynamo: Multi-Node Orchestrator
+
+Dynamo operates above the inference engine layer. It does not manage individual KV cache blocks -- it tracks which nodes have which prefixes cached and routes accordingly:
+
+```python
+# Dynamo Router conceptual structure
+class DynamoRouter:
+    """Cluster-level KV-aware router."""
+    def __init__(self, workers):
+        self.workers = workers
+        # Maps: prefix_hash -> set of worker_ids that have it cached
+        self.cache_index = {}
+
+    def route(self, request):
+        """Route request to the worker with best KV cache overlap."""
+        prompt_hash = hash_prefix(request.prompt_tokens)
+
+        best_worker = None
+        best_score = -1
+
+        for worker in self.workers:
+            # Score = KV cache overlap - queue penalty
+            overlap = self._compute_overlap(prompt_hash, worker)
+            queue_penalty = worker.queue_depth * worker.avg_step_time
+            score = overlap - queue_penalty
+
+            if score > best_score:
+                best_score = score
+                best_worker = worker
+
+        return best_worker
+
+    def _compute_overlap(self, prompt_hash, worker):
+        """Estimate KV cache overlap between request and worker."""
+        # Worker reports its cached prefix hashes periodically
+        worker_hashes = self.cache_index.get(worker.id, set())
+        if prompt_hash in worker_hashes:
+            return 1.0  # Full prefix cached
+        # Check partial prefix matches
+        for prefix_len in range(len(prompt_hash) - 1, 0, -1):
+            partial_hash = prompt_hash[:prefix_len]
+            if partial_hash in worker_hashes:
+                return prefix_len / len(prompt_hash)
+        return 0.0
+```
+
+### Key Differences
+
+<Benchmark
+  title="Architectural Comparison: SGLang vs Dynamo"
+  columns={["Aspect", "SGLang", "Dynamo"]}
+  rows={[
+    { values: ["Scope", "Single node", "Multi-node cluster"], highlight: true },
+    { values: ["Cache granularity", "Per-block (16 tokens)", "Per-prefix-hash (coarse)"], highlight: false },
+    { values: ["Cache sharing", "Radix tree (exact match)", "Hash-based (prefix match)"], highlight: false },
+    { values: ["Routing scope", "Within-GPU scheduling", "Across-node routing"], highlight: true },
+    { values: ["Prefill/decode split", "No (unified)", "Yes (disaggregated)"], highlight: false },
+    { values: ["Language", "Python + CUDA", "Rust + Python"], highlight: false },
+    { values: ["KV transfer", "In-GPU-memory (zero copy)", "GPU-to-GPU (NIXL/RDMA)"], highlight: false },
+    { values: ["Cold start", "Model load from disk", "NIXL streaming from peer"], highlight: false },
+    { values: ["Autoscaling", "No", "Planner + Grove autoscaler"], highlight: false },
+  ]}
+/>
+
+---
+
+## 2. RadixAttention Deep Dive
+
+### How the Radix Tree Enables Sharing
+
+Consider three requests arriving at an SGLang server:
+
+```
+Request 1: [System prompt (200 tok)] + [User: "Summarize this code" (50 tok)]
+Request 2: [System prompt (200 tok)] + [User: "Explain this error" (40 tok)]
+Request 3: [System prompt (200 tok)] + [Few-shot examples (500 tok)] + [User: "Classify" (20 tok)]
+```
+
+The radix tree after all three requests:
+
+```
+Root
+ |-- [System prompt, 200 tok] --> KV blocks 0-12
+      |-- [User: "Summarize...", 50 tok] --> KV blocks 13-16 (Request 1)
+      |-- [User: "Explain...", 40 tok] --> KV blocks 13-15 (Request 2)
+      |-- [Few-shot examples, 500 tok] --> KV blocks 13-43 (Request 3)
+           |-- [User: "Classify", 20 tok] --> KV blocks 44-45 (Request 3)
+```
+
+Requests 1 and 2 share the system prompt KV cache (blocks 0-12). Request 3 shares the system prompt and has its own few-shot branch. Without RadixAttention, each request would independently compute the system prompt -- 3x the prefill work.
+
+The savings compound with scale:
+
+<PerfChart
+  title="Prefix Cache Hit Rate vs. System Prompt Sharing (100 RPS)"
+  data={[
+    { label: "No sharing", value: 0, color: "red" },
+    { label: "1 system prompt", value: 85, color: "green", annotation: "All share same prefix" },
+    { label: "5 system prompts", value: 72, color: "blue" },
+    { label: "50 system prompts", value: 35, color: "orange" },
+    { label: "Random prompts", value: 5, color: "red", annotation: "No common prefixes" },
+  ]}
+  unit="% hit rate"
+/>
+
+### Cache Eviction
+
+When GPU memory is full, SGLang evicts the least-recently-used leaf nodes from the radix tree:
+
+```python
+class RadixTreeEvictor:
+    """LRU eviction from the radix tree."""
+
+    def evict(self, tree, num_blocks_to_free):
+        """Evict leaf nodes to free KV cache blocks."""
+        freed = 0
+        # Collect all leaf nodes with their last access time
+        leaves = self._collect_leaves(tree.root)
+        leaves.sort(key=lambda n: n.last_access_time)  # Oldest first
+
+        for leaf in leaves:
+            if freed >= num_blocks_to_free:
+                break
+            if leaf.ref_count == 0:  # Only evict unreferenced nodes
+                blocks_freed = self._remove_leaf(tree, leaf)
+                freed += blocks_freed
+
+        return freed
+
+    def _collect_leaves(self, node, depth=0):
+        """Collect all leaf nodes."""
+        if not node.children:
+            return [node]
+        leaves = []
+        for child in node.children.values():
+            leaves.extend(self._collect_leaves(child, depth + 1))
+        return leaves
+
+    def _remove_leaf(self, tree, leaf):
+        """Remove a leaf node and free its KV blocks."""
+        block_id = leaf.kv_cache_block_id
+        # Walk up and remove if parent has no other children
+        # (prune empty branches)
+        return 1  # Freed one block
+```
+
+---
+
+## 3. Dynamo KV-Aware Routing Deep Dive
+
+### The Cache Index
+
+Dynamo maintains a cluster-wide index of which workers have which prefix hashes cached:
+
+```python
+class ClusterCacheIndex:
+    """Cluster-wide index of KV cache prefix locations."""
+
+    def __init__(self):
+        # prefix_hash -> {worker_id: cached_token_count}
+        self.index = {}
+        self.lock = threading.Lock()
+
+    def update_worker_cache(self, worker_id, cached_prefixes):
+        """Worker reports its cached prefixes."""
+        with self.lock:
+            # Remove old entries for this worker
+            for prefix_hash in list(self.index.keys()):
+                if worker_id in self.index[prefix_hash]:
+                    del self.index[prefix_hash][worker_id]
+                    if not self.index[prefix_hash]:
+                        del self.index[prefix_hash]
+
+            # Add new entries
+            for prefix_hash, token_count in cached_prefixes.items():
+                if prefix_hash not in self.index:
+                    self.index[prefix_hash] = {}
+                self.index[prefix_hash][worker_id] = token_count
+
+    def find_best_worker(self, prompt_hashes, workers):
+        """Find the worker with best cache overlap for this prompt."""
+        scores = {w.id: 0 for w in workers}
+
+        with self.lock:
+            for prefix_hash in prompt_hashes:
+                if prefix_hash in self.index:
+                    for worker_id, cached_count in self.index[prefix_hash].items():
+                        if worker_id in scores:
+                            scores[worker_id] += cached_count
+
+        best_id = max(scores, key=scores.get)
+        return next(w for w in workers if w.id == best_id), scores[best_id]
+```
+
+### Routing Staleness
+
+The cache index is updated periodically (every 1-5 seconds), not in real-time. This means routing decisions are based on slightly stale information:
+
+```python
+class StalenessAwareRouter:
+    """Route with awareness of cache index staleness."""
+
+    def __init__(self, cache_index, update_interval=2.0):
+        self.cache_index = cache_index
+        self.update_interval = update_interval
+        self.last_update = {}  # worker_id -> timestamp
+
+    def route(self, request, workers):
+        # Compute cache overlap scores
+        scores = {}
+        for worker in workers:
+            overlap = self.cache_index.find_overlap(request, worker)
+            staleness = time.time() - self.last_update.get(worker.id, 0)
+
+            # Discount overlap score by staleness
+            # After 5 seconds, cache state could have changed significantly
+            freshness = max(0, 1.0 - staleness / (self.update_interval * 3))
+            scores[worker] = overlap * freshness + (1 - freshness) * 0.5
+
+        # Also factor in queue depth (always fresh, reported per-request)
+        for worker in workers:
+            queue_cost = worker.queue_depth * 0.01  # Penalty per queued request
+            scores[worker] -= queue_cost
+
+        return max(scores, key=scores.get)
+```
+
+<Callout type="info" title="Staleness Is Acceptable">
+A 2-second staleness window means the router might route a request to a worker that evicted the relevant cache 1 second ago. The cost of this miss is one redundant prefill (50-500ms). Compared to the alternative (real-time cache synchronization across the cluster, which would add network overhead to every cache operation), periodic updates with staleness tolerance is the right tradeoff.
+</Callout>
+
+---
+
+## 4. Where Each System Excels
+
+### SGLang Wins: High Prefix Sharing, Single Node
+
+When most requests share common prefixes (same system prompt, similar few-shot patterns) and the workload fits on a single node:
+
+```python
+def simulate_sglang_advantage():
+    """Scenario where SGLang's fine-grained sharing excels."""
+    # 100 requests, all sharing a 4K system prompt
+    system_prompt_tokens = 4096
+    user_query_tokens = 200  # Average
+
+    # SGLang: prefill 4096 tokens once, then 200 per request
+    sglang_prefill_total = system_prompt_tokens + 100 * user_query_tokens
+    # = 4096 + 20000 = 24,096 tokens
+
+    # Without prefix caching: prefill everything per request
+    naive_prefill_total = 100 * (system_prompt_tokens + user_query_tokens)
+    # = 100 * 4296 = 429,600 tokens
+
+    savings = 1 - sglang_prefill_total / naive_prefill_total
+    # = 94.4% prefill savings
+
+    return {
+        'sglang_prefill_tokens': sglang_prefill_total,
+        'naive_prefill_tokens': naive_prefill_total,
+        'savings_percent': savings * 100,
+    }
+```
+
+### Dynamo Wins: Multi-Node, Heterogeneous Traffic
+
+When the workload spans multiple nodes with diverse traffic patterns:
+
+```python
+def simulate_dynamo_advantage():
+    """Scenario where Dynamo's cluster routing excels."""
+    # 4 nodes, each with 80GB KV cache
+    # 20 different system prompts, each requiring 1GB of KV cache
+    # Without Dynamo: each node stores all 20 prompts
+    #   = 20 * 1GB = 20GB per node (25% of KV cache for system prompts)
+
+    # With Dynamo: route by system prompt, each node handles 5 prompts
+    #   = 5 * 1GB = 5GB per node (6.25% of KV cache)
+    # More KV cache available for user-specific data
+
+    nodes = 4
+    prompts = 20
+    prompt_kv_size_gb = 1
+
+    without_dynamo_kv_per_node = prompts * prompt_kv_size_gb
+    with_dynamo_kv_per_node = (prompts / nodes) * prompt_kv_size_gb
+
+    kv_savings_gb = without_dynamo_kv_per_node - with_dynamo_kv_per_node
+
+    return {
+        'without_dynamo_kv_overhead_gb': without_dynamo_kv_per_node,
+        'with_dynamo_kv_overhead_gb': with_dynamo_kv_per_node,
+        'kv_savings_gb_per_node': kv_savings_gb,
+        'additional_sequences_per_node': int(kv_savings_gb * 1024 / 5.24),
+        # ~2860 more sequences per node at 5.24 MB/block for Llama 70B
+    }
+```
+
+<Benchmark
+  title="Performance Comparison by Scenario"
+  columns={["Scenario", "SGLang Only", "Dynamo Only", "SGLang + Dynamo"]}
+  rows={[
+    { values: ["Single node, shared prefix", "1.0x (baseline)", "0.9x (routing overhead)", "1.0x"], highlight: true },
+    { values: ["4 nodes, shared prefix", "1.0x per node", "1.8x (cache routing)", "2.0x"], highlight: false },
+    { values: ["4 nodes, diverse prompts", "1.0x per node", "2.5x (locality routing)", "2.8x"], highlight: true },
+    { values: ["16 nodes, bursty traffic", "1.0x per node", "3.5x (load balancing)", "4.0x"], highlight: true },
+    { values: ["Prefill/decode disagg.", "N/A (not supported)", "2.0x (pipeline)", "2.2x"], highlight: false },
+  ]}
+  notes="Speedup is in aggregate tokens/sec vs. a single SGLang node without optimization."
+/>
+
+---
+
+## 5. Integration Architecture
+
+### Dynamo + SGLang: The Best of Both
+
+The optimal architecture uses Dynamo as the cluster orchestrator and SGLang as the per-node inference engine:
+
+```python
+class IntegratedSystem:
+    """Dynamo cluster routing with SGLang per-node engines."""
+
+    def __init__(self, num_nodes):
+        # Dynamo components
+        self.router = DynamoRouter()
+        self.planner = DynamoPlanner()
+
+        # SGLang instances (one per node)
+        self.sglang_engines = {}
+        for node_id in range(num_nodes):
+            engine = SGLangEngine(
+                model="meta-llama/Llama-3-70B",
+                tp_size=8,
+                enable_radix_attention=True,
+            )
+            self.sglang_engines[node_id] = engine
+            self.router.register_worker(node_id, engine)
+
+        # Cache synchronization: SGLang reports cache state to Dynamo
+        self._start_cache_sync()
+
+    def handle_request(self, request):
+        """Route via Dynamo, execute via SGLang."""
+        # Step 1: Dynamo routes to the best node
+        target_node = self.router.route(request)
+
+        # Step 2: SGLang on that node handles execution
+        # SGLang's RadixAttention provides fine-grained prefix sharing
+        engine = self.sglang_engines[target_node]
+        result = engine.generate(request)
+
+        return result
+
+    def _start_cache_sync(self):
+        """Periodically sync SGLang cache state to Dynamo router."""
+        def sync_loop():
+            while True:
+                for node_id, engine in self.sglang_engines.items():
+                    # SGLang reports its cached prefix hashes
+                    cached_prefixes = engine.get_cached_prefix_hashes()
+                    self.router.cache_index.update_worker_cache(
+                        node_id, cached_prefixes
+                    )
+                time.sleep(2)  # Sync every 2 seconds
+
+        import threading
+        threading.Thread(target=sync_loop, daemon=True).start()
+```
+
+### The Cache Sync Protocol
+
+SGLang must expose its internal radix tree state to Dynamo. This is done via a lightweight export:
+
+```python
+class SGLangCacheExporter:
+    """Export SGLang's RadixAttention cache state for Dynamo."""
+
+    def __init__(self, sglang_engine):
+        self.engine = sglang_engine
+
+    def export_cache_hashes(self):
+        """Export cached prefix hashes and their sizes."""
+        radix_tree = self.engine.get_radix_tree()
+        exports = {}
+
+        def walk(node, prefix_tokens):
+            if node.kv_cache_block_id is not None:
+                prefix_hash = hash_tokens(prefix_tokens)
+                exports[prefix_hash] = len(prefix_tokens)
+
+            for token_id, child in node.children.items():
+                walk(child, prefix_tokens + [token_id])
+
+        walk(radix_tree.root, [])
+
+        # Limit exports to top-100 most accessed prefixes
+        # (to keep the sync payload small)
+        sorted_exports = sorted(
+            exports.items(),
+            key=lambda x: x[1],  # By prefix length (longer = more valuable)
+            reverse=True,
+        )[:100]
+
+        return dict(sorted_exports)
+```
+
+### Routing Feedback Loop
+
+When Dynamo routes a request to node A because of a cache hit, but the request actually gets a cache miss (because the cache was evicted between sync updates), the system should learn:
+
+```python
+class RoutingFeedback:
+    """Track routing decisions and actual cache hit outcomes."""
+
+    def __init__(self):
+        self.decisions = []
+        self.hits = 0
+        self.misses = 0
+
+    def record_decision(self, request_id, target_node, expected_overlap):
+        self.decisions.append({
+            'request_id': request_id,
+            'target_node': target_node,
+            'expected_overlap': expected_overlap,
+            'timestamp': time.time(),
+        })
+
+    def record_outcome(self, request_id, actual_overlap):
+        for d in reversed(self.decisions):
+            if d['request_id'] == request_id:
+                if actual_overlap >= d['expected_overlap'] * 0.8:
+                    self.hits += 1
+                else:
+                    self.misses += 1
+                d['actual_overlap'] = actual_overlap
+                break
+
+    @property
+    def routing_accuracy(self):
+        total = self.hits + self.misses
+        return self.hits / total if total > 0 else 0
+
+    def get_sync_interval_recommendation(self):
+        """Recommend cache sync interval based on routing accuracy."""
+        accuracy = self.routing_accuracy
+        if accuracy > 0.95:
+            return 5.0  # Slow sync is fine
+        elif accuracy > 0.85:
+            return 2.0  # Default
+        elif accuracy > 0.70:
+            return 1.0  # Need fresher data
+        else:
+            return 0.5  # Very aggressive sync
+```
+
+---
+
+## 6. Performance Comparison Benchmarks
+
+### Benchmark Setup
+
+```python
+class RouterBenchmark:
+    """Benchmark routing strategies."""
+
+    def __init__(self, num_nodes, num_prompts, total_requests):
+        self.num_nodes = num_nodes
+        self.num_prompts = num_prompts
+        self.total_requests = total_requests
+
+    def generate_workload(self):
+        """Generate a realistic workload."""
+        import random
+        requests = []
+        # Zipf distribution: some prompts are much more common
+        prompt_weights = [1.0 / (i + 1) for i in range(self.num_prompts)]
+        total_weight = sum(prompt_weights)
+        prompt_probs = [w / total_weight for w in prompt_weights]
+
+        for _ in range(self.total_requests):
+            prompt_id = random.choices(range(self.num_prompts), weights=prompt_probs)[0]
+            requests.append({
+                'prompt_id': prompt_id,
+                'prompt_length': random.randint(1000, 4000),
+                'output_length': random.randint(100, 500),
+            })
+        return requests
+
+    def simulate_round_robin(self, requests):
+        """Baseline: round-robin routing."""
+        node_caches = [set() for _ in range(self.num_nodes)]
+        cache_hits = 0
+        cache_misses = 0
+
+        for i, req in enumerate(requests):
+            node = i % self.num_nodes
+            if req['prompt_id'] in node_caches[node]:
+                cache_hits += 1
+            else:
+                cache_misses += 1
+                node_caches[node].add(req['prompt_id'])
+
+        return cache_hits / len(requests)
+
+    def simulate_dynamo_routing(self, requests):
+        """Dynamo: KV-aware routing."""
+        node_caches = [set() for _ in range(self.num_nodes)]
+        cache_hits = 0
+
+        for req in requests:
+            # Find node with this prompt cached
+            best_node = None
+            for n in range(self.num_nodes):
+                if req['prompt_id'] in node_caches[n]:
+                    best_node = n
+                    break
+
+            if best_node is not None:
+                cache_hits += 1
+            else:
+                # Route to least-loaded node
+                best_node = min(range(self.num_nodes), key=lambda n: len(node_caches[n]))
+                node_caches[best_node].add(req['prompt_id'])
+
+        return cache_hits / len(requests)
+```
+
+<PerfChart
+  title="Cache Hit Rate: Round-Robin vs KV-Aware Routing (4 nodes, 50 prompts, 10K requests)"
+  data={[
+    { label: "Round-robin", value: 23, color: "red" },
+    { label: "Least-connections", value: 31, color: "orange" },
+    { label: "Dynamo KV-aware", value: 78, color: "green" },
+    { label: "SGLang (per-node)", value: 85, color: "green", annotation: "Finer granularity" },
+    { label: "Dynamo + SGLang", value: 92, color: "green", annotation: "Best of both" },
+  ]}
+  unit="% cache hit rate"
+/>
+
+---
+
+## 7. Integration Implementation
+
+```python
+class DynamoSGLangIntegration:
+    """
+    Complete integration of Dynamo routing with SGLang engines.
+    """
+
+    def __init__(self, config):
+        # Initialize SGLang engines
+        self.engines = {}
+        for node in config.nodes:
+            engine = self._start_sglang(node)
+            self.engines[node.id] = engine
+
+        # Initialize Dynamo router
+        self.cache_index = ClusterCacheIndex()
+        self.router = StalenessAwareRouter(self.cache_index)
+        self.feedback = RoutingFeedback()
+
+        # Start background tasks
+        self._start_sync()
+        self._start_metrics()
+
+    def generate(self, request):
+        """Handle a generation request."""
+        # Hash the prompt for routing
+        prompt_hashes = hash_prefix_chain(
+            request.prompt_tokens, block_size=16
+        )
+
+        # Route via Dynamo
+        workers = list(self.engines.keys())
+        target_node, expected_overlap = self.cache_index.find_best_worker(
+            prompt_hashes,
+            [type('W', (), {'id': w}) for w in workers],
+        )
+
+        self.feedback.record_decision(
+            request.id, target_node, expected_overlap
+        )
+
+        # Execute via SGLang
+        engine = self.engines[target_node]
+        result = engine.generate(
+            prompt=request.prompt_tokens,
+            sampling_params=request.sampling_params,
+        )
+
+        # Record outcome
+        actual_overlap = result.get('prefix_cache_hit_tokens', 0) / len(request.prompt_tokens)
+        self.feedback.record_outcome(request.id, actual_overlap)
+
+        return result
+
+    def _start_sglang(self, node_config):
+        """Start an SGLang engine on a node."""
+        return SGLangEngine(
+            model=node_config.model_name,
+            tp_size=node_config.tp_size,
+            port=node_config.port,
+        )
+
+    def _start_sync(self):
+        """Start cache state synchronization."""
+        def sync():
+            while True:
+                interval = self.feedback.get_sync_interval_recommendation()
+                for node_id, engine in self.engines.items():
+                    try:
+                        cached = engine.get_cached_prefix_hashes()
+                        self.cache_index.update_worker_cache(node_id, cached)
+                    except Exception as e:
+                        print(f"Cache sync failed for node {node_id}: {e}")
+                time.sleep(interval)
+
+        import threading
+        threading.Thread(target=sync, daemon=True).start()
+
+    def _start_metrics(self):
+        """Collect and report integration metrics."""
+        def metrics():
+            while True:
+                accuracy = self.feedback.routing_accuracy
+                print(f"Routing accuracy: {accuracy:.2%}")
+                time.sleep(30)
+
+        import threading
+        threading.Thread(target=metrics, daemon=True).start()
+
+    def get_status(self):
+        return {
+            'num_engines': len(self.engines),
+            'routing_accuracy': self.feedback.routing_accuracy,
+            'cache_index_size': len(self.cache_index.index),
+        }
+```
+
+---
+
+## 8. When to Use What
+
+```python
+def recommend_architecture(workload):
+    """Recommend SGLang, Dynamo, or both based on workload."""
+    if workload.num_nodes == 1:
+        return {
+            'recommendation': 'SGLang only',
+            'reason': 'Single node -- Dynamo adds overhead without benefit',
+        }
+
+    if workload.num_nodes > 1 and workload.prefix_diversity < 10:
+        return {
+            'recommendation': 'Dynamo + SGLang',
+            'reason': (
+                'Multi-node with shared prefixes -- '
+                'Dynamo routes by prefix, SGLang shares within node'
+            ),
+        }
+
+    if workload.num_nodes > 4 and workload.needs_disaggregation:
+        return {
+            'recommendation': 'Dynamo + SGLang',
+            'reason': (
+                'Large cluster with disaggregated prefill/decode -- '
+                'Dynamo manages pools, SGLang runs per-node'
+            ),
+        }
+
+    if workload.prefix_diversity > 100:
+        return {
+            'recommendation': 'Dynamo + simple engine',
+            'reason': (
+                'High prefix diversity -- RadixAttention hit rate is low, '
+                'Dynamo routing provides more value'
+            ),
+        }
+
+    return {
+        'recommendation': 'Dynamo + SGLang',
+        'reason': 'Default: both systems provide complementary benefits',
+    }
+```
+
+---
+
+## Reviewer Agent Challenges
+
+1. **Build a cache overlap simulator**: Implement a simulation that generates 10,000 requests with a Zipf distribution over 100 system prompts, routes them across 8 nodes using round-robin, least-connections, Dynamo KV-aware, and the integrated Dynamo+SGLang approach. Measure and compare: (a) cache hit rate, (b) total prefill tokens computed, (c) average TTFT (modeled as proportional to uncached tokens). Show the results in a summary table.
+
+2. **Implement adaptive sync frequency**: Build an `AdaptiveSyncController` that monitors routing accuracy (fraction of requests where the expected cache overlap matched reality) and adjusts the cache sync interval between 0.5s and 10s. When accuracy drops below 80%, increase sync frequency. When accuracy is above 95%, decrease it to save network bandwidth. Implement and test with a workload that has bursty cache evictions.
+
+3. **Design a cache-aware load balancer**: Instead of routing purely by KV cache overlap, implement a `BalancedCacheRouter` that optimizes a weighted objective: $\text{score}(w) = \alpha \cdot \text{cache\_overlap}(w) - \beta \cdot \text{queue\_depth}(w) - \gamma \cdot \text{memory\_pressure}(w)$. Find the optimal weights $\alpha, \beta, \gamma$ by running the simulator with different weight combinations and measuring the resulting TTFT P95.

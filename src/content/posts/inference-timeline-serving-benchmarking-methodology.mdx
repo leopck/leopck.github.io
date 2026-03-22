@@ -1,0 +1,903 @@
+---
+title: "Serving Benchmark Methodology: How to Properly Measure LLM Inference Performance"
+author: "stanley-phoong"
+description: "Most LLM inference benchmarks are wrong. They measure cold cache performance, use unrealistic batch sizes, ignore tail latency, or confuse throughput with per-user latency. This post covers correct methodology: warmup procedures, steady-state measurement, TTFT/TBT/throughput at different QPS levels, open vs closed loop testing, and practical tooling with vllm benchmark_serving.py and GenAI-Perf."
+publishDate: 2025-03-22
+category: llm-inference
+tags: [benchmarking, methodology, ttft, tbt, throughput, latency, genai-perf]
+difficulty: expert
+readingTime: 32
+draft: false
+featured: false
+series: "Inference Optimization Timeline"
+seriesOrder: 39
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+
+A vendor claims their inference engine achieves 10,000 tokens/second on Llama 70B. Is this number meaningful? It depends on: what batch size, what sequence length, what quantization, prefill-only or including decode, cold or warm cache, what GPU, and what latency constraints. Without this context, the number is useless. Worse, many benchmarks are actively misleading because they measure conditions that never occur in production.
+
+## The Five Most Common Benchmarking Mistakes
+
+### Mistake 1: Measuring Cold Cache Performance
+
+The first request to a serving engine suffers unique overhead: CUDA graph capture, JIT compilation, memory pool initialization, and KV cache allocation. This adds 100-500ms of one-time cost that does not affect subsequent requests.
+
+```python
+import time
+import requests
+
+def bad_benchmark():
+    """Measuring cold start as if it represents steady-state performance."""
+    # Start server
+    # Immediately send ONE request and measure
+    t0 = time.perf_counter()
+    response = requests.post(
+        "http://localhost:8000/v1/completions",
+        json={"prompt": "Hello", "max_tokens": 100}
+    )
+    elapsed = time.perf_counter() - t0
+    print(f"Latency: {elapsed:.3f}s")
+    # This includes: CUDA graph capture (~200ms) + first-request overhead
+    # Reported latency: 450ms
+    # Actual steady-state: 120ms
+
+def correct_benchmark():
+    """Warmup, then measure steady state."""
+    # Warmup: send enough requests to trigger all CUDA graph captures
+    # and fill the memory pool
+    for _ in range(20):
+        requests.post(
+            "http://localhost:8000/v1/completions",
+            json={"prompt": "Warmup request " * 100, "max_tokens": 50}
+        )
+
+    # Now measure
+    latencies = []
+    for _ in range(200):
+        t0 = time.perf_counter()
+        response = requests.post(
+            "http://localhost:8000/v1/completions",
+            json={"prompt": "Benchmark request " * 100, "max_tokens": 100}
+        )
+        latencies.append(time.perf_counter() - t0)
+
+    print(f"P50: {sorted(latencies)[100]:.3f}s")
+    print(f"P99: {sorted(latencies)[198]:.3f}s")
+```
+
+### Mistake 2: Using the Wrong Batch Size
+
+Reporting throughput at batch=1 is misleading because no production system runs batch=1. Reporting throughput at batch=512 is equally misleading if your latency SLO cannot tolerate it.
+
+```python
+def throughput_vs_latency_tradeoff(engine, batch_sizes):
+    """Show that throughput and latency are inversely related."""
+    results = []
+    for bs in batch_sizes:
+        # Run decode at this batch size
+        latencies = []
+        for _ in range(100):
+            t0 = time.perf_counter()
+            engine.decode_step(batch_size=bs)
+            torch.cuda.synchronize()
+            latencies.append(time.perf_counter() - t0)
+
+        avg_latency = sum(latencies) / len(latencies)
+        throughput = bs / avg_latency  # tokens per second
+
+        results.append({
+            "batch_size": bs,
+            "latency_ms": avg_latency * 1000,
+            "throughput_tps": throughput,
+        })
+
+    return results
+```
+
+<PerfChart
+  title="The Throughput-Latency Tradeoff (Llama 70B, H100)"
+  type="line"
+  data={{
+    labels: ["1", "4", "16", "32", "64", "128", "256", "512"],
+    datasets: [
+      {
+        label: "Throughput (tokens/s)",
+        data: [24, 95, 380, 750, 1480, 2900, 4800, 6200],
+        borderColor: "#51cf66"
+      },
+      {
+        label: "Per-token Latency (ms)",
+        data: [42, 42, 42, 43, 43, 44, 53, 83],
+        borderColor: "#ff6b6b"
+      }
+    ]
+  }}
+/>
+
+<Callout type="warning">
+A vendor quoting "6,200 tokens/s" without mentioning that it requires batch=512 and 83ms per-token latency is being dishonest. At a typical production SLO of 50ms per token, the maximum batch size is approximately 128, giving 2,900 tokens/s. The correct way to report is: "2,900 tokens/s at 44ms P50 ITL" or "6,200 tokens/s at 83ms P50 ITL."
+</Callout>
+
+### Mistake 3: Ignoring Tail Latency
+
+Reporting only P50 or mean latency hides the worst-case experience. In production, P99 or P99.9 latency matters because 1% of users experiencing 10x higher latency is unacceptable.
+
+```python
+import numpy as np
+
+def analyze_tail_latency(latencies):
+    """Report full latency distribution, not just mean."""
+    latencies = sorted(latencies)
+    n = len(latencies)
+
+    return {
+        "mean": np.mean(latencies),
+        "p50": latencies[int(n * 0.50)],
+        "p75": latencies[int(n * 0.75)],
+        "p90": latencies[int(n * 0.90)],
+        "p95": latencies[int(n * 0.95)],
+        "p99": latencies[int(n * 0.99)],
+        "p999": latencies[int(n * 0.999)] if n >= 1000 else None,
+        "max": latencies[-1],
+        "tail_ratio_p99_p50": latencies[int(n * 0.99)] / latencies[int(n * 0.50)],
+    }
+```
+
+<Benchmark
+  title="Why Tail Latency Matters: Same Mean, Different P99"
+  columns={["Engine", "Mean TTFT (ms)", "P50 TTFT (ms)", "P99 TTFT (ms)", "P99/P50 Ratio"]}
+  rows={[
+    { values: ["Engine A", "85", "78", "120", "1.54x"], highlight: true },
+    { values: ["Engine B", "82", "45", "680", "15.1x"], highlight: false },
+    { values: ["Engine C", "90", "88", "105", "1.19x"], highlight: true },
+  ]}
+/>
+
+Engine B has the lowest mean TTFT but the worst P99 because it batches aggressively: most requests are fast, but requests that arrive during a large prefill batch wait 680ms. Engine C has the highest mean but the best tail behavior: consistent, predictable latency.
+
+### Mistake 4: Measuring Prefill-Only Throughput
+
+Some benchmarks report only prefill throughput (tokens processed per second during prompt encoding) and ignore decode. This is misleading because:
+
+1. Prefill throughput is compute-bound and scales linearly with prompt length
+2. Decode throughput is bandwidth-bound and independent of prompt length
+3. In a real conversation, decode produces 10-1000x more tokens than prefill processes
+
+```python
+def misleading_prefill_benchmark():
+    """This gives artificially high throughput numbers."""
+    prompt = "token " * 4096  # 4K tokens
+    t0 = time.perf_counter()
+    # Process prompt (prefill only, no decode)
+    engine.prefill(prompt)
+    torch.cuda.synchronize()
+    elapsed = time.perf_counter() - t0
+
+    throughput = 4096 / elapsed
+    print(f"Throughput: {throughput:.0f} tokens/s")
+    # Reports ~50,000 tokens/s (just prefill, which is compute-bound)
+    # But decode runs at ~3,000 tokens/s for the same model
+    # And actual end-to-end throughput depends on the output length
+
+def correct_end_to_end_benchmark():
+    """Measure end-to-end including decode."""
+    prompt = "token " * 512  # 512 token prompt
+    max_tokens = 256  # 256 token output
+
+    t0 = time.perf_counter()
+    output = engine.generate(prompt, max_tokens=max_tokens)
+    elapsed = time.perf_counter() - t0
+
+    # Report both prefill and decode metrics
+    ttft = output.metrics.time_to_first_token
+    total_tokens = output.num_output_tokens
+    decode_time = elapsed - ttft
+
+    print(f"TTFT: {ttft*1000:.1f} ms")
+    print(f"Decode throughput: {total_tokens / decode_time:.0f} tokens/s")
+    print(f"End-to-end throughput: {(512 + total_tokens) / elapsed:.0f} tokens/s")
+```
+
+### Mistake 5: Open Loop vs Closed Loop Testing
+
+**Closed loop**: send request, wait for response, send next request. This never overloads the server and always shows optimal latency.
+
+**Open loop**: send requests at a fixed rate regardless of responses. This reveals how the system behaves under load.
+
+Production traffic is open-loop: users do not wait for other users' requests to finish before sending theirs.
+
+```python
+import asyncio
+import aiohttp
+import time
+
+class OpenLoopBenchmark:
+    """Send requests at a fixed QPS regardless of responses."""
+
+    def __init__(self, endpoint, qps):
+        self.endpoint = endpoint
+        self.qps = qps
+        self.results = []
+
+    async def run(self, duration_sec=60, prompt_tokens=512, max_output=256):
+        """Generate load at fixed QPS for the specified duration."""
+        interval = 1.0 / self.qps
+        tasks = []
+        start = time.perf_counter()
+
+        async with aiohttp.ClientSession() as session:
+            request_id = 0
+            while time.perf_counter() - start < duration_sec:
+                send_time = time.perf_counter()
+                task = asyncio.create_task(
+                    self._send_request(session, request_id, send_time,
+                                       prompt_tokens, max_output)
+                )
+                tasks.append(task)
+                request_id += 1
+
+                # Wait until next send time
+                next_send = start + request_id * interval
+                sleep_time = next_send - time.perf_counter()
+                if sleep_time > 0:
+                    await asyncio.sleep(sleep_time)
+
+            # Wait for all responses
+            await asyncio.gather(*tasks)
+
+        return self._analyze_results()
+
+    async def _send_request(self, session, req_id, send_time,
+                             prompt_tokens, max_output):
+        """Send one request and record timing."""
+        prompt = self._generate_prompt(prompt_tokens)
+
+        first_token_time = None
+        token_times = []
+        all_tokens = []
+
+        async with session.post(
+            f"{self.endpoint}/v1/completions",
+            json={
+                "prompt": prompt,
+                "max_tokens": max_output,
+                "stream": True,
+            }
+        ) as response:
+            async for chunk in response.content:
+                now = time.perf_counter()
+                if first_token_time is None:
+                    first_token_time = now
+                else:
+                    token_times.append(now)
+
+        self.results.append({
+            "request_id": req_id,
+            "send_time": send_time,
+            "ttft": first_token_time - send_time if first_token_time else None,
+            "token_times": token_times,
+            "inter_token_latencies": [
+                token_times[i] - token_times[i-1]
+                for i in range(1, len(token_times))
+            ] if len(token_times) > 1 else [],
+            "total_time": (token_times[-1] if token_times else first_token_time) - send_time,
+        })
+
+    def _analyze_results(self):
+        """Compute metrics from collected results."""
+        ttfts = [r["ttft"] for r in self.results if r["ttft"] is not None]
+        all_itls = []
+        for r in self.results:
+            all_itls.extend(r["inter_token_latencies"])
+
+        total_tokens = sum(len(r["token_times"]) for r in self.results)
+        total_time = max(r["send_time"] for r in self.results) - min(r["send_time"] for r in self.results)
+
+        return {
+            "num_requests": len(self.results),
+            "actual_qps": len(self.results) / total_time if total_time > 0 else 0,
+            "throughput_tps": total_tokens / total_time if total_time > 0 else 0,
+            "ttft": analyze_tail_latency(ttfts),
+            "itl": analyze_tail_latency(all_itls) if all_itls else None,
+        }
+```
+
+<PerfChart
+  title="Closed Loop vs Open Loop: TTFT at Different Request Rates"
+  type="line"
+  data={{
+    labels: ["1 QPS", "5 QPS", "10 QPS", "20 QPS", "30 QPS", "40 QPS", "50 QPS"],
+    datasets: [
+      {
+        label: "Closed Loop P50 TTFT (ms)",
+        data: [82, 85, 88, 92, 95, 98, 102],
+        borderColor: "#51cf66"
+      },
+      {
+        label: "Open Loop P50 TTFT (ms)",
+        data: [82, 88, 105, 180, 450, 1200, 5000],
+        borderColor: "#ff6b6b"
+      },
+      {
+        label: "Open Loop P99 TTFT (ms)",
+        data: [95, 120, 280, 800, 2500, 8000, 30000],
+        borderColor: "#ff6b6b",
+        borderDash: [5, 5]
+      }
+    ]
+  }}
+/>
+
+The divergence between closed-loop and open-loop results is dramatic above 20 QPS. Closed-loop testing shows that P50 TTFT stays under 100ms because the client self-throttles (waiting for responses before sending more). Open-loop testing reveals that the server saturates around 30 QPS: requests queue up, TTFT explodes, and P99 becomes 50x worse than P50.
+
+## The Correct Metrics
+
+Four metrics fully characterize LLM inference performance:
+
+```python
+class InferenceMetrics:
+    """The four metrics that matter for LLM serving."""
+
+    def __init__(self):
+        self.ttft_ms = None     # Time To First Token
+        self.tbt_ms = None      # Time Between Tokens (inter-token latency)
+        self.e2e_ms = None      # End-to-end latency
+        self.throughput = None   # Output tokens per second (server-wide)
+
+    @staticmethod
+    def definitions():
+        return {
+            "TTFT": {
+                "definition": "Time from request arrival to first token generated",
+                "includes": "Queue wait + tokenization + prefill + first sample",
+                "unit": "milliseconds",
+                "slo_typical": "200-500ms for interactive, 2s for batch",
+                "measures": "User-perceived responsiveness",
+            },
+            "TBT": {
+                "definition": "Time between consecutive output tokens",
+                "also_called": "Inter-token latency (ITL)",
+                "includes": "Decode forward + sample + detokenize",
+                "unit": "milliseconds",
+                "slo_typical": "30-50ms (20-33 tokens/sec reading speed)",
+                "measures": "Streaming smoothness",
+            },
+            "E2E": {
+                "definition": "Time from request arrival to last token",
+                "formula": "TTFT + (output_tokens - 1) * TBT",
+                "unit": "milliseconds",
+                "measures": "Total request completion time",
+            },
+            "Throughput": {
+                "definition": "Total output tokens generated per second across all requests",
+                "unit": "tokens/second",
+                "measures": "Server capacity / cost efficiency",
+                "note": "Must be measured at a specific QPS and SLO",
+            },
+        }
+```
+
+<Benchmark
+  title="Metric Relationships and Tradeoffs"
+  columns={["Optimization", "TTFT Effect", "TBT Effect", "Throughput Effect"]}
+  rows={[
+    { values: ["Increase batch size", "Worse (queue delay)", "Worse (more compute)", "Better (amortize weights)"], highlight: false },
+    { values: ["Chunked prefill", "Worse (split prefill)", "Better (less preemption)", "Similar"], highlight: false },
+    { values: ["Disaggregated serving", "Better (dedicated prefill)", "Better (dedicated decode)", "Better (specialized HW)"], highlight: true },
+    { values: ["FP8 quantization", "Better (faster prefill)", "Better (less bandwidth)", "Better (2x throughput)"], highlight: true },
+    { values: ["Speculative decoding", "Neutral", "Better (more tokens/step)", "Neutral (same total work)"], highlight: false },
+    { values: ["More GPUs (TP)", "Better (faster prefill)", "Better (faster decode)", "Better (more HBM BW)"], highlight: true },
+  ]}
+/>
+
+## Benchmark Protocol
+
+```python
+class StandardBenchmarkProtocol:
+    """Standardized benchmark protocol for reproducible results."""
+
+    def __init__(self, endpoint):
+        self.endpoint = endpoint
+
+    async def run_full_benchmark(self, config):
+        """Complete benchmark following best practices."""
+
+        # Step 1: Warmup (essential, not optional)
+        print("Phase 1: Warmup...")
+        await self._warmup(
+            num_requests=50,
+            prompt_tokens=config.prompt_tokens,
+            max_output=config.max_output_tokens,
+        )
+
+        # Step 2: Sweep QPS to find saturation point
+        print("Phase 2: QPS sweep...")
+        qps_results = {}
+        for qps in config.qps_sweep:
+            result = await OpenLoopBenchmark(self.endpoint, qps).run(
+                duration_sec=config.duration_per_qps,
+                prompt_tokens=config.prompt_tokens,
+                max_output=config.max_output_tokens,
+            )
+            qps_results[qps] = result
+            print(f"  QPS={qps}: TTFT P50={result['ttft']['p50']*1000:.1f}ms, "
+                  f"P99={result['ttft']['p99']*1000:.1f}ms, "
+                  f"Throughput={result['throughput_tps']:.0f} tok/s")
+
+            # Stop if P99 TTFT exceeds SLO
+            if result["ttft"]["p99"] > config.ttft_slo_sec:
+                print(f"  Saturation reached at QPS={qps}")
+                break
+
+        # Step 3: Sustained load test at target QPS
+        print("Phase 3: Sustained load test...")
+        target_qps = self._find_max_qps_under_slo(qps_results, config)
+        sustained = await OpenLoopBenchmark(self.endpoint, target_qps).run(
+            duration_sec=300,  # 5-minute sustained test
+            prompt_tokens=config.prompt_tokens,
+            max_output=config.max_output_tokens,
+        )
+
+        return {
+            "qps_sweep": qps_results,
+            "max_qps_under_slo": target_qps,
+            "sustained_test": sustained,
+            "config": config,
+        }
+
+    async def _warmup(self, num_requests, prompt_tokens, max_output):
+        """Send warmup requests to trigger CUDA graph capture and caching."""
+        tasks = []
+        async with aiohttp.ClientSession() as session:
+            for i in range(num_requests):
+                task = asyncio.create_task(
+                    self._send_warmup(session, prompt_tokens, max_output)
+                )
+                tasks.append(task)
+                await asyncio.sleep(0.1)  # Stagger warmup requests
+            await asyncio.gather(*tasks)
+
+        # Extra wait for any background operations
+        await asyncio.sleep(2.0)
+
+    def _find_max_qps_under_slo(self, qps_results, config):
+        """Find maximum QPS where P99 TTFT meets SLO."""
+        max_qps = 0
+        for qps, result in sorted(qps_results.items()):
+            if result["ttft"]["p99"] <= config.ttft_slo_sec:
+                max_qps = qps
+        return max_qps
+```
+
+### Prompt and Output Length Distributions
+
+Using a single fixed prompt length and output length is unrealistic. Production traffic has a distribution:
+
+```python
+import numpy as np
+
+class RealisticTrafficGenerator:
+    """Generate requests with realistic prompt/output length distributions."""
+
+    # Distributions from production LLM serving (approximate)
+    DISTRIBUTIONS = {
+        "chat": {
+            "prompt_mean": 500, "prompt_std": 300,
+            "prompt_min": 50, "prompt_max": 4000,
+            "output_mean": 200, "output_std": 150,
+            "output_min": 10, "output_max": 2000,
+        },
+        "code_generation": {
+            "prompt_mean": 1500, "prompt_std": 800,
+            "prompt_min": 200, "prompt_max": 8000,
+            "output_mean": 500, "output_std": 400,
+            "output_min": 50, "output_max": 4000,
+        },
+        "long_context_qa": {
+            "prompt_mean": 16000, "prompt_std": 12000,
+            "prompt_min": 2000, "prompt_max": 128000,
+            "output_mean": 300, "output_std": 200,
+            "output_min": 20, "output_max": 2000,
+        },
+        "summarization": {
+            "prompt_mean": 4000, "prompt_std": 2000,
+            "prompt_min": 500, "prompt_max": 32000,
+            "output_mean": 150, "output_std": 80,
+            "output_min": 50, "output_max": 500,
+        },
+    }
+
+    def __init__(self, workload_type="chat"):
+        self.dist = self.DISTRIBUTIONS[workload_type]
+
+    def sample_lengths(self, n):
+        """Sample n (prompt_length, output_length) pairs."""
+        prompts = np.clip(
+            np.random.lognormal(
+                mean=np.log(self.dist["prompt_mean"]),
+                sigma=0.8, size=n
+            ).astype(int),
+            self.dist["prompt_min"],
+            self.dist["prompt_max"],
+        )
+        outputs = np.clip(
+            np.random.lognormal(
+                mean=np.log(self.dist["output_mean"]),
+                sigma=0.8, size=n
+            ).astype(int),
+            self.dist["output_min"],
+            self.dist["output_max"],
+        )
+        return list(zip(prompts, outputs))
+```
+
+## vLLM's benchmark_serving.py
+
+vLLM provides a comprehensive serving benchmark tool:
+
+```bash
+# Basic benchmark
+python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Llama-3.1-70B \
+    --tensor-parallel-size 8 \
+    --port 8000 &
+
+# Run benchmark with realistic traffic
+python benchmarks/benchmark_serving.py \
+    --backend vllm \
+    --base-url http://localhost:8000 \
+    --model meta-llama/Llama-3.1-70B \
+    --dataset-name sharegpt \
+    --dataset-path ShareGPT_V3_unfiltered.json \
+    --num-prompts 1000 \
+    --request-rate 10 \
+    --seed 42
+```
+
+Key parameters:
+
+```python
+# What benchmark_serving.py measures:
+"""
+--request-rate: QPS (open-loop, Poisson arrivals)
+--dataset-name: Use real conversation data (ShareGPT) for realistic lengths
+--num-prompts: Total requests to send (1000+ for statistical significance)
+--seed: Reproducibility
+
+Output metrics:
+- Request throughput (requests/s)
+- Output token throughput (tokens/s)
+- Mean/P50/P99 TTFT
+- Mean/P50/P99 TBT (time between tokens)
+- Mean/P50/P99 TPOT (time per output token)
+- Mean/P50/P99 E2E latency
+"""
+```
+
+## NVIDIA GenAI-Perf
+
+GenAI-Perf is NVIDIA's benchmarking tool specifically designed for LLM inference:
+
+```bash
+# Install
+pip install genai-perf
+
+# Run benchmark against an OpenAI-compatible endpoint
+genai-perf profile \
+    -m meta-llama/Llama-3.1-70B \
+    --endpoint v1/completions \
+    --endpoint-type completions \
+    --service-kind openai \
+    --url localhost:8000 \
+    --streaming \
+    --concurrency 32 \
+    --input-tokens-mean 512 \
+    --input-tokens-stddev 128 \
+    --output-tokens-mean 256 \
+    --output-tokens-stddev 64 \
+    --measurement-interval 60000 \
+    --warmup-interval 10000
+```
+
+GenAI-Perf's advantages over custom scripts:
+
+1. **Poisson arrival process**: accurate open-loop testing
+2. **Token-level timing**: measures per-token latency from SSE events
+3. **Warmup period**: configurable warmup before measurement
+4. **Statistical rigor**: confidence intervals, percentile reporting
+5. **Output formats**: CSV, JSON, and visual plots
+
+## Building a Benchmark Report
+
+```python
+class BenchmarkReport:
+    """Generate a complete benchmark report."""
+
+    def __init__(self, results, config):
+        self.results = results
+        self.config = config
+
+    def generate(self):
+        """Generate benchmark report with all required context."""
+        report = {
+            # Hardware context
+            "hardware": {
+                "gpu": self.config.gpu_model,
+                "num_gpus": self.config.num_gpus,
+                "interconnect": self.config.interconnect,
+                "memory_per_gpu_gb": self.config.hbm_gb,
+            },
+            # Model context
+            "model": {
+                "name": self.config.model_name,
+                "size": self.config.model_size,
+                "quantization": self.config.quantization,
+                "tp_size": self.config.tp_size,
+                "pp_size": self.config.pp_size,
+            },
+            # Engine context
+            "engine": {
+                "name": self.config.engine_name,
+                "version": self.config.engine_version,
+                "attention_backend": self.config.attention_backend,
+                "scheduling": self.config.scheduling_policy,
+            },
+            # Workload context
+            "workload": {
+                "prompt_distribution": self.config.prompt_dist,
+                "output_distribution": self.config.output_dist,
+                "dataset": self.config.dataset_name,
+                "num_requests": self.config.num_requests,
+                "request_rate": self.config.request_rate,
+                "duration_sec": self.config.duration,
+            },
+            # Results
+            "results": {
+                "ttft_ms": {
+                    "p50": self.results.ttft_p50 * 1000,
+                    "p99": self.results.ttft_p99 * 1000,
+                },
+                "tbt_ms": {
+                    "p50": self.results.tbt_p50 * 1000,
+                    "p99": self.results.tbt_p99 * 1000,
+                },
+                "throughput_tps": self.results.throughput,
+                "max_qps_under_slo": self.results.max_qps,
+            },
+        }
+
+        return report
+```
+
+<Benchmark
+  title="Example Benchmark Report: Llama 70B on 8x H100"
+  columns={["Metric", "Value", "Measurement Condition"]}
+  rows={[
+    { values: ["TTFT P50", "92 ms", "Open-loop, 20 QPS, ShareGPT prompts"], highlight: true },
+    { values: ["TTFT P99", "180 ms", "Open-loop, 20 QPS, ShareGPT prompts"], highlight: false },
+    { values: ["TBT P50", "35 ms", "Open-loop, 20 QPS, ShareGPT outputs"], highlight: true },
+    { values: ["TBT P99", "48 ms", "Open-loop, 20 QPS, ShareGPT outputs"], highlight: false },
+    { values: ["Throughput", "3,200 tok/s", "At 20 QPS, 35ms TBT SLO met"], highlight: true },
+    { values: ["Max QPS (TTFT SLO 500ms)", "35 QPS", "P99 TTFT under 500ms"], highlight: true },
+    { values: ["Max QPS (TBT SLO 50ms)", "28 QPS", "P99 TBT under 50ms"], highlight: true },
+  ]}
+/>
+
+## The QPS-Latency Curve
+
+The single most informative plot for LLM serving performance is the QPS-latency curve: P50 and P99 latency as a function of request rate.
+
+```python
+async def generate_qps_latency_curve(endpoint, config):
+    """Generate the QPS-latency curve data."""
+    qps_values = [1, 2, 5, 8, 10, 15, 20, 25, 30, 35, 40, 50]
+    curve_data = {"qps": [], "ttft_p50": [], "ttft_p99": [],
+                  "tbt_p50": [], "tbt_p99": [], "throughput": []}
+
+    for qps in qps_values:
+        result = await OpenLoopBenchmark(endpoint, qps).run(
+            duration_sec=60,
+            prompt_tokens=config.prompt_tokens,
+            max_output=config.max_output_tokens,
+        )
+
+        curve_data["qps"].append(qps)
+        curve_data["ttft_p50"].append(result["ttft"]["p50"] * 1000)
+        curve_data["ttft_p99"].append(result["ttft"]["p99"] * 1000)
+        if result["itl"]:
+            curve_data["tbt_p50"].append(result["itl"]["p50"] * 1000)
+            curve_data["tbt_p99"].append(result["itl"]["p99"] * 1000)
+        curve_data["throughput"].append(result["throughput_tps"])
+
+        # Stop if system is clearly saturated
+        if result["ttft"]["p99"] > 10.0:  # 10 second TTFT = saturated
+            break
+
+    return curve_data
+```
+
+<PerfChart
+  title="QPS-Latency Curve: Llama 70B, 8x H100, vLLM v1"
+  type="line"
+  data={{
+    labels: ["1", "5", "10", "15", "20", "25", "30", "35", "40"],
+    datasets: [
+      {
+        label: "TTFT P50 (ms)",
+        data: [82, 85, 92, 105, 135, 220, 480, 1200, 5000],
+        borderColor: "#51cf66"
+      },
+      {
+        label: "TTFT P99 (ms)",
+        data: [95, 110, 180, 280, 450, 800, 2500, 8000, 30000],
+        borderColor: "#ff6b6b"
+      },
+      {
+        label: "500ms SLO line",
+        data: [500, 500, 500, 500, 500, 500, 500, 500, 500],
+        borderColor: "#868e96",
+        borderDash: [5, 5]
+      }
+    ]
+  }}
+/>
+
+Reading this chart: at 20 QPS, P99 TTFT is 450ms (under the 500ms SLO). At 25 QPS, P99 TTFT jumps to 800ms (SLO violated). The maximum sustainable QPS for a 500ms TTFT SLO is therefore approximately 22 QPS. This is the number that matters for capacity planning.
+
+## Benchmark Checklist
+
+Before publishing or trusting any LLM inference benchmark:
+
+<Benchmark
+  title="Benchmark Validation Checklist"
+  columns={["Check", "Requirement", "Why It Matters"]}
+  rows={[
+    { values: ["Warmup", "50+ requests before measurement", "Avoid cold cache / JIT overhead"], highlight: false },
+    { values: ["Open loop", "Fixed QPS, Poisson arrivals", "Reveals saturation behavior"], highlight: true },
+    { values: ["Tail latency", "Report P50, P99, P99.9", "Mean hides worst-case experience"], highlight: true },
+    { values: ["Realistic prompts", "Use ShareGPT or production distribution", "Fixed-length prompts miss scheduling effects"], highlight: false },
+    { values: ["QPS sweep", "Test at multiple request rates", "Single-QPS results miss the knee point"], highlight: true },
+    { values: ["Duration", "60s+ per QPS level", "Short tests miss GC pauses, preemption"], highlight: false },
+    { values: ["Hardware context", "Report GPU model, count, interconnect", "Results are hardware-specific"], highlight: false },
+    { values: ["Quantization", "Report precision (FP16/FP8/INT8)", "2x difference between FP16 and FP8"], highlight: false },
+    { values: ["Batch size", "Report what QPS implies for batching", "Throughput without latency is meaningless"], highlight: true },
+    { values: ["Both phases", "Report TTFT (prefill) and TBT (decode)", "Different bottlenecks, different numbers"], highlight: true },
+  ]}
+/>
+
+<Callout type="danger">
+Any benchmark that reports only throughput without specifying latency constraints is incomplete. Any benchmark that uses closed-loop testing is underestimating real-world latency. Any benchmark that skips warmup is measuring one-time initialization cost. Any benchmark that uses a single fixed prompt length is missing the scheduling effects that dominate production performance. Follow the checklist above or the numbers are not trustworthy.
+</Callout>
+
+## Comparing Engines: A/B Testing Methodology
+
+When comparing two inference engines (e.g., vLLM vs SGLang, or two versions of the same engine), controlling for confounds is critical:
+
+```python
+class ABEngineComparison:
+    """Rigorous A/B comparison between two inference engines."""
+
+    def __init__(self, engine_a_url, engine_b_url, config):
+        self.engine_a = engine_a_url
+        self.engine_b = engine_b_url
+        self.config = config
+
+    async def run_comparison(self, num_rounds=5):
+        """Run alternating benchmark rounds to control for thermal effects."""
+        results_a = []
+        results_b = []
+
+        # Pre-generate ALL requests (same requests for both engines)
+        traffic = RealisticTrafficGenerator(self.config.workload_type)
+        request_set = traffic.sample_lengths(self.config.num_requests)
+
+        for round_idx in range(num_rounds):
+            # Alternate which engine goes first to control for
+            # thermal throttling and background noise
+            if round_idx % 2 == 0:
+                first, second = self.engine_a, self.engine_b
+            else:
+                first, second = self.engine_b, self.engine_a
+
+            # Warmup both engines
+            await self._warmup(first, request_set[:20])
+            await self._warmup(second, request_set[:20])
+
+            # Run on first engine
+            result_first = await OpenLoopBenchmark(
+                first, self.config.target_qps
+            ).run(
+                duration_sec=60,
+                prompt_tokens=None,  # Use pre-generated varied lengths
+                request_set=request_set,
+            )
+
+            # Wait for GPU to cool / stabilize
+            await asyncio.sleep(10)
+
+            # Run on second engine with IDENTICAL requests
+            result_second = await OpenLoopBenchmark(
+                second, self.config.target_qps
+            ).run(
+                duration_sec=60,
+                prompt_tokens=None,
+                request_set=request_set,
+            )
+
+            if round_idx % 2 == 0:
+                results_a.append(result_first)
+                results_b.append(result_second)
+            else:
+                results_b.append(result_first)
+                results_a.append(result_second)
+
+        return self._statistical_comparison(results_a, results_b)
+
+    def _statistical_comparison(self, results_a, results_b):
+        """Compare with statistical significance testing."""
+        from scipy import stats
+
+        ttft_a = [r["ttft"]["p99"] for r in results_a]
+        ttft_b = [r["ttft"]["p99"] for r in results_b]
+
+        t_stat, p_value = stats.ttest_ind(ttft_a, ttft_b)
+
+        return {
+            "engine_a_ttft_p99_mean": np.mean(ttft_a),
+            "engine_b_ttft_p99_mean": np.mean(ttft_b),
+            "difference_ms": (np.mean(ttft_a) - np.mean(ttft_b)) * 1000,
+            "p_value": p_value,
+            "significant": p_value < 0.05,
+            "winner": "A" if np.mean(ttft_a) < np.mean(ttft_b) else "B",
+        }
+```
+
+<Callout type="tip">
+When comparing engines, always use the same pre-generated request set with identical prompt lengths and output lengths. Send requests in the same order at the same QPS. Alternate which engine runs first across rounds. Report p-values from a paired t-test or Wilcoxon signed-rank test. A "10% faster" claim without statistical significance testing is not credible.
+</Callout>
+
+## Capacity Planning From Benchmark Data
+
+The ultimate purpose of benchmarking is capacity planning: how many GPUs do you need for your target workload?
+
+```python
+def capacity_plan(benchmark_results, target_qps, slo_ttft_ms, slo_tbt_ms):
+    """Compute required GPU count from benchmark data."""
+
+    # Find max QPS per instance that meets both SLOs
+    max_qps_per_instance = 0
+    for qps, result in sorted(benchmark_results["qps_sweep"].items()):
+        ttft_ok = result["ttft"]["p99"] * 1000 <= slo_ttft_ms
+        tbt_ok = result["itl"]["p99"] * 1000 <= slo_tbt_ms if result["itl"] else True
+        if ttft_ok and tbt_ok:
+            max_qps_per_instance = qps
+
+    if max_qps_per_instance == 0:
+        return {"error": "SLO cannot be met even at 1 QPS"}
+
+    # Number of instances needed
+    num_instances = int(target_qps / max_qps_per_instance + 0.99)
+    gpus_per_instance = benchmark_results["config"]["num_gpus"]
+    total_gpus = num_instances * gpus_per_instance
+
+    # Add 20% headroom for traffic spikes
+    total_gpus_with_headroom = int(total_gpus * 1.2)
+
+    return {
+        "max_qps_per_instance": max_qps_per_instance,
+        "instances_needed": num_instances,
+        "gpus_per_instance": gpus_per_instance,
+        "total_gpus": total_gpus,
+        "total_gpus_with_headroom": total_gpus_with_headroom,
+    }
+
+# Example: 100 QPS target, 500ms TTFT SLO, 50ms TBT SLO
+# Benchmark shows 22 QPS max per 8-GPU instance
+# Need: ceil(100/22) = 5 instances = 40 GPUs
+# With headroom: 48 GPUs (6 instances)
+```
+
+Correct benchmarking methodology is not optional -- it is the foundation of every capacity planning decision, hardware procurement choice, and engine comparison. A flawed benchmark leads to overprovisioning (wasting money) or underprovisioning (violating SLOs). The QPS-latency curve at P99 with open-loop Poisson arrivals and realistic prompt distributions is the gold standard. Everything else is approximation.

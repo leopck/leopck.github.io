@@ -1,0 +1,700 @@
+---
+title: "Distributed Inference: Tensor Parallelism vs Pipeline Parallelism for Serving"
+author: "stanley-phoong"
+description: "Serving models that do not fit on a single GPU requires distributing computation. Tensor parallelism splits layers across GPUs with all-reduce per layer. Pipeline parallelism places layers on different GPUs and pipelines the batch. This post covers TP implementation for inference, PP micro-batching, when TP wins (NVLink, low latency), when PP wins (inter-node), and combined TP+PP for 405B models."
+publishDate: 2025-03-22
+category: llm-inference
+tags: [tensor-parallelism, pipeline-parallelism, distributed-inference, all-reduce, nvlink, serving]
+difficulty: expert
+readingTime: 34
+draft: false
+featured: false
+series: "Inference Optimization Timeline"
+seriesOrder: 38
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+
+Llama 3.1 405B in FP16 requires 810 GB of weight storage. A single H100 has 80 GB of HBM. Even with FP8 quantization (405 GB), a minimum of 6 GPUs is needed just for weights, and you still need HBM for KV cache and activations. Distributed inference is mandatory for large models, and the choice of parallelism strategy directly determines latency, throughput, and hardware utilization.
+
+## Tensor Parallelism for Inference
+
+Tensor parallelism (TP) splits each layer's weight matrices across GPUs. For a linear layer $Y = XW$ where $W \in \mathbb{R}^{d \times d}$, TP splits $W$ column-wise across $N$ GPUs:
+
+$$W = [W_1 | W_2 | \cdots | W_N], \quad W_i \in \mathbb{R}^{d \times d/N}$$
+
+Each GPU computes $Y_i = X W_i$ using its local shard. For the complete output, an all-reduce (sum) collects partial results.
+
+### Column-Parallel and Row-Parallel Linear Layers
+
+```python
+import torch
+import torch.distributed as dist
+
+class ColumnParallelLinear:
+    """Split weight along output dimension (columns).
+    W: [input_dim, output_dim] -> each GPU has [input_dim, output_dim/N]
+    Each GPU receives the FULL input X and produces output_dim/N outputs."""
+
+    def __init__(self, weight_shard, tp_rank, tp_size):
+        self.weight = weight_shard  # [input_dim, output_dim // tp_size]
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
+
+    def forward(self, x):
+        """x: [batch, seq_len, input_dim] (same on all ranks)
+        returns: [batch, seq_len, output_dim // tp_size] (different on each rank)
+        """
+        # Local GEMM: full input x local weight shard
+        # No communication needed
+        return torch.matmul(x, self.weight)
+
+class RowParallelLinear:
+    """Split weight along input dimension (rows).
+    W: [input_dim, output_dim] -> each GPU has [input_dim/N, output_dim]
+    Each GPU receives input_dim/N of the input and produces full output_dim."""
+
+    def __init__(self, weight_shard, tp_rank, tp_size, tp_group):
+        self.weight = weight_shard  # [input_dim // tp_size, output_dim]
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
+        self.tp_group = tp_group
+
+    def forward(self, x):
+        """x: [batch, seq_len, input_dim // tp_size] (different on each rank)
+        returns: [batch, seq_len, output_dim] (same on all ranks after all-reduce)
+        """
+        # Local GEMM: partial input x local weight shard
+        local_output = torch.matmul(x, self.weight)
+        # All-reduce to get full output (sum across ranks)
+        dist.all_reduce(local_output, group=self.tp_group)
+        return local_output
+```
+
+### Complete TP Transformer Layer
+
+In Megatron-style TP, each transformer layer uses column-parallel for the first linear (QKV projection, gate/up projection) and row-parallel for the second (O projection, down projection). This requires exactly 2 all-reduces per layer.
+
+```python
+class TPTransformerLayer:
+    """Tensor-parallel transformer layer with 2 all-reduces."""
+
+    def __init__(self, layer_weights, tp_rank, tp_size, tp_group):
+        d = layer_weights["hidden_size"]
+        kv_heads = layer_weights["num_kv_heads"]
+        q_heads = layer_weights["num_attention_heads"]
+        head_dim = d // q_heads
+        ffn_dim = layer_weights["intermediate_size"]
+
+        # Attention: column-parallel QKV, row-parallel O
+        # Split Q heads across TP ranks
+        q_heads_per_rank = q_heads // tp_size
+        kv_heads_per_rank = max(1, kv_heads // tp_size)
+
+        self.qkv_proj = ColumnParallelLinear(
+            weight_shard=layer_weights["qkv"][:, tp_rank],
+            tp_rank=tp_rank, tp_size=tp_size
+        )
+        self.o_proj = RowParallelLinear(
+            weight_shard=layer_weights["o"][tp_rank, :],
+            tp_rank=tp_rank, tp_size=tp_size, tp_group=tp_group
+        )
+        # All-reduce #1: after O projection
+
+        # FFN: column-parallel gate+up, row-parallel down
+        self.gate_up_proj = ColumnParallelLinear(
+            weight_shard=layer_weights["gate_up"][:, tp_rank],
+            tp_rank=tp_rank, tp_size=tp_size
+        )
+        self.down_proj = RowParallelLinear(
+            weight_shard=layer_weights["down"][tp_rank, :],
+            tp_rank=tp_rank, tp_size=tp_size, tp_group=tp_group
+        )
+        # All-reduce #2: after down projection
+
+    def forward(self, hidden_states, kv_cache):
+        """Forward pass with 2 all-reduces."""
+        residual = hidden_states
+
+        # Attention block
+        normed = rms_norm(hidden_states)
+        qkv = self.qkv_proj.forward(normed)  # Column-parallel, no comm
+        q, k, v = split_qkv(qkv)
+        attn_output = attention(q, k, v, kv_cache)
+        hidden_states = self.o_proj.forward(attn_output)  # Row-parallel + ALL-REDUCE
+        hidden_states = hidden_states + residual
+
+        # FFN block
+        residual = hidden_states
+        normed = rms_norm(hidden_states)
+        gate_up = self.gate_up_proj.forward(normed)  # Column-parallel, no comm
+        gate, up = gate_up.chunk(2, dim=-1)
+        ffn_out = torch.nn.functional.silu(gate) * up
+        hidden_states = self.down_proj.forward(ffn_out)  # Row-parallel + ALL-REDUCE
+        hidden_states = hidden_states + residual
+
+        return hidden_states
+```
+
+### TP Communication Cost
+
+Each all-reduce on $N$ GPUs with message size $M$ bytes uses the ring all-reduce algorithm:
+
+$$T_{\text{all-reduce}} = 2 \times (N-1)/N \times M / \text{bandwidth}$$
+
+For Llama 70B with TP=8 and hidden dim 8192:
+
+```python
+def tp_communication_cost(hidden_dim, batch_tokens, tp_size,
+                           bw_gbps, num_layers):
+    """Calculate TP communication overhead per forward pass."""
+    # Message size per all-reduce: batch_tokens * hidden_dim * 2 bytes (FP16)
+    msg_bytes = batch_tokens * hidden_dim * 2
+
+    # Ring all-reduce: 2 * (N-1)/N * msg_bytes / bandwidth
+    factor = 2 * (tp_size - 1) / tp_size
+    ar_time = factor * msg_bytes / (bw_gbps * 1e9)
+
+    # 2 all-reduces per layer
+    ar_per_layer = 2 * ar_time
+    total_ar = num_layers * ar_per_layer
+
+    return {
+        "msg_bytes_kb": msg_bytes / 1024,
+        "ar_time_per_layer_us": ar_per_layer * 1e6,
+        "total_ar_ms": total_ar * 1000,
+        "ar_fraction_prefill": None,  # Depends on compute time
+    }
+
+# NVLink (900 GB/s bidirectional on H100):
+# Decode batch=1: msg = 1 * 8192 * 2 = 16 KB
+# AR time = 2 * 7/8 * 16KB / 900GB/s = 0.031 us per AR
+# 2 AR/layer * 80 layers = 160 AR * 0.031 us = 5.0 us total
+
+# InfiniBand NDR (400 Gbps = 50 GB/s):
+# Decode batch=1: same msg = 16 KB
+# AR time = 2 * 7/8 * 16KB / 50GB/s = 0.56 us per AR
+# 160 AR * 0.56 us = 89.6 us total
+```
+
+<Benchmark
+  title="TP Communication Overhead: NVLink vs InfiniBand"
+  columns={["Interconnect", "Bandwidth", "AR per Layer (decode, B=1)", "Total 80 Layers", "% of Decode Time"]}
+  rows={[
+    { values: ["NVLink (H100)", "900 GB/s", "0.031 us", "5.0 us", "0.01%"], highlight: true },
+    { values: ["PCIe 5.0", "64 GB/s", "0.44 us", "70 us", "0.2%"], highlight: false },
+    { values: ["InfiniBand NDR", "50 GB/s", "0.56 us", "90 us", "0.3%"], highlight: false },
+    { values: ["Ethernet 100G", "12.5 GB/s", "2.24 us", "358 us", "1.1%"], highlight: false },
+  ]}
+/>
+
+<Callout type="perf">
+At decode batch=1, TP communication overhead is negligible even over InfiniBand (0.3% of decode time). The reason: the message size is tiny (16 KB per all-reduce). TP communication becomes significant during prefill with long prompts: at S=32K, the message is $32768 \times 8192 \times 2 = 512\text{ MB}$ per all-reduce, taking 1.14 ms over NVLink (significant when prefill per layer takes ~1 ms).
+</Callout>
+
+## Pipeline Parallelism for Inference
+
+Pipeline parallelism (PP) assigns different layers to different GPUs. For PP=4 with an 80-layer model: GPU 0 runs layers 0-19, GPU 1 runs layers 20-39, GPU 2 runs layers 40-59, GPU 3 runs layers 60-79.
+
+### Basic PP Implementation
+
+```python
+class PPInferenceEngine:
+    """Pipeline-parallel inference engine."""
+
+    def __init__(self, model_layers, pp_rank, pp_size, pp_group):
+        self.pp_rank = pp_rank
+        self.pp_size = pp_size
+        self.pp_group = pp_group
+
+        # This rank's layers
+        layers_per_rank = len(model_layers) // pp_size
+        start = pp_rank * layers_per_rank
+        end = start + layers_per_rank
+        self.local_layers = model_layers[start:end]
+
+        # First rank has embedding, last rank has LM head
+        self.has_embedding = (pp_rank == 0)
+        self.has_lm_head = (pp_rank == pp_size - 1)
+
+    def forward(self, input_data):
+        """Forward pass for this PP stage.
+        Receives activations from previous stage, sends to next."""
+
+        if self.has_embedding:
+            # First stage: embed input tokens
+            hidden_states = self.embedding(input_data)
+        else:
+            # Receive activations from previous stage
+            hidden_states = self._recv_activation()
+
+        # Process local layers
+        for layer in self.local_layers:
+            hidden_states = layer(hidden_states)
+
+        if self.has_lm_head:
+            # Last stage: compute logits
+            logits = self.lm_head(hidden_states)
+            return logits
+        else:
+            # Send activations to next stage
+            self._send_activation(hidden_states)
+            return None
+
+    def _send_activation(self, tensor):
+        """Send activation to next PP rank."""
+        dist.send(tensor, dst=self.pp_rank + 1, group=self.pp_group)
+
+    def _recv_activation(self):
+        """Receive activation from previous PP rank."""
+        # Must know the shape in advance
+        buffer = torch.empty(self.activation_shape, device="cuda",
+                              dtype=torch.float16)
+        dist.recv(buffer, src=self.pp_rank - 1, group=self.pp_group)
+        return buffer
+```
+
+### The PP Bubble Problem for Inference
+
+With a single request, PP has a critical inefficiency: only one GPU is active at a time. While GPU 0 processes layers 0-19, GPUs 1-3 are idle. The pipeline takes $P$ stage-times to process one request.
+
+```
+Single request, PP=4:
+
+Time -->
+GPU 0: [Stage 0] ........  ........  ........
+GPU 1: ........  [Stage 1] ........  ........
+GPU 2: ........  ........  [Stage 2] ........
+GPU 3: ........  ........  ........  [Stage 3]
+
+Utilization: 25% (each GPU active 1/4 of the time)
+Latency: 4x a single-GPU (if model fit on one GPU)
+```
+
+### Micro-Batching for PP
+
+To improve utilization, split the batch into micro-batches and pipeline them:
+
+```python
+class PPMicroBatchEngine:
+    """Pipeline parallelism with micro-batching."""
+
+    def __init__(self, model_layers, pp_rank, pp_size, num_micro_batches=4):
+        self.pp_rank = pp_rank
+        self.pp_size = pp_size
+        self.num_micro = num_micro_batches
+
+        layers_per_rank = len(model_layers) // pp_size
+        start = pp_rank * layers_per_rank
+        end = start + layers_per_rank
+        self.local_layers = model_layers[start:end]
+
+    def forward_pipeline(self, full_batch):
+        """Process full batch as micro-batches through the pipeline."""
+
+        # Split batch into micro-batches
+        micro_batches = torch.chunk(full_batch, self.num_micro, dim=0)
+        outputs = [None] * self.num_micro
+
+        # Pipeline schedule: 1F1B (one forward, one backward - simplified for inference)
+        # For inference, we just pipeline forwards
+        for step in range(self.num_micro + self.pp_size - 1):
+            micro_idx = step - self.pp_rank
+
+            if 0 <= micro_idx < self.num_micro:
+                if self.pp_rank == 0:
+                    hidden = self.embedding(micro_batches[micro_idx])
+                else:
+                    hidden = self._recv_activation()
+
+                for layer in self.local_layers:
+                    hidden = layer(hidden)
+
+                if self.pp_rank == self.pp_size - 1:
+                    outputs[micro_idx] = self.lm_head(hidden)
+                else:
+                    self._send_activation(hidden)
+
+        if self.pp_rank == self.pp_size - 1:
+            return torch.cat([o for o in outputs if o is not None], dim=0)
+        return None
+```
+
+```
+4 micro-batches, PP=4:
+
+Time -->
+GPU 0: [M0] [M1] [M2] [M3] ....  ....  ....
+GPU 1: ....  [M0] [M1] [M2] [M3] ....  ....
+GPU 2: ....  ....  [M0] [M1] [M2] [M3] ....
+GPU 3: ....  ....  ....  [M0] [M1] [M2] [M3]
+
+Pipeline fill: 3 stages
+Pipeline drain: 3 stages
+Steady state: 4 micro-batches
+
+Utilization: 4 / (4 + 3) = 57%
+With 16 micro-batches: 16 / (16 + 3) = 84%
+```
+
+## When TP Wins vs When PP Wins
+
+```python
+def compare_tp_pp(model_config, hardware_config, batch_config):
+    """Compare TP and PP latency for a given configuration."""
+    d = model_config["hidden_dim"]
+    L = model_config["num_layers"]
+    N = hardware_config["num_gpus"]
+
+    # Weight bytes per layer
+    w_per_layer = 32 * d * d  # Approximate, FP16
+
+    # TP: each GPU has w_per_layer/N weights, 2 all-reduces per layer
+    tp_weight_per_gpu = w_per_layer / N
+    tp_bw_time = tp_weight_per_gpu / hardware_config["hbm_bw"]
+    tp_ar_time = 2 * d * batch_config["batch_tokens"] * 2 / hardware_config["interconnect_bw"]
+    tp_layer_time = tp_bw_time + tp_ar_time
+    tp_total = L * tp_layer_time
+
+    # PP: each GPU has w_per_layer * (L/N) weights, 1 send per stage
+    pp_weight_per_gpu = w_per_layer  # Full layer weight
+    pp_layers_per_gpu = L // N
+    pp_bw_time = pp_weight_per_gpu / hardware_config["hbm_bw"]
+    pp_layer_time = pp_bw_time  # No all-reduce
+    pp_stage_time = pp_layers_per_gpu * pp_layer_time
+    pp_send_time = d * batch_config["batch_tokens"] * 2 / hardware_config["interconnect_bw"]
+
+    # PP with micro-batching
+    pp_num_micro = batch_config.get("num_micro_batches", N)
+    pp_total = pp_stage_time * pp_num_micro + (N - 1) * pp_stage_time + (N - 1) * pp_send_time
+
+    # PP per-token (average)
+    pp_per_token = pp_total / (batch_config["batch_tokens"] * pp_num_micro)
+
+    return {
+        "tp_total_ms": tp_total * 1000,
+        "pp_total_ms": pp_total * 1000,
+        "tp_wins": tp_total < pp_total,
+        "tp_advantage": "Low latency, all GPUs work on every token",
+        "pp_advantage": "Less communication, works over slow interconnect",
+    }
+```
+
+<Benchmark
+  title="TP vs PP: Latency Comparison (Llama 70B, 8 GPUs)"
+  columns={["Configuration", "TP=8 Decode Latency", "PP=8 Decode Latency", "Winner"]}
+  rows={[
+    { values: ["NVLink, batch=1", "4.2 ms", "33.8 ms (sequential)", "TP (8x faster)"], highlight: true },
+    { values: ["NVLink, batch=128", "4.5 ms/tok", "4.5 ms/tok (pipelined)", "Tie"], highlight: false },
+    { values: ["InfiniBand, batch=1", "4.3 ms", "34.5 ms", "TP (8x faster)"], highlight: true },
+    { values: ["InfiniBand, batch=128", "4.6 ms/tok", "4.8 ms/tok", "TP (slight)"], highlight: false },
+    { values: ["100G Ethernet, batch=1", "5.1 ms", "35.2 ms", "TP (7x faster)"], highlight: false },
+    { values: ["100G Ethernet, batch=128", "5.8 ms/tok", "4.9 ms/tok", "PP (faster)"], highlight: true },
+  ]}
+/>
+
+The pattern is clear:
+
+- **TP wins for latency** because all GPUs work on every layer simultaneously. The single-request latency is $L \times (t_{\text{compute}}/N + t_{\text{all-reduce}})$.
+- **PP wins for throughput over slow interconnects** because it only sends activations once per stage (not 2x per layer). With micro-batching, the pipeline stays full.
+- **TP requires fast interconnect** (NVLink or InfiniBand) because it communicates 2L times per forward pass. PP communicates only P-1 times.
+
+<PerfChart
+  title="Single-Request Latency: TP vs PP vs TP+PP (Llama 405B, 16 GPUs)"
+  type="bar"
+  data={{
+    labels: ["TP=16", "PP=16", "TP=8,PP=2", "TP=4,PP=4", "TP=2,PP=8"],
+    datasets: [{
+      label: "Decode Latency (ms), batch=1",
+      data: [5.2, 132.0, 8.8, 15.4, 35.2],
+      backgroundColor: ["#51cf66", "#ff6b6b", "#339af0", "#ffa94d", "#ff6b6b"]
+    }]
+  }}
+/>
+
+## Combined TP+PP for 405B Models
+
+For Llama 405B on a 2-node cluster with 8 H100s per node (16 GPUs total):
+
+- **TP=16**: requires all 16 GPUs in one all-reduce group. Cross-node all-reduce over InfiniBand is slow.
+- **PP=16**: 16 pipeline stages, terrible latency for single requests.
+- **TP=8 PP=2**: TP within each node (NVLink), PP across nodes (InfiniBand). Best of both worlds.
+
+```python
+class TPPPInferenceEngine:
+    """Combined TP+PP inference engine for multi-node serving."""
+
+    def __init__(self, model, tp_size=8, pp_size=2, global_rank=0):
+        self.tp_size = tp_size
+        self.pp_size = pp_size
+
+        # Determine this rank's role
+        self.tp_rank = global_rank % tp_size
+        self.pp_rank = global_rank // tp_size
+
+        # Communication groups
+        # TP group: ranks on the same node
+        self.tp_group = self._create_tp_group()
+        # PP group: corresponding ranks across nodes
+        self.pp_group = self._create_pp_group()
+
+        # This rank's model shard
+        total_layers = model.config.num_hidden_layers
+        layers_per_pp = total_layers // pp_size
+        layer_start = self.pp_rank * layers_per_pp
+        layer_end = layer_start + layers_per_pp
+
+        self.layers = []
+        for i in range(layer_start, layer_end):
+            # Each layer is TP-sharded across tp_size GPUs
+            self.layers.append(
+                TPTransformerLayer(
+                    model.layers[i].get_tp_shard(self.tp_rank, tp_size),
+                    tp_rank=self.tp_rank,
+                    tp_size=tp_size,
+                    tp_group=self.tp_group,
+                )
+            )
+
+    def forward(self, input_data):
+        """Forward pass through TP+PP engine.
+        TP all-reduces happen within each layer (NVLink, fast).
+        PP activation transfers happen between stages (InfiniBand, once per stage).
+        """
+        if self.pp_rank == 0:
+            hidden = self.embed_tp(input_data)  # TP-parallel embedding
+        else:
+            hidden = self._pp_recv()  # Receive from previous PP stage
+
+        for layer in self.layers:
+            hidden = layer.forward(hidden)  # Includes TP all-reduces
+
+        if self.pp_rank == self.pp_size - 1:
+            logits = self.lm_head_tp(hidden)  # TP-parallel LM head
+            return logits
+        else:
+            self._pp_send(hidden)  # Send to next PP stage
+            return None
+```
+
+### Communication Analysis for TP=8 PP=2
+
+```python
+def tppp_communication_analysis():
+    """Communication breakdown for Llama 405B, TP=8 PP=2."""
+    d = 16384  # 405B hidden dim
+    L = 126    # 405B layers
+    layers_per_pp = L // 2  # 63 layers per PP stage
+
+    # TP all-reduces (within node, NVLink 900 GB/s)
+    # 2 per layer, msg = batch_tokens * d * 2 bytes
+    tp_ar_count = 2 * layers_per_pp  # 126 per stage
+    # Decode batch=1: msg = 1 * 16384 * 2 = 32 KB
+    tp_ar_time_each = 2 * 7/8 * 32768 / (900e9)  # 0.064 us
+    tp_ar_total = tp_ar_count * tp_ar_time_each  # 8.1 us
+
+    # PP activation transfer (across nodes, InfiniBand 50 GB/s)
+    # 1 transfer, msg = batch_tokens * d * 2 bytes = 32 KB
+    pp_transfer_time = 32768 / (50e9)  # 0.66 us
+    # But InfiniBand has ~1us latency overhead
+    pp_total = 0.66e-6 + 1e-6  # 1.66 us
+
+    return {
+        "tp_ar_total_us": tp_ar_total * 1e6,
+        "pp_transfer_us": pp_total * 1e6,
+        "total_comm_us": (tp_ar_total + pp_total) * 1e6,
+    }
+```
+
+<Benchmark
+  title="Llama 405B Communication Overhead: Different TP+PP Configurations"
+  columns={["Config", "TP Comm (per fwd)", "PP Comm (per fwd)", "Total Comm", "% of Decode"]}
+  rows={[
+    { values: ["TP=16 PP=1", "Cross-node AR: 0.4 ms", "None", "0.4 ms", "5.8%"], highlight: false },
+    { values: ["TP=8 PP=2", "Intra-node AR: 0.008 ms", "1 IB send: 0.002 ms", "0.010 ms", "0.15%"], highlight: true },
+    { values: ["TP=4 PP=4", "Intra-node AR: 0.006 ms", "3 IB sends: 0.006 ms", "0.012 ms", "0.18%"], highlight: false },
+    { values: ["TP=2 PP=8", "Intra-node AR: 0.004 ms", "7 IB sends: 0.012 ms", "0.016 ms", "0.24%"], highlight: false },
+  ]}
+/>
+
+<Callout type="info">
+TP=8 PP=2 is the sweet spot for 2-node 405B serving: TP stays within the NVLink domain (900 GB/s), while PP only crosses the node boundary once (InfiniBand, 50 GB/s). The total communication overhead is less than 0.2% of decode time. TP=16 PP=1 forces cross-node all-reduces, increasing communication overhead by 40x.
+</Callout>
+
+## vLLM's TP Implementation
+
+```python
+# Simplified from vLLM's distributed implementation
+class VLLMTPWorker:
+    """vLLM tensor-parallel worker (symmetric architecture in v1)."""
+
+    def __init__(self, tp_rank, tp_size, model_config):
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
+
+        # Initialize NCCL
+        self.tp_group = dist.new_group(ranks=list(range(tp_size)))
+
+        # Load model shard for this rank
+        self.model = self._load_model_shard(model_config)
+
+    def _load_model_shard(self, config):
+        """Load only this rank's weight shard from safetensors."""
+        from safetensors import safe_open
+
+        # Each safetensors file may contain all ranks' weights
+        # We load only our shard based on naming convention
+        state_dict = {}
+        for path in config.model_paths:
+            f = safe_open(str(path), framework="pt", device=f"cuda:{self.tp_rank}")
+            for name in f.keys():
+                tensor = f.get_tensor(name)
+                # Shard column-parallel weights
+                if self._is_column_parallel(name):
+                    chunk_size = tensor.shape[1] // self.tp_size
+                    tensor = tensor[:, self.tp_rank * chunk_size:(self.tp_rank + 1) * chunk_size]
+                # Shard row-parallel weights
+                elif self._is_row_parallel(name):
+                    chunk_size = tensor.shape[0] // self.tp_size
+                    tensor = tensor[self.tp_rank * chunk_size:(self.tp_rank + 1) * chunk_size, :]
+                state_dict[name] = tensor
+
+        return state_dict
+
+    def execute_model(self, batch):
+        """All TP ranks execute the same batch synchronously.
+        No explicit scheduling coordination needed (symmetric workers)."""
+        # Every rank processes the same batch
+        # All-reduces inside the model keep ranks synchronized
+        logits = self.model.forward(
+            batch.input_ids,
+            batch.positions,
+            self.kv_caches,
+            batch.attn_metadata,
+        )
+        return logits
+```
+
+## Choosing Your Parallelism Strategy
+
+```python
+def recommend_parallelism(model_size_gb, num_gpus, gpu_hbm_gb,
+                           intra_node_bw_gbps, inter_node_bw_gbps,
+                           gpus_per_node, latency_priority=True):
+    """Recommend TP/PP split."""
+
+    # Minimum GPUs for weights
+    min_gpus = max(1, int(model_size_gb / (gpu_hbm_gb * 0.6) + 0.5))
+
+    if num_gpus <= gpus_per_node:
+        # Single node: pure TP (NVLink is fast)
+        return {"tp": num_gpus, "pp": 1, "reason": "Single node, NVLink available"}
+
+    if latency_priority:
+        # Multi-node, latency-sensitive: TP within node, PP across nodes
+        num_nodes = num_gpus // gpus_per_node
+        tp = gpus_per_node
+        pp = num_nodes
+        return {"tp": tp, "pp": pp,
+                "reason": "Latency priority: TP within NVLink, PP across IB"}
+    else:
+        # Multi-node, throughput priority: can use more PP
+        # PP allows more micro-batching = higher throughput
+        tp = min(gpus_per_node, min_gpus)
+        pp = num_gpus // tp
+        return {"tp": tp, "pp": pp,
+                "reason": "Throughput priority: smaller TP for less comm"}
+
+# Examples:
+# 70B on 8 H100 (1 node):    TP=8, PP=1
+# 70B on 16 H100 (2 nodes):  TP=8, PP=2 (latency) or TP=4, PP=4 (throughput)
+# 405B on 16 H100 (2 nodes): TP=8, PP=2
+# 405B on 32 H100 (4 nodes): TP=8, PP=4
+```
+
+<Benchmark
+  title="Recommended Configurations for Common Models"
+  columns={["Model", "GPUs", "Nodes", "TP", "PP", "Decode Latency (B=1)"]}
+  rows={[
+    { values: ["Llama 8B", "1", "1", "1", "1", "12 ms"], highlight: false },
+    { values: ["Llama 70B", "8", "1", "8", "1", "4.2 ms"], highlight: true },
+    { values: ["Llama 70B", "16", "2", "8", "2", "4.5 ms"], highlight: false },
+    { values: ["Llama 405B", "16", "2", "8", "2", "6.8 ms"], highlight: true },
+    { values: ["Llama 405B", "32", "4", "8", "4", "7.2 ms"], highlight: false },
+  ]}
+/>
+
+## Expert Parallelism for MoE Models
+
+Mixture-of-Experts models (DeepSeek V3, Mixtral) add a third dimension: expert parallelism (EP). Each GPU holds a subset of experts, and tokens are routed to the appropriate GPU based on the gating function's output.
+
+```python
+class ExpertParallelLayer:
+    """Expert parallelism for MoE inference."""
+
+    def __init__(self, experts, ep_rank, ep_size, ep_group):
+        self.ep_rank = ep_rank
+        self.ep_size = ep_size
+        self.ep_group = ep_group
+
+        # This rank's local experts
+        experts_per_rank = len(experts) // ep_size
+        start = ep_rank * experts_per_rank
+        self.local_experts = experts[start:start + experts_per_rank]
+
+    def forward(self, hidden_states, router_logits):
+        """MoE forward with expert parallelism.
+        1. Router selects top-K experts per token
+        2. All-to-all sends tokens to the GPU holding their expert
+        3. Each GPU runs its local experts
+        4. All-to-all sends results back
+        """
+        # Router: select top-2 experts per token
+        routing_weights, expert_indices = self._route(router_logits)
+
+        # Prepare dispatch: group tokens by destination GPU
+        tokens_per_rank = self._compute_dispatch(
+            hidden_states, expert_indices
+        )
+
+        # All-to-all: send tokens to expert-owning GPUs
+        received_tokens = self._all_to_all(tokens_per_rank)
+
+        # Execute local experts on received tokens
+        local_outputs = {}
+        for expert_id, tokens in received_tokens.items():
+            local_expert_idx = expert_id - self.ep_rank * len(self.local_experts)
+            local_outputs[expert_id] = self.local_experts[local_expert_idx](tokens)
+
+        # All-to-all: send results back to original GPUs
+        result_tokens = self._all_to_all_reverse(local_outputs)
+
+        # Combine expert outputs with routing weights
+        output = self._combine(result_tokens, routing_weights)
+        return output
+```
+
+For a model like DeepSeek V3 (256 experts, top-8 routing), the typical configuration on a 2-node, 16-GPU cluster is:
+
+- **TP=1 or 2**: Within-layer weight splitting (for the shared attention layers)
+- **EP=8 or 16**: Expert distribution across GPUs
+- **PP=1 or 2**: Pipeline across nodes if needed
+
+The all-to-all communication pattern in EP is different from TP's all-reduce: it sends different data to different GPUs rather than aggregating the same data. This means EP bandwidth scales with the number of tokens routed cross-GPU, which depends on the load balance of the router.
+
+<PerfChart
+  title="Parallelism Strategies: Communication Pattern Comparison"
+  type="bar"
+  data={{
+    labels: ["TP all-reduce", "PP activation send", "EP all-to-all", "TP+PP combined"],
+    datasets: [{
+      label: "Communication Volume per Layer (MB, Llama 70B batch=128)",
+      data: [2.0, 2.0, 8.0, 2.0],
+      backgroundColor: ["#339af0", "#51cf66", "#ffa94d", "#845ef7"]
+    }]
+  }}
+/>
+
+The rule of thumb: TP within the NVLink domain, PP across nodes. TP gives the lowest latency (all GPUs contribute to every token), but it requires high-bandwidth interconnect for the frequent all-reduces. PP requires minimal interconnect bandwidth (one activation transfer per stage) but adds pipeline latency. For production serving, the TP=8 PP=2 configuration on 2-node H100 clusters has become the de facto standard for 405B-class models, delivering sub-7ms decode latency with less than 0.2% communication overhead. For MoE models, expert parallelism adds a third axis that interacts with TP and PP -- the optimal configuration depends on the expert count, top-K routing value, and the balance between shared (attention) and expert (FFN) computation.
