@@ -439,6 +439,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"frontier-research-efficient-finetuning-lora-dora-galore.mdx": {
+	id: "frontier-research-efficient-finetuning-lora-dora-galore.mdx";
+  slug: "frontier-research-efficient-finetuning-lora-dora-galore";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "frontier-research-lightning-attention-linear-scaling.mdx": {
 	id: "frontier-research-lightning-attention-linear-scaling.mdx";
   slug: "frontier-research-lightning-attention-linear-scaling";
@@ -915,6 +922,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"transformer-anatomy-activation-functions-relu-gelu-silu.mdx": {
+	id: "transformer-anatomy-activation-functions-relu-gelu-silu.mdx";
+  slug: "transformer-anatomy-activation-functions-relu-gelu-silu";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "transformer-anatomy-gradient-flow-backprop.mdx": {
 	id: "transformer-anatomy-gradient-flow-backprop.mdx";
   slug: "transformer-anatomy-gradient-flow-backprop";
@@ -992,6 +1006,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"vllm-v1-attention-backends-flash-flashinfer-paged.mdx": {
+	id: "vllm-v1-attention-backends-flash-flashinfer-paged.mdx";
+  slug: "vllm-v1-attention-backends-flash-flashinfer-paged";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "vllm-v1-block-manager-kv-cache-internals.mdx": {
 	id: "vllm-v1-block-manager-kv-cache-internals.mdx";
   slug: "vllm-v1-block-manager-kv-cache-internals";
@@ -1009,6 +1030,13 @@ declare module 'astro:content' {
 "vllm-v1-omniconnector-multimodal-lifecycle.mdx": {
 	id: "vllm-v1-omniconnector-multimodal-lifecycle.mdx";
   slug: "vllm-v1-omniconnector-multimodal-lifecycle";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"vllm-v1-unified-scheduler-one-queue.mdx": {
+	id: "vllm-v1-unified-scheduler-one-queue.mdx";
+  slug: "vllm-v1-unified-scheduler-one-queue";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">

@@ -1,0 +1,721 @@
+---
+title: "Dynamo Multi-Model Serving: GPU Sharing, Model Priority, and Adapter Pool Management"
+author: "stanley-phoong"
+description: "How Dynamo manages multiple models on shared GPU clusters through temporal and spatial sharing, adapter pooling with S-LoRA scheduling, SLO-based priority assignment, and cold/warm model switching. Implementation details for the multi-model scheduler and memory partitioning system."
+publishDate: 2025-03-22
+category: llm-inference
+tags: [dynamo, multi-model, gpu-sharing, model-priority, adapter-pool]
+difficulty: expert
+readingTime: 34
+draft: false
+featured: false
+series: "NVIDIA Dynamo & llm-d"
+seriesOrder: 7
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+
+Production inference clusters do not serve one model. They serve five, ten, fifty models simultaneously -- different sizes, different architectures, different latency requirements. A coding assistant runs Llama 70B with strict P99 latency targets. A translation service runs a 7B model that tolerates higher latency. An internal chatbot runs a fine-tuned 13B model with bursty traffic. A batch summarization pipeline runs overnight with no latency constraint at all.
+
+Naive deployment dedicates GPUs to each model: 8 H100s for the 70B, 2 for the 7B, 2 for the 13B. This wastes capacity. The 70B model peaks at 2 PM and idles at 3 AM. The 13B model gets traffic bursts during business hours and nothing on weekends. Dedicated allocation means paying for peak capacity 24/7.
+
+Dynamo solves this through three mechanisms: temporal sharing (switching models on a GPU based on traffic), spatial sharing (running multiple small models on one GPU simultaneously), and adapter pooling (one base model with thousands of LoRA adapters). This post covers each mechanism at the implementation level.
+
+---
+
+## 1. The Multi-Model Problem
+
+### Capacity Waste in Static Allocation
+
+Consider a cluster of 16 H100 GPUs serving four models:
+
+<Benchmark
+  title="Static Allocation: Capacity Waste Analysis"
+  columns={["Model", "Size", "Min GPUs (TP)", "Allocated GPUs", "Peak Utilization", "Average Utilization", "Wasted GPU-hours/day"]}
+  rows={[
+    { values: ["Llama 70B (coding)", "140 GB FP16", "2 (TP=2)", "8", "85%", "35%", "124.8"], highlight: true },
+    { values: ["Mistral 7B (translate)", "14 GB FP16", "1", "2", "60%", "20%", "38.4"], highlight: false },
+    { values: ["Llama 13B (chatbot)", "26 GB FP16", "1", "4", "70%", "15%", "81.6"], highlight: true },
+    { values: ["Qwen 7B (summarize)", "14 GB FP16", "1", "2", "90% (batch)", "10%", "43.2"], highlight: false },
+  ]}
+  notes="Total cluster: 16 GPUs, 384 GPU-hours/day. Wasted: 288 GPU-hours/day (75% waste). At $2/GPU-hour, that is $576/day wasted."
+/>
+
+75% waste is typical for statically-allocated multi-model clusters. The fundamental issue: peak load determines allocation, but average load determines utilization.
+
+### Dynamic Sharing Requirements
+
+A multi-model scheduler must solve three subproblems:
+
+1. **When to switch**: Detect traffic shifts and decide when moving a model onto or off a GPU is worthwhile
+2. **How to switch**: Load/unload model weights with minimal disruption to in-flight requests
+3. **Where to place**: Decide which GPU runs which model, considering KV cache locality, GPU memory capacity, and interconnect topology
+
+---
+
+## 2. Temporal Sharing: Switching Models on a GPU
+
+Temporal sharing assigns one model to a GPU at a time, but changes the assignment based on demand. The model switch can be cold (full weight load) or warm (weights stay in memory).
+
+### Cold Switching
+
+A cold switch evicts the current model's weights from GPU HBM and loads the new model. This is the simplest approach but the slowest.
+
+```python
+class ColdModelSwitch:
+    """Evict current model, load new model from storage."""
+
+    def __init__(self, gpu_id, storage_backend):
+        self.gpu_id = gpu_id
+        self.storage = storage_backend  # NVMe, network storage, or peer GPU
+        self.current_model = None
+
+    def switch_to(self, target_model):
+        """
+        Cold switch timeline:
+        1. Drain in-flight requests (wait for decode to finish)
+        2. Free GPU memory (model weights + KV cache)
+        3. Load new model weights
+        4. Rebuild CUDA graphs (if used)
+        5. Accept new requests
+        """
+        # Step 1: Drain
+        drain_start = time.monotonic()
+        self._drain_inflight_requests()
+        drain_time = time.monotonic() - drain_start
+
+        # Step 2: Free
+        if self.current_model is not None:
+            free_gpu_memory(self.gpu_id, self.current_model)
+            torch.cuda.empty_cache()
+
+        # Step 3: Load weights
+        load_start = time.monotonic()
+        weight_bytes = target_model.weight_size_bytes
+
+        if self.storage.type == "nvme":
+            # NVMe SSD: ~14 GB/s read bandwidth (PCIe 5.0 x4)
+            # 140 GB model -> ~10 seconds
+            load_model_from_nvme(self.gpu_id, target_model)
+        elif self.storage.type == "model_express":
+            # GPU-to-GPU via NIXL over NVLink: ~900 GB/s
+            # 140 GB model -> ~160 ms
+            load_model_from_peer_gpu(self.gpu_id, target_model)
+        elif self.storage.type == "cpu_dram":
+            # CPU DRAM via PCIe: ~64 GB/s (PCIe 5.0 x16)
+            # 140 GB model -> ~2.2 seconds
+            load_model_from_cpu(self.gpu_id, target_model)
+
+        load_time = time.monotonic() - load_start
+
+        # Step 4: Rebuild CUDA graphs
+        graph_start = time.monotonic()
+        rebuild_cuda_graphs(self.gpu_id, target_model)
+        graph_time = time.monotonic() - graph_start
+
+        self.current_model = target_model
+
+        return SwitchMetrics(drain_time, load_time, graph_time)
+```
+
+<Benchmark
+  title="Cold Switch Latency by Storage Backend (Llama 70B, 140 GB FP16)"
+  columns={["Storage", "Bandwidth", "Weight Load Time", "CUDA Graph Rebuild", "Total Switch Time"]}
+  rows={[
+    { values: ["NVMe SSD (PCIe 5.0)", "14 GB/s", "10.0 s", "2.0 s", "~12 s"], highlight: false },
+    { values: ["CPU DRAM (PCIe 5.0)", "64 GB/s", "2.2 s", "2.0 s", "~4.2 s"], highlight: false },
+    { values: ["Peer GPU (NVLink 4.0)", "450 GB/s", "310 ms", "200 ms*", "~510 ms"], highlight: true },
+    { values: ["ModelExpress (binary ckpt)", "900 GB/s", "160 ms", "0 ms*", "~200 ms"], highlight: true },
+  ]}
+  notes="*ModelExpress transfers pre-built CUDA graphs as binary blobs, eliminating graph rebuild. Requires same GPU architecture on source and destination."
+/>
+
+ModelExpress (covered in Part 2 of this series) transforms cold switching from a 12-second disruption to a 200ms blip. This makes temporal sharing practical for models that need to be swapped every few minutes rather than every few hours.
+
+### Warm Switching
+
+When total GPU memory can hold multiple models simultaneously, warm switching avoids the load/evict cycle entirely. Both models remain in HBM, and switching means changing which model the inference engine dispatches to.
+
+```python
+class WarmModelSwitch:
+    """Keep multiple models resident in GPU HBM. Switch is instant."""
+
+    def __init__(self, gpu_id, total_hbm_bytes):
+        self.gpu_id = gpu_id
+        self.total_hbm = total_hbm_bytes
+        self.loaded_models = {}       # model_id -> ModelState
+        self.active_model = None
+        self.kv_cache_budget = 0      # Remaining memory after model weights
+
+    def load_model(self, model):
+        """Load model weights without evicting existing models."""
+        weight_bytes = model.weight_size_bytes
+        current_usage = sum(m.weight_size_bytes for m in self.loaded_models.values())
+        kv_reserved = self.total_hbm * 0.3  # Reserve 30% for KV cache
+
+        if current_usage + weight_bytes > self.total_hbm - kv_reserved:
+            raise InsufficientMemoryError(
+                f"Cannot fit {model.name} ({weight_bytes / 1e9:.1f} GB) "
+                f"alongside existing models ({current_usage / 1e9:.1f} GB used). "
+                f"Total HBM: {self.total_hbm / 1e9:.1f} GB, "
+                f"KV reserve: {kv_reserved / 1e9:.1f} GB"
+            )
+
+        load_weights_to_gpu(self.gpu_id, model)
+        self.loaded_models[model.id] = model
+        self._update_kv_budget()
+
+    def switch_to(self, model_id):
+        """Instant switch: just change the active model pointer."""
+        if model_id not in self.loaded_models:
+            raise ModelNotLoadedError(f"Model {model_id} not resident on GPU {self.gpu_id}")
+
+        # Drain current model's in-flight requests
+        self._drain_inflight_requests()
+
+        # Switch is a pointer swap -- zero latency
+        self.active_model = model_id
+
+        return SwitchMetrics(drain_time=0, load_time=0, graph_time=0)
+
+    def _update_kv_budget(self):
+        """Recompute KV cache budget after loading/evicting a model."""
+        weight_usage = sum(m.weight_size_bytes for m in self.loaded_models.values())
+        self.kv_cache_budget = self.total_hbm - weight_usage
+```
+
+The tradeoff: warm switching is instant (sub-millisecond), but keeping multiple models in HBM reduces the KV cache budget for each model. This directly reduces maximum batch size and throughput.
+
+<Benchmark
+  title="Warm Switching: Memory Budget on H100-80GB"
+  columns={["Configuration", "Model Weights", "KV Cache Budget", "Max Concurrent Seqs (4K ctx, FP16)"]}
+  rows={[
+    { values: ["Single Llama 70B", "35 GB (INT4)", "43 GB", "~8,200"], highlight: false },
+    { values: ["Llama 70B + Mistral 7B", "35 + 3.5 = 38.5 GB", "39.5 GB", "~7,500 (70B) or ~75,000 (7B)"], highlight: false },
+    { values: ["Two Llama 7B models", "3.5 + 3.5 = 7 GB", "71 GB", "~135,000 each"], highlight: true },
+    { values: ["Two Llama 13B models", "6.5 + 6.5 = 13 GB", "65 GB", "~62,000 each"], highlight: false },
+    { values: ["Llama 70B + 13B + 7B", "35 + 6.5 + 3.5 = 45 GB", "33 GB", "~6,300 (70B)"], highlight: true },
+  ]}
+  notes="INT4 quantization for 70B. FP16 for smaller models. KV cache budget = 80 GB - model weights - 2 GB CUDA overhead."
+/>
+
+---
+
+## 3. Spatial Sharing: Two Models on One GPU Simultaneously
+
+Spatial sharing goes beyond warm switching: instead of time-multiplexing the GPU between models, it runs both models concurrently. This requires partitioning GPU resources -- CUDA streams, SM allocation, and memory bandwidth.
+
+### Memory Partitioning
+
+Each model gets a dedicated partition of GPU HBM for its weights and KV cache. The partitioning is static (set at deployment time) because dynamic repartitioning would require migrating KV cache, which is expensive.
+
+```python
+class SpatialPartition:
+    """Manage two models sharing a single GPU with isolated memory regions."""
+
+    def __init__(self, gpu_id, total_hbm_bytes, split_ratio=0.5):
+        self.gpu_id = gpu_id
+        self.total_hbm = total_hbm_bytes
+
+        # Partition HBM into two isolated regions
+        overhead = 2 * 1024**3  # 2 GB for CUDA runtime per model
+        usable = total_hbm_bytes - overhead
+
+        self.partition_a_bytes = int(usable * split_ratio)
+        self.partition_b_bytes = usable - self.partition_a_bytes
+
+        # Pre-allocate memory pools using CUDA memory pools
+        self.pool_a = torch.cuda.CUDAPluggableAllocator(
+            max_size=self.partition_a_bytes
+        )
+        self.pool_b = torch.cuda.CUDAPluggableAllocator(
+            max_size=self.partition_b_bytes
+        )
+
+    def launch_model_a(self, model_a, stream_a):
+        """Run model A's forward pass on its partition."""
+        with torch.cuda.stream(stream_a):
+            with torch.cuda.memory.use_allocator(self.pool_a):
+                return model_a.forward(input_a)
+
+    def launch_model_b(self, model_b, stream_b):
+        """Run model B's forward pass on its partition."""
+        with torch.cuda.stream(stream_b):
+            with torch.cuda.memory.use_allocator(self.pool_b):
+                return model_b.forward(input_b)
+```
+
+### SM Partitioning with MPS
+
+NVIDIA Multi-Process Service (MPS) allows multiple CUDA contexts to share a GPU with configurable SM allocation. Dynamo uses MPS to enforce that each model gets a guaranteed share of SMs:
+
+```bash
+# Configure MPS for 60/40 SM split
+# Model A (higher priority): 60% of SMs = 79 SMs on H100
+# Model B (lower priority): 40% of SMs = 53 SMs on H100
+
+export CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=60  # For model A's process
+export CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=40  # For model B's process
+
+# Start MPS daemon
+nvidia-cuda-mps-control -d
+
+# Launch model processes
+vllm serve model_a --gpu-memory-utilization 0.48 &  # Uses partition A
+vllm serve model_b --gpu-memory-utilization 0.48 &  # Uses partition B
+```
+
+<Callout type="warning" title="Spatial Sharing Limitations">
+Spatial sharing has three major limitations. First, CUDA MPS does not provide hard isolation -- a model that exceeds its SM allocation can steal cycles from the other model, causing latency spikes. Second, memory bandwidth is shared and cannot be partitioned -- two bandwidth-bound decode workloads will contend on HBM bandwidth. Third, if one model crashes (e.g., CUDA OOM), the MPS daemon may kill both processes. Use spatial sharing only for models where latency predictability is not critical.
+</Callout>
+
+### When Spatial Sharing Works
+
+Spatial sharing is effective when the two models have complementary resource profiles:
+
+```python
+def is_spatial_sharing_beneficial(model_a_profile, model_b_profile):
+    """
+    Spatial sharing works when models have complementary resource needs.
+
+    Complementary pairs:
+    - Prefill-heavy (compute-bound) + Decode-heavy (bandwidth-bound)
+    - Large batch (high SM utilization) + Small batch (low SM utilization)
+    - Short context (low KV memory) + Long context (high KV memory)
+    """
+    # Compute utilization overlap: both models fighting for tensor cores = bad
+    compute_overlap = min(model_a_profile.sm_utilization, model_b_profile.sm_utilization)
+
+    # Bandwidth utilization overlap: both models saturating HBM = bad
+    bw_overlap = min(model_a_profile.hbm_bw_utilization, model_b_profile.hbm_bw_utilization)
+
+    # If either overlap is high, spatial sharing causes contention
+    if compute_overlap > 0.6 or bw_overlap > 0.7:
+        return False
+
+    # Check if models fit in memory together
+    total_memory = model_a_profile.weight_bytes + model_b_profile.weight_bytes
+    total_kv = model_a_profile.kv_budget_needed + model_b_profile.kv_budget_needed
+    if total_memory + total_kv > GPU_HBM_BYTES * 0.95:
+        return False
+
+    return True
+```
+
+<PerfChart
+  title="Spatial Sharing Throughput: Complementary vs Competing Workloads (H100)"
+  unit="combined tokens/second"
+  data={[
+    { label: "7B prefill + 7B decode", value: 8200, color: "green", annotation: "complementary" },
+    { label: "7B decode + 7B decode", value: 4100, color: "red", annotation: "competing (BW)" },
+    { label: "7B prefill + 7B prefill", value: 5800, color: "orange", annotation: "competing (compute)" },
+    { label: "7B alone (full GPU)", value: 5500, color: "blue", annotation: "baseline" }
+  ]}
+  baseline={0}
+/>
+
+Complementary workloads (one prefill-bound, one decode-bound) achieve 1.49x the throughput of a single model using the full GPU. Competing workloads (two decode-bound) achieve only 0.75x of single-model throughput due to HBM bandwidth contention.
+
+---
+
+## 4. Adapter Pool: One Base Model, Thousands of LoRA Adapters
+
+The most memory-efficient form of multi-model serving: a single base model (e.g., Llama 70B) with LoRA adapters that customize behavior for different tasks or tenants. Each adapter adds 0.1-2% of the base model's parameters.
+
+### LoRA Memory Cost
+
+A LoRA adapter modifies a weight matrix $W \in \mathbb{R}^{d \times d}$ with a low-rank update $\Delta W = BA$ where $B \in \mathbb{R}^{d \times r}$ and $A \in \mathbb{R}^{r \times d}$, with rank $r \ll d$.
+
+$$\text{adapter\_bytes} = \text{num\_target\_modules} \times 2 \times r \times d \times \text{dtype\_bytes}$$
+
+For Llama 70B with rank $r = 16$, targeting Q, K, V, O projections (4 modules per layer, 80 layers):
+
+$$320 \times 2 \times 16 \times 8192 \times 2 = 167{,}772{,}160 \text{ bytes} \approx 160 \text{ MB}$$
+
+A single H100 with 80 GB HBM can hold the base model (35 GB in INT4) plus the KV cache (30 GB) and still have 15 GB for adapters -- room for approximately 93 rank-16 adapters simultaneously.
+
+```python
+class AdapterPool:
+    """Manage a pool of LoRA adapters for a single base model."""
+
+    def __init__(self, base_model, gpu_memory_budget_bytes):
+        self.base_model = base_model
+        self.budget = gpu_memory_budget_bytes
+
+        # Adapter storage
+        self.loaded_adapters = {}    # adapter_id -> AdapterState
+        self.adapter_lru = OrderedDict()  # LRU eviction tracking
+
+        # Pre-allocated adapter slot buffer
+        self.max_slots = gpu_memory_budget_bytes // self._adapter_slot_size()
+        self.slot_buffer = torch.empty(
+            self.max_slots, self._adapter_slot_size(),
+            dtype=torch.uint8, device="cuda"
+        )
+        self.free_slots = list(range(self.max_slots))
+
+    def _adapter_slot_size(self):
+        """Size of one adapter in bytes."""
+        num_modules = self.base_model.num_lora_target_modules
+        rank = 16  # Default rank
+        dim = self.base_model.hidden_dim
+        dtype_bytes = 2  # FP16
+        return num_modules * 2 * rank * dim * dtype_bytes
+
+    def get_adapter(self, adapter_id):
+        """Load adapter if not resident, evicting LRU if needed."""
+        if adapter_id in self.loaded_adapters:
+            # Cache hit: move to front of LRU
+            self.adapter_lru.move_to_end(adapter_id)
+            return self.loaded_adapters[adapter_id]
+
+        # Cache miss: need to load
+        if not self.free_slots:
+            # Evict LRU adapter
+            evict_id, _ = self.adapter_lru.popitem(last=False)
+            evicted = self.loaded_adapters.pop(evict_id)
+            self.free_slots.append(evicted.slot_index)
+
+        # Load adapter into free slot
+        slot_idx = self.free_slots.pop()
+        adapter = load_adapter_weights(adapter_id, self.slot_buffer[slot_idx])
+        self.loaded_adapters[adapter_id] = AdapterState(adapter, slot_idx)
+        self.adapter_lru[adapter_id] = True
+
+        return self.loaded_adapters[adapter_id]
+```
+
+### S-LoRA Scheduling
+
+When a batch contains requests targeting different LoRA adapters, the forward pass must apply different adapter weights to different sequences in the batch. S-LoRA (Sheng et al., 2023) solves this by batching the base model computation and then applying adapter-specific GEMM operations using a custom CUDA kernel.
+
+```python
+class SLoRAForwardPass:
+    """Batched forward pass with per-sequence LoRA adapters."""
+
+    def forward_linear_with_lora(self, x, base_weight, adapter_indices, adapter_pool):
+        """
+        x: [batch, seq_len, hidden_dim]
+        base_weight: [hidden_dim, hidden_dim]  (shared across all sequences)
+        adapter_indices: [batch]  (which adapter each sequence uses)
+
+        Output = x @ W_base + x @ B_i @ A_i  (adapter i for sequence i)
+        """
+        # Step 1: Base model computation (batched, one GEMM)
+        base_output = torch.matmul(x, base_weight.T)  # [batch, seq_len, hidden_dim]
+
+        # Step 2: Group sequences by adapter
+        adapter_groups = {}
+        for seq_idx, adapter_id in enumerate(adapter_indices):
+            adapter_groups.setdefault(adapter_id, []).append(seq_idx)
+
+        # Step 3: Adapter computation (one GEMM per unique adapter)
+        lora_output = torch.zeros_like(base_output)
+
+        for adapter_id, seq_indices in adapter_groups.items():
+            adapter = adapter_pool.get_adapter(adapter_id)
+            A, B = adapter.weights  # A: [rank, hidden], B: [hidden, rank]
+
+            # Gather sequences for this adapter
+            x_group = x[seq_indices]  # [group_size, seq_len, hidden_dim]
+
+            # Two small GEMMs: x @ B @ A
+            intermediate = torch.matmul(x_group, B.T)   # [group, seq, rank]
+            lora_delta = torch.matmul(intermediate, A.T)  # [group, seq, hidden]
+
+            # Scatter back
+            lora_output[seq_indices] = lora_delta
+
+        return base_output + lora_output
+```
+
+The computational overhead is proportional to the number of unique adapters in the batch, not the total number of sequences. If 100 sequences in a batch use 5 unique adapters, the overhead is 5 small GEMMs (rank-16 instead of full-rank), adding approximately 1-3% to the forward pass latency.
+
+<Callout type="perf" title="Adapter Batching Efficiency">
+The key optimization in S-LoRA scheduling: batch requests that share the same adapter together. If the scheduler receives 10 requests for adapter A and 5 for adapter B, it can form two adapter groups and run two adapter GEMMs. The alternative -- one adapter GEMM per sequence -- would run 15 GEMMs. The scheduler in Dynamo sorts incoming requests by adapter ID before forming batches, maximizing adapter group sizes and minimizing the number of adapter GEMMs per forward pass.
+</Callout>
+
+### Adapter Prefetching
+
+When the adapter pool is larger than GPU memory, some adapters must be fetched from CPU DRAM or storage. This fetch latency (100us from CPU, 1ms+ from SSD) can add to TTFT if it happens on the critical path.
+
+Dynamo's adapter prefetcher predicts which adapters will be needed based on recent request patterns:
+
+```python
+class AdapterPrefetcher:
+    """Predict and prefetch adapters based on request patterns."""
+
+    def __init__(self, adapter_pool, request_history_window=1000):
+        self.pool = adapter_pool
+        self.request_counts = defaultdict(int)  # adapter_id -> recent count
+        self.window = request_history_window
+
+    def on_request(self, adapter_id):
+        """Track adapter usage."""
+        self.request_counts[adapter_id] += 1
+
+    def prefetch_top_k(self, k=10):
+        """
+        Preload the K most-requested adapters that are not currently loaded.
+
+        Called periodically (every 100ms) by the scheduler.
+        """
+        sorted_adapters = sorted(
+            self.request_counts.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+
+        for adapter_id, count in sorted_adapters[:k]:
+            if adapter_id not in self.pool.loaded_adapters:
+                # Async load: does not block serving
+                self.pool.async_load_adapter(adapter_id)
+
+    def should_evict(self, adapter_id):
+        """Only evict adapters with zero recent requests."""
+        return self.request_counts.get(adapter_id, 0) == 0
+```
+
+---
+
+## 5. SLO-Based Model Priority
+
+Not all models are equal. A revenue-generating coding assistant has a P99 TTFT target of 200ms. An internal summarization tool has a P99 of 5 seconds. Dynamo's priority system allocates GPU resources proportional to each model's SLO strictness.
+
+### Priority Tiers
+
+```python
+class ModelPriority:
+    CRITICAL = 1    # Dedicated GPUs, never preempted, SLO: P99 < 200ms
+    HIGH = 2        # Preferred GPUs, preempted only by CRITICAL, SLO: P99 < 500ms
+    STANDARD = 3    # Shared GPUs, can be preempted, SLO: P99 < 2s
+    BATCH = 4       # Best-effort, runs when capacity is available, no SLO
+
+class ModelDeploymentSpec:
+    def __init__(self, model_id, priority, slo_ttft_ms, slo_tpot_ms, min_replicas, max_replicas):
+        self.model_id = model_id
+        self.priority = priority
+        self.slo_ttft_ms = slo_ttft_ms     # Time to first token target (P99)
+        self.slo_tpot_ms = slo_tpot_ms     # Time per output token target (P99)
+        self.min_replicas = min_replicas    # Minimum GPU replicas always running
+        self.max_replicas = max_replicas    # Maximum GPUs to scale to
+
+# Example deployment configuration
+deployments = [
+    ModelDeploymentSpec("llama-70b-code", ModelPriority.CRITICAL, 200, 30, 4, 8),
+    ModelDeploymentSpec("mistral-7b-translate", ModelPriority.HIGH, 500, 50, 1, 4),
+    ModelDeploymentSpec("llama-13b-chat", ModelPriority.STANDARD, 2000, 80, 1, 4),
+    ModelDeploymentSpec("qwen-7b-summarize", ModelPriority.BATCH, None, None, 0, 4),
+]
+```
+
+### The Priority Scheduler
+
+The multi-model scheduler runs every 10 seconds (or on-demand when traffic spikes are detected). It allocates GPUs to models based on priority and current SLO compliance:
+
+```python
+class MultiModelScheduler:
+    """Allocate GPUs to models based on priority and SLO compliance."""
+
+    def __init__(self, gpu_pool, deployments):
+        self.gpus = gpu_pool              # List of available GPUs
+        self.deployments = deployments     # Sorted by priority (CRITICAL first)
+        self.allocations = {}             # model_id -> set of gpu_ids
+
+    def schedule(self, current_metrics):
+        """
+        Rebalance GPU allocations.
+
+        Algorithm:
+        1. Satisfy min_replicas for all models (priority order)
+        2. Allocate remaining GPUs to models violating SLOs (priority order)
+        3. Allocate remaining GPUs to models with headroom below threshold
+        4. Any leftover GPUs go to BATCH priority models
+        """
+        free_gpus = set(self.gpus)
+        new_allocations = {}
+
+        # Phase 1: Guarantee minimum replicas
+        for deploy in sorted(self.deployments, key=lambda d: d.priority):
+            needed = deploy.min_replicas
+            model_tp = get_tp_degree(deploy.model_id)
+
+            # Allocate in TP-group-sized chunks
+            allocated = set()
+            while len(allocated) < needed * model_tp and free_gpus:
+                gpu = self._pick_best_gpu(free_gpus, deploy.model_id)
+                allocated.add(gpu)
+                free_gpus.discard(gpu)
+
+            new_allocations[deploy.model_id] = allocated
+
+        # Phase 2: Fix SLO violations
+        for deploy in sorted(self.deployments, key=lambda d: d.priority):
+            if deploy.slo_ttft_ms is None:
+                continue  # BATCH models have no SLO
+
+            metrics = current_metrics.get(deploy.model_id)
+            if metrics and metrics.p99_ttft_ms > deploy.slo_ttft_ms:
+                # SLO violated: add more replicas
+                deficit = self._estimate_replicas_needed(deploy, metrics)
+                model_tp = get_tp_degree(deploy.model_id)
+
+                for _ in range(deficit):
+                    if len(free_gpus) < model_tp:
+                        # No free GPUs: preempt lower-priority models
+                        freed = self._preempt_lower_priority(deploy.priority, model_tp)
+                        free_gpus.update(freed)
+
+                    if len(free_gpus) >= model_tp:
+                        for _ in range(model_tp):
+                            gpu = self._pick_best_gpu(free_gpus, deploy.model_id)
+                            new_allocations[deploy.model_id].add(gpu)
+                            free_gpus.discard(gpu)
+
+        # Phase 3: Allocate remaining to BATCH models
+        for deploy in self.deployments:
+            if deploy.priority == ModelPriority.BATCH and free_gpus:
+                model_tp = get_tp_degree(deploy.model_id)
+                while len(free_gpus) >= model_tp and len(new_allocations.get(deploy.model_id, set())) < deploy.max_replicas * model_tp:
+                    allocated = new_allocations.setdefault(deploy.model_id, set())
+                    for _ in range(model_tp):
+                        gpu = free_gpus.pop()
+                        allocated.add(gpu)
+
+        # Apply allocation changes
+        self._apply_changes(self.allocations, new_allocations)
+        self.allocations = new_allocations
+
+    def _preempt_lower_priority(self, current_priority, gpus_needed):
+        """Preempt the lowest-priority model to free GPUs."""
+        for deploy in sorted(self.deployments, key=lambda d: -d.priority):
+            if deploy.priority <= current_priority:
+                continue  # Do not preempt same or higher priority
+
+            allocated = self.allocations.get(deploy.model_id, set())
+            excess = len(allocated) - deploy.min_replicas * get_tp_degree(deploy.model_id)
+
+            if excess > 0:
+                to_free = list(allocated)[-min(excess, gpus_needed):]
+                for gpu in to_free:
+                    allocated.discard(gpu)
+                    drain_and_evict(gpu, deploy.model_id)
+                return set(to_free)
+
+        return set()  # Nothing to preempt
+
+    def _estimate_replicas_needed(self, deploy, metrics):
+        """Estimate additional replicas needed to meet SLO."""
+        current_replicas = len(self.allocations.get(deploy.model_id, set())) // get_tp_degree(deploy.model_id)
+        if current_replicas == 0:
+            return 1
+
+        # Linear scaling estimate: if P99 is 2x the target, double the replicas
+        overshoot_ratio = metrics.p99_ttft_ms / deploy.slo_ttft_ms
+        target_replicas = int(math.ceil(current_replicas * overshoot_ratio))
+        return min(target_replicas - current_replicas, deploy.max_replicas - current_replicas)
+```
+
+### Preemption Mechanics
+
+When a CRITICAL model needs more GPUs and all are occupied, Dynamo preempts BATCH and STANDARD models. Preemption is not instant -- in-flight requests must be handled:
+
+```python
+def preempt_model_on_gpu(gpu_id, model_id):
+    """
+    Preemption pipeline:
+    1. Stop accepting new requests for this model on this GPU
+    2. Wait for in-flight decode to complete (or migrate requests)
+    3. Optionally migrate KV cache to another GPU running same model
+    4. Free GPU memory
+    """
+    worker = get_worker(gpu_id)
+
+    # Step 1: Fence -- no new requests
+    worker.set_accepting_requests(model_id, False)
+
+    # Step 2: Drain or migrate
+    inflight = worker.get_inflight_requests(model_id)
+
+    if len(inflight) > 0:
+        # Try to migrate to another GPU running the same model
+        alternative_gpu = find_alternative_gpu(model_id, exclude=gpu_id)
+        if alternative_gpu is not None:
+            for req in inflight:
+                # Transfer partial KV cache and resume on alternative GPU
+                migrate_request(req, gpu_id, alternative_gpu)
+        else:
+            # No alternative: wait for completion
+            worker.drain_requests(model_id, timeout_ms=30000)
+
+    # Step 3: Free memory
+    worker.unload_model(model_id)
+```
+
+<Callout type="info" title="Request Migration Cost">
+Migrating a request means transferring its partial KV cache from one GPU to another. For a sequence at position 2,000 with Llama 70B (GQA, 8 KV heads), the KV cache is approximately $2000 \times 8 \times 128 \times 2 \times 2 \times 80 = 655$ MB. Over NVLink 4.0 at 450 GB/s, this takes ~1.5 ms. Over InfiniBand NDR at 50 GB/s, ~13 ms. Migration is fast enough to be invisible to the user at NVLink bandwidth, but noticeable over InfiniBand for long sequences.
+</Callout>
+
+---
+
+## 6. Putting It Together: The Multi-Model Control Loop
+
+Dynamo's multi-model management combines temporal sharing, spatial sharing, adapter pooling, and priority scheduling into a single control loop:
+
+```python
+class MultiModelControlLoop:
+    """Main control loop: runs every 10 seconds."""
+
+    def run_cycle(self):
+        # 1. Collect metrics from all GPUs
+        metrics = self.collect_metrics()  # throughput, latency, utilization per model per GPU
+
+        # 2. Check SLO compliance
+        violations = self.check_slo_compliance(metrics)
+
+        # 3. Run priority scheduler
+        if violations:
+            self.priority_scheduler.schedule(metrics)
+
+        # 4. Update adapter prefetch predictions
+        self.adapter_prefetcher.prefetch_top_k(k=10)
+
+        # 5. Check for spatial sharing opportunities
+        for gpu in self.underutilized_gpus(metrics, threshold=0.4):
+            candidate = self.find_spatial_sharing_candidate(gpu)
+            if candidate:
+                self.enable_spatial_sharing(gpu, candidate)
+
+        # 6. Check for temporal sharing savings
+        for gpu in self.overprovisioned_gpus(metrics, threshold=0.2):
+            model_to_evict = self.find_eviction_candidate(gpu)
+            if model_to_evict:
+                self.schedule_temporal_eviction(gpu, model_to_evict)
+```
+
+---
+
+## 7. Reviewer Agent Validation Challenge
+
+Validate your understanding with these multi-model scheduling scenarios.
+
+**Scenario A**: You have 8 H100 GPUs. Model A (70B, TP=2, CRITICAL, P99 TTFT target=200ms) needs at least 4 GPUs (2 replicas). Model B (7B, TP=1, STANDARD) and Model C (7B, TP=1, BATCH) each need 1 GPU minimum. Traffic for Model A spikes and P99 TTFT hits 350ms. The scheduler runs. What happens?
+
+**Scenario B**: You have a Llama 70B base model serving 500 LoRA adapters. GPU HBM is 80 GB. The base model uses 35 GB (INT4). KV cache is 30 GB. Adapter budget is 15 GB. Each adapter is 160 MB. A request arrives for adapter #487, which is not currently loaded. What happens?
+
+**Scenario C**: Two 7B models are spatially sharing an H100. Both models suddenly receive large prefill batches (4K tokens each). What performance problem occurs?
+
+**Answers**:
+- **A**: Model A's SLO is violated (350ms vs 200ms target, overshoot ratio = 1.75). The scheduler estimates 1 additional TP=2 replica is needed (ceiling of $2 \times 1.75 = 3.5$, minus existing 2 = 2 more replicas, but capped at available GPUs). It first tries free GPUs (there are 2: the remaining after 4+1+1=6 allocated). It allocates those 2 GPUs to Model A as a third TP=2 replica. If still insufficient, it would preempt Model C (BATCH priority) next.
+- **B**: The adapter pool can hold $\lfloor 15{,}360 / 160 \rfloor = 96$ adapters. If all 96 slots are occupied, the LRU adapter is evicted. Adapter #487 is loaded from CPU DRAM (100us) into the freed slot. The request's TTFT increases by ~100us. The adapter prefetcher updates its frequency counters.
+- **C**: Both models become compute-bound simultaneously. With MPS at 50/50 SM allocation, each model gets only 66 SMs (half of H100's 132). Prefill throughput drops by more than 50% for each model because SM utilization is the bottleneck. The effective throughput is worse than time-sharing (where each model would get all 132 SMs for half the time). The spatial sharing should be disabled and replaced with temporal sharing when both models have concurrent compute-bound workloads.
+
+---
+
+## Summary
+
+Multi-model serving on shared GPUs is a scheduling problem with three dimensions: time (temporal sharing), space (spatial sharing), and parameters (adapter pooling). Dynamo's control loop considers all three, guided by SLO-based priority. The key insight: no single sharing strategy is universally optimal. Temporal sharing minimizes wasted capacity but incurs switch latency. Spatial sharing eliminates switch latency but creates resource contention. Adapter pooling is the most efficient but only applies when models share a common base.
+
+The scheduler must continuously evaluate which strategy to apply to each GPU, adapting as traffic patterns shift. The priority system ensures that revenue-critical models always get the resources they need, while lower-priority workloads absorb the variance.

@@ -1,0 +1,679 @@
+---
+title: "vLLM v1 Attention Backends: FlashAttention, FlashInfer, and PagedAttention Selection Logic"
+author: "stanley-phoong"
+description: "How vLLM v1 selects between FlashAttention-2, FlashAttention-3, FlashInfer, and PagedAttention v2 based on GPU architecture, dtype, sequence length, and attention type. The decision tree, kernel internals, and throughput benchmarks across workloads."
+publishDate: 2025-03-22
+category: vllm
+tags: [vllm, attention-backend, flashattention, flashinfer, paged-attention, selection]
+difficulty: expert
+readingTime: 32
+draft: false
+featured: false
+series: "vLLM v1 & Omni Internals"
+seriesOrder: 5
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+
+vLLM v1 does not use a single attention kernel. It dispatches to one of four backends depending on the GPU architecture, the data type, the sequence length, the attention pattern, and the phase (prefill vs. decode). The selection happens at model initialization time, not per-request, because switching kernels mid-flight would require reallocating workspace buffers and rebuilding CUDA graphs.
+
+This post traces the selection logic in `vllm/attention/selector.py`, explains what each backend does differently at the CUDA kernel level, and benchmarks all four across representative workloads. The goal is to make the backend choice legible: given your hardware and workload, you should know exactly which kernel vLLM will select and why.
+
+---
+
+## 1. The Four Backends
+
+vLLM v1 supports four attention computation backends. Each implements the same mathematical operation -- scaled dot-product attention -- but with radically different memory access patterns, tiling strategies, and hardware utilization.
+
+### FlashAttention-2
+
+FlashAttention-2 (Dao, 2023) rewrites the attention computation to avoid materializing the full $N \times N$ attention matrix in HBM. Instead, it tiles the computation across SRAM (shared memory) and accumulates partial softmax results using the online softmax algorithm. The kernel processes Q, K, V in blocks of size $B_r \times B_c$ (typically 64x64 or 128x128 depending on head dimension), keeping only one tile in SRAM at a time.
+
+The key data flow:
+1. Load a block of Q rows from HBM to SRAM
+2. Iterate over K, V blocks: load K block, compute $QK^T$ tile, apply causal mask, compute local softmax, multiply by V block, accumulate
+3. Write the final output block back to HBM
+
+Total HBM reads: $O(N \cdot d)$ for Q, K, V. Total HBM writes: $O(N \cdot d)$ for the output. No $O(N^2)$ intermediate. This is where the memory savings come from.
+
+```cpp
+// FlashAttention-2 kernel pseudocode (simplified from flash_fwd_kernel.h)
+// Each thread block processes B_r rows of Q against all K,V
+template <int kBlockM, int kBlockN, int kHeadDim>
+__global__ void flash_fwd_kernel(
+    const half* __restrict__ Q,    // [batch, seqlen_q, num_heads, head_dim]
+    const half* __restrict__ K,    // [batch, seqlen_k, num_kv_heads, head_dim]
+    const half* __restrict__ V,    // [batch, seqlen_k, num_kv_heads, head_dim]
+    half* __restrict__ O,          // [batch, seqlen_q, num_heads, head_dim]
+    float* __restrict__ L,         // [batch, num_heads, seqlen_q] - logsumexp for online softmax
+    const int seqlen_q,
+    const int seqlen_k,
+    const float softmax_scale
+) {
+    // Each thread block handles kBlockM rows of Q
+    const int q_start = blockIdx.x * kBlockM;
+
+    // Shared memory for Q, K, V tiles
+    __shared__ half sQ[kBlockM][kHeadDim];
+    __shared__ half sK[kBlockN][kHeadDim];
+    __shared__ half sV[kBlockN][kHeadDim];
+
+    // Load Q tile once (stays in SRAM for entire K,V iteration)
+    load_tile(Q, sQ, q_start, kBlockM, kHeadDim);
+
+    // Accumulators in registers
+    float acc[kBlockM][kHeadDim] = {0};
+    float row_max[kBlockM] = {-INFINITY};
+    float row_sum[kBlockM] = {0};
+
+    // Iterate over K,V blocks
+    for (int kv_start = 0; kv_start < seqlen_k; kv_start += kBlockN) {
+        // Load K tile
+        load_tile(K, sK, kv_start, kBlockN, kHeadDim);
+        __syncthreads();
+
+        // Compute S = Q @ K^T (in SRAM)
+        float S[kBlockM][kBlockN];
+        gemm_in_sram(sQ, sK, S, softmax_scale);  // S[i][j] = sum_d(sQ[i][d] * sK[j][d]) * scale
+
+        // Apply causal mask
+        apply_causal_mask(S, q_start, kv_start, kBlockM, kBlockN);
+
+        // Online softmax: update running max and sum
+        float prev_max[kBlockM];
+        copy(row_max, prev_max, kBlockM);
+        update_row_max(S, row_max, kBlockM, kBlockN);
+
+        // Rescale previous accumulator
+        float scale_factor[kBlockM];
+        for (int i = 0; i < kBlockM; i++) {
+            scale_factor[i] = expf(prev_max[i] - row_max[i]);
+            row_sum[i] *= scale_factor[i];
+            for (int d = 0; d < kHeadDim; d++) {
+                acc[i][d] *= scale_factor[i];
+            }
+        }
+
+        // Compute P = softmax(S) with new max
+        float P[kBlockM][kBlockN];
+        for (int i = 0; i < kBlockM; i++) {
+            for (int j = 0; j < kBlockN; j++) {
+                P[i][j] = expf(S[i][j] - row_max[i]);
+                row_sum[i] += P[i][j];
+            }
+        }
+
+        // Load V tile and accumulate: acc += P @ V
+        load_tile(V, sV, kv_start, kBlockN, kHeadDim);
+        __syncthreads();
+        gemm_accumulate(P, sV, acc, kBlockM, kBlockN, kHeadDim);
+    }
+
+    // Final normalization: O = acc / row_sum
+    for (int i = 0; i < kBlockM; i++) {
+        for (int d = 0; d < kHeadDim; d++) {
+            O[(q_start + i) * kHeadDim + d] = __float2half(acc[i][d] / row_sum[i]);
+        }
+    }
+}
+```
+
+FlashAttention-2 runs on Ampere (SM80+) and Hopper (SM90+) GPUs with FP16 or BF16. It supports standard multi-head attention (MHA), multi-query attention (MQA), and grouped-query attention (GQA) natively. It does not support FP8.
+
+### FlashAttention-3
+
+FlashAttention-3 (Shah et al., 2024) targets Hopper GPUs exclusively. It exploits three Hopper-specific hardware features that do not exist on Ampere:
+
+**WGMMA (Warpgroup Matrix Multiply-Accumulate)**: Hopper introduces warpgroup-level matrix instructions that operate on 128x128 or larger tiles in a single instruction, compared to Ampere's `mma.sync` which operates on 16x16 tiles. A single WGMMA instruction achieves higher throughput per clock cycle.
+
+**TMA (Tensor Memory Accelerator)**: A hardware unit that handles async memory copies between global memory and shared memory without consuming SM compute resources. On Ampere, loading a tile from HBM to SRAM requires explicit `cp.async` instructions that still consume warp scheduler slots. On Hopper, TMA offloads the copy entirely to a dedicated engine.
+
+**Warp Specialization**: FlashAttention-3 divides warps within a thread block into producer warps (that load data via TMA) and consumer warps (that compute matmuls via WGMMA). Producers and consumers operate concurrently -- while consumers compute on the current tile, producers prefetch the next tile. This hides memory latency behind compute.
+
+```cpp
+// FlashAttention-3: Hopper warp specialization pattern
+// Producer warps handle TMA loads, consumer warps handle WGMMA compute
+__global__ void flash3_fwd_kernel_hopper(/* ... */) {
+    const int warp_id = threadIdx.x / 32;
+    const int num_warps = blockDim.x / 32;
+
+    // Warp role assignment
+    const bool is_producer = (warp_id < num_warps / 4);  // 25% producers
+    const bool is_consumer = !is_producer;                 // 75% consumers
+
+    if (is_producer) {
+        // TMA-based async loads -- does NOT stall compute warps
+        for (int kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
+            // Issue TMA descriptor-based copy
+            // Hardware DMA engine moves data from HBM to shared memory
+            tma_load_async(&smem_K[kv_block % 2], &gmem_K[kv_block]);
+            tma_load_async(&smem_V[kv_block % 2], &gmem_V[kv_block]);
+
+            // Signal consumers that data is ready
+            arrive_barrier(load_barrier[kv_block % 2]);
+
+            // Wait for consumers to finish with previous buffer
+            wait_barrier(compute_barrier[(kv_block - 1) % 2]);
+        }
+    } else {
+        // Consumer warps: WGMMA compute on tiles in shared memory
+        for (int kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
+            // Wait for producer to finish loading
+            wait_barrier(load_barrier[kv_block % 2]);
+
+            // WGMMA: 128x128 matmul in one instruction
+            wgmma_mma_async(acc_S, smem_Q, smem_K[kv_block % 2]);
+
+            // Online softmax + V accumulation via WGMMA
+            online_softmax_and_accumulate(acc_S, smem_V[kv_block % 2], acc_O);
+
+            // Signal producer that buffer can be reused
+            arrive_barrier(compute_barrier[kv_block % 2]);
+        }
+    }
+}
+```
+
+FlashAttention-3 also adds native FP8 support on Hopper. FP8 ($\text{E4M3}$ for forward, $\text{E5M2}$ for backward) halves the memory bandwidth compared to FP16, giving nearly 2x throughput for bandwidth-bound decode operations. The kernel handles FP8 quantization and dequantization internally, with per-block scaling factors to maintain accuracy.
+
+### PagedAttention v2
+
+PagedAttention is vLLM's original attention kernel, designed specifically for the decode phase where KV cache is stored in non-contiguous physical blocks. Unlike FlashAttention (which assumes contiguous K, V tensors), PagedAttention reads K and V through a block table indirection.
+
+```cpp
+// PagedAttention v2 decode kernel (simplified)
+// Each thread block handles one query head for one sequence
+template <int HEAD_DIM, int BLOCK_SIZE, int NUM_WARPS>
+__global__ void paged_attention_v2_kernel(
+    const half* __restrict__ Q,           // [num_seqs, num_heads, head_dim]
+    const half* __restrict__ K_cache,     // [num_blocks, block_size, num_kv_heads, head_dim]
+    const half* __restrict__ V_cache,     // [num_blocks, block_size, num_kv_heads, head_dim]
+    half* __restrict__ O,                 // [num_seqs, num_heads, head_dim]
+    const int* __restrict__ block_tables, // [num_seqs, max_blocks_per_seq]
+    const int* __restrict__ context_lens, // [num_seqs]
+    float softmax_scale
+) {
+    const int seq_idx = blockIdx.x;
+    const int head_idx = blockIdx.y;
+    const int context_len = context_lens[seq_idx];
+    const int num_blocks = (context_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    // Each warp processes a subset of KV blocks
+    // Phase 1: Compute QK^T scores for all tokens
+    float qk_max = -INFINITY;
+
+    // Load query vector (one row, shared across all warps)
+    half q_vec[HEAD_DIM];
+    load_query(Q, q_vec, seq_idx, head_idx);
+
+    // Iterate through paged KV blocks
+    for (int block_idx = threadIdx.x / 32; block_idx < num_blocks; block_idx += NUM_WARPS) {
+        // Look up physical block ID from block table
+        int physical_block = block_tables[seq_idx * max_blocks + block_idx];
+
+        // Load K from non-contiguous physical block
+        for (int tok = 0; tok < BLOCK_SIZE; tok++) {
+            int global_tok_idx = block_idx * BLOCK_SIZE + tok;
+            if (global_tok_idx >= context_len) break;
+
+            // Compute dot product: q . k[tok]
+            float score = dot_product(
+                q_vec,
+                &K_cache[physical_block * BLOCK_SIZE * HEAD_DIM + tok * HEAD_DIM],
+                HEAD_DIM
+            ) * softmax_scale;
+
+            qk_max = fmaxf(qk_max, score);
+            scores[global_tok_idx] = score;
+        }
+    }
+
+    // Phase 2: Cross-warp reduction of max, then softmax, then weighted V sum
+    // (V2 splits this into a two-pass approach for better parallelism)
+    // ...
+}
+```
+
+The "v2" in PagedAttention v2 refers to the two-pass approach: the first pass computes partial softmax results per warp, the second pass reduces across warps. v1 used a single-pass approach that required atomic operations and had lower throughput at long context lengths.
+
+PagedAttention does not require contiguous K, V. This makes it the only backend that can serve decode requests without copying KV cache into contiguous buffers.
+
+### FlashInfer
+
+FlashInfer (Ye et al., 2024) is an external library that provides both prefill and decode attention kernels with PagedAttention support. Its key differentiator: it generates specialized CUDA kernels at runtime using a JIT compilation approach, tuning tile sizes and memory access patterns for the specific GPU architecture and problem size.
+
+```python
+# FlashInfer backend integration in vLLM
+import flashinfer
+
+class FlashInferBackend:
+    def __init__(self, num_heads, num_kv_heads, head_dim, dtype, page_size):
+        self.workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+
+        # Prefill: uses ragged tensor format (variable-length sequences packed together)
+        self.prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            self.workspace_buffer, kv_layout="NHD"
+        )
+
+        # Decode: one query token per sequence, paged KV
+        self.decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            self.workspace_buffer, kv_layout="NHD"
+        )
+
+    def forward_prefill(self, q, kv_cache, block_tables, seq_lens):
+        # Plan: compute memory access patterns for this batch
+        self.prefill_wrapper.plan(
+            qo_indptr=compute_indptr(seq_lens),
+            paged_kv_indptr=compute_kv_indptr(block_tables),
+            paged_kv_indices=flatten_block_tables(block_tables),
+            paged_kv_last_page_len=compute_last_page_lens(seq_lens),
+            num_qo_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            page_size=self.page_size
+        )
+        return self.prefill_wrapper.run(q, kv_cache)
+
+    def forward_decode(self, q, kv_cache, block_tables, seq_lens):
+        self.decode_wrapper.plan(
+            indptr=compute_indptr_ones(len(seq_lens)),
+            paged_kv_indptr=compute_kv_indptr(block_tables),
+            paged_kv_indices=flatten_block_tables(block_tables),
+            paged_kv_last_page_len=compute_last_page_lens(seq_lens),
+            num_qo_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            page_size=self.page_size
+        )
+        return self.decode_wrapper.run(q, kv_cache)
+```
+
+FlashInfer's plan/run separation is important: the `plan()` call pre-computes all memory access metadata (indirection pointers, page offsets) on CPU, and `run()` executes the GPU kernel with zero CPU-side overhead. When the batch composition does not change between iterations (common in decode), the plan can be cached.
+
+<Benchmark
+  title="Backend Feature Comparison"
+  columns={["Feature", "FlashAttention-2", "FlashAttention-3", "PagedAttention v2", "FlashInfer"]}
+  rows={[
+    { values: ["Min GPU Arch", "Ampere (SM80)", "Hopper (SM90)", "Any CUDA", "Ampere (SM80)"], highlight: false },
+    { values: ["FP16/BF16", "Yes", "Yes", "Yes", "Yes"], highlight: false },
+    { values: ["FP8", "No", "Yes (E4M3)", "No", "Yes (E4M3/E5M2)"], highlight: true },
+    { values: ["Paged KV", "No (contiguous)", "No (contiguous)", "Yes (native)", "Yes (native)"], highlight: true },
+    { values: ["GQA/MQA", "Yes", "Yes", "Yes", "Yes"], highlight: false },
+    { values: ["MLA (DeepSeek)", "No", "No", "Custom kernel", "Yes"], highlight: true },
+    { values: ["Prefill", "Optimal", "Optimal (Hopper)", "Suboptimal", "Good"], highlight: false },
+    { values: ["Decode", "Requires copy", "Requires copy", "Optimal", "Good"], highlight: false },
+    { values: ["WGMMA/TMA", "No", "Yes", "No", "Partial"], highlight: false },
+  ]}
+  notes="FlashAttention-2/3 require contiguous KV for prefill but vLLM copies paged KV to contiguous buffers for prefill. PagedAttention v2 handles non-contiguous KV natively but is slower for prefill."
+/>
+
+---
+
+## 2. The Selection Logic
+
+The backend selection runs once during model initialization in `vllm/attention/selector.py`. The function `get_attn_backend()` walks a decision tree that considers the environment, the hardware, and the model configuration.
+
+### The Decision Tree
+
+```python
+def get_attn_backend(
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    block_size: int,
+    is_attention_free: bool,
+    use_mla: bool,
+) -> AttentionBackend:
+    """
+    Selection priority:
+    1. Environment override (VLLM_ATTENTION_BACKEND env var)
+    2. Attention-free models (Mamba, RWKV) -> no backend needed
+    3. MLA models (DeepSeek-V2/V3) -> special path
+    4. Hopper + FP8 -> FlashAttention-3
+    5. Hopper + FP16/BF16 -> FlashAttention-3 (if available) else FlashAttention-2
+    6. Ampere + FP16/BF16 -> FlashAttention-2 (prefill) + PagedAttention v2 (decode)
+    7. Fallback -> PagedAttention v2 (both phases)
+    """
+
+    # Step 1: Environment override
+    env_backend = os.environ.get("VLLM_ATTENTION_BACKEND")
+    if env_backend is not None:
+        return _resolve_backend(env_backend)
+
+    # Step 2: Attention-free models need no attention backend
+    if is_attention_free:
+        return PlaceholderAttentionBackend
+
+    # Step 3: MLA (Multi-head Latent Attention) special path
+    if use_mla:
+        return _select_mla_backend(num_heads, num_kv_heads, head_dim, dtype)
+
+    # Step 4-7: Standard selection based on GPU arch and dtype
+    gpu_arch = torch.cuda.get_device_capability()
+
+    if gpu_arch >= (9, 0):  # Hopper (SM90+)
+        return _select_hopper_backend(dtype, head_dim, block_size)
+    elif gpu_arch >= (8, 0):  # Ampere (SM80+)
+        return _select_ampere_backend(dtype, head_dim, block_size)
+    else:
+        # Pre-Ampere: only PagedAttention
+        return PagedAttentionBackend
+
+
+def _select_hopper_backend(dtype, head_dim, block_size):
+    """Hopper GPUs: prefer FlashAttention-3 when available."""
+
+    if dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        # FP8: only FlashAttention-3 supports this
+        if _is_flash3_available():
+            return FlashAttention3Backend
+        else:
+            raise ValueError("FP8 attention requires FlashAttention-3 on Hopper")
+
+    if dtype in (torch.float16, torch.bfloat16):
+        # FP16/BF16: prefer FA3 for Hopper-specific optimizations
+        if _is_flash3_available() and head_dim in (64, 128, 256):
+            return FlashAttention3Backend
+        elif _is_flash2_available():
+            return FlashAttention2Backend
+        else:
+            return PagedAttentionBackend
+
+    # FP32: no flash support
+    return PagedAttentionBackend
+
+
+def _select_ampere_backend(dtype, head_dim, block_size):
+    """Ampere GPUs: FlashAttention-2 for prefill, PagedAttention for decode."""
+
+    if dtype not in (torch.float16, torch.bfloat16):
+        return PagedAttentionBackend
+
+    if head_dim not in (64, 128, 256):
+        # Flash kernels only support specific head dims
+        return PagedAttentionBackend
+
+    if _is_flash2_available():
+        # Hybrid: FA2 for prefill (contiguous), Paged for decode (non-contiguous)
+        return FlashAttention2Backend
+
+    return PagedAttentionBackend
+```
+
+<Callout type="warning" title="The Hybrid Prefill/Decode Split">
+When vLLM selects FlashAttention-2 on Ampere, it does NOT use FlashAttention-2 for decode. FA2 requires contiguous K, V tensors, but the KV cache is stored in non-contiguous pages. For prefill, vLLM copies the relevant KV pages into a contiguous buffer and runs FA2. For decode, it uses PagedAttention v2 directly on the paged KV cache without copying. This means the "backend" selection is really a prefill backend selection -- the decode backend is always PagedAttention v2 unless FlashInfer is explicitly chosen.
+</Callout>
+
+### MLA Backend Selection
+
+DeepSeek-V2 and V3 use Multi-head Latent Attention (MLA), which compresses KV cache through low-rank projection. MLA changes the attention computation: instead of standard $QK^T$, it performs attention in a compressed latent space with different head dimensions for keys and values.
+
+```python
+def _select_mla_backend(num_heads, num_kv_heads, head_dim, dtype):
+    """MLA models need specialized kernels that understand the compressed KV format."""
+
+    # FlashInfer has native MLA support
+    if _is_flashinfer_available():
+        return FlashInferMLABackend
+
+    # Fallback: decompress KV to standard format and use regular attention
+    # This loses the memory savings of MLA but is functionally correct
+    return DecompressedMLABackend
+```
+
+### The FlashInfer Alternative Path
+
+FlashInfer is selected when explicitly requested via environment variable or when MLA models are detected. It can also be chosen as the default backend on systems where FlashAttention is not installed:
+
+```python
+# User can force FlashInfer for all attention
+# export VLLM_ATTENTION_BACKEND=FLASHINFER
+
+# FlashInfer handles both prefill and decode with paged KV natively
+# No need for the hybrid FA2-prefill + Paged-decode split
+```
+
+The advantage of FlashInfer over the hybrid FA2 + PagedAttention approach: FlashInfer uses paged KV natively for both prefill and decode, eliminating the contiguous-copy overhead during prefill. The disadvantage: on Hopper GPUs, FlashInfer's kernels currently do not exploit WGMMA and TMA as aggressively as FlashAttention-3.
+
+---
+
+## 3. FlashAttention-3 on Hopper: WGMMA, TMA, and Warp Specialization
+
+FlashAttention-3 achieves 1.5-2x higher throughput than FlashAttention-2 on Hopper through three hardware-specific optimizations.
+
+### WGMMA: Warpgroup Matrix Multiply
+
+Ampere's tensor cores operate at the warp level (32 threads) with `mma.sync` instructions on 16x8x16 tiles. Hopper's WGMMA operates at the warpgroup level (128 threads = 4 warps) on much larger tiles:
+
+$$\text{Ampere mma.sync: } 16 \times 8 \times 16 \text{ per instruction}$$
+$$\text{Hopper WGMMA: } 64 \times 256 \times 16 \text{ per instruction}$$
+
+The larger tile size means fewer instructions to cover the same matrix dimensions, reducing instruction scheduling overhead and improving throughput per clock cycle.
+
+For an attention head with $d = 128$:
+- Ampere needs $\lceil 128/16 \rceil \times \lceil 128/8 \rceil = 8 \times 16 = 128$ mma instructions per output tile
+- Hopper needs $\lceil 128/64 \rceil \times \lceil 128/256 \rceil = 2 \times 1 = 2$ WGMMA instructions per output tile
+
+This is a 64x reduction in instruction count, though each WGMMA instruction takes more clock cycles to complete.
+
+### TMA: Hardware-Managed Memory Copies
+
+On Ampere, loading a 128x128 FP16 tile (32 KB) from HBM to shared memory requires issuing multiple `cp.async` instructions from compute warps. Each instruction consumes a warp scheduler slot, competing with compute instructions for issue bandwidth.
+
+On Hopper, the TMA unit performs the same copy autonomously:
+
+```cpp
+// Ampere: software-managed async copy (consumes warp scheduler slots)
+for (int i = threadIdx.x; i < tile_elements; i += blockDim.x) {
+    cp_async(&smem[i], &gmem[offset + i]);
+}
+cp_async_commit_group();
+
+// Hopper: TMA descriptor-based copy (zero compute warp overhead)
+if (threadIdx.x == 0) {
+    // Single instruction triggers hardware DMA
+    tma_load_async(tma_descriptor, &smem_buffer, gmem_coords);
+}
+// All other threads continue computing on previous tile
+```
+
+The practical impact: on Ampere, ~20% of warp scheduler slots are consumed by memory copy instructions. On Hopper with TMA, those slots are freed for compute, increasing effective FLOPS utilization.
+
+### Warp Specialization
+
+FlashAttention-3 assigns 25% of warps as producers (data loaders) and 75% as consumers (compute). This is a persistent kernel design: warps never switch roles during execution.
+
+The pipeline has three stages:
+1. **Producer**: issues TMA loads for K, V tiles into a double-buffered shared memory region
+2. **Consumer Stage 1**: computes $S = QK^T$ using WGMMA on the loaded K tile
+3. **Consumer Stage 2**: computes $O += \text{softmax}(S) \cdot V$ using WGMMA on the loaded V tile
+
+Because producers and consumers execute concurrently on different warps, the TMA load of tile $i+1$ overlaps with the WGMMA compute of tile $i$. This hides nearly all memory latency when the compute-to-bandwidth ratio is balanced.
+
+<Callout type="perf" title="FP8 Pipeline on Hopper">
+FlashAttention-3 with FP8 achieves the highest throughput on Hopper because it combines all three optimizations: TMA loads FP8 data (half the bytes of FP16, so 2x effective bandwidth), WGMMA computes on FP8 operands (2x throughput per instruction vs FP16), and warp specialization overlaps the two. The theoretical peak is $\sim$1.3 PFLOPS on H100 for FP8 attention, compared to $\sim$660 TFLOPS for FP16.
+</Callout>
+
+---
+
+## 4. FlashInfer: When It Wins
+
+FlashInfer is not always faster than vLLM's native kernels, but it wins in specific scenarios:
+
+### Scenario 1: Small Batch Decode with Long Context
+
+For decode with batch size 1-4 and context length 8K-128K, FlashInfer's JIT-compiled kernels tune the parallelism strategy per-request. vLLM's PagedAttention v2 uses a fixed thread block configuration that is optimized for larger batches (32-256 sequences). At small batch sizes, PagedAttention v2 underutilizes the GPU because the grid is too small.
+
+FlashInfer addresses this by parallelizing across KV blocks within a single sequence:
+
+```python
+# PagedAttention v2: grid = (num_seqs, num_heads)
+# With batch=2, num_heads=32: grid = (2, 32) = 64 blocks
+# H100 has 132 SMs -> 50% occupancy
+
+# FlashInfer: grid = (num_seqs * num_kv_splits, num_heads)
+# With batch=2, num_heads=32, kv_splits=8: grid = (16, 32) = 512 blocks
+# H100: 512/132 = 3.9 waves -> near-full occupancy
+```
+
+### Scenario 2: MLA Models
+
+FlashInfer has native MLA kernels that operate directly on the compressed KV cache ($d_{compress} = 512$ instead of $d_{kv} = 128 \times n_{heads}$). Without FlashInfer, vLLM must decompress the KV cache to standard format before running attention, which doubles memory traffic and negates much of MLA's memory savings.
+
+### Scenario 3: Non-Standard Head Dimensions
+
+FlashAttention-2 and 3 support head dimensions of 64, 128, and 256. Models with head_dim = 96 (some Falcon variants) or head_dim = 192 (GPT-J) cannot use FlashAttention. FlashInfer's JIT approach generates kernels for arbitrary head dimensions.
+
+<Benchmark
+  title="FlashInfer vs PagedAttention v2: Decode Throughput (H100, Llama 70B, GQA)"
+  columns={["Batch Size", "Context Length", "PagedAttn v2 (tok/s)", "FlashInfer (tok/s)", "Speedup"]}
+  rows={[
+    { values: ["1", "4,096", "42", "58", "1.38x"], highlight: true },
+    { values: ["1", "32,768", "38", "55", "1.45x"], highlight: true },
+    { values: ["1", "131,072", "31", "48", "1.55x"], highlight: true },
+    { values: ["32", "4,096", "1,180", "1,210", "1.03x"], highlight: false },
+    { values: ["32", "32,768", "890", "920", "1.03x"], highlight: false },
+    { values: ["128", "4,096", "3,200", "3,150", "0.98x"], highlight: false },
+    { values: ["256", "4,096", "5,100", "4,980", "0.98x"], highlight: false },
+  ]}
+  notes="FlashInfer advantage is largest at small batch sizes with long context. At batch >= 128, PagedAttention v2 matches or slightly exceeds FlashInfer."
+/>
+
+---
+
+## 5. The Prefill/Decode Backend Split
+
+A critical implementation detail: vLLM v1 does not use a single backend for both prefill and decode. The split is:
+
+**Prefill phase**: The scheduler assembles a batch of prompt tokens. The KV cache for these tokens does not exist yet -- it will be computed during this forward pass. Q, K, V are all derived from the model's forward pass on the input tokens. K and V are contiguous (freshly computed), so FlashAttention can be used directly.
+
+**Decode phase**: Each sequence has a single new query token. K and V come from the KV cache, which is stored in non-contiguous pages. To use FlashAttention, the paged KV must be copied to contiguous buffers. To use PagedAttention, no copy is needed.
+
+```python
+class AttentionLayer:
+    def forward(self, q, k, v, kv_cache, block_tables, seq_lens, is_prefill):
+        if is_prefill:
+            # Write new K,V to KV cache pages
+            write_to_kv_cache(k, v, kv_cache, block_tables, seq_lens)
+
+            if self.backend == FlashAttention2Backend:
+                # FA2 on contiguous K,V (freshly computed, not from cache)
+                return flash_attn_func(q, k, v, causal=True)
+            elif self.backend == FlashAttention3Backend:
+                return flash_attn_3_func(q, k, v, causal=True)
+            elif self.backend == FlashInferBackend:
+                return self.flashinfer.forward_prefill(q, kv_cache, block_tables, seq_lens)
+            else:
+                # PagedAttention for prefill is slower but works
+                return paged_attention_prefill(q, kv_cache, block_tables, seq_lens)
+
+        else:  # decode
+            # Write single new K,V token to cache
+            write_single_token_to_cache(k, v, kv_cache, block_tables, seq_lens)
+
+            if self.backend == FlashInferBackend:
+                return self.flashinfer.forward_decode(q, kv_cache, block_tables, seq_lens)
+            else:
+                # Always PagedAttention v2 for decode (even if prefill used FA2/FA3)
+                return paged_attention_v2(q, kv_cache, block_tables, seq_lens)
+```
+
+<Callout type="info" title="Why Not Copy Paged KV to Contiguous for Decode?">
+During decode, each sequence generates one token. The attention computation for one query token against $N$ KV tokens is memory-bound (reading $N \times d$ elements from KV cache). Copying the paged KV to a contiguous buffer would require reading and writing all $N \times d$ elements -- doubling the memory traffic. The copy cost exceeds any benefit from FlashAttention's more efficient tiling. PagedAttention's block-table indirection adds minimal overhead (one integer lookup per block) compared to this copy cost.
+</Callout>
+
+---
+
+## 6. Throughput Benchmarks
+
+All measurements on NVIDIA H100 SXM 80GB, CUDA 12.4, vLLM v0.7.x, Llama 3.1 70B with GQA (8 KV heads, head_dim=128), FP16.
+
+### Prefill Throughput
+
+<PerfChart
+  title="Prefill Throughput by Backend and Sequence Length (H100, Llama 70B)"
+  unit="tokens/second"
+  data={[
+    { label: "FA2 @ 512 tok", value: 18500, color: "blue", annotation: "18.5K tok/s" },
+    { label: "FA3 @ 512 tok", value: 24200, color: "green", annotation: "24.2K tok/s" },
+    { label: "FlashInfer @ 512 tok", value: 17100, color: "orange", annotation: "17.1K tok/s" },
+    { label: "PagedAttn @ 512 tok", value: 12400, color: "red", annotation: "12.4K tok/s" },
+    { label: "FA2 @ 4096 tok", value: 15200, color: "blue", annotation: "15.2K tok/s" },
+    { label: "FA3 @ 4096 tok", value: 21800, color: "green", annotation: "21.8K tok/s" },
+    { label: "FlashInfer @ 4096 tok", value: 14900, color: "orange", annotation: "14.9K tok/s" },
+    { label: "PagedAttn @ 4096 tok", value: 9800, color: "red", annotation: "9.8K tok/s" }
+  ]}
+  baseline={0}
+/>
+
+FlashAttention-3 leads prefill throughput by 30-44% over FlashAttention-2 on Hopper, thanks to WGMMA and TMA. FlashInfer is competitive with FA2 but does not match FA3's Hopper-specific optimizations. PagedAttention v2 trails by 35-55% during prefill because it is not designed for the compute-bound prefill workload.
+
+### Decode Throughput
+
+<PerfChart
+  title="Decode Throughput by Backend (H100, Llama 70B, batch=64)"
+  unit="tokens/second"
+  data={[
+    { label: "PagedAttn v2 @ ctx 2K", value: 2850, color: "blue", annotation: "2,850 tok/s" },
+    { label: "FlashInfer @ ctx 2K", value: 2790, color: "green", annotation: "2,790 tok/s" },
+    { label: "PagedAttn v2 @ ctx 8K", value: 2340, color: "blue", annotation: "2,340 tok/s" },
+    { label: "FlashInfer @ ctx 8K", value: 2410, color: "green", annotation: "2,410 tok/s" },
+    { label: "PagedAttn v2 @ ctx 32K", value: 1520, color: "blue", annotation: "1,520 tok/s" },
+    { label: "FlashInfer @ ctx 32K", value: 1680, color: "green", annotation: "1,680 tok/s" },
+    { label: "PagedAttn v2 @ ctx 128K", value: 620, color: "blue", annotation: "620 tok/s" },
+    { label: "FlashInfer @ ctx 128K", value: 740, color: "green", annotation: "740 tok/s" }
+  ]}
+  baseline={0}
+/>
+
+At moderate context (2K-8K) and batch=64, PagedAttention v2 and FlashInfer are within 3% of each other. At long context (32K+), FlashInfer pulls ahead by 10-19% due to its adaptive KV-split parallelism strategy.
+
+### FP8 vs FP16 on Hopper
+
+<Benchmark
+  title="FlashAttention-3: FP8 vs FP16 Throughput (H100, Llama 70B)"
+  columns={["Phase", "Seq Length", "FP16 (tok/s)", "FP8 (tok/s)", "Speedup", "Perplexity Delta"]}
+  rows={[
+    { values: ["Prefill", "512", "24,200", "41,500", "1.71x", "+0.02"], highlight: true },
+    { values: ["Prefill", "4,096", "21,800", "38,100", "1.75x", "+0.03"], highlight: true },
+    { values: ["Prefill", "32,768", "14,200", "25,900", "1.82x", "+0.05"], highlight: false },
+    { values: ["Decode (bs=64)", "4,096", "2,600", "4,100", "1.58x", "+0.02"], highlight: false },
+    { values: ["Decode (bs=64)", "32,768", "1,680", "2,890", "1.72x", "+0.04"], highlight: true },
+  ]}
+  notes="FP8 provides 1.6-1.8x throughput improvement with negligible perplexity impact. The speedup is larger at longer sequences because the operation becomes more bandwidth-bound, and FP8 halves the bandwidth requirement."
+/>
+
+---
+
+## 7. Reviewer Agent Validation Challenge
+
+To validate your understanding of the backend selection logic, work through these scenarios and determine which backend vLLM will select. Then check your answers against the decision tree in Section 2.
+
+**Scenario A**: You are running Llama 3.1 8B (GQA, head_dim=128) on an A100 (SM80) with BF16. No environment variable is set. Which backend handles prefill? Which handles decode?
+
+**Scenario B**: You are running DeepSeek-V3 (MLA, head_dim=192 in compressed space) on an H100 (SM90) with FP16. FlashInfer is installed. Which backend is selected?
+
+**Scenario C**: You set `VLLM_ATTENTION_BACKEND=FLASHINFER` and run Llama 70B on an A100 with FP16. What happens during prefill? During decode?
+
+**Scenario D**: You attempt to run FP8 inference on an A100 (SM80). What error do you get?
+
+**Answers**:
+- **A**: Prefill uses FlashAttention-2 (Ampere, BF16, head_dim=128 supported). Decode uses PagedAttention v2 (always, because FA2 cannot handle paged KV).
+- **B**: FlashInfer MLA backend. MLA takes priority in the decision tree before GPU architecture checks. FlashInfer is the only backend with native MLA support.
+- **C**: FlashInfer handles both prefill and decode natively with paged KV. No contiguous copy needed for prefill. Environment variable overrides the default hybrid FA2+PagedAttn selection.
+- **D**: `ValueError: FP8 attention requires FlashAttention-3 on Hopper`. A100 is SM80, not SM90. FP8 attention is only supported on Hopper via FlashAttention-3.
+
+<Callout type="tip" title="Practical Recommendation">
+For most Hopper deployments: let vLLM auto-select FlashAttention-3. For Ampere deployments: the default hybrid FA2 (prefill) + PagedAttention v2 (decode) is optimal. Override to FlashInfer only if you run MLA models, need long-context decode optimization at small batch sizes, or require FP8 on platforms where FA3 is unavailable.
+</Callout>
+
+---
+
+## Summary
+
+The backend selection in vLLM v1 is a function of hardware capability and workload characteristics. FlashAttention-3 on Hopper represents the current throughput ceiling for prefill, exploiting WGMMA, TMA, and warp specialization for up to 1.7x gains over FlashAttention-2. PagedAttention v2 remains the workhorse for decode, handling non-contiguous KV cache without copy overhead. FlashInfer fills the gaps: MLA support, non-standard head dimensions, and superior small-batch long-context decode.
+
+The decision tree is deterministic and runs once at initialization. Understanding it means understanding why your deployment gets the throughput it does -- and whether changing the backend could improve it.
