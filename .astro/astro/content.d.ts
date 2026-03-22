@@ -411,6 +411,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"frontier-research-lightning-attention-linear-scaling.mdx": {
+	id: "frontier-research-lightning-attention-linear-scaling.mdx";
+  slug: "frontier-research-lightning-attention-linear-scaling";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "frontier-research-reasoning-scaling-laws.mdx": {
 	id: "frontier-research-reasoning-scaling-laws.mdx";
   slug: "frontier-research-reasoning-scaling-laws";
@@ -638,6 +645,13 @@ declare module 'astro:content' {
 "nvidia-dynamo-modelexpress-nixl-cold-start.mdx": {
 	id: "nvidia-dynamo-modelexpress-nixl-cold-start.mdx";
   slug: "nvidia-dynamo-modelexpress-nixl-cold-start";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"nvidia-dynamo-planner-grove-gang-scheduling.mdx": {
+	id: "nvidia-dynamo-planner-grove-gang-scheduling.mdx";
+  slug: "nvidia-dynamo-planner-grove-gang-scheduling";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">

@@ -1,0 +1,212 @@
+---
+title: "NVIDIA Dynamo Part 3: The Planner, Grove Operator, and Gang Scheduling on NVL72"
+author: "stanley-phoong"
+description: "How Dynamo's Planner calculates topology-aware routing costs across GB200 NVL72 clusters, the Grove Kubernetes operator for inference pod placement, and gang scheduling that co-locates TP groups on NVLink-connected GPUs."
+publishDate: 2025-03-22
+category: llm-inference
+tags: [dynamo, nvidia, planner, grove, gang-scheduling, nvl72, topology, kubernetes]
+difficulty: expert
+readingTime: 30
+draft: false
+featured: false
+series: "NVIDIA Dynamo & llm-d"
+seriesOrder: 3
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+import MemoryLayout from '@/components/mdx/MemoryLayout.astro';
+
+A GB200 NVL72 rack contains 72 Blackwell GPUs connected by NVLink 5.0. Not all GPU pairs have equal connectivity: adjacent GPUs share direct NVLink at 1.8 TB/s, while GPUs across NVSwitch domains have lower effective bandwidth (~600 GB/s). Placing a tensor-parallel group on poorly-connected GPUs can degrade all-reduce latency by 3x.
+
+Dynamo's Planner and the Grove Kubernetes operator solve this: they understand the GPU topology and make placement decisions that respect connectivity constraints. This post covers the topology model, the cost function, and the gang scheduling algorithm.
+
+## The NVL72 Topology
+
+<MemoryLayout
+  title="GB200 NVL72 Connectivity Hierarchy"
+  layout={[
+    { name: "Intra-Tray (2 GPUs)", power: "Direct NVLink 5.0", state: "1,800 GB/s bidirectional, 0.5 us latency", color: "#10b981" },
+    { name: "Intra-Rack via NVSwitch", power: "Up to 72 GPUs", state: "~600 GB/s effective cross-domain, 1-2 us", color: "#3b82f6" },
+    { name: "Inter-Rack (InfiniBand NDR)", power: "Across racks", state: "50 GB/s, 5-10 us latency", color: "#f59e0b" },
+    { name: "Cross-Datacenter (WAN)", power: "Remote clusters", state: "1-10 GB/s, 1-50 ms latency", color: "#ef4444" },
+  ]}
+/>
+
+The Planner maintains a **topology graph** where each GPU is a node and each link has measured bandwidth and latency:
+
+```python
+class TopologyGraph:
+    def __init__(self):
+        self.gpus = {}           # gpu_id -> GPUNode
+        self.links = {}          # (gpu_a, gpu_b) -> LinkInfo
+        self.domains = {}        # domain_id -> set of gpu_ids
+
+    def add_gpu(self, gpu_id, rack_id, tray_id, domain_id):
+        self.gpus[gpu_id] = GPUNode(gpu_id, rack_id, tray_id, domain_id)
+        self.domains.setdefault(domain_id, set()).add(gpu_id)
+
+    def add_link(self, gpu_a, gpu_b, bandwidth_gbps, latency_us):
+        self.links[(gpu_a, gpu_b)] = LinkInfo(bandwidth_gbps, latency_us)
+        self.links[(gpu_b, gpu_a)] = LinkInfo(bandwidth_gbps, latency_us)
+
+    def all_reduce_cost(self, gpu_group):
+        """Estimate all-reduce latency for a TP group on these GPUs."""
+        # Ring all-reduce: message passes through (N-1) links
+        # Bottleneck is the slowest link in the ring
+        min_bw = float("inf")
+        max_latency = 0
+        for i in range(len(gpu_group)):
+            j = (i + 1) % len(gpu_group)
+            link = self.links.get((gpu_group[i], gpu_group[j]))
+            if link is None:
+                return float("inf")  # No direct connection
+            min_bw = min(min_bw, link.bandwidth_gbps)
+            max_latency = max(max_latency, link.latency_us)
+
+        # All-reduce volume: 2 * (N-1)/N * message_size
+        # Time: volume / bandwidth + N * latency
+        return min_bw, max_latency
+```
+
+## The Planner's Cost Function
+
+For each incoming request or model deployment, the Planner computes a placement cost:
+
+$$\text{Cost}(M, G) = w_1 \cdot T_{\text{allreduce}}(G) + w_2 \cdot T_{\text{kv\_transfer}}(G) + w_3 \cdot Q_{\text{depth}}(G) + w_4 \cdot (1 - \text{cache\_hit}}(G))$$
+
+Where:
+- $M$ = model configuration (TP degree, PP stages)
+- $G$ = candidate GPU group
+- $T_{\text{allreduce}}(G)$ = estimated all-reduce time based on GPU connectivity
+- $T_{\text{kv\_transfer}}(G)$ = estimated KV cache transfer time from prefill to decode GPUs
+- $Q_{\text{depth}}(G)$ = current queue depth on candidate GPUs
+- $\text{cache\_hit}(G)$ = fraction of KV cache already present on candidate GPUs
+
+The Planner minimizes this cost across all feasible GPU groups.
+
+<Benchmark
+  title="Placement Cost Examples (Llama 70B, TP=8)"
+  columns={["GPU Group", "All-Reduce BW", "All-Reduce Time (2MB msg)", "Queue Depth", "Total Cost"]}
+  rows={[
+    { values: ["8 GPUs, same tray", "1,800 GB/s", "0.016 ms", "2 requests", "Low"], highlight: true },
+    { values: ["8 GPUs, same rack/domain", "600 GB/s", "0.048 ms", "5 requests", "Medium"], highlight: false },
+    { values: ["8 GPUs, cross-rack (IB)", "50 GB/s", "0.576 ms", "1 request", "High (despite low queue)"], highlight: false },
+  ]}
+  notes="All-reduce time dominates the cost function for TP workloads. Cross-rack TP is 36x slower than same-tray TP."
+/>
+
+<Callout type="warning" title="Cross-Rack TP Is Almost Never Worth It">
+Tensor parallelism requires 2 all-reduce operations per transformer layer (forward and backward paths for attention and FFN). At 80 layers, that is 160 all-reduces per forward pass. Cross-rack adds 0.56ms per all-reduce = 89.6ms total overhead. Same-tray adds only 2.56ms total. The Planner avoids cross-rack TP placements unless no intra-rack options are available.
+</Callout>
+
+## Gang Scheduling
+
+A tensor-parallel group MUST be scheduled atomically: all N GPUs start the model simultaneously, or none do. This is gang scheduling.
+
+```python
+def gang_schedule(model_config, topology, available_gpus):
+    """Find the best GPU group for a TP model deployment."""
+    tp_degree = model_config.tp_degree  # e.g., 8
+
+    # Generate candidate groups: prefer same-domain GPUs
+    candidates = []
+    for domain_id, domain_gpus in topology.domains.items():
+        free_gpus = [g for g in domain_gpus if g in available_gpus]
+        if len(free_gpus) >= tp_degree:
+            # All combinations of tp_degree GPUs from this domain
+            from itertools import combinations
+            for group in combinations(free_gpus, tp_degree):
+                cost = compute_placement_cost(model_config, group, topology)
+                candidates.append((cost, group))
+
+    if not candidates:
+        # Fall back to cross-domain placement
+        all_free = list(available_gpus)
+        if len(all_free) >= tp_degree:
+            for group in combinations(all_free, tp_degree):
+                cost = compute_placement_cost(model_config, group, topology)
+                candidates.append((cost, group))
+
+    if not candidates:
+        return None  # Cannot schedule
+
+    # Select lowest-cost group
+    candidates.sort(key=lambda x: x[0])
+    best_cost, best_group = candidates[0]
+
+    # Atomically reserve all GPUs in the group
+    for gpu in best_group:
+        available_gpus.remove(gpu)
+
+    return best_group
+```
+
+### The Grove Kubernetes Operator
+
+Grove translates Dynamo's scheduling decisions into Kubernetes pod specifications. It creates a custom resource definition (CRD) for inference deployments:
+
+```yaml
+apiVersion: dynamo.nvidia.com/v1
+kind: InferenceDeployment
+metadata:
+  name: llama-70b-serving
+spec:
+  model:
+    name: meta-llama/Llama-3-70B
+    tensorParallelism: 8
+    pipelineParallelism: 1
+  placement:
+    affinityPolicy: "same-nvswitch-domain"
+    antiAffinityPolicy: "spread-across-racks"
+  scaling:
+    minReplicas: 2
+    maxReplicas: 16
+    targetLatency:
+      ttft_p99_ms: 500
+      tbt_p99_ms: 50
+    scaleUpTrigger:
+      queueDepth: 10
+    scaleDownDelay: 300s
+  coldStart:
+    strategy: "modelexpress"  # Use GPU-to-GPU streaming
+    sourceReplica: "any-healthy"
+```
+
+Grove reads the topology from NVIDIA's `nv-topology-exporter` DaemonSet, which reports NVLink connectivity and bandwidth for every GPU pair. It then uses the Planner's cost function to translate `affinityPolicy: "same-nvswitch-domain"` into concrete pod-to-node assignments.
+
+<Callout type="info" title="Why Kubernetes Alone Is Not Enough">
+Standard Kubernetes scheduling assigns pods to nodes based on CPU/memory availability. It has no concept of NVLink topology, GPU interconnect bandwidth, or KV cache locality. Grove extends the scheduler with GPU-topology-aware placement, ensuring TP groups land on well-connected GPUs. Without Grove, a TP=8 deployment might spread across 4 nodes with InfiniBand links, degrading performance 36x.
+</Callout>
+
+## Reviewer Agent Validation
+
+**Challenge**: Using only this post, write a function that takes a list of available GPUs with their NVSwitch domain IDs, and returns the best group of 8 GPUs for TP=8 deployment, preferring GPUs in the same domain.
+
+Expected implementation:
+
+```python
+def find_tp8_group(gpus_with_domains):
+    """
+    Args: gpus_with_domains: list of (gpu_id, domain_id)
+    Returns: list of 8 gpu_ids in same domain, or None
+    """
+    from collections import defaultdict
+    domains = defaultdict(list)
+    for gpu_id, domain_id in gpus_with_domains:
+        domains[domain_id].append(gpu_id)
+
+    # Prefer largest domain with at least 8 free GPUs
+    best_domain = None
+    for domain_id, gpu_list in domains.items():
+        if len(gpu_list) >= 8:
+            if best_domain is None or len(gpu_list) > len(domains[best_domain]):
+                best_domain = domain_id
+
+    if best_domain is not None:
+        return domains[best_domain][:8]
+    return None  # No single domain has 8 free GPUs
+```
+
+If the Reviewer Agent produces this, the topology model was explained clearly enough.
