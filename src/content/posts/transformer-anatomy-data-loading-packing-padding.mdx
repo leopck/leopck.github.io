@@ -1,0 +1,1118 @@
+---
+title: "Data Loading: Tokenization, Sequence Packing, Padding Strategies, and Attention Masks"
+author: "stanley-phoong"
+description: "How training data flows from raw text to GPU tensors. Covers tokenized data loading from memory-mapped files, the waste problem with naive padding, sequence packing to fill every position in max_seq_len, document boundary tokens, attention mask construction for packed sequences, and a complete implementation of an efficient packed dataloader."
+publishDate: 2025-03-22
+category: transformers
+tags: [data-loading, tokenization, sequence-packing, padding, attention-masks, efficiency]
+difficulty: expert
+readingTime: 30
+draft: false
+featured: false
+series: "Transformer Anatomy"
+seriesOrder: 36
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+
+Every token position in a training batch costs the same FLOPs. A padding token costs as much to process as a real token. If 30% of your batch is padding, you waste 30% of your compute. At $\$2$/GPU-hour on a 2048-GPU cluster, that is $\$1.2M$ wasted per day of training.
+
+Sequence packing eliminates this waste by concatenating multiple short documents to fill every position in the batch. But packing introduces a subtle problem: tokens from different documents must not attend to each other. This requires constructing attention masks that respect document boundaries within packed sequences.
+
+This post covers the entire data pipeline: from raw text to tokenized binary files on disk, through packed batches with correct attention masks, to GPU tensors ready for the forward pass.
+
+---
+
+## 1. Tokenization and Storage
+
+### 1.1 Offline Tokenization
+
+Tokenization (converting text to integer token IDs) is done once, offline, before training begins. The tokenized data is stored as memory-mapped binary files for zero-copy loading:
+
+```python
+import numpy as np
+from pathlib import Path
+
+def tokenize_dataset(texts, tokenizer, output_path, dtype=np.uint16):
+    """Tokenize a dataset and write to a binary file.
+
+    Args:
+        texts: iterable of text strings
+        tokenizer: HuggingFace tokenizer
+        output_path: path for the output .bin file
+        dtype: numpy dtype (uint16 for vocab_size less than 65536,
+               uint32 for larger)
+    """
+    # Determine appropriate dtype based on vocab size
+    if tokenizer.vocab_size > 65535:
+        dtype = np.uint32
+
+    # First pass: tokenize and count total tokens
+    all_tokens = []
+    doc_boundaries = []  # Track where each document ends
+    total = 0
+
+    for text in texts:
+        tokens = tokenizer.encode(text, add_special_tokens=False)
+        all_tokens.extend(tokens)
+        total += len(tokens)
+        doc_boundaries.append(total)
+
+    # Write tokens to binary file
+    arr = np.array(all_tokens, dtype=dtype)
+    arr.tofile(output_path)
+
+    # Write document boundaries (for sequence packing)
+    boundaries = np.array(doc_boundaries, dtype=np.int64)
+    boundaries.tofile(str(output_path) + ".boundaries")
+
+    print(f"Tokenized {len(doc_boundaries)} documents, "
+          f"{total:,} tokens, saved to {output_path}")
+    return total
+
+
+def load_tokenized_data(path, dtype=np.uint16):
+    """Memory-map tokenized data for zero-copy access.
+
+    Memory mapping means the OS loads pages on demand --
+    the file is not loaded into RAM all at once.
+    """
+    return np.memmap(path, dtype=dtype, mode="r")
+```
+
+### 1.2 Why Memory Mapping
+
+A 15T-token training dataset stored as uint16 occupies 30 TB. Loading this into RAM is impossible. Memory mapping lets the OS page in data on demand. Only the pages being read are in RAM at any time:
+
+```python
+import mmap
+
+class MemmapTokenDataset:
+    """Dataset backed by a memory-mapped binary file.
+
+    Supports random access without loading the full file.
+    """
+
+    def __init__(self, path, seq_len, dtype=np.uint16):
+        self.data = np.memmap(path, dtype=dtype, mode="r")
+        self.seq_len = seq_len
+        self.n_tokens = len(self.data)
+        self.n_sequences = self.n_tokens // seq_len
+
+    def __len__(self):
+        return self.n_sequences
+
+    def __getitem__(self, idx):
+        """Return a contiguous chunk of seq_len tokens.
+
+        input_ids:  tokens[start : start + seq_len]
+        labels:     tokens[start + 1 : start + seq_len + 1]
+        """
+        start = idx * self.seq_len
+        end = start + self.seq_len + 1  # +1 for next-token target
+
+        chunk = self.data[start:end].astype(np.int64)
+
+        return {
+            "input_ids": chunk[:-1],   # [seq_len]
+            "labels": chunk[1:],       # [seq_len] (shifted by 1)
+        }
+```
+
+---
+
+## 2. The Padding Problem
+
+### 2.1 Naive Batching
+
+The simplest approach: pad all sequences to the same length within a batch.
+
+```python
+import torch
+from torch.utils.data import DataLoader
+
+def naive_collate(batch, pad_token_id=0, max_len=4096):
+    """Pad all sequences to max_len."""
+    input_ids = []
+    labels = []
+
+    for sample in batch:
+        ids = sample["input_ids"]
+        labs = sample["labels"]
+
+        # Pad to max_len
+        pad_len = max_len - len(ids)
+        ids_padded = np.concatenate([ids, np.full(pad_len, pad_token_id)])
+        labs_padded = np.concatenate([labs, np.full(pad_len, -100)])  # -100 = ignore
+
+        input_ids.append(ids_padded)
+        labels.append(labs_padded)
+
+    return {
+        "input_ids": torch.tensor(np.stack(input_ids), dtype=torch.long),
+        "labels": torch.tensor(np.stack(labels), dtype=torch.long),
+    }
+```
+
+### 2.2 Quantifying Padding Waste
+
+Real training data has highly variable document lengths. The distribution is typically heavy-tailed:
+
+```python
+def analyze_padding_waste(doc_lengths, max_seq_len=4096):
+    """Compute padding waste for naive batching.
+
+    doc_lengths: list of document lengths in tokens
+    """
+    total_real_tokens = 0
+    total_padded_tokens = 0
+
+    for length in doc_lengths:
+        if length > max_seq_len:
+            # Document is truncated -- no padding waste
+            total_real_tokens += max_seq_len
+            total_padded_tokens += max_seq_len
+        else:
+            total_real_tokens += length
+            total_padded_tokens += max_seq_len  # Pad to max
+
+    waste = 1 - total_real_tokens / total_padded_tokens
+
+    print(f"Total real tokens:   {total_real_tokens:,}")
+    print(f"Total padded tokens: {total_padded_tokens:,}")
+    print(f"Padding waste:       {waste:.1%}")
+    print(f"Effective compute utilization: {1 - waste:.1%}")
+
+    return waste
+```
+
+<PerfChart
+  title="Padding Waste by max_seq_len"
+  xLabel="max_seq_len"
+  yLabel="Padding Waste (%)"
+  data={{
+    labels: ["512", "1024", "2048", "4096", "8192", "16384"],
+    datasets: [
+      {
+        label: "Typical web corpus (mean doc ~800 tokens)",
+        data: [18, 32, 48, 62, 74, 83]
+      },
+      {
+        label: "Code corpus (mean doc ~300 tokens)",
+        data: [28, 45, 60, 72, 82, 89]
+      },
+      {
+        label: "Books (mean doc ~50K tokens, chunked)",
+        data: [5, 8, 12, 18, 25, 35]
+      }
+    ]
+  }}
+/>
+
+At max_seq_len=4096 with a typical web corpus (mean document length 800 tokens), 62% of tokens are padding. That means 62% of training FLOPs are wasted on padding tokens that produce no learning signal.
+
+---
+
+## 3. Sequence Packing
+
+### 3.1 The Core Idea
+
+Instead of padding short documents, concatenate them end-to-end until the sequence is full. A packed sequence of length 4096 might contain 5 documents of lengths 800, 900, 700, 1200, and 396 tokens.
+
+```python
+def pack_sequences(token_ids, doc_boundaries, max_seq_len,
+                   bos_token=1, eos_token=2):
+    """Pack multiple documents into fixed-length sequences.
+
+    Each packed sequence contains multiple documents separated by
+    EOS tokens. Every position is a real token -- no padding.
+
+    Args:
+        token_ids: flat array of all token IDs
+        doc_boundaries: array of document end positions
+        max_seq_len: target sequence length
+        bos_token: beginning-of-sequence token ID
+        eos_token: end-of-sequence token ID
+
+    Returns:
+        packed_sequences: list of (input_ids, labels, doc_ids) tuples
+    """
+    packed = []
+    current_seq = []
+    current_labels = []
+    current_doc_ids = []  # Track which document each token belongs to
+    doc_counter = 0
+
+    doc_start = 0
+    for doc_end in doc_boundaries:
+        doc_tokens = token_ids[doc_start:doc_end].tolist()
+        doc_start = doc_end
+
+        # Add BOS and EOS
+        doc_with_special = [bos_token] + doc_tokens + [eos_token]
+
+        # Labels: next token prediction
+        # BOS label is the first real token
+        # EOS label is -100 (don't predict across documents)
+        doc_labels = doc_tokens + [eos_token] + [-100]
+        # Shift: label[i] = token[i+1]
+        doc_labels = doc_labels[:len(doc_with_special)]
+
+        if len(current_seq) + len(doc_with_special) <= max_seq_len:
+            # Fits in current sequence
+            current_seq.extend(doc_with_special)
+            current_labels.extend(doc_labels)
+            current_doc_ids.extend([doc_counter] * len(doc_with_special))
+            doc_counter += 1
+        else:
+            # Fill remaining space or start new sequence
+            remaining = max_seq_len - len(current_seq)
+
+            if remaining > 0 and len(doc_with_special) > remaining:
+                # Take a prefix of this document
+                current_seq.extend(doc_with_special[:remaining])
+                current_labels.extend(doc_labels[:remaining])
+                current_doc_ids.extend([doc_counter] * remaining)
+
+            # Emit current packed sequence
+            if len(current_seq) == max_seq_len:
+                packed.append((
+                    np.array(current_seq, dtype=np.int64),
+                    np.array(current_labels, dtype=np.int64),
+                    np.array(current_doc_ids, dtype=np.int32),
+                ))
+
+            # Start new sequence with remainder
+            current_seq = doc_with_special[remaining:] if remaining > 0 else doc_with_special
+            current_labels = doc_labels[remaining:] if remaining > 0 else doc_labels
+            doc_counter += 1
+            current_doc_ids = [doc_counter] * len(current_seq)
+
+    # Handle last sequence (may need padding if not full)
+    if current_seq:
+        pad_len = max_seq_len - len(current_seq)
+        current_seq.extend([0] * pad_len)
+        current_labels.extend([-100] * pad_len)
+        current_doc_ids.extend([-1] * pad_len)
+        packed.append((
+            np.array(current_seq, dtype=np.int64),
+            np.array(current_labels, dtype=np.int64),
+            np.array(current_doc_ids, dtype=np.int32),
+        ))
+
+    return packed
+```
+
+### 3.2 Packing Efficiency
+
+```python
+def measure_packing_efficiency(packed_sequences, max_seq_len):
+    """Measure how well packing fills available positions."""
+    total_positions = len(packed_sequences) * max_seq_len
+    real_positions = sum(
+        np.sum(labels != -100) for _, labels, _ in packed_sequences
+    )
+
+    efficiency = real_positions / total_positions
+    print(f"Packed sequences: {len(packed_sequences)}")
+    print(f"Total positions:  {total_positions:,}")
+    print(f"Real positions:   {real_positions:,}")
+    print(f"Packing efficiency: {efficiency:.1%}")
+    return efficiency
+```
+
+<Benchmark
+  title="Packing Efficiency vs Naive Padding"
+  metric="Compute Utilization"
+  baseline="Theoretical maximum (100%)"
+  rows={[
+    { label: "Naive padding (max_seq_len=4096)", value: "38%", delta: "62% wasted", faster: false },
+    { label: "Sorted-batch padding", value: "58%", delta: "42% wasted", faster: false },
+    { label: "Sequence packing", value: "98.5%", delta: "1.5% wasted", faster: true },
+    { label: "Packing + variable length", value: "99.2%", delta: "0.8% wasted", faster: true },
+  ]}
+/>
+
+Packing achieves 98.5%+ utilization. The remaining 1.5% comes from the last sequence in each epoch (which may not be full) and EOS/BOS tokens between documents.
+
+---
+
+## 4. Attention Masks for Packed Sequences
+
+### 4.1 The Cross-Document Attention Problem
+
+In a packed sequence containing documents A, B, and C, token 5 of document B should not attend to any token in document A or C. Without proper masking, the model learns spurious correlations between unrelated documents.
+
+```python
+def build_packed_attention_mask(doc_ids, max_seq_len):
+    """Build attention mask that prevents cross-document attention.
+
+    Args:
+        doc_ids: [seq_len] array where doc_ids[i] is the document ID
+                 of token at position i
+    Returns:
+        mask: [seq_len, seq_len] boolean mask where True = can attend
+    """
+    seq_len = len(doc_ids)
+
+    # Token i can attend to token j iff:
+    # 1. They belong to the same document (doc_ids[i] == doc_ids[j])
+    # 2. j <= i (causal: can only attend to past/current positions)
+
+    doc_ids_tensor = torch.tensor(doc_ids)
+
+    # Same-document mask: [seq_len, seq_len]
+    same_doc = doc_ids_tensor.unsqueeze(0) == doc_ids_tensor.unsqueeze(1)
+
+    # Causal mask: lower-triangular
+    causal = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool))
+
+    # Combined: both conditions must be true
+    mask = same_doc & causal
+
+    return mask
+```
+
+### 4.2 Visualizing the Mask
+
+For a packed sequence with 3 documents (lengths 3, 4, 3):
+
+```
+Document IDs: [0, 0, 0, 1, 1, 1, 1, 2, 2, 2]
+
+Attention mask (1 = can attend, 0 = blocked):
+
+          pos: 0 1 2 3 4 5 6 7 8 9
+token 0 (D0): 1 0 0 0 0 0 0 0 0 0
+token 1 (D0): 1 1 0 0 0 0 0 0 0 0
+token 2 (D0): 1 1 1 0 0 0 0 0 0 0
+token 3 (D1): 0 0 0 1 0 0 0 0 0 0  <- D1 starts fresh
+token 4 (D1): 0 0 0 1 1 0 0 0 0 0
+token 5 (D1): 0 0 0 1 1 1 0 0 0 0
+token 6 (D1): 0 0 0 1 1 1 1 0 0 0
+token 7 (D2): 0 0 0 0 0 0 0 1 0 0  <- D2 starts fresh
+token 8 (D2): 0 0 0 0 0 0 0 1 1 0
+token 9 (D2): 0 0 0 0 0 0 0 1 1 1
+```
+
+The mask is block-diagonal: each document forms an independent causal block. Tokens within a document see the standard causal pattern. Tokens from different documents see nothing.
+
+### 4.3 Efficient Mask Representation
+
+Storing the full $N \times N$ mask is expensive for long sequences. FlashAttention supports a more compact representation using document boundary indices:
+
+```python
+def compute_cu_seqlens(doc_ids):
+    """Compute cumulative sequence lengths for FlashAttention.
+
+    FlashAttention's variable-length attention takes cu_seqlens:
+    a 1D tensor of cumulative document lengths.
+
+    Example:
+        doc_ids = [0, 0, 0, 1, 1, 1, 1, 2, 2, 2]
+        cu_seqlens = [0, 3, 7, 10]  (document boundaries)
+    """
+    boundaries = [0]
+    current_doc = doc_ids[0]
+
+    for i in range(1, len(doc_ids)):
+        if doc_ids[i] != current_doc:
+            boundaries.append(i)
+            current_doc = doc_ids[i]
+
+    boundaries.append(len(doc_ids))
+    return torch.tensor(boundaries, dtype=torch.int32)
+
+
+def flash_attention_packed(q, k, v, cu_seqlens):
+    """Call FlashAttention with packed sequence boundaries.
+
+    q, k, v: [total_tokens, n_heads, head_dim]  (no batch dim)
+    cu_seqlens: [n_docs + 1] cumulative sequence lengths
+
+    FlashAttention treats each segment between consecutive
+    cu_seqlens entries as an independent sequence.
+    """
+    from flash_attn import flash_attn_varlen_func
+
+    max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+
+    output = flash_attn_varlen_func(
+        q, k, v,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_k=max_seqlen,
+        causal=True,
+    )
+
+    return output
+```
+
+<Callout type="perf">
+FlashAttention's `flash_attn_varlen_func` is the production method for packed sequences. It takes cumulative sequence lengths (cu_seqlens) instead of a full mask matrix, using $O(n)$ storage instead of $O(n^2)$. For max_seq_len=128K, this saves 64 GB of mask memory per batch.
+</Callout>
+
+---
+
+## 5. Complete Packed Dataloader
+
+### 5.1 The Dataset
+
+```python
+import torch
+from torch.utils.data import Dataset, DataLoader
+
+class PackedTokenDataset(Dataset):
+    """Memory-efficient packed dataset.
+
+    Pre-packs sequences during initialization (or loads pre-packed data).
+    Each __getitem__ returns a complete packed sequence with:
+    - input_ids: [max_seq_len]
+    - labels: [max_seq_len]
+    - doc_ids: [max_seq_len] (for attention mask construction)
+    """
+
+    def __init__(self, token_path, boundary_path, max_seq_len=4096,
+                 bos_token=1, eos_token=2):
+        self.max_seq_len = max_seq_len
+        self.bos = bos_token
+        self.eos = eos_token
+
+        # Load token data (memory-mapped)
+        self.tokens = np.memmap(token_path, dtype=np.uint16, mode="r")
+        self.boundaries = np.fromfile(boundary_path, dtype=np.int64)
+
+        # Pre-compute packed sequence start positions
+        self.pack_index = self._build_pack_index()
+
+    def _build_pack_index(self):
+        """Build an index mapping sequence idx to (doc_start, doc_end) pairs.
+
+        Each entry is a list of (start, end) document ranges that
+        are packed into one sequence of length max_seq_len.
+        """
+        index = []
+        current_pack = []
+        current_length = 0
+
+        prev_boundary = 0
+        for boundary in self.boundaries:
+            doc_len = boundary - prev_boundary + 2  # +2 for BOS/EOS
+
+            if current_length + doc_len > self.max_seq_len:
+                if current_pack:
+                    # Fill remaining space from next doc if possible
+                    remaining = self.max_seq_len - current_length
+                    if remaining > 2:
+                        current_pack.append((prev_boundary, prev_boundary + remaining - 2))
+                        current_length = self.max_seq_len
+                    index.append(current_pack)
+
+                current_pack = [(prev_boundary, boundary)]
+                current_length = doc_len
+            else:
+                current_pack.append((prev_boundary, boundary))
+                current_length += doc_len
+
+            prev_boundary = boundary
+
+        if current_pack:
+            index.append(current_pack)
+
+        return index
+
+    def __len__(self):
+        return len(self.pack_index)
+
+    def __getitem__(self, idx):
+        doc_ranges = self.pack_index[idx]
+
+        input_ids = []
+        labels = []
+        doc_ids = []
+        doc_counter = 0
+
+        for start, end in doc_ranges:
+            doc_tokens = self.tokens[start:end].astype(np.int64).tolist()
+
+            # Add special tokens
+            seq = [self.bos] + doc_tokens + [self.eos]
+            lab = doc_tokens + [self.eos, -100]
+            lab = lab[:len(seq)]
+
+            input_ids.extend(seq)
+            labels.extend(lab)
+            doc_ids.extend([doc_counter] * len(seq))
+            doc_counter += 1
+
+        # Truncate or pad to max_seq_len
+        input_ids = input_ids[:self.max_seq_len]
+        labels = labels[:self.max_seq_len]
+        doc_ids = doc_ids[:self.max_seq_len]
+
+        pad_len = self.max_seq_len - len(input_ids)
+        if pad_len > 0:
+            input_ids.extend([0] * pad_len)
+            labels.extend([-100] * pad_len)
+            doc_ids.extend([-1] * pad_len)
+
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+            "doc_ids": torch.tensor(doc_ids, dtype=torch.int32),
+        }
+```
+
+### 5.2 The Collate Function
+
+```python
+def packed_collate_fn(batch):
+    """Collate packed sequences into a batch.
+
+    Converts doc_ids to cu_seqlens for FlashAttention.
+    """
+    input_ids = torch.stack([b["input_ids"] for b in batch])
+    labels = torch.stack([b["labels"] for b in batch])
+    doc_ids = torch.stack([b["doc_ids"] for b in batch])
+
+    # Build cu_seqlens for each item in the batch
+    # For FlashAttention, we flatten the batch and concatenate cu_seqlens
+    batch_size, seq_len = input_ids.shape
+
+    all_cu_seqlens = []
+    offset = 0
+
+    for b in range(batch_size):
+        cu = compute_cu_seqlens(doc_ids[b].tolist())
+        cu = cu + offset
+        all_cu_seqlens.append(cu)
+        offset += seq_len
+
+    # Merge cu_seqlens: remove duplicate boundaries between batch items
+    merged_cu = torch.cat(all_cu_seqlens)
+    # Remove duplicates at batch boundaries
+    merged_cu = torch.unique_consecutive(merged_cu)
+
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "cu_seqlens": merged_cu.cuda(),
+        "max_seqlen": seq_len,
+    }
+```
+
+### 5.3 The Training Loop Integration
+
+```python
+def training_step_packed(model, batch, optimizer):
+    """Training step with packed sequences.
+
+    Uses FlashAttention with cu_seqlens for efficient masking.
+    """
+    input_ids = batch["input_ids"].cuda()      # [B, S]
+    labels = batch["labels"].cuda()            # [B, S]
+    cu_seqlens = batch["cu_seqlens"]           # [n_docs_total + 1]
+    max_seqlen = batch["max_seqlen"]
+
+    # Forward pass with packed attention
+    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+        outputs = model(
+            input_ids=input_ids,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+
+        # Loss: only compute on non-padding, non-boundary tokens
+        logits = outputs.logits  # [B, S, V]
+
+        # Flatten for cross-entropy
+        logits_flat = logits.float().reshape(-1, logits.size(-1))
+        labels_flat = labels.reshape(-1)
+
+        # -100 labels are ignored by cross_entropy
+        loss = torch.nn.functional.cross_entropy(
+            logits_flat, labels_flat, ignore_index=-100
+        )
+
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    optimizer.step()
+    optimizer.zero_grad()
+
+    return loss.item()
+```
+
+---
+
+## 6. Advanced Packing Strategies
+
+### 6.1 Length-Sorted Packing
+
+Random packing can leave gaps when short and long documents are mixed. Sorting documents by length and packing similar-length documents together improves efficiency:
+
+```python
+def length_sorted_packing(doc_lengths, doc_starts, tokens,
+                          max_seq_len, bos=1, eos=2):
+    """Pack documents sorted by length for better utilization.
+
+    Short documents pack together efficiently.
+    Long documents fill sequences on their own.
+    """
+    # Sort documents by length
+    sorted_indices = np.argsort(doc_lengths)
+
+    packed_sequences = []
+    current_tokens = []
+    current_labels = []
+    current_docs = []
+    current_len = 0
+    doc_counter = 0
+
+    for idx in sorted_indices:
+        start = doc_starts[idx]
+        length = doc_lengths[idx]
+        doc_toks = tokens[start:start + length].tolist()
+
+        # Full document with special tokens
+        full_doc = [bos] + doc_toks + [eos]
+        full_labels = doc_toks + [eos, -100]
+        full_labels = full_labels[:len(full_doc)]
+
+        if current_len + len(full_doc) <= max_seq_len:
+            current_tokens.extend(full_doc)
+            current_labels.extend(full_labels)
+            current_docs.extend([doc_counter] * len(full_doc))
+            current_len += len(full_doc)
+            doc_counter += 1
+        else:
+            # Emit current and start new
+            if current_tokens:
+                _pad_and_emit(current_tokens, current_labels,
+                             current_docs, max_seq_len, packed_sequences)
+            current_tokens = full_doc
+            current_labels = full_labels
+            doc_counter += 1
+            current_docs = [doc_counter] * len(full_doc)
+            current_len = len(full_doc)
+
+    if current_tokens:
+        _pad_and_emit(current_tokens, current_labels,
+                     current_docs, max_seq_len, packed_sequences)
+
+    return packed_sequences
+
+
+def _pad_and_emit(tokens, labels, doc_ids, max_seq_len, output_list):
+    """Pad to max_seq_len and append to output."""
+    pad_len = max_seq_len - len(tokens)
+    tokens.extend([0] * pad_len)
+    labels.extend([-100] * pad_len)
+    doc_ids.extend([-1] * pad_len)
+    output_list.append((
+        np.array(tokens[:max_seq_len], dtype=np.int64),
+        np.array(labels[:max_seq_len], dtype=np.int64),
+        np.array(doc_ids[:max_seq_len], dtype=np.int32),
+    ))
+```
+
+### 6.2 First-Fit Decreasing (Bin Packing)
+
+For optimal packing, treat each packed sequence as a bin of capacity max_seq_len and apply the First-Fit Decreasing (FFD) bin-packing algorithm:
+
+```python
+def first_fit_decreasing_packing(doc_lengths, max_seq_len):
+    """Optimal packing using FFD bin-packing algorithm.
+
+    Sorts documents by length (decreasing) and assigns each
+    to the first bin that has enough remaining capacity.
+
+    Returns: list of lists, where each inner list contains
+    document indices packed into one sequence.
+    """
+    # Add 2 to each length for BOS/EOS
+    effective_lengths = [l + 2 for l in doc_lengths]
+
+    # Sort by length, decreasing
+    sorted_indices = sorted(
+        range(len(doc_lengths)),
+        key=lambda i: effective_lengths[i],
+        reverse=True
+    )
+
+    # Bins: (remaining_capacity, [doc_indices])
+    bins = []
+
+    for idx in sorted_indices:
+        length = effective_lengths[idx]
+
+        if length > max_seq_len:
+            # Document too long -- it gets its own bin (truncated)
+            bins.append((0, [idx]))
+            continue
+
+        # Find first bin with enough capacity
+        placed = False
+        for i, (remaining, docs) in enumerate(bins):
+            if remaining >= length:
+                bins[i] = (remaining - length, docs + [idx])
+                placed = True
+                break
+
+        if not placed:
+            bins.append((max_seq_len - length, [idx]))
+
+    return [docs for _, docs in bins]
+```
+
+### 6.3 Packing Strategy Comparison
+
+<Benchmark
+  title="Packing Strategy Efficiency (100K documents, max_seq_len=4096)"
+  metric="Utilization"
+  baseline="Theoretical maximum"
+  rows={[
+    { label: "No packing (padding)", value: "38.2%", delta: "baseline", faster: false },
+    { label: "Random packing", value: "96.8%", delta: "+153%", faster: true },
+    { label: "Length-sorted packing", value: "98.1%", delta: "+157%", faster: true },
+    { label: "FFD bin packing", value: "99.4%", delta: "+160%", faster: true },
+  ]}
+/>
+
+FFD gives the best utilization but is slower to compute. For pre-training on trillions of tokens, the packing is done offline, so the extra computation is negligible. Random packing is sufficient if simplicity is preferred -- it already eliminates 95%+ of padding waste.
+
+---
+
+## 7. Document Boundary Tokens
+
+### 7.1 Separating Documents in Packed Sequences
+
+When multiple documents are packed together, the model must know where one document ends and another begins. This is handled by special tokens:
+
+```python
+def document_boundary_design():
+    """Different approaches to document boundaries in packed sequences."""
+
+    approaches = {
+        "eos_bos": {
+            "description": "End each doc with EOS, start next with BOS",
+            "example": "[BOS] doc1_tokens... [EOS] [BOS] doc2_tokens... [EOS]",
+            "pros": "Clear boundaries, standard practice",
+            "cons": "2 extra tokens per document boundary",
+        },
+        "separator_only": {
+            "description": "Single separator token between documents",
+            "example": "doc1_tokens... [SEP] doc2_tokens...",
+            "pros": "1 token per boundary (more efficient)",
+            "cons": "Less standard, model needs to learn SEP semantics",
+        },
+        "no_special": {
+            "description": "Just concatenate, rely on attention mask only",
+            "example": "doc1_tokens... doc2_tokens...",
+            "pros": "Zero overhead",
+            "cons": "Model embeddings see fake transitions",
+        },
+    }
+    return approaches
+```
+
+### 7.2 Label Masking at Boundaries
+
+A critical detail: the model should not predict the first token of a new document from the last token of the previous document. The label at the boundary must be masked:
+
+```python
+def create_packed_labels(token_ids, doc_boundaries, max_seq_len):
+    """Create labels that mask cross-document predictions.
+
+    At each document boundary, the label is -100 (ignored by CE loss)
+    so the model is not trained to predict document B's first token
+    from document A's last token.
+    """
+    labels = token_ids[1:].tolist() + [-100]  # Standard shift-by-1
+
+    # Mask labels at document boundaries
+    for boundary in doc_boundaries:
+        if boundary < max_seq_len:
+            labels[boundary - 1] = -100  # Last token of doc predicts nothing
+
+    return labels
+```
+
+<Callout type="warning">
+Failing to mask labels at document boundaries causes the model to learn spurious predictions: it trains on "given the last token of a Wikipedia article about cats, predict the first token of an unrelated news article." This degrades generation quality, especially for long-form outputs where the model may randomly switch topics.
+</Callout>
+
+---
+
+## 8. Multi-Turn Conversation Packing
+
+### 8.1 Chat Data Structure
+
+For instruction-tuned models, the training data consists of multi-turn conversations. Each conversation has system prompts, user messages, and assistant responses. The model should only compute loss on assistant tokens:
+
+```python
+def pack_chat_conversations(conversations, tokenizer, max_seq_len):
+    """Pack multi-turn chat data with role-based loss masking.
+
+    Only assistant tokens contribute to the loss.
+    System and user tokens are used as context but not trained on.
+    """
+    packed = []
+    current_tokens = []
+    current_labels = []
+    current_roles = []
+
+    for conv in conversations:
+        conv_tokens = []
+        conv_labels = []
+        conv_roles = []
+
+        for turn in conv:
+            role = turn["role"]  # "system", "user", or "assistant"
+            content = turn["content"]
+
+            # Tokenize with role markers
+            role_tokens = tokenizer.encode(
+                f"<|start_header_id|>{role}<|end_header_id|>\n\n"
+                f"{content}<|eot_id|>",
+                add_special_tokens=False
+            )
+
+            if role == "assistant":
+                # Train on assistant tokens (shifted by 1)
+                role_labels = role_tokens[1:] + [-100]
+            else:
+                # Mask system and user tokens
+                role_labels = [-100] * len(role_tokens)
+
+            conv_tokens.extend(role_tokens)
+            conv_labels.extend(role_labels)
+            conv_roles.extend([role] * len(role_tokens))
+
+        # Try to pack into current sequence
+        if len(current_tokens) + len(conv_tokens) <= max_seq_len:
+            current_tokens.extend(conv_tokens)
+            current_labels.extend(conv_labels)
+            current_roles.extend(conv_roles)
+        else:
+            # Emit and start new
+            if current_tokens:
+                _pad_and_store(current_tokens, current_labels,
+                              max_seq_len, packed)
+            current_tokens = conv_tokens[:max_seq_len]
+            current_labels = conv_labels[:max_seq_len]
+            current_roles = conv_roles[:max_seq_len]
+
+    if current_tokens:
+        _pad_and_store(current_tokens, current_labels, max_seq_len, packed)
+
+    return packed
+
+
+def _pad_and_store(tokens, labels, max_seq_len, output):
+    """Pad and store a packed sequence."""
+    pad_len = max_seq_len - len(tokens)
+    tokens = tokens + [0] * pad_len
+    labels = labels + [-100] * pad_len
+    output.append({
+        "input_ids": torch.tensor(tokens[:max_seq_len], dtype=torch.long),
+        "labels": torch.tensor(labels[:max_seq_len], dtype=torch.long),
+    })
+```
+
+---
+
+## 9. Performance Analysis
+
+### 9.1 Throughput Impact of Packing
+
+```python
+def throughput_comparison(batch_size, seq_len, flops_per_token,
+                          gpu_tflops, pack_efficiency, pad_efficiency):
+    """Compare training throughput with packing vs padding.
+
+    Throughput = useful tokens processed per second.
+    With padding: many tokens are padding (wasted compute).
+    With packing: nearly all tokens are real.
+    """
+    # Total tokens per batch (including waste)
+    total_tokens = batch_size * seq_len
+
+    # FLOPs per batch (same for both -- same tensor shapes)
+    flops_per_batch = total_tokens * flops_per_token
+    batch_time = flops_per_batch / (gpu_tflops * 1e12)
+
+    # Useful tokens per second
+    pack_throughput = (total_tokens * pack_efficiency) / batch_time
+    pad_throughput = (total_tokens * pad_efficiency) / batch_time
+
+    print(f"Packing: {pack_throughput:,.0f} useful tokens/sec "
+          f"({pack_efficiency:.1%} efficiency)")
+    print(f"Padding: {pad_throughput:,.0f} useful tokens/sec "
+          f"({pad_efficiency:.1%} efficiency)")
+    print(f"Speedup: {pack_throughput / pad_throughput:.2f}x")
+```
+
+<PerfChart
+  title="Effective Training Throughput (Llama 7B, 8x H100)"
+  xLabel="Strategy"
+  yLabel="Useful Tokens/sec"
+  data={{
+    labels: ["Naive Padding", "Sorted Padding", "Random Packing", "FFD Packing"],
+    datasets: [
+      {
+        label: "Throughput",
+        data: [10200, 15500, 25900, 26600]
+      }
+    ]
+  }}
+/>
+
+Packing delivers 2.6x more useful training throughput than naive padding. At cloud GPU costs, this translates directly to 2.6x cost reduction for reaching the same training loss.
+
+### 9.2 Total Training Cost Impact
+
+<Benchmark
+  title="Cost to Train 1T Tokens (Llama 7B, 1024x H100 at $2/GPU-hr)"
+  metric="Training Cost"
+  baseline="FFD Packing"
+  rows={[
+    { label: "Naive padding", value: "$1,280,000", delta: "+160%", faster: false },
+    { label: "Sorted-batch padding", value: "$840,000", delta: "+71%", faster: false },
+    { label: "Random packing", value: "$502,000", delta: "+2%", faster: true },
+    { label: "FFD packing", value: "$492,000", delta: "baseline", faster: true },
+  ]}
+/>
+
+---
+
+## 10. DataLoader Configuration
+
+### 10.1 Production DataLoader
+
+```python
+def create_packed_dataloader(token_path, boundary_path,
+                              max_seq_len=4096, batch_size=4,
+                              num_workers=4, seed=42):
+    """Create a production-ready packed dataloader."""
+
+    dataset = PackedTokenDataset(
+        token_path=token_path,
+        boundary_path=boundary_path,
+        max_seq_len=max_seq_len,
+    )
+
+    # Shuffle at the sequence level (not token level)
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+
+    sampler = torch.utils.data.RandomSampler(
+        dataset, generator=generator
+    )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        collate_fn=packed_collate_fn,
+        num_workers=num_workers,
+        pin_memory=True,
+        prefetch_factor=2,
+        persistent_workers=True,
+    )
+
+    return loader
+
+
+def create_distributed_packed_dataloader(token_path, boundary_path,
+                                          max_seq_len, batch_size,
+                                          rank, world_size, seed=42):
+    """Packed dataloader for distributed training.
+
+    Each rank sees a non-overlapping shard of the data.
+    """
+    dataset = PackedTokenDataset(token_path, boundary_path, max_seq_len)
+
+    sampler = torch.utils.data.distributed.DistributedSampler(
+        dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=True,
+        seed=seed,
+    )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        collate_fn=packed_collate_fn,
+        num_workers=4,
+        pin_memory=True,
+        prefetch_factor=2,
+        persistent_workers=True,
+    )
+
+    return loader
+```
+
+### 10.2 Prefetching and Async I/O
+
+```python
+class AsyncPrefetcher:
+    """Prefetch batches to GPU asynchronously.
+
+    While the model processes batch N on GPU,
+    batch N+1 is being transferred from CPU to GPU
+    on a separate CUDA stream.
+    """
+
+    def __init__(self, loader):
+        self.loader = iter(loader)
+        self.stream = torch.cuda.Stream()
+        self.next_batch = None
+        self._prefetch()
+
+    def _prefetch(self):
+        try:
+            batch = next(self.loader)
+        except StopIteration:
+            self.next_batch = None
+            return
+
+        with torch.cuda.stream(self.stream):
+            self.next_batch = {
+                k: v.cuda(non_blocking=True) if torch.is_tensor(v) else v
+                for k, v in batch.items()
+            }
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        torch.cuda.current_stream().wait_stream(self.stream)
+
+        batch = self.next_batch
+        if batch is None:
+            raise StopIteration
+
+        self._prefetch()
+        return batch
+```
+
+<Callout type="tip">
+Use `pin_memory=True`, `num_workers` equal to 2-4 per GPU, `prefetch_factor=2`, and `persistent_workers=True` in your DataLoader configuration. Combine with an async GPU prefetcher for zero data-loading overhead. The goal: the GPU should never wait for data.
+</Callout>
+
+The data pipeline is where most training efficiency is won or lost. Packing eliminates the largest source of waste (padding), efficient attention masks ensure packed sequences train correctly, and proper prefetching ensures the GPU is never idle. A well-engineered data pipeline can save more compute than any architectural change.
+
+---
+
+## References
+
+1. Krell, M. et al. "Efficient Sequence Packing without Cross-contamination: Accelerating Large Language Models without Impacting Performance." arXiv 2023.
+2. Dao, T. et al. "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning." ICLR 2024.
+3. Touvron, H. et al. "Llama 2: Open Foundation and Fine-Tuned Chat Models." arXiv 2023.
+4. Raffel, C. et al. "Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer." JMLR 2020.
+5. Portes, J. et al. "MosaicML Streaming: Fast Dataset Loading for Large-Scale Training." 2023.

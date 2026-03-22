@@ -642,6 +642,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"inference-timeline-disaggregated-v2-mooncake-loongserve.mdx": {
+	id: "inference-timeline-disaggregated-v2-mooncake-loongserve.mdx";
+  slug: "inference-timeline-disaggregated-v2-mooncake-loongserve";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "inference-timeline-dynamic-batching-orca-sarathi.mdx": {
 	id: "inference-timeline-dynamic-batching-orca-sarathi.mdx";
   slug: "inference-timeline-dynamic-batching-orca-sarathi";
@@ -659,6 +666,13 @@ declare module 'astro:content' {
 "inference-timeline-inference-profiling-nsight-torch.mdx": {
 	id: "inference-timeline-inference-profiling-nsight-torch.mdx";
   slug: "inference-timeline-inference-profiling-nsight-torch";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"inference-timeline-inference-stack-2026.mdx": {
+	id: "inference-timeline-inference-stack-2026.mdx";
+  slug: "inference-timeline-inference-stack-2026";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -925,6 +939,13 @@ declare module 'astro:content' {
 "nvidia-dynamo-modelexpress-nixl-cold-start.mdx": {
 	id: "nvidia-dynamo-modelexpress-nixl-cold-start.mdx";
   slug: "nvidia-dynamo-modelexpress-nixl-cold-start";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"nvidia-dynamo-moe-expert-routing.mdx": {
+	id: "nvidia-dynamo-moe-expert-routing.mdx";
+  slug: "nvidia-dynamo-moe-expert-routing";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -1317,6 +1338,13 @@ declare module 'astro:content' {
 "vllm-v1-unified-scheduler-one-queue.mdx": {
 	id: "vllm-v1-unified-scheduler-one-queue.mdx";
   slug: "vllm-v1-unified-scheduler-one-queue";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"vllm-v1-vision-encoder-integration.mdx": {
+	id: "vllm-v1-vision-encoder-integration.mdx";
+  slug: "vllm-v1-vision-encoder-integration";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
