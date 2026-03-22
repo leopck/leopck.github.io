@@ -1,0 +1,429 @@
+---
+title: "Data Curation at Scale: DCLM, FineWeb-Edu, and the Exact Heuristics That Filter the Web"
+author: "stanley-phoong"
+description: "How DCLM and FineWeb-Edu transform raw web crawls into high-quality LLM training data. The exact heuristic filters, quality classifiers, deduplication algorithms, and the pipeline that converts 100TB of HTML into 1TB of clean tokens."
+publishDate: 2025-03-22
+category: llm-inference
+tags: [data-curation, dclm, fineweb, web-filtering, deduplication, training-data]
+difficulty: advanced
+readingTime: 28
+draft: false
+featured: false
+series: "The Dataset Frontier"
+seriesOrder: 2
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+
+Common Crawl contains roughly 250 billion web pages totaling over 100 TB of compressed data. Of that, perhaps 0.5-1% is useful for LLM pre-training. The rest is ads, boilerplate navigation, SEO spam, duplicated content, toxic material, and machine-generated text. The curation pipeline that extracts the useful fraction determines model quality more than any architectural choice.
+
+This post documents the exact pipeline: text extraction, heuristic filters with specific thresholds, quality classifiers, and deduplication algorithms. Every step includes code.
+
+## The Reduction Funnel
+
+<PerfChart
+  title="Data Volume at Each Pipeline Stage (Starting from Common Crawl)"
+  data={[
+    { label: "Raw HTML", value: 100, color: "red", annotation: "100 TB compressed" },
+    { label: "After text extraction", value: 35, color: "orange", annotation: "35 TB of text" },
+    { label: "After heuristic filters", value: 7, color: "blue", annotation: "7 TB passing all filters" },
+    { label: "After quality classifier", value: 2, color: "green", annotation: "2 TB high-quality" },
+    { label: "After deduplication", value: 0.8, color: "green", annotation: "0.8 TB final dataset" },
+  ]}
+  unit="TB"
+/>
+
+Each stage removes 50-80% of the remaining data. The order matters: cheap filters first (heuristics at millions of docs/sec), expensive classifiers later (thousands of docs/sec on GPU). This ordering minimizes total compute cost.
+
+## Text Extraction
+
+Raw HTML must become clean text. Naive tag stripping produces garbage — it concatenates navigation menus, ad copy, and sidebar widgets with the actual content. Production pipelines use **trafilatura** (FineWeb) or **resiliparse** (DCLM).
+
+The core algorithm: parse the DOM tree, identify the largest contiguous text block (usually the main content area), strip everything else. A minimal extraction:
+
+```python
+import trafilatura
+
+def extract_text(html_bytes):
+    """Extract main content text from raw HTML."""
+    result = trafilatura.extract(
+        html_bytes,
+        include_comments=False,
+        include_tables=False,
+        no_fallback=True,
+    )
+    return result  # None if extraction fails
+```
+
+### Text-to-HTML Ratio
+
+One of the simplest quality signals: the byte length of extracted text divided by raw HTML length.
+
+$$r = \frac{|\text{extracted\_text}|}{|\text{raw\_html}|}$$
+
+High-quality articles typically have $r$ above 0.15. Spam and navigation-heavy pages have $r$ below 0.05. This single ratio eliminates 30-40% of pages.
+
+<Benchmark
+  title="Text-to-HTML Ratio by Page Type"
+  columns={["Page Type", "Typical Ratio", "Action"]}
+  rows={[
+    { values: ["Technical blog post", "0.25 - 0.45", "Keep"], highlight: true },
+    { values: ["News article", "0.15 - 0.30", "Keep"], highlight: false },
+    { values: ["E-commerce product page", "0.05 - 0.12", "Borderline"], highlight: false },
+    { values: ["Navigation/index page", "0.01 - 0.05", "Discard"], highlight: false },
+    { values: ["JavaScript SPA (no SSR)", "0.00 - 0.01", "Discard"], highlight: false },
+  ]}
+/>
+
+## Heuristic Filters
+
+Seven filters applied sequentially, cheapest first. Each runs at millions of documents per second on CPU.
+
+### Filter 1: Language Detection
+
+```python
+import fasttext
+
+lang_model = fasttext.load_model("lid.176.bin")
+
+def language_filter(text, target_lang="en", min_confidence=0.65):
+    """Keep only documents in the target language."""
+    predictions = lang_model.predict(text.replace("\n", " ")[:512])
+    lang = predictions[0][0].replace("__label__", "")
+    confidence = predictions[1][0]
+    return lang == target_lang and confidence >= min_confidence
+```
+
+Threshold: 0.65 confidence. Below this, the language is ambiguous (often mixed-language or very short text). Drop rate: 40-60% of Common Crawl for English-only datasets.
+
+### Filter 2: Length
+
+```python
+def length_filter(text, min_chars=200, min_words=50):
+    """Discard very short documents."""
+    if len(text) < min_chars:
+        return False
+    if len(text.split()) < min_words:
+        return False
+    return True
+```
+
+Documents under 200 characters or 50 words rarely contain enough signal for pre-training. Drop rate: 10-15%.
+
+### Filter 3: Perplexity (KenLM)
+
+A 5-gram KenLM language model trained on Wikipedia scores each document. Perplexity measures how "surprised" the model is:
+
+```python
+import kenlm
+
+kenlm_model = kenlm.Model("en_wiki_5gram.binary")
+
+def perplexity_filter(text, min_ppl=10.0, max_ppl=1000.0):
+    """Discard documents with extreme perplexity."""
+    words = text.split()
+    if len(words) == 0:
+        return False
+    log_score = kenlm_model.score(" ".join(words), bos=True, eos=True)
+    ppl = 10 ** (-log_score / len(words))
+    return min_ppl <= ppl <= max_ppl
+```
+
+Low perplexity (under 10): repetitive boilerplate, auto-generated lists. High perplexity (above 1000): garbled text, OCR noise, encoding errors. Drop rate: 15-25%.
+
+### Filter 4: Repetition
+
+```python
+from collections import Counter
+
+def repetition_filter(text, n=10, max_repeat=3):
+    """Discard documents with excessive n-gram repetition."""
+    words = text.split()
+    if len(words) < n:
+        return True
+    ngrams = [" ".join(words[i:i+n]) for i in range(len(words) - n + 1)]
+    counts = Counter(ngrams)
+    most_common_count = counts.most_common(1)[0][1]
+    return most_common_count <= max_repeat
+```
+
+Any 10-gram appearing more than 3 times indicates template-generated or scraped content. Drop rate: 5-10%.
+
+### Filter 5: URL Blacklist
+
+A curated list of approximately 2 million domains known to host low-quality content: porn, gambling, malware, content farms, SEO spam. Simple domain lookup. Drop rate: 3-5%.
+
+### Filter 6: Special Character Ratio
+
+```python
+def special_char_filter(text, max_ratio=0.30):
+    """Discard documents with too many non-alphanumeric characters."""
+    if len(text) == 0:
+        return False
+    alpha_count = sum(1 for c in text if c.isalnum() or c.isspace())
+    ratio = 1.0 - (alpha_count / len(text))
+    return ratio <= max_ratio
+```
+
+Pages with more than 30% special characters are usually code dumps, emoji-heavy social media, or encoding artifacts. Drop rate: 2-5%.
+
+### Filter 7: Sentence Structure
+
+```python
+def sentence_filter(text, min_sentences=3, min_avg_words=5, max_avg_words=100):
+    """Discard documents without proper sentence structure."""
+    sentences = [s.strip() for s in text.split(".") if len(s.strip()) > 0]
+    if len(sentences) < min_sentences:
+        return False
+    word_counts = [len(s.split()) for s in sentences]
+    avg = sum(word_counts) / len(word_counts)
+    return min_avg_words <= avg <= max_avg_words
+```
+
+Documents without proper sentences (keyword lists, navigation menus, form labels) are filtered. Drop rate: 5-10%.
+
+<Benchmark
+  title="Heuristic Filter Impact (FineWeb Pipeline)"
+  columns={["Filter", "Drop Rate", "Cumulative Retained", "Cost (docs/sec/core)"]}
+  rows={[
+    { values: ["Language detection", "45%", "55%", "50K"], highlight: false },
+    { values: ["Length", "12%", "48%", "10M"], highlight: false },
+    { values: ["Perplexity", "18%", "40%", "200K"], highlight: false },
+    { values: ["Repetition", "8%", "37%", "500K"], highlight: false },
+    { values: ["URL blacklist", "4%", "35%", "5M"], highlight: false },
+    { values: ["Special chars", "3%", "34%", "2M"], highlight: false },
+    { values: ["Sentence structure", "6%", "32%", "1M"], highlight: false },
+  ]}
+  notes="Applied sequentially. Starting from ~15B documents after text extraction, ~4.8B survive all heuristic filters."
+/>
+
+## Quality Classifiers
+
+Heuristic filters remove obvious noise. Quality classifiers identify the *best* content from what remains.
+
+### DCLM Approach: fastText Binary Classifier
+
+Train a fastText classifier on two classes: high-quality (Wikipedia + curated educational text) vs. low-quality (random web pages that passed heuristic filters).
+
+```python
+# Training data preparation
+# Positive: Wikipedia articles, OpenStax textbooks, Stack Exchange top answers
+# Negative: Random sample of heuristic-filtered web text
+
+# Train: takes about 10 minutes on 1M examples
+# fasttext train_supervised -input train.txt -output quality_model \
+#   -lr 0.1 -epoch 5 -wordNgrams 2 -dim 256
+
+import fasttext
+
+quality_model = fasttext.load_model("quality_model.bin")
+
+def score_quality(text):
+    """Score document quality. Returns probability of high-quality."""
+    pred = quality_model.predict(text.replace("\n", " ")[:1024])
+    label = pred[0][0]
+    prob = pred[1][0]
+    if label == "__label__hq":
+        return float(prob)
+    return 1.0 - float(prob)
+```
+
+DataComp-LM (DCLM) showed this single classifier — trained in 10 minutes on a CPU — improves downstream model quality by 2-3 perplexity points. Keep documents scoring above 0.50. Drop rate: 65-75%.
+
+### FineWeb-Edu: RoBERTa-Based Educational Classifier
+
+A 125M-parameter RoBERTa model fine-tuned on educational quality annotations (scores 0-5). Keep documents scoring 3+.
+
+```python
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import torch
+
+tokenizer = AutoTokenizer.from_pretrained("HuggingFaceFW/fineweb-edu-classifier")
+model = AutoModelForSequenceClassification.from_pretrained(
+    "HuggingFaceFW/fineweb-edu-classifier"
+)
+
+@torch.no_grad()
+def score_educational(text, max_length=512):
+    """Score educational quality (0-5 scale)."""
+    inputs = tokenizer(text, truncation=True, max_length=max_length, return_tensors="pt")
+    outputs = model(**inputs)
+    score = outputs.logits.squeeze().item()
+    return max(0.0, min(5.0, score))
+```
+
+FineWeb-Edu outperforms plain FineWeb on knowledge-intensive benchmarks by 5-10% because it selects for content that teaches rather than merely informs.
+
+<PerfChart
+  title="Downstream Model Quality by Curation Method"
+  data={[
+    { label: "No filtering (raw CC)", value: 28.5, color: "red", annotation: "MMLU score" },
+    { label: "Heuristic filters only", value: 42.1, color: "orange" },
+    { label: "DCLM (fastText classifier)", value: 52.8, color: "blue" },
+    { label: "FineWeb-Edu (RoBERTa)", value: 55.2, color: "green" },
+  ]}
+  unit="MMLU (7B model trained on each dataset)"
+/>
+
+<Callout type="perf" title="The 10-Minute Classifier That Changes Everything">
+DCLM's most striking finding: a fastText classifier trained in 10 minutes produces a dataset nearly as good as one filtered by a 125M-parameter RoBERTa model that takes days to run on the full corpus. For teams without GPU clusters for inference, the fastText approach is remarkably effective.
+</Callout>
+
+## Deduplication
+
+After quality filtering, 30-60% of remaining documents are duplicates or near-duplicates. Three levels of dedup are applied:
+
+### Level 1: Exact Deduplication
+
+Hash each document, remove identical copies:
+
+```python
+import hashlib
+
+def compute_hash(text):
+    normalized = " ".join(text.lower().split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+# In practice: distributed hash set via Spark or sorted hash files
+# Drop rate: 5-15%
+```
+
+### Level 2: Near-Deduplication (MinHash + LSH)
+
+Documents that are 80%+ similar (e.g., same article syndicated across multiple sites with minor edits). MinHash + Locality-Sensitive Hashing finds these efficiently:
+
+```python
+import mmh3
+import struct
+
+class MinHashLSH:
+    def __init__(self, num_hashes=128, num_bands=20, ngram_size=5):
+        self.num_hashes = num_hashes
+        self.num_bands = num_bands
+        self.rows_per_band = num_hashes // num_bands
+        self.ngram_size = ngram_size
+        self.buckets = [{} for _ in range(num_bands)]
+        self.signatures = {}
+
+    def _get_shingles(self, text):
+        text = " ".join(text.lower().split())
+        return {text[i:i+self.ngram_size]
+                for i in range(len(text) - self.ngram_size + 1)}
+
+    def _compute_minhash(self, shingles):
+        signature = []
+        for i in range(self.num_hashes):
+            min_h = float("inf")
+            for s in shingles:
+                h = mmh3.hash(s, seed=i, signed=False)
+                if h < min_h:
+                    min_h = h
+            signature.append(min_h if min_h != float("inf") else 0)
+        return signature
+
+    def add_document(self, doc_id, text):
+        shingles = self._get_shingles(text)
+        if not shingles:
+            return
+        sig = self._compute_minhash(shingles)
+        self.signatures[doc_id] = sig
+        for band_idx in range(self.num_bands):
+            start = band_idx * self.rows_per_band
+            band = tuple(sig[start:start + self.rows_per_band])
+            band_key = hash(band)
+            if band_key not in self.buckets[band_idx]:
+                self.buckets[band_idx][band_key] = []
+            self.buckets[band_idx][band_key].append(doc_id)
+
+    def find_duplicates(self):
+        duplicate_pairs = set()
+        for band_buckets in self.buckets:
+            for doc_ids in band_buckets.values():
+                if len(doc_ids) > 1:
+                    for i in range(len(doc_ids)):
+                        for j in range(i + 1, len(doc_ids)):
+                            duplicate_pairs.add(
+                                (min(doc_ids[i], doc_ids[j]),
+                                 max(doc_ids[i], doc_ids[j]))
+                            )
+        return duplicate_pairs
+```
+
+With 128 hash functions divided into 20 bands of 6-7 rows each, this configuration catches document pairs with Jaccard similarity above ~0.8. Near-dedup typically removes 20-40% of remaining documents.
+
+### Level 3: Substring Deduplication
+
+Shared boilerplate paragraphs (cookie notices, copyright footers, "about the author" blocks) that appear across thousands of documents. Suffix array-based detection finds all repeated substrings above a threshold length (typically 200 characters) and removes them.
+
+Drop rate: 5-10% of total content (measured by removed bytes, not documents).
+
+<Benchmark
+  title="Deduplication Impact"
+  columns={["Method", "Drop Rate", "Quality Impact", "Compute Cost"]}
+  rows={[
+    { values: ["Exact dedup (SHA-256)", "8%", "Removes perfect copies", "Fast (hash + lookup)"], highlight: false },
+    { values: ["Near-dedup (MinHash LSH)", "28%", "Removes syndicated content", "Moderate (128 hashes per doc)"], highlight: true },
+    { values: ["Substring dedup", "7% (by bytes)", "Removes shared boilerplate", "Expensive (suffix array)"], highlight: false },
+    { values: ["Total", "35-40%", "+1.5 PPL improvement", "Hours on 1000-core cluster"], highlight: true },
+  ]}
+/>
+
+## The Reviewer Agent Exercise
+
+Build a minimal pipeline that takes raw HTML and produces training-ready JSONL:
+
+```python
+import json
+import hashlib
+import trafilatura
+
+def mini_pipeline(html_pages):
+    """Minimal curation pipeline: extract, filter, deduplicate."""
+    results = []
+    seen_hashes = set()
+
+    for html in html_pages:
+        # Step 1: Extract text
+        text = trafilatura.extract(html, include_comments=False)
+        if text is None:
+            continue
+
+        # Step 2: Length filter
+        if len(text.split()) < 50:
+            continue
+
+        # Step 3: Repetition filter
+        words = text.split()
+        if len(words) >= 10:
+            ngrams = [" ".join(words[i:i+10]) for i in range(len(words)-9)]
+            from collections import Counter
+            if Counter(ngrams).most_common(1)[0][1] > 3:
+                continue
+
+        # Step 4: Exact dedup
+        doc_hash = hashlib.sha256(
+            " ".join(text.lower().split()).encode()
+        ).hexdigest()
+        if doc_hash in seen_hashes:
+            continue
+        seen_hashes.add(doc_hash)
+
+        # Passed all filters
+        results.append({"text": text, "hash": doc_hash})
+
+    return results
+
+# Usage:
+# cleaned = mini_pipeline(raw_html_list)
+# with open("training_data.jsonl", "w") as f:
+#     for doc in cleaned:
+#         f.write(json.dumps(doc) + "\n")
+```
+
+This 40-line pipeline implements the core curation logic. A production pipeline adds: language detection, perplexity scoring, quality classification, MinHash dedup, and parallel processing across thousands of cores. But the structure is identical — extract, filter sequentially (cheapest first), deduplicate, output JSONL.
+
+<Callout type="tip" title="The Key Insight">
+Data curation is not about any single brilliant technique. It is about the disciplined application of many simple filters in the right order. Each filter removes 5-40% of remaining data. Stacked together, they reduce 100 TB to 0.8 TB — a 125x compression that extracts the signal from the noise. The quality of this compression determines the quality of the model trained on it.
+</Callout>

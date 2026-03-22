@@ -271,6 +271,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"dataset-frontier-curation-dclm-fineweb.mdx": {
+	id: "dataset-frontier-curation-dclm-fineweb.mdx";
+  slug: "dataset-frontier-curation-dclm-fineweb";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "dataset-frontier-synthetic-data-pipelines.mdx": {
 	id: "dataset-frontier-synthetic-data-pipelines.mdx";
   slug: "dataset-frontier-synthetic-data-pipelines";
@@ -400,6 +407,13 @@ declare module 'astro:content' {
 "frontier-models-2025-architectural-convergence.mdx": {
 	id: "frontier-models-2025-architectural-convergence.mdx";
   slug: "frontier-models-2025-architectural-convergence";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"frontier-research-reasoning-scaling-laws.mdx": {
+	id: "frontier-research-reasoning-scaling-laws.mdx";
+  slug: "frontier-research-reasoning-scaling-laws";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -603,6 +617,13 @@ declare module 'astro:content' {
 "normalization-layernorm-rmsnorm-training-stability.mdx": {
 	id: "normalization-layernorm-rmsnorm-training-stability.mdx";
   slug: "normalization-layernorm-rmsnorm-training-stability";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"nvidia-dynamo-kv-aware-routing-inference-os.mdx": {
+	id: "nvidia-dynamo-kv-aware-routing-inference-os.mdx";
+  slug: "nvidia-dynamo-kv-aware-routing-inference-os";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">

@@ -1,0 +1,331 @@
+---
+title: "NVIDIA Dynamo: KV-Aware Routing and the Inference Operating System for GPU Clusters"
+author: "stanley-phoong"
+description: "How Dynamo routes LLM requests based on KV cache locality, disaggregates prefill and decode across GPU pools, streams model weights via NIXL at NVLink speeds, and autoscales with SLA-driven planning."
+publishDate: 2025-03-22
+category: llm-inference
+tags: [dynamo, nvidia, kv-routing, disaggregated-serving, nixl, model-express, inference-os]
+difficulty: expert
+readingTime: 32
+draft: false
+featured: true
+series: "NVIDIA Dynamo & llm-d"
+seriesOrder: 1
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+import MemoryLayout from '@/components/mdx/MemoryLayout.astro';
+
+Single-node inference engines — vLLM, SGLang, TensorRT-LLM — optimize what happens on one GPU or one machine. But production LLM serving runs across dozens to hundreds of GPUs. Who decides which GPU handles which request? How do you avoid recomputing KV cache that another GPU already has? How do you spin up new model replicas without 60-second cold starts?
+
+NVIDIA Dynamo is the orchestration layer that answers these questions. Built in Rust (for performance) and Python (for extensibility), it turns individual inference engines into a coordinated multi-node system. The result: 2x faster TTFT through KV-aware routing, 7x faster cold starts via GPU-to-GPU weight streaming, and SLA-driven autoscaling that meets latency targets at minimum cost.
+
+## The Architecture
+
+Dynamo sits between the load balancer and the inference engines:
+
+<MemoryLayout
+  title="Dynamo System Architecture"
+  layout={[
+    { name: "API Gateway / Load Balancer", power: "Receives client HTTP requests", state: "Passes to Dynamo Router", color: "#3b82f6" },
+    { name: "Dynamo Router", power: "KV-aware request routing", state: "Routes based on cache overlap + worker load", color: "#ef4444" },
+    { name: "Dynamo Planner", power: "SLA-driven autoscaler", state: "Profiles workloads, scales GPU pools", color: "#f59e0b" },
+    { name: "Prefill Workers (GPU Pool A)", power: "Compute-optimized GPUs", state: "Run prefill phase, generate KV cache", color: "#10b981" },
+    { name: "Decode Workers (GPU Pool B)", power: "Bandwidth-optimized GPUs", state: "Run decode phase, serve tokens", color: "#39c5cf" },
+    { name: "KV Block Manager (KVBM)", power: "Multi-tier KV cache store", state: "GPU HBM -> CPU DRAM -> SSD -> Remote", color: "#a371f7" },
+  ]}
+/>
+
+Each component is independently scalable. The Router runs on CPU (low latency decisions). Workers run on GPUs (model execution). The Planner runs periodically (minutes-scale optimization). The KVBM spans all tiers.
+
+## KV-Aware Routing
+
+The core innovation. Standard load balancers use round-robin or least-connections — they have no knowledge of what each GPU has cached. Dynamo's router knows which GPU holds which KV cache blocks.
+
+### The Routing Decision
+
+For an incoming request $R$ with prompt tokens $P$, the router must choose a worker $W_i$ from $N$ available workers. The cost of routing $R$ to $W_i$ is:
+
+$$\text{TTFT}(R, W_i) = T_{\text{prefill}}(\text{uncached}(P, W_i)) + T_{\text{transfer}}(\text{missing\_kv}(P, W_i)) + T_{\text{queue}}(W_i)$$
+
+Where:
+- $\text{uncached}(P, W_i)$ = tokens in $P$ not already cached on $W_i$
+- $T_{\text{prefill}}(n)$ = time to prefill $n$ tokens (roughly $n / \text{prefill\_throughput}$)
+- $T_{\text{transfer}}$ = time to transfer any missing KV blocks from another worker
+- $T_{\text{queue}}(W_i)$ = current queue depth on worker $W_i$
+
+The router selects: $W^* = \arg\min_i \text{TTFT}(R, W_i)$
+
+### How Cache Overlap Is Tracked
+
+Each worker reports its cached prompt hashes to the router. The router maintains an in-memory index:
+
+```python
+# Router state: which worker has which prefix cached
+cache_index = {
+    "hash_system_prompt_v3": [worker_0, worker_1, worker_2],
+    "hash_system_prompt_v3+user_greeting": [worker_0],
+    "hash_code_review_prompt": [worker_3, worker_4],
+}
+
+def route_request(request, workers):
+    # Compute prompt hash chain
+    prompt_hashes = compute_hash_chain(request.prompt_tokens, block_size=16)
+
+    best_worker = None
+    best_cost = float("inf")
+
+    for worker in workers:
+        # Count how many prefix blocks are cached
+        cached_blocks = 0
+        for h in prompt_hashes:
+            if worker.id in cache_index.get(h, []):
+                cached_blocks += 1
+            else:
+                break  # Prefix caching is sequential
+
+        uncached_tokens = (len(prompt_hashes) - cached_blocks) * block_size
+        prefill_cost = uncached_tokens / worker.prefill_throughput
+        queue_cost = worker.queue_depth * worker.avg_decode_time
+        total_cost = prefill_cost + queue_cost
+
+        if total_cost < best_cost:
+            best_cost = total_cost
+            best_worker = worker
+
+    return best_worker
+```
+
+<Callout type="perf" title="The 2x TTFT Improvement">
+In production chatbot workloads with shared system prompts (2K-4K tokens), 80-95% of requests have a full prefix cache hit on at least one worker. Routing to that worker skips the entire system prompt prefill — saving 10-50ms per request. At p50, this yields roughly 2x faster TTFT compared to cache-unaware routing.
+</Callout>
+
+### Concrete Example
+
+A chatbot with a 3,072-token system prompt. 8 decode workers. The system prompt KV cache is 3,072 tokens x 327 KB/token (Llama 70B) = ~1 GB per worker that caches it.
+
+Without KV-aware routing: every request hits a random worker. 7/8 chance of cache miss. Prefill 3,072 tokens = ~40ms wasted.
+
+With KV-aware routing: router sends to a worker with the system prompt cached. Cache hit rate: 95%+. Only the user-specific suffix (100-500 tokens) needs prefill: ~2-7ms. TTFT improvement: 40ms to 5ms = **8x faster** for the system prompt portion.
+
+<Benchmark
+  title="KV-Aware Routing Impact (Llama 70B, 8 workers, chatbot workload)"
+  columns={["Metric", "Round-Robin", "KV-Aware", "Improvement"]}
+  rows={[
+    { values: ["Cache hit rate", "12.5% (1/N)", "92%", "7.4x"], highlight: false },
+    { values: ["Avg prefill tokens", "3,072 + 200", "200 (suffix only)", "16x fewer"], highlight: true },
+    { values: ["p50 TTFT", "48 ms", "12 ms", "4.0x"], highlight: true },
+    { values: ["p99 TTFT", "85 ms", "35 ms", "2.4x"], highlight: false },
+    { values: ["GPU prefill utilization", "72%", "18%", "4x less compute wasted"], highlight: false },
+  ]}
+/>
+
+## Disaggregated Prefill/Decode
+
+Dynamo separates prefill and decode into independent GPU pools:
+
+**Prefill pool**: Optimized for compute throughput. Large batch sizes, high tensor core utilization. These GPUs process incoming prompts and generate KV cache. They don't serve decode tokens.
+
+**Decode pool**: Optimized for memory bandwidth. Many concurrent sequences, each generating one token per iteration. These GPUs read KV cache and produce output tokens.
+
+### The KV Cache Transfer
+
+After prefill completes on a prefill worker, the KV cache must move to a decode worker. Transfer size for Llama 70B at context length $S$:
+
+$$\text{KV bytes} = 2 \times L \times n_{\text{kv\_heads}} \times d_{\text{head}} \times S \times \text{dtype\_bytes}$$
+
+For $S = 4096$, $L = 80$, $n_{\text{kv}} = 8$, $d = 128$, FP16:
+
+$$= 2 \times 80 \times 8 \times 128 \times 4096 \times 2 = 1.34 \text{ GB}$$
+
+<Benchmark
+  title="KV Cache Transfer Latency by Interconnect"
+  columns={["Interconnect", "Bandwidth", "1.34 GB Transfer Time", "Viable?"]}
+  rows={[
+    { values: ["NVLink 4.0 (intra-node)", "900 GB/s", "1.5 ms", "Excellent"], highlight: true },
+    { values: ["NVLink 5.0 (Blackwell)", "1.8 TB/s", "0.7 ms", "Excellent"], highlight: true },
+    { values: ["InfiniBand HDR (inter-node)", "25 GB/s", "54 ms", "Acceptable for long prompts"], highlight: false },
+    { values: ["InfiniBand NDR (inter-node)", "50 GB/s", "27 ms", "Good"], highlight: false },
+    { values: ["PCIe Gen5 (CPU mediated)", "28 GB/s", "48 ms", "Slow, avoid"], highlight: false },
+  ]}
+/>
+
+<Callout type="warning" title="When Disaggregation Hurts">
+For short prompts (under 512 tokens), the prefill is so fast (under 5ms) that the KV transfer overhead exceeds the benefit of disaggregation. Dynamo's planner detects this and routes short prompts to combined prefill+decode workers instead of splitting them.
+</Callout>
+
+## ModelExpress and NIXL
+
+### The Cold Start Problem
+
+Loading a 140 GB model (Llama 70B FP16) from NVMe SSD to GPU: ~5-10 seconds at 14-28 GB/s. From network storage: 30-60 seconds. This cold start is unacceptable for autoscaling — you cannot respond to traffic spikes if new replicas take a minute to come online.
+
+### ModelExpress: GPU-to-GPU Weight Streaming
+
+Instead of loading from storage, stream weights from a GPU that already has the model to a new GPU:
+
+- NVLink 4.0: 900 GB/s. 140 GB in **156 ms**.
+- NVLink 5.0 (Blackwell): 1.8 TB/s. 140 GB in **78 ms**.
+
+That is 7x faster than NVMe on Hopper, and 14x faster on Blackwell.
+
+<PerfChart
+  title="Model Loading Time: 140 GB (Llama 70B FP16)"
+  data={[
+    { label: "Network storage", value: 45000, color: "red", annotation: "45 sec" },
+    { label: "NVMe SSD", value: 7000, color: "orange", annotation: "7 sec" },
+    { label: "PCIe Gen5 (CPU RAM)", value: 5000, color: "blue", annotation: "5 sec" },
+    { label: "NVLink 4.0 (GPU-GPU)", value: 156, color: "green", annotation: "156 ms" },
+    { label: "NVLink 5.0 (GPU-GPU)", value: 78, color: "green", annotation: "78 ms" },
+  ]}
+  unit="ms"
+/>
+
+### NIXL: The Transfer Library
+
+NIXL (NVIDIA Inference eXchange Library) is the low-level library that implements the GPU-to-GPU transfers. It handles:
+- Direct GPU memory access via NVLink without CPU involvement
+- Multi-path transfers (use all available NVLink lanes simultaneously)
+- Pipelining: start model execution before the full model is loaded (stream layer-by-layer)
+
+With pipelining, the effective cold start is even shorter: the first layer arrives in under 1ms, and execution begins immediately while subsequent layers stream in. The model "warms up" progressively.
+
+## The Planner: SLA-Driven Autoscaling
+
+The Planner periodically profiles the workload and adjusts GPU allocation:
+
+**Inputs:**
+- Latency SLO: e.g., p99 TTFT under 500ms, p99 TBT under 50ms
+- Current traffic rate (requests/sec) and prompt length distribution
+- Current GPU utilization per pool
+- Cost constraints (max GPUs, budget)
+
+**Output:**
+- Number of prefill GPUs, number of decode GPUs
+- Which models on which GPUs
+- When to scale up/down
+
+```python
+def plan(current_state, slo_targets, traffic_forecast):
+    # Estimate required decode throughput
+    decode_tokens_per_sec = traffic_forecast.rps * traffic_forecast.avg_output_len
+    decode_gpus_needed = ceil(decode_tokens_per_sec / per_gpu_decode_throughput)
+
+    # Estimate required prefill throughput
+    prefill_tokens_per_sec = traffic_forecast.rps * traffic_forecast.avg_input_len
+    prefill_gpus_needed = ceil(prefill_tokens_per_sec / per_gpu_prefill_throughput)
+
+    # Check latency SLOs
+    if estimated_p99_ttft(prefill_gpus_needed) > slo_targets.ttft_p99:
+        prefill_gpus_needed += 1  # Add headroom
+
+    # Apply constraints
+    total = min(prefill_gpus_needed + decode_gpus_needed, max_gpus)
+
+    return AllocationPlan(
+        prefill_gpus=prefill_gpus_needed,
+        decode_gpus=decode_gpus_needed,
+        scale_action=compute_delta(current_state, total),
+    )
+```
+
+<Callout type="info" title="Scaling Lag">
+GPU autoscaling has a 30-60 second lag with traditional model loading. With ModelExpress, the lag drops to under 1 second (NVLink streaming). This makes Dynamo reactive enough to handle sudden traffic spikes without pre-provisioning excess capacity.
+</Callout>
+
+## The KV Block Manager (KVBM)
+
+Dynamo extends vLLM's block manager with multi-tier offloading across the cluster:
+
+<Benchmark
+  title="KVBM Tier Hierarchy"
+  columns={["Tier", "Capacity (per GPU node)", "Bandwidth", "Latency (1MB block)", "Use Case"]}
+  rows={[
+    { values: ["GPU HBM", "80 GB", "3.35 TB/s", "0.3 us", "Active sequences"], highlight: true },
+    { values: ["CPU DRAM", "512 GB - 2 TB", "50 GB/s (PCIe)", "20 us", "Recently preempted"], highlight: false },
+    { values: ["NVMe SSD", "4-16 TB", "7 GB/s", "143 us", "Long-idle sequences"], highlight: false },
+    { values: ["Remote GPU (NVLink)", "80 GB x N", "900 GB/s", "1.5 us", "Cross-GPU cache sharing"], highlight: true },
+    { values: ["Remote (InfiniBand)", "Cluster-wide", "25-50 GB/s", "40-80 us", "Cluster-wide cache pool"], highlight: false },
+  ]}
+/>
+
+The remote GPU tier is unique to Dynamo: KV cache on one GPU can be accessed by another GPU over NVLink or InfiniBand. This enables the KV-aware routing — the router can send a request to any GPU in the cluster and have it access the cached KV from whichever GPU holds it.
+
+## Implementer Exercise: Minimal KV-Aware Router
+
+A complete router that selects GPUs based on cache overlap and queue depth:
+
+```python
+import hashlib
+from dataclasses import dataclass
+
+@dataclass
+class WorkerState:
+    worker_id: int
+    cached_prefix_hashes: set  # set of block hash strings
+    queue_depth: int
+    prefill_tok_per_sec: float
+
+def hash_block(tokens, block_size=16):
+    """Hash a block of token IDs for cache lookup."""
+    token_bytes = bytes(tokens)
+    return hashlib.sha256(token_bytes).hexdigest()[:16]
+
+def compute_hash_chain(prompt_tokens, block_size=16):
+    """Compute sequential hash chain for prefix matching."""
+    hashes = []
+    parent = "root"
+    for i in range(0, len(prompt_tokens), block_size):
+        block = prompt_tokens[i:i+block_size]
+        combined = f"{parent}:{hash_block(block)}"
+        block_hash = hashlib.sha256(combined.encode()).hexdigest()[:16]
+        hashes.append(block_hash)
+        parent = block_hash
+    return hashes
+
+def route(request_tokens, workers, block_size=16):
+    """Route request to worker with lowest estimated TTFT."""
+    prompt_hashes = compute_hash_chain(request_tokens, block_size)
+
+    best_worker = None
+    best_ttft = float("inf")
+
+    for w in workers:
+        # Count cached prefix length
+        cached = 0
+        for h in prompt_hashes:
+            if h in w.cached_prefix_hashes:
+                cached += 1
+            else:
+                break
+
+        uncached_tokens = (len(prompt_hashes) - cached) * block_size
+        prefill_time = uncached_tokens / w.prefill_tok_per_sec
+        queue_time = w.queue_depth * 0.030  # 30ms avg per queued request
+        ttft = prefill_time + queue_time
+
+        if ttft < best_ttft:
+            best_ttft = ttft
+            best_worker = w
+
+    return best_worker
+```
+
+This router runs in under 0.1ms for typical cluster sizes (8-64 workers) — negligible compared to the prefill time it saves.
+
+<Callout type="tip" title="Connection to Other Series">
+Dynamo builds on concepts from the Inference Optimization Timeline series: PagedAttention (Part 5) provides the block-level KV cache abstraction, prefix caching (Part 8) provides the hash-chain mechanism, and disaggregated serving (Part 10) provides the prefill/decode split. Dynamo takes these single-node optimizations and extends them to the cluster level.
+</Callout>
+
+## What Dynamo Changes for Production
+
+Before Dynamo, multi-GPU LLM serving required manual configuration: static model placement, fixed routing rules, no cross-GPU cache sharing. Dynamo automates all of this:
+
+1. **KV-aware routing** eliminates redundant prefill computation — saving 50-80% of prefill GPU cycles in cache-friendly workloads.
+2. **Disaggregated serving** lets each GPU pool be optimized independently — prefill GPUs maximize tensor core utilization, decode GPUs maximize HBM bandwidth utilization.
+3. **ModelExpress** reduces cold starts from minutes to milliseconds — enabling reactive autoscaling that tracks demand in real time.
+4. **The Planner** closes the loop — automatically adjusting GPU allocation to meet SLOs at minimum cost.
+
+The combination transforms a cluster of GPUs from a collection of independent inference servers into a unified inference system where every GPU contributes to serving every request optimally.
