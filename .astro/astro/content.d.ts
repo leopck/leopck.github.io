@@ -586,6 +586,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"moe-masterclass-deepseek-mla-implementation.mdx": {
+	id: "moe-masterclass-deepseek-mla-implementation.mdx";
+  slug: "moe-masterclass-deepseek-mla-implementation";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "moe-masterclass-expert-parallelism-communication.mdx": {
 	id: "moe-masterclass-expert-parallelism-communication.mdx";
   slug: "moe-masterclass-expert-parallelism-communication";
@@ -624,6 +631,13 @@ declare module 'astro:content' {
 "nvidia-dynamo-kv-aware-routing-inference-os.mdx": {
 	id: "nvidia-dynamo-kv-aware-routing-inference-os.mdx";
   slug: "nvidia-dynamo-kv-aware-routing-inference-os";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"nvidia-dynamo-modelexpress-nixl-cold-start.mdx": {
+	id: "nvidia-dynamo-modelexpress-nixl-cold-start.mdx";
+  slug: "nvidia-dynamo-modelexpress-nixl-cold-start";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
