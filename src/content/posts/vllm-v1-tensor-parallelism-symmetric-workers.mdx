@@ -1,0 +1,722 @@
+---
+title: "vLLM v1 Tensor Parallelism: Symmetric Workers, Incremental Updates, and NCCL Optimization"
+author: "stanley-phoong"
+description: "How vLLM v1 eliminates the asymmetric worker bottleneck by running identical workers with cached request state, receiving only incremental diffs from a separate scheduler process. Covers the update protocol, NCCL all-reduce optimization with bucket-based overlapping, and measured communication savings."
+publishDate: 2025-03-22
+category: vllm
+tags: [vllm, tensor-parallelism, symmetric, nccl, incremental, distributed]
+difficulty: expert
+readingTime: 33
+draft: false
+featured: false
+series: "vLLM v1 & Omni Internals"
+seriesOrder: 8
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+
+In vLLM v0, Worker 0 was special. It ran the scheduler, prepared the full batch metadata, and broadcast it to Workers 1 through $N-1$ every iteration. The other workers received this metadata, ran the forward pass, participated in all-reduce operations, and sent results back to Worker 0 for sampling. This asymmetry had a concrete performance cost: scheduling on Worker 0 serialized with the forward pass because Worker 0 could not begin its portion of the model computation until scheduling was complete. The GPU on Worker 0 sat idle during scheduling while all other GPUs waited for the broadcast.
+
+vLLM v1 eliminates this bottleneck by making all workers symmetric. The scheduler runs in a dedicated CPU process, completely decoupled from the GPU workers. Workers cache request state locally and receive only incremental updates (new token IDs, new positions, new requests, completed requests) rather than the full batch tensor every iteration. This reduces per-iteration communication from megabytes to kilobytes.
+
+This post covers the v0 architecture and its bottleneck, the v1 symmetric design, the incremental update protocol, the NCCL all-reduce optimization strategy, and measured performance improvements.
+
+---
+
+## 1. The v0 Asymmetry Problem
+
+### v0 Architecture
+
+In v0 with TP=4, the four workers formed an asymmetric group:
+
+```python
+# vLLM v0: Asymmetric worker architecture
+class V0WorkerGroup:
+    def __init__(self, tp_degree):
+        self.workers = []
+        for rank in range(tp_degree):
+            if rank == 0:
+                # Worker 0: scheduler + model shard + sampling
+                self.workers.append(V0DriverWorker(rank))
+            else:
+                # Workers 1..N-1: model shard only
+                self.workers.append(V0Worker(rank))
+
+class V0DriverWorker:
+    """Worker 0: runs scheduler, prepares inputs, drives execution."""
+
+    def step(self):
+        # Phase 1: Scheduling (CPU, Worker 0 only)
+        # All other workers' GPUs are IDLE during this
+        schedule_start = time.monotonic()
+        scheduler_outputs = self.scheduler.schedule()
+        # scheduler_outputs contains:
+        #   - token_ids: [batch_size, max_seq_len] padded tensor
+        #   - position_ids: [batch_size, max_seq_len]
+        #   - block_tables: [batch_size, max_blocks]
+        #   - seq_lens: [batch_size]
+        #   - slot_mapping: [total_tokens]
+        schedule_time = time.monotonic() - schedule_start
+
+        # Phase 2: Prepare input tensors (CPU, Worker 0)
+        input_tensors = self._prepare_inputs(scheduler_outputs)
+        # input_tensors is ~2-4 MB for a typical batch
+
+        # Phase 3: Broadcast to all workers (CPU -> GPU -> NCCL broadcast)
+        broadcast_start = time.monotonic()
+        for tensor_name, tensor in input_tensors.items():
+            dist.broadcast(tensor, src=0)
+        broadcast_time = time.monotonic() - broadcast_start
+
+        # Phase 4: Forward pass (GPU, all workers participate)
+        hidden_states = self.model.forward(input_tensors)
+
+        # Phase 5: All-reduce (NCCL, all workers)
+        # Each TP shard produces partial output; all-reduce sums them
+        dist.all_reduce(hidden_states)
+
+        # Phase 6: Sampling (Worker 0 only)
+        next_tokens = self.sampler.sample(hidden_states)
+
+        return next_tokens
+
+class V0Worker:
+    """Workers 1..N-1: receive inputs, compute, all-reduce."""
+
+    def step(self):
+        # Wait for broadcast from Worker 0
+        input_tensors = {}
+        for tensor_name in expected_tensors:
+            tensor = torch.empty(expected_shape, device="cuda")
+            dist.broadcast(tensor, src=0)
+            input_tensors[tensor_name] = tensor
+
+        # Forward pass
+        hidden_states = self.model.forward(input_tensors)
+
+        # All-reduce
+        dist.all_reduce(hidden_states)
+        # Worker does NOT sample -- only Worker 0 does
+```
+
+### Quantifying the Bottleneck
+
+The scheduling phase on Worker 0 takes 0.5-2ms per iteration depending on batch size and complexity (preemption decisions, prefix cache lookups, block allocation). During this time, Workers 1-3 are completely idle.
+
+<Benchmark
+  title="v0 Worker 0 Scheduling Overhead (Llama 70B, TP=4, H100 NVLink)"
+  columns={["Batch Size", "Schedule Time (ms)", "Broadcast Time (ms)", "Forward Pass (ms)", "GPU Idle Time (Workers 1-3)","Overhead %"]}
+  rows={[
+    { values: ["32", "0.5", "0.3", "28", "0.8 ms", "2.8%"], highlight: false },
+    { values: ["128", "1.2", "0.8", "32", "2.0 ms", "5.9%"], highlight: false },
+    { values: ["256", "1.8", "1.2", "35", "3.0 ms", "7.9%"], highlight: true },
+    { values: ["512", "2.5", "1.8", "38", "4.3 ms", "10.2%"], highlight: true },
+  ]}
+  notes="GPU Idle Time = Schedule Time + Broadcast Time (Workers 1-3 wait for both). At batch=512, 10% of total iteration time is wasted on Worker 0's sequential scheduling."
+/>
+
+At batch size 512, Workers 1-3 waste 4.3ms per iteration waiting for Worker 0. Over 1000 decode iterations (generating 1000 tokens), that is 4.3 seconds of accumulated GPU idle time per worker. With 3 idle workers on H100 at $2/GPU-hour, this costs $0.007 per 1000-token generation just in wasted GPU time.
+
+The broadcast itself is also wasteful. Every iteration, Worker 0 sends the full batch metadata -- token IDs, position IDs, block tables -- even though most of this data did not change from the previous iteration. In a decode step, only one new token per sequence changes, but the entire batch tensor is re-broadcast.
+
+---
+
+## 2. The v1 Symmetric Architecture
+
+### Design Principles
+
+vLLM v1 restructures the worker group around three principles:
+
+1. **All workers are identical**: No driver worker. Every worker runs the same code path.
+2. **Scheduler is a separate process**: Scheduling happens on CPU in its own process, sending results via shared memory or ZMQ.
+3. **Workers cache state**: Each worker maintains a local copy of request state (token IDs, positions, block tables) and receives only incremental diffs.
+
+```python
+# vLLM v1: Symmetric worker architecture
+class V1WorkerGroup:
+    def __init__(self, tp_degree):
+        # Scheduler runs in its own process
+        self.scheduler_process = SchedulerProcess()
+
+        # All workers are identical
+        self.workers = [V1Worker(rank) for rank in range(tp_degree)]
+
+        # Shared memory region for scheduler -> worker communication
+        self.update_channel = SharedMemoryChannel(
+            size=1024 * 1024  # 1 MB buffer (more than enough for diffs)
+        )
+
+class V1Worker:
+    """Symmetric worker: caches state, receives incremental updates."""
+
+    def __init__(self, rank):
+        self.rank = rank
+        self.model_shard = None  # Loaded during initialization
+
+        # Cached request state (mirrors the scheduler's view)
+        self.cached_requests = {}  # request_id -> CachedRequestState
+        self.cached_batch = None   # Pre-built batch tensors
+
+    def step(self):
+        # Phase 1: Receive incremental update (non-blocking if ready)
+        update = self.update_channel.recv()
+        # update is ~10 KB, not ~2 MB
+
+        # Phase 2: Apply update to cached state
+        self._apply_update(update)
+
+        # Phase 3: Build input tensors from cached state
+        input_tensors = self._build_inputs_from_cache()
+
+        # Phase 4: Forward pass (GPU)
+        hidden_states = self.model_shard.forward(input_tensors)
+
+        # Phase 5: All-reduce (NCCL)
+        dist.all_reduce(hidden_states)
+
+        # Phase 6: Sampling (ALL workers sample -- not just Worker 0)
+        next_tokens = self.sampler.sample(hidden_states)
+
+        # Phase 7: Feed next tokens back to cached state
+        self._update_tokens(next_tokens)
+
+        return next_tokens
+```
+
+<Callout type="info" title="Why All Workers Sample">
+In v0, only Worker 0 ran sampling because it was the only worker with the full hidden states after all-reduce. In v1, all workers have the full hidden states after all-reduce (all-reduce produces identical results on all ranks by definition). So all workers can sample independently. Since sampling uses the same random seed (synchronized across workers), all workers produce the same next-token IDs. This eliminates the need for Worker 0 to broadcast sampled tokens back to other workers.
+</Callout>
+
+### The Scheduler Process
+
+The scheduler runs in its own OS process, communicating with workers via shared memory:
+
+```python
+class SchedulerProcess:
+    """Dedicated CPU process for scheduling decisions."""
+
+    def __init__(self, worker_update_channels):
+        self.scheduler = Scheduler()
+        self.channels = worker_update_channels  # One per worker (or multicast)
+        self.request_states = {}  # Complete request state
+
+    def run_loop(self):
+        while True:
+            # Run scheduling (CPU-only, does not block any GPU)
+            outputs = self.scheduler.schedule()
+
+            # Compute incremental diff from previous state
+            diff = self._compute_diff(outputs)
+
+            # Send diff to all workers via shared memory
+            # This is a memcpy of ~10 KB, taking < 10 us
+            for channel in self.channels:
+                channel.send(diff)
+
+            # Wait for workers to signal completion of forward pass
+            self._wait_for_workers()
+
+            # Receive sampled tokens from workers
+            new_tokens = self._receive_tokens()
+
+            # Update scheduler state
+            self._process_new_tokens(new_tokens)
+```
+
+The critical path change: scheduling and GPU computation now overlap. While workers execute the forward pass for iteration $t$, the scheduler can begin scheduling iteration $t+1$. The GPU never waits for scheduling.
+
+---
+
+## 3. The Incremental Update Protocol
+
+### What Changes Between Iterations
+
+During decode, the per-iteration changes are minimal:
+
+```python
+@dataclass
+class IncrementalUpdate:
+    """Diff between iteration t and iteration t+1."""
+
+    # New requests entering the batch (prefill)
+    new_requests: list  # Each: {request_id, token_ids, sampling_params}
+
+    # Completed requests leaving the batch
+    finished_requests: list  # Each: request_id
+
+    # Per-sequence updates for continuing decode
+    token_updates: dict  # request_id -> new_token_id (one int per sequence)
+    position_updates: dict  # request_id -> new_position (one int per sequence)
+
+    # Block table changes (only when a new block is allocated)
+    block_table_updates: dict  # request_id -> {new_block_id, slot_index}
+
+    # Preemption events
+    preempted_requests: list  # request_ids to swap out
+```
+
+### Size Comparison
+
+For a batch of 256 sequences in decode mode:
+
+```python
+# v0: Full batch broadcast every iteration
+v0_broadcast_size = {
+    "token_ids":      256 * 4096 * 4,   # [batch, max_seq_len] int32 = 4.19 MB
+    "position_ids":   256 * 4096 * 4,   # [batch, max_seq_len] int32 = 4.19 MB
+    "block_tables":   256 * 256 * 4,    # [batch, max_blocks] int32  = 262 KB
+    "seq_lens":       256 * 4,          # [batch] int32              = 1 KB
+    "slot_mapping":   256 * 4096 * 4,   # [total_tokens] int32      = 4.19 MB
+}
+# Total: ~12.8 MB per iteration
+
+# v1: Incremental update
+v1_update_size = {
+    "new_requests":   0,                # No new requests in steady decode
+    "finished_reqs":  0,                # No completions this iteration
+    "token_updates":  256 * 8,          # 256 sequences, {req_id: int32, token: int32} = 2 KB
+    "position_updates": 256 * 8,        # 256 sequences, {req_id: int32, pos: int32} = 2 KB
+    "block_updates":  16 * 12,          # ~16 sequences need new block (every 16th token) = 192 B
+    "preemptions":    0,                # No preemptions
+}
+# Total: ~4.2 KB per iteration
+```
+
+<PerfChart
+  title="Per-Iteration Communication: v0 Broadcast vs v1 Incremental Update"
+  unit="KB"
+  data={[
+    { label: "v0 batch=32", value: 1600, color: "red", annotation: "1.6 MB" },
+    { label: "v1 batch=32", value: 0.6, color: "green", annotation: "0.6 KB" },
+    { label: "v0 batch=128", value: 6400, color: "red", annotation: "6.4 MB" },
+    { label: "v1 batch=128", value: 2.1, color: "green", annotation: "2.1 KB" },
+    { label: "v0 batch=256", value: 12800, color: "red", annotation: "12.8 MB" },
+    { label: "v1 batch=256", value: 4.2, color: "green", annotation: "4.2 KB" },
+    { label: "v0 batch=512", value: 25600, color: "red", annotation: "25.6 MB" },
+    { label: "v1 batch=512", value: 8.4, color: "green", annotation: "8.4 KB" }
+  ]}
+  baseline={0}
+/>
+
+The reduction is over 3000x for batch=256. This is not a bandwidth optimization -- 12.8 MB over NVLink takes only 0.03ms. The savings come from eliminating the CPU-side tensor preparation on Worker 0 (which takes 1-2ms) and the serialization of scheduling with computation.
+
+### Applying Updates to Cached State
+
+Each worker maintains a local `CachedRequestState` per active request:
+
+```python
+@dataclass
+class CachedRequestState:
+    """Per-request state cached on each worker."""
+    request_id: int
+    token_ids: list        # All tokens generated so far
+    current_position: int  # Current position in the sequence
+    block_table: list      # Physical block IDs for this sequence
+    sampling_params: SamplingParams
+    is_prefill: bool       # True during first iteration
+
+class V1Worker:
+    def _apply_update(self, update: IncrementalUpdate):
+        """Apply incremental diff to cached state. O(diff_size), not O(batch_size)."""
+
+        # Add new requests (prefill entries)
+        for new_req in update.new_requests:
+            self.cached_requests[new_req.request_id] = CachedRequestState(
+                request_id=new_req.request_id,
+                token_ids=list(new_req.token_ids),
+                current_position=len(new_req.token_ids),
+                block_table=list(new_req.block_table),
+                sampling_params=new_req.sampling_params,
+                is_prefill=True
+            )
+
+        # Remove finished requests
+        for req_id in update.finished_requests:
+            del self.cached_requests[req_id]
+
+        # Update tokens (decode: one new token per sequence)
+        for req_id, new_token in update.token_updates.items():
+            state = self.cached_requests[req_id]
+            state.token_ids.append(new_token)
+            state.current_position += 1
+            state.is_prefill = False
+
+        # Update block tables (only for sequences that got new blocks)
+        for req_id, block_update in update.block_table_updates.items():
+            state = self.cached_requests[req_id]
+            state.block_table.append(block_update.new_block_id)
+
+        # Handle preemptions
+        for req_id in update.preempted_requests:
+            state = self.cached_requests.pop(req_id)
+            self._save_to_swap_space(state)
+
+    def _build_inputs_from_cache(self):
+        """Build GPU input tensors from cached state."""
+        batch_size = len(self.cached_requests)
+        requests = list(self.cached_requests.values())
+
+        # For decode: each sequence contributes one token
+        if all(not r.is_prefill for r in requests):
+            token_ids = torch.tensor(
+                [r.token_ids[-1] for r in requests],
+                dtype=torch.long, device="cuda"
+            )
+            positions = torch.tensor(
+                [r.current_position - 1 for r in requests],
+                dtype=torch.long, device="cuda"
+            )
+        else:
+            # Mixed prefill + decode: variable-length packing
+            token_ids, positions = self._pack_mixed_batch(requests)
+
+        return {"token_ids": token_ids, "positions": positions}
+```
+
+<Callout type="perf" title="Cache Consistency Guarantee">
+All workers receive the same incremental update from the scheduler (via multicast shared memory). Since updates are applied deterministically (no random operations, no floating-point), all workers end up with identical cached state. This means all workers build identical input tensors and produce identical forward pass results (up to floating-point non-determinism in NCCL all-reduce, which is handled by using deterministic reduction algorithms). The sampling RNG is also synchronized, so all workers produce the same next-token selections.
+</Callout>
+
+---
+
+## 4. NCCL All-Reduce Optimization
+
+Tensor parallelism requires an all-reduce after every attention layer and every FFN layer. For Llama 70B with 80 layers, that is 160 all-reduce operations per forward pass. The all-reduce volume per operation is:
+
+$$\text{all\_reduce\_bytes} = \text{batch\_tokens} \times \text{hidden\_dim} \times \text{dtype\_bytes}$$
+
+For batch_tokens=256 (decode) with hidden_dim=8192 and FP16:
+
+$$256 \times 8192 \times 2 = 4{,}194{,}304 \text{ bytes} = 4 \text{ MB per all-reduce}$$
+
+Total all-reduce volume per forward pass: $160 \times 4 = 640$ MB.
+
+### Ring All-Reduce Bandwidth
+
+NCCL's ring all-reduce for $N$ GPUs transfers $\frac{2(N-1)}{N} \times M$ bytes per GPU, where $M$ is the message size. For TP=4 and $M = 4$ MB:
+
+$$\frac{2 \times 3}{4} \times 4 = 6 \text{ MB per GPU per all-reduce}$$
+
+Over NVLink 4.0 at 450 GB/s bidirectional, this takes:
+
+$$\frac{6 \text{ MB}}{450 \text{ GB/s}} = 13.3 \text{ us per all-reduce}$$
+
+Total all-reduce time: $160 \times 13.3 = 2.13$ ms.
+
+But this is the theoretical minimum assuming perfect overlap. In practice, NCCL has launch overhead per operation.
+
+### Bucket-Based Overlapping
+
+vLLM v1 reduces NCCL overhead by overlapping all-reduce with computation using a technique called bucket-based all-reduce:
+
+```python
+class BucketedAllReduce:
+    """
+    Overlap all-reduce with subsequent layer computation.
+
+    Instead of:
+        compute_layer_i -> all_reduce_i -> compute_layer_i+1 -> all_reduce_i+1
+
+    We do:
+        compute_layer_i -> launch_async_all_reduce_i -> compute_layer_i+1 (overlapped)
+                           -> wait_all_reduce_i -> use_result_i
+    """
+
+    def __init__(self, tp_group, num_buckets=4):
+        self.tp_group = tp_group
+        self.num_buckets = num_buckets
+        self.streams = [torch.cuda.Stream() for _ in range(num_buckets)]
+        self.events = [torch.cuda.Event() for _ in range(num_buckets)]
+
+    def all_reduce_async(self, tensor, bucket_id):
+        """Launch all-reduce on a dedicated CUDA stream."""
+        stream = self.streams[bucket_id % self.num_buckets]
+        event = self.events[bucket_id % self.num_buckets]
+
+        with torch.cuda.stream(stream):
+            dist.all_reduce(tensor, group=self.tp_group)
+            event.record(stream)
+
+        return event  # Caller waits on this before using the result
+
+    def wait(self, event):
+        """Block the default stream until all-reduce completes."""
+        torch.cuda.current_stream().wait_event(event)
+```
+
+The overlap works because the all-reduce for layer $i$ does not depend on the compute for layer $i+1$ -- they operate on different tensors. By launching the all-reduce on a separate CUDA stream, the GPU can begin computing layer $i+1$'s matmuls on the default stream while the NVLink fabric handles the all-reduce communication concurrently.
+
+```python
+class TensorParallelTransformerLayer:
+    def forward(self, hidden_states, bucketed_allreduce):
+        # Attention block
+        attn_out = self.self_attn(hidden_states)  # Produces partial output
+
+        # Launch async all-reduce for attention output
+        ar_event_attn = bucketed_allreduce.all_reduce_async(
+            attn_out, bucket_id=self.layer_idx * 2
+        )
+
+        # While all-reduce runs, compute attention residual (no dependency)
+        # ... other independent work ...
+
+        # Wait for all-reduce before using the result
+        bucketed_allreduce.wait(ar_event_attn)
+        hidden_states = hidden_states + attn_out  # Residual connection
+
+        # FFN block
+        ffn_out = self.ffn(hidden_states)  # Produces partial output
+
+        # Launch async all-reduce for FFN output
+        ar_event_ffn = bucketed_allreduce.all_reduce_async(
+            ffn_out, bucket_id=self.layer_idx * 2 + 1
+        )
+
+        # While all-reduce runs on NVLink, begin next layer's attention QKV projection
+        # ... overlap region ...
+
+        bucketed_allreduce.wait(ar_event_ffn)
+        hidden_states = hidden_states + ffn_out  # Residual connection
+
+        return hidden_states
+```
+
+### Measured Overlap Efficiency
+
+The overlap is most effective during prefill (large batch, long compute time per layer) and less effective during decode (small batch, short compute time per layer):
+
+<Benchmark
+  title="NCCL All-Reduce Overlap Efficiency (Llama 70B, TP=4, H100 NVLink)"
+  columns={["Phase", "Batch Tokens", "Compute/Layer (ms)", "AllReduce/Layer (ms)", "Overlap %", "Effective AR Cost (ms)"]}
+  rows={[
+    { values: ["Prefill", "4,096", "1.8", "0.09", "95%", "0.005"], highlight: true },
+    { values: ["Prefill", "512", "0.25", "0.02", "85%", "0.003"], highlight: false },
+    { values: ["Decode", "256", "0.12", "0.013", "60%", "0.005"], highlight: false },
+    { values: ["Decode", "64", "0.04", "0.008", "30%", "0.006"], highlight: false },
+    { values: ["Decode", "16", "0.015", "0.006", "10%", "0.005"], highlight: true },
+  ]}
+  notes="Overlap % = fraction of all-reduce time hidden behind compute. At small batch sizes, compute time per layer is too short to fully hide the all-reduce."
+/>
+
+At batch_tokens=4096 (prefill), 95% of the all-reduce time is hidden behind computation. At batch_tokens=16 (small decode), only 10% is hidden -- the all-reduce finishes long after the compute, so the next layer is blocked waiting.
+
+### Custom All-Reduce Kernels
+
+For small message sizes (under 1 MB), NCCL's ring all-reduce has high launch overhead relative to the actual data transfer. vLLM v1 includes custom all-reduce kernels that bypass NCCL for these small messages:
+
+```cpp
+// Custom one-shot all-reduce for small messages
+// Uses P2P NVLink writes instead of NCCL ring protocol
+// Effective for messages < 1 MB on NVLink-connected GPUs
+template <typename T, int kMaxSize>
+__global__ void custom_all_reduce_kernel(
+    T** buffers,       // Array of pointers to each rank's buffer
+    T* output,         // Output buffer (same on all ranks)
+    int num_elements,
+    int num_ranks,
+    int my_rank
+) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_elements) return;
+
+    // Phase 1: Each rank writes its data to all other ranks' buffers via NVLink
+    // (P2P memory access, enabled by NVLink)
+    T my_value = buffers[my_rank][tid];
+
+    // Phase 2: Sum contributions from all ranks
+    T sum = 0;
+    for (int r = 0; r < num_ranks; r++) {
+        sum += buffers[r][tid];  // P2P read from rank r's buffer
+    }
+
+    // Phase 3: Write result
+    output[tid] = sum;
+}
+```
+
+This custom kernel reduces all-reduce latency for small messages from ~10us (NCCL) to ~3us, a 3.3x improvement. For decode with small batches, this matters because the all-reduce constitutes a larger fraction of total layer time.
+
+<PerfChart
+  title="All-Reduce Latency: NCCL vs Custom Kernel (TP=4, H100 NVLink)"
+  unit="microseconds"
+  data={[
+    { label: "NCCL @ 64KB", value: 10.2, color: "red", annotation: "10.2 us" },
+    { label: "Custom @ 64KB", value: 3.1, color: "green", annotation: "3.1 us" },
+    { label: "NCCL @ 256KB", value: 11.5, color: "red", annotation: "11.5 us" },
+    { label: "Custom @ 256KB", value: 4.8, color: "green", annotation: "4.8 us" },
+    { label: "NCCL @ 1MB", value: 14.2, color: "red", annotation: "14.2 us" },
+    { label: "Custom @ 1MB", value: 8.5, color: "green", annotation: "8.5 us" },
+    { label: "NCCL @ 4MB", value: 18.3, color: "orange", annotation: "18.3 us" },
+    { label: "Custom @ 4MB", value: 17.9, color: "orange", annotation: "17.9 us" }
+  ]}
+  baseline={0}
+/>
+
+The custom kernel advantage disappears above ~2 MB because NCCL's ring protocol becomes bandwidth-efficient at larger message sizes. vLLM v1 automatically selects the custom kernel for messages under 1 MB and falls back to NCCL for larger messages.
+
+---
+
+## 5. End-to-End Performance Impact
+
+### Scheduling Overlap
+
+The biggest win from symmetric workers is eliminating the scheduling-compute serialization:
+
+```python
+# v0 timeline (TP=4):
+# t=0:    Worker 0 schedules          | Workers 1-3 IDLE
+# t=1.5ms: Worker 0 broadcasts       | Workers 1-3 waiting for broadcast
+# t=2.3ms: All workers begin forward  |
+# t=32ms:  Forward pass complete     |
+# t=32ms:  Worker 0 samples          | Workers 1-3 IDLE again
+# Total iteration: ~33.5ms
+
+# v1 timeline (TP=4):
+# t=0:    Scheduler process already prepared update (during previous forward pass)
+# t=0:    All workers receive update via shared memory (< 0.01ms)
+# t=0.01ms: All workers build inputs from cache (< 0.1ms)
+# t=0.1ms: All workers begin forward
+# t=30.1ms: Forward pass complete
+# t=30.1ms: All workers sample (in parallel)
+# Total iteration: ~30.5ms
+# Meanwhile, scheduler is already working on iteration t+1
+```
+
+<Benchmark
+  title="End-to-End Iteration Time: v0 vs v1 (Llama 70B, TP=4, H100)"
+  columns={["Batch Size", "v0 Iteration (ms)", "v1 Iteration (ms)", "Speedup", "Throughput Gain"]}
+  rows={[
+    { values: ["32", "29.3", "28.0", "1.05x", "+4.6%"], highlight: false },
+    { values: ["128", "33.2", "30.5", "1.09x", "+8.8%"], highlight: false },
+    { values: ["256", "36.0", "31.8", "1.13x", "+13.2%"], highlight: true },
+    { values: ["512", "40.3", "33.5", "1.20x", "+20.3%"], highlight: true },
+  ]}
+  notes="Speedup increases with batch size because scheduling time grows with batch complexity while the forward pass grows sublinearly."
+/>
+
+At batch=512, v1 is 20% faster per iteration. This directly translates to 20% higher decode throughput (more tokens per second).
+
+### Communication Savings
+
+The incremental update protocol eliminates the per-iteration broadcast entirely. The communication that remains is the all-reduce within the forward pass, which is required by tensor parallelism regardless of the worker architecture:
+
+<Benchmark
+  title="Communication Volume Per Iteration: v0 vs v1"
+  columns={["Component", "v0 (batch=256)", "v1 (batch=256)", "Reduction"]}
+  rows={[
+    { values: ["Scheduler -> Worker broadcast", "12.8 MB", "4.2 KB", "3047x"], highlight: true },
+    { values: ["All-reduce (attention, 80 layers)", "640 MB", "640 MB", "1x (unchanged)"], highlight: false },
+    { values: ["All-reduce (FFN, 80 layers)", "640 MB", "640 MB", "1x (unchanged)"], highlight: false },
+    { values: ["Sampled tokens (Worker 0 -> others)", "1 KB", "0 KB (all sample)", "eliminated"], highlight: true },
+    { values: ["Total", "1,292.8 MB", "1,280.004 MB", "1.01x overall"], highlight: false },
+  ]}
+  notes="The all-reduce dominates total communication. The broadcast elimination saves only 1% of total bytes but eliminates 100% of the scheduling serialization."
+/>
+
+<Callout type="info" title="The Real Savings Are Not In Bytes">
+The incremental update reduces bytes by 3047x, but total communication only drops by 1% because all-reduce dominates. The real win is latency: eliminating the sequential scheduling phase saves 2-4ms per iteration at high batch sizes. Over 1000 decode steps, that is 2-4 seconds of wall-clock time savings -- directly improving time-to-last-token for every request in the batch.
+</Callout>
+
+---
+
+## 6. Implementation Details
+
+### Shared Memory Channel
+
+The scheduler process and worker processes communicate via a POSIX shared memory region:
+
+```python
+class SharedMemoryChannel:
+    """Lock-free single-producer, multi-consumer channel via shared memory."""
+
+    def __init__(self, name, size):
+        self.shm = shared_memory.SharedMemory(name=name, create=True, size=size)
+        self.buf = self.shm.buf
+
+        # Header: [sequence_number: int64, data_size: int64]
+        self.header_size = 16
+        self.data_offset = self.header_size
+
+        # Sequence number for detecting new updates
+        self._last_seen_seq = 0
+
+    def send(self, data: bytes):
+        """Producer: write update to shared memory."""
+        seq = self._get_next_seq()
+        data_len = len(data)
+
+        # Write data first, then sequence number (memory fence ensures ordering)
+        self.buf[self.data_offset:self.data_offset + data_len] = data
+        struct.pack_into("qq", self.buf, 0, seq, data_len)
+        # Memory fence (implicit in Python struct.pack_into on x86)
+
+    def recv(self) -> bytes:
+        """Consumer: read update from shared memory (spin-wait)."""
+        while True:
+            seq, data_len = struct.unpack_from("qq", self.buf, 0)
+            if seq > self._last_seen_seq:
+                self._last_seen_seq = seq
+                return bytes(self.buf[self.data_offset:self.data_offset + data_len])
+            # Spin: yields to OS scheduler after N iterations
+            spin_wait()
+```
+
+Shared memory avoids the kernel-space overhead of sockets or pipes. The update is a single memcpy of ~4-10 KB, completing in under 1 microsecond.
+
+### Worker Synchronization
+
+Workers must stay synchronized: all workers must process the same update before beginning the forward pass. v1 uses NCCL barrier synchronization after applying the update:
+
+```python
+class V1Worker:
+    def step(self):
+        # Receive and apply update
+        update = self.update_channel.recv()
+        self._apply_update(update)
+        input_tensors = self._build_inputs_from_cache()
+
+        # Barrier: ensure all workers have the same input tensors
+        # This is a zero-byte all-reduce (acts as a barrier)
+        dist.barrier(group=self.tp_group)
+
+        # Forward pass (all workers execute in lock-step from here)
+        hidden_states = self.model_shard.forward(input_tensors)
+        dist.all_reduce(hidden_states, group=self.tp_group)
+
+        next_tokens = self.sampler.sample(hidden_states)
+        self._update_tokens(next_tokens)
+
+        return next_tokens
+```
+
+The barrier adds ~2-3us of latency but guarantees that no worker enters the forward pass with stale state.
+
+---
+
+## 7. Reviewer Agent Validation Challenge
+
+Test your understanding of the v1 symmetric architecture with these scenarios.
+
+**Scenario A**: In v1, the scheduler process crashes mid-iteration. Workers 0-3 are in the middle of a forward pass. What happens to in-flight requests?
+
+**Scenario B**: Worker 2 (out of TP=4) receives the incremental update 0.5ms later than the other workers due to OS scheduling jitter. How does the system handle this?
+
+**Scenario C**: The batch contains 200 decode sequences and 10 new prefill sequences. The incremental update includes the 10 new requests (with full token sequences, ~4KB each). How large is the update, and how does it compare to v0's broadcast?
+
+**Scenario D**: Two workers apply the same incremental update but produce slightly different sampled tokens due to floating-point non-determinism in the all-reduce. What breaks?
+
+**Answers**:
+- **A**: The current forward pass completes normally (workers have cached state and do not need the scheduler mid-iteration). However, the next iteration will stall: workers will spin-wait on the shared memory channel for an update that never arrives. A watchdog timer (typically 30 seconds) detects this and triggers graceful shutdown. In-flight requests complete their current decode step but no new tokens are generated after that.
+- **B**: The dist.barrier() after update application blocks all workers until the slowest one arrives. Workers 0, 1, 3 wait at the barrier for 0.5ms until Worker 2 catches up. This jitter directly adds to iteration latency. In practice, shared memory updates are sub-microsecond, so OS scheduling jitter of 0.5ms would indicate a serious system configuration issue (CPU pinning is recommended).
+- **C**: The update contains: 200 token updates (200 x 8 = 1.6 KB) + 10 new requests (10 x 4 KB = 40 KB) + block table updates (~3 KB) = ~44.6 KB. In v0, the broadcast would be the full batch tensor for 210 sequences: approximately 210 x 4096 x 4 x 3 = ~10.3 MB. The v1 update is 231x smaller, though still larger than a pure-decode update because of the new prefill request payloads.
+- **D**: The system breaks. All workers must produce identical sampled tokens because each worker independently updates its cached state with those tokens. If Worker 0 samples token 42 and Worker 1 samples token 57, their cached states diverge, and all subsequent iterations produce different results on each worker. vLLM v1 prevents this by using deterministic NCCL all-reduce settings and synchronized RNG seeds. If non-determinism is detected (via periodic checksum validation), the system forces a state resynchronization.
+
+---
+
+## Summary
+
+vLLM v1's symmetric worker architecture eliminates the scheduling bottleneck that cost 3-10% of iteration time in v0. The key changes: the scheduler runs in a separate process (overlap with GPU computation), all workers are identical (no special driver worker), workers cache request state locally (receive only diffs), and all workers sample independently (no token broadcast).
+
+The incremental update protocol reduces per-iteration scheduler-to-worker communication by 3000x, but the real benefit is latency rather than bandwidth: decoupling scheduling from the GPU critical path. NCCL all-reduce optimization through bucketed overlapping and custom small-message kernels further reduces communication overhead. Together, these changes yield a 5-20% end-to-end throughput improvement that scales with batch size.

@@ -964,6 +964,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"transformer-anatomy-knowledge-distillation.mdx": {
+	id: "transformer-anatomy-knowledge-distillation.mdx";
+  slug: "transformer-anatomy-knowledge-distillation";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "transformer-anatomy-learning-rate-schedules.mdx": {
 	id: "transformer-anatomy-learning-rate-schedules.mdx";
   slug: "transformer-anatomy-learning-rate-schedules";
@@ -1058,6 +1065,13 @@ declare module 'astro:content' {
 "vllm-v1-omniconnector-multimodal-lifecycle.mdx": {
 	id: "vllm-v1-omniconnector-multimodal-lifecycle.mdx";
   slug: "vllm-v1-omniconnector-multimodal-lifecycle";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"vllm-v1-tensor-parallelism-symmetric-workers.mdx": {
+	id: "vllm-v1-tensor-parallelism-symmetric-workers.mdx";
+  slug: "vllm-v1-tensor-parallelism-symmetric-workers";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
