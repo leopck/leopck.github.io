@@ -271,6 +271,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"dataset-frontier-synthetic-data-pipelines.mdx": {
+	id: "dataset-frontier-synthetic-data-pipelines.mdx";
+  slug: "dataset-frontier-synthetic-data-pipelines";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "decoding-performance-beam-vs-sampling-2020.mdx": {
 	id: "decoding-performance-beam-vs-sampling-2020.mdx";
   slug: "decoding-performance-beam-vs-sampling-2020";
@@ -565,6 +572,20 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"moe-masterclass-expert-parallelism-communication.mdx": {
+	id: "moe-masterclass-expert-parallelism-communication.mdx";
+  slug: "moe-masterclass-expert-parallelism-communication";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"moe-masterclass-gated-layer-implementation.mdx": {
+	id: "moe-masterclass-gated-layer-implementation.mdx";
+  slug: "moe-masterclass-gated-layer-implementation";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "multi-gpu-data-vs-model-parallel-2020.mdx": {
 	id: "multi-gpu-data-vs-model-parallel-2020.mdx";
   slug: "multi-gpu-data-vs-model-parallel-2020";
@@ -771,6 +792,20 @@ declare module 'astro:content' {
 "vllm-scheduler-continuous-batching-internals.mdx": {
 	id: "vllm-scheduler-continuous-batching-internals.mdx";
   slug: "vllm-scheduler-continuous-batching-internals";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"vllm-v1-block-manager-kv-cache-internals.mdx": {
+	id: "vllm-v1-block-manager-kv-cache-internals.mdx";
+  slug: "vllm-v1-block-manager-kv-cache-internals";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"vllm-v1-disaggregated-multimodal-serving.mdx": {
+	id: "vllm-v1-disaggregated-multimodal-serving.mdx";
+  slug: "vllm-v1-disaggregated-multimodal-serving";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">

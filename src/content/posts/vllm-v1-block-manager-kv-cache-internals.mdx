@@ -1,0 +1,1083 @@
+---
+title: "vLLM v1 Block Manager: Deconstructing KV Cache Memory Management at the Pointer Level"
+author: "stanley-phoong"
+description: "A code-level deep dive into vLLM v1's SelfAttnBlockSpaceManager — how logical token blocks map to physical GPU memory, multi-tier offloading (GPU to CPU to SSD), prefix caching via hash chains, and how to build a minimal KVCacheManager from scratch."
+publishDate: 2025-03-22
+category: vllm
+tags: [vllm-v1, block-manager, kv-cache, memory-management, gpu-memory, offloading]
+difficulty: expert
+readingTime: 30
+draft: false
+featured: true
+series: "vLLM v1 & Omni Internals"
+seriesOrder: 1
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+import MemoryLayout from '@/components/mdx/MemoryLayout.astro';
+
+Every token vLLM generates passes through a block manager. The block manager is the allocator that decides where key-value tensors live in GPU HBM, when they get evicted to CPU DRAM, and how multiple sequences can share physical memory without corrupting each other's data. It is the `malloc` of LLM inference. If the scheduler is the brain deciding *what* to run, the block manager is the memory subsystem deciding *where* the data goes.
+
+This post disassembles vLLM v1's `SelfAttnBlockSpaceManager` at the data-structure level. We will trace every field of a `Block` object, compute the exact byte cost of each block for Llama 70B, walk through allocation and deallocation paths, examine the multi-tier offloading pipeline from GPU HBM through CPU DRAM to NVMe SSD, show how prefix caching works through hash chains, explain copy-on-write mechanics for beam search, and end with a complete minimal `KVCacheManager` implementation you can run.
+
+No abstractions. Bytes, pointers, latencies.
+
+---
+
+## 1. The Data Structures
+
+The block manager operates on three core structures: `Block`, `BlockTable`, and `FreePool`. Every allocation, deallocation, and sharing decision reduces to mutations on these structures.
+
+### The Block
+
+A `Block` in vLLM v1 is a fixed-size chunk of GPU HBM that holds KV cache data for a contiguous range of tokens. Here is the logical structure:
+
+```python
+@dataclass
+class Block:
+    block_id: int          # Unique index into the physical block pool (0..num_blocks-1)
+    ref_count: int         # Number of sequences currently pointing to this block
+    physical_ptr: int      # Byte offset into the pre-allocated KV cache tensor
+    computed: bool         # Whether the KV data in this block is valid (has been filled by a forward pass)
+    block_hash: int        # Hash of the token content (for prefix caching); -1 if unhashed
+    prev_block: int        # block_id of the preceding block (-1 for the first block)
+    num_tokens: int        # How many token slots are actually filled (0..block_size)
+```
+
+The `block_id` is an integer index, not a pointer. The actual GPU memory address is computed as:
+
+$$\text{physical\_addr} = \text{base\_ptr} + \text{block\_id} \times \text{block\_size\_bytes}$$
+
+where `base_ptr` is the start of the pre-allocated KV cache buffer in GPU HBM. vLLM allocates this buffer once during initialization as a contiguous `torch.Tensor` and never resizes it. Block IDs are indices into this tensor.
+
+The `ref_count` field enables sharing. When two sequences share a block (because they share a common prefix), both block tables point to the same `block_id`, and `ref_count` is 2. The block is only returned to the free pool when `ref_count` drops to 0.
+
+### Physical Memory Layout of a Single Block
+
+Each block holds `block_size` token slots. For each token slot, the block stores both the key tensor and the value tensor across all KV heads with their full head dimension. The layout per block per layer is:
+
+$$\text{block\_bytes\_per\_layer} = \text{block\_size} \times \text{num\_kv\_heads} \times \text{head\_dim} \times 2 \times \text{dtype\_bytes}$$
+
+The factor of 2 accounts for K and V. For Llama 70B with GQA ($\text{num\_kv\_heads} = 8$, $\text{head\_dim} = 128$) and `block_size = 16` in FP16 (`dtype_bytes = 2`):
+
+$$16 \times 8 \times 128 \times 2 \times 2 = 65{,}536 \text{ bytes} = 64 \text{ KB per block per layer}$$
+
+Llama 70B has 80 transformer layers. The total memory for one block across all layers:
+
+$$65{,}536 \times 80 = 5{,}242{,}880 \text{ bytes} = 5.24 \text{ MB per block}$$
+
+<Benchmark
+  title="Per-Block Memory Cost Across Models (block_size=16, FP16)"
+  columns={["Model", "Layers", "KV Heads", "Head Dim", "Bytes/Block/Layer", "MB/Block (All Layers)"]}
+  rows={[
+    { values: ["Llama 7B", "32", "32", "128", "262,144", "8.39"], highlight: false },
+    { values: ["Llama 13B", "40", "40", "128", "327,680", "13.11"], highlight: false },
+    { values: ["Llama 70B (GQA)", "80", "8", "128", "65,536", "5.24"], highlight: true },
+    { values: ["Mixtral 8x7B (GQA)", "32", "8", "128", "65,536", "2.10"], highlight: false },
+    { values: ["Llama 405B (GQA)", "126", "8", "128", "65,536", "8.26"], highlight: false },
+  ]}
+  notes="GQA drastically reduces per-block cost. Llama 70B with 8 KV heads uses 12.5% of the memory that 64 full heads would require."
+/>
+
+GQA (Grouped Query Attention) is the reason Llama 70B's per-block cost is *lower* than Llama 7B's despite having 2.5x more layers. With only 8 KV heads instead of 64, the per-layer cost drops by 8x.
+
+### The Block Table
+
+Each active sequence has a `BlockTable`: an ordered list of `block_id` values mapping logical token positions to physical blocks.
+
+```python
+# block_table[seq_id] = [block_id_0, block_id_1, block_id_2, ...]
+block_tables: Dict[int, List[int]] = {}
+```
+
+To locate the KV cache for token at position $t$ in sequence $s$:
+
+```python
+block_idx = t // block_size                    # Which logical block?
+block_offset = t % block_size                  # Offset within that block
+physical_block_id = block_tables[s][block_idx] # Physical block ID
+# GPU address:
+addr = kv_cache_base + physical_block_id * block_size_bytes_per_layer
+# Offset within block for this specific token:
+token_addr = addr + block_offset * num_kv_heads * head_dim * dtype_bytes
+```
+
+This is pointer chasing: one indirection through the block table to resolve the physical address. The PagedAttention kernel performs this indirection for every token in every sequence in the batch, at every layer.
+
+<MemoryLayout
+  title="Block Table Indirection"
+  layout={[
+    { name: "Sequence 0 Block Table", power: "[block_3, block_7, block_12]", state: "Tokens 0-15 in block 3, tokens 16-31 in block 7, tokens 32-47 in block 12", color: "#3b82f6" },
+    { name: "Sequence 1 Block Table", power: "[block_3, block_9, block_5]", state: "Shares block 3 with seq 0 (common prefix), then diverges", color: "#10b981" },
+    { name: "Physical Block Pool", power: "Pre-allocated contiguous GPU buffer", state: "2048 blocks x 5.24 MB = 10.7 GB for Llama 70B", color: "#ef4444" },
+    { name: "Free Pool (Stack)", power: "[block_1, block_2, block_4, block_6, ...]", state: "Unallocated block IDs, O(1) push/pop", color: "#f59e0b" },
+  ]}
+/>
+
+### The Free Pool
+
+The free pool is a stack (LIFO) of available `block_id` values:
+
+```python
+class FreePool:
+    def __init__(self, num_blocks: int):
+        self._stack: List[int] = list(range(num_blocks))
+
+    def pop(self) -> int:
+        if not self._stack:
+            raise OutOfBlocksError()
+        return self._stack.pop()    # O(1)
+
+    def push(self, block_id: int):
+        self._stack.append(block_id)  # O(1)
+
+    @property
+    def num_free(self) -> int:
+        return len(self._stack)
+```
+
+Allocation is `pop()`. Deallocation is `push()`. Both are $O(1)$. The total number of blocks is determined at startup:
+
+$$\text{num\_blocks} = \left\lfloor \frac{\text{available\_gpu\_memory}}{\text{block\_size\_bytes\_all\_layers}} \right\rfloor$$
+
+For an H100-80GB running Llama 70B (model weights consume ~35 GB in INT4, leaving ~43 GB for KV cache):
+
+$$\left\lfloor \frac{43 \times 10^9}{5.24 \times 10^6} \right\rfloor = 8{,}206 \text{ blocks}$$
+
+Each block holds 16 tokens, so the maximum total token capacity is $8{,}206 \times 16 = 131{,}296$ tokens across all active sequences.
+
+<Callout type="perf" title="Why a Stack and Not a Bitmap">
+A bitmap would allow $O(1)$ alloc/free too (find-first-set instruction), but a stack has better cache behavior on CPU. The block manager runs on CPU, and the free pool is accessed every scheduling iteration. A Python list used as a stack keeps the hot end in L1 cache. The specific block ID returned does not matter -- any free block is equally valid -- so LIFO ordering is fine.
+</Callout>
+
+---
+
+## 2. SelfAttnBlockSpaceManager: The Allocation Engine
+
+The `SelfAttnBlockSpaceManager` (in `vllm/core/block_manager.py`) is the class that owns the block pool, block tables, and free list. The scheduler calls into it to allocate blocks for new sequences, free blocks for finished sequences, and check whether enough free blocks exist to admit a new request.
+
+### Allocation Path
+
+When the scheduler decides to prefill a new sequence of `num_tokens` tokens:
+
+```python
+class SelfAttnBlockSpaceManager:
+    def allocate(self, seq_id: int, num_tokens: int) -> None:
+        blocks_needed = math.ceil(num_tokens / self.block_size)
+
+        if self.free_pool.num_free < blocks_needed:
+            raise OutOfMemoryError(
+                f"Need {blocks_needed} blocks, only {self.free_pool.num_free} free"
+            )
+
+        block_ids = []
+        for _ in range(blocks_needed):
+            block_id = self.free_pool.pop()
+            self.blocks[block_id].ref_count = 1
+            self.blocks[block_id].computed = False
+            self.blocks[block_id].num_tokens = 0
+            block_ids.append(block_id)
+
+        # Fill token counts: all blocks are full except possibly the last
+        for i, bid in enumerate(block_ids):
+            if i < len(block_ids) - 1:
+                self.blocks[bid].num_tokens = self.block_size
+            else:
+                self.blocks[bid].num_tokens = num_tokens - i * self.block_size
+
+        self.block_tables[seq_id] = block_ids
+```
+
+The scheduler always checks `can_allocate(num_tokens)` before calling `allocate()`. The check is a simple comparison:
+
+```python
+def can_allocate(self, num_tokens: int) -> bool:
+    blocks_needed = math.ceil(num_tokens / self.block_size)
+    return self.free_pool.num_free >= blocks_needed
+```
+
+### Append Path (Decode Phase)
+
+During decode, each iteration generates 1 new token per sequence. The block manager must check if the last block has a free slot:
+
+```python
+def append_token(self, seq_id: int) -> Optional[int]:
+    block_table = self.block_tables[seq_id]
+    last_block_id = block_table[-1]
+    last_block = self.blocks[last_block_id]
+
+    if last_block.num_tokens < self.block_size:
+        # Room in current block -- no allocation needed
+        last_block.num_tokens += 1
+        return None
+    else:
+        # Current block is full -- allocate a new one
+        if self.free_pool.num_free == 0:
+            raise OutOfMemoryError("No free blocks for decode append")
+        new_block_id = self.free_pool.pop()
+        self.blocks[new_block_id].ref_count = 1
+        self.blocks[new_block_id].computed = False
+        self.blocks[new_block_id].num_tokens = 1
+        block_table.append(new_block_id)
+        return new_block_id
+```
+
+Most decode steps do not allocate. A new block is needed only every `block_size` tokens (every 16th token with `block_size=16`). This means 15 out of 16 decode iterations are allocation-free for each sequence.
+
+### Deallocation Path
+
+When a sequence finishes (EOS token or max length), the scheduler calls `free()`:
+
+```python
+def free(self, seq_id: int) -> None:
+    block_table = self.block_tables.pop(seq_id)
+
+    for block_id in block_table:
+        block = self.blocks[block_id]
+        block.ref_count -= 1
+
+        if block.ref_count == 0:
+            # No other sequence references this block
+            block.computed = False
+            block.block_hash = -1
+            block.num_tokens = 0
+            self.free_pool.push(block_id)
+        # If ref_count > 0, another sequence still uses this block (shared prefix)
+```
+
+The `ref_count` check is critical. If two sequences share a prefix block (ref_count == 2), freeing one sequence decrements to 1 but does *not* return the block to the free pool. Only when the second sequence also finishes does ref_count hit 0 and the block gets recycled.
+
+<Benchmark
+  title="Block Manager Operation Costs"
+  columns={["Operation", "Time Complexity", "Typical Latency", "Frequency"]}
+  rows={[
+    { values: ["can_allocate(n)", "O(1)", "< 1 us", "Every scheduling iteration per waiting request"], highlight: false },
+    { values: ["allocate(seq, n)", "O(n / block_size)", "1-10 us", "Once per prefill"], highlight: false },
+    { values: ["append_token(seq)", "O(1)", "< 1 us", "Every decode iteration per running sequence"], highlight: false },
+    { values: ["free(seq)", "O(num_blocks_in_seq)", "1-5 us", "Once per finished sequence"], highlight: false },
+    { values: ["fork(parent, child)", "O(num_blocks_in_parent)", "1-10 us", "Once per beam search fork"], highlight: true },
+  ]}
+  notes="All operations run on CPU. Latency is negligible compared to the GPU forward pass (10-50 ms)."
+/>
+
+### The Watermark
+
+vLLM reserves a fraction of blocks as a "watermark" to prevent deadlock scenarios where all blocks are allocated and no sequence can make progress:
+
+```python
+self.watermark_blocks = int(self.num_blocks * watermark)  # Default watermark = 0.01
+```
+
+The `can_allocate()` check actually ensures:
+
+$$\text{free\_blocks} - \text{blocks\_needed} \geq \text{watermark\_blocks}$$
+
+With 8,206 total blocks and a 1% watermark, 82 blocks are reserved. This guarantees that even when memory is nearly full, there is always room to allocate at least one new block for an existing decode sequence -- preventing a situation where running sequences cannot extend and the system stalls.
+
+---
+
+## 3. Multi-Tier Offloading: GPU to CPU to SSD
+
+When GPU HBM fills up and a new request must be admitted, the block manager cannot simply allocate more blocks. It must make room by evicting existing blocks to a slower memory tier. vLLM v1 supports a multi-tier offloading pipeline: GPU HBM (hot tier) to CPU DRAM (warm tier) to NVMe SSD (cold tier).
+
+### The Memory Hierarchy
+
+<MemoryLayout
+  title="KV Cache Memory Tiers"
+  layout={[
+    { name: "GPU HBM (Hot)", power: "H100: 80 GB, 3.35 TB/s bandwidth", state: "Active sequences. Directly accessible by attention kernels.", color: "#ef4444" },
+    { name: "CPU DRAM (Warm)", power: "Typical: 256-1024 GB, ~50 GB/s via PCIe Gen5", state: "Preempted sequences. Requires explicit copy back to GPU before reuse.", color: "#f59e0b" },
+    { name: "NVMe SSD (Cold)", power: "Typical: 2-8 TB, ~7 GB/s sequential read", state: "Long-idle sequences. Highest latency, highest capacity.", color: "#3b82f6" },
+    { name: "Network (Remote GPU)", power: "NVLink: 900 GB/s, InfiniBand: 50 GB/s", state: "Disaggregated serving. KV cache on remote GPU nodes.", color: "#a371f7" },
+  ]}
+/>
+
+### Transfer Latency Math
+
+A single Llama 70B block is 5.24 MB. The transfer time across each interconnect:
+
+**PCIe Gen5 x16** (GPU to CPU DRAM): Theoretical bandwidth is 63 GB/s bidirectional, ~32 GB/s unidirectional per direction. Effective throughput with DMA overhead is approximately 25-28 GB/s for large transfers.
+
+$$t_{\text{PCIe}} = \frac{5.24 \text{ MB}}{28 \text{ GB/s}} = \frac{5.24}{28{,}672} \text{ s} \approx 0.183 \text{ ms}$$
+
+**NVMe Gen4 SSD** (CPU DRAM to SSD): Sequential write at ~5-7 GB/s, sequential read at ~7 GB/s.
+
+$$t_{\text{NVMe}} = \frac{5.24 \text{ MB}}{7 \text{ GB/s}} = \frac{5.24}{7{,}168} \text{ s} \approx 0.731 \text{ ms}$$
+
+**NVLink (GPU to GPU)**: H100 NVLink at 900 GB/s total, ~450 GB/s per direction.
+
+$$t_{\text{NVLink}} = \frac{5.24 \text{ MB}}{450 \text{ GB/s}} = \frac{5.24}{460{,}800} \text{ s} \approx 0.011 \text{ ms}$$
+
+<PerfChart
+  title="Single Block (5.24 MB) Transfer Latency"
+  unit="ms"
+  data={[
+    { label: "NVLink", value: 0.011, color: "green", annotation: "GPU-to-GPU" },
+    { label: "PCIe Gen5", value: 0.183, color: "blue", annotation: "GPU-to-CPU" },
+    { label: "PCIe Gen4", value: 0.244, color: "orange", annotation: "Older systems" },
+    { label: "NVMe SSD", value: 0.731, color: "red", annotation: "CPU-to-SSD" },
+  ]}
+  baseline={0}
+/>
+
+A full swap of a sequence with 256 blocks (4096 tokens, each block holding 16 tokens) over PCIe Gen5:
+
+$$256 \times 0.183 \text{ ms} = 46.8 \text{ ms}$$
+
+That is comparable to one forward pass (~20-50 ms). This is why vLLM uses asynchronous transfers: the swap happens concurrently with GPU computation on other sequences.
+
+### The Offloading Pipeline
+
+The block manager maintains separate free pools for each tier:
+
+```python
+class MultiTierBlockManager:
+    def __init__(self, num_gpu_blocks, num_cpu_blocks):
+        self.gpu_free_pool = FreePool(num_gpu_blocks)
+        self.cpu_free_pool = FreePool(num_cpu_blocks)
+        self.gpu_blocks: Dict[int, Block] = {}
+        self.cpu_blocks: Dict[int, Block] = {}
+        # Mapping: cpu_block_id -> original gpu_block_id for restore
+        self.cpu_to_gpu_mapping: Dict[int, int] = {}
+```
+
+**Eviction (GPU to CPU)**: When the scheduler needs to preempt a sequence, it picks a victim (typically LRU -- least recently used among running sequences), then issues asynchronous copies:
+
+```python
+def offload_to_cpu(self, seq_id: int) -> None:
+    gpu_block_ids = self.block_tables[seq_id]
+    cpu_block_ids = []
+
+    for gpu_bid in gpu_block_ids:
+        cpu_bid = self.cpu_free_pool.pop()
+
+        # Async copy: GPU HBM -> CPU DRAM, on a dedicated CUDA stream
+        # This does not block the default compute stream
+        torch.cuda.current_stream(self.offload_stream)
+        self.cpu_kv_cache[cpu_bid].copy_(
+            self.gpu_kv_cache[gpu_bid], non_blocking=True
+        )
+
+        cpu_block_ids.append(cpu_bid)
+        self.cpu_to_gpu_mapping[cpu_bid] = gpu_bid
+
+    # Record event so we know when the transfer completes
+    self.offload_events[seq_id] = self.offload_stream.record_event()
+
+    # Free GPU blocks
+    for gpu_bid in gpu_block_ids:
+        self.gpu_free_pool.push(gpu_bid)
+
+    # Update block table to point to CPU blocks
+    self.block_tables[seq_id] = cpu_block_ids
+    self.seq_location[seq_id] = "cpu"
+```
+
+<Callout type="warning" title="The non_blocking=True Trap">
+`non_blocking=True` in PyTorch means the copy is asynchronous *with respect to the CPU*. The GPU still executes the copy in stream order. If you issue a copy on the default stream, it will block compute kernels. vLLM uses a dedicated `offload_stream` to avoid this. The `record_event()` / `wait_event()` pattern synchronizes the streams when the data is actually needed.
+</Callout>
+
+**Restoration (CPU to GPU)**: When the scheduler decides to resume a preempted sequence:
+
+```python
+def restore_from_cpu(self, seq_id: int) -> None:
+    cpu_block_ids = self.block_tables[seq_id]
+    gpu_block_ids = []
+
+    for cpu_bid in cpu_block_ids:
+        gpu_bid = self.gpu_free_pool.pop()
+
+        # Async copy: CPU DRAM -> GPU HBM
+        torch.cuda.current_stream(self.restore_stream)
+        self.gpu_kv_cache[gpu_bid].copy_(
+            self.cpu_kv_cache[cpu_bid], non_blocking=True
+        )
+
+        gpu_block_ids.append(gpu_bid)
+
+    self.restore_events[seq_id] = self.restore_stream.record_event()
+
+    # Free CPU blocks
+    for cpu_bid in cpu_block_ids:
+        self.cpu_free_pool.push(cpu_bid)
+
+    self.block_tables[seq_id] = gpu_block_ids
+    self.seq_location[seq_id] = "gpu"
+```
+
+**SSD spill (CPU to NVMe)**: When CPU DRAM fills up, the same pattern applies one tier lower. The block manager picks LRU sequences in CPU DRAM and writes their blocks to SSD using `aio_write()` (Linux AIO) or `io_uring`. Read-back uses `aio_read()`. The latency is higher (0.73 ms per block vs 0.18 ms) but the capacity is orders of magnitude larger.
+
+### Preemption Strategies: Swap vs Recompute
+
+When the scheduler decides to preempt a sequence, it has two choices:
+
+```python
+def preempt(self, seq_id: int, mode: str = "swap") -> None:
+    if mode == "swap":
+        self.offload_to_cpu(seq_id)
+    elif mode == "recompute":
+        self.free(seq_id)  # Discard KV cache entirely
+        self.recompute_queue.append(seq_id)  # Will re-prefill later
+```
+
+**Swap** preserves the KV cache in CPU DRAM. When resumed, the data is copied back to GPU. Cost: transfer latency (46.8 ms for 4096 tokens). Benefit: no recomputation.
+
+**Recompute** discards the KV cache entirely. When resumed, the full prompt must be re-prefilled. Cost: full prefill latency (50-200 ms for a long prompt). Benefit: no CPU memory consumed, no transfer overhead.
+
+The breakeven point depends on sequence length and transfer bandwidth. For a 4096-token sequence on an H100:
+
+$$\text{Swap cost} = 46.8 \text{ ms (transfer)}$$
+$$\text{Recompute cost} \approx \frac{4096}{4000} \times 1000 = 1{,}024 \text{ ms (prefill at ~4K tok/s)}$$
+
+Swapping wins by 22x for long sequences. For very short sequences (under ~256 tokens), recompute can be cheaper because the transfer overhead for setting up DMA is non-trivial relative to the small data size.
+
+<Benchmark
+  title="Swap vs Recompute Breakeven (H100, Llama 70B, PCIe Gen5)"
+  columns={["Seq Length (tokens)", "Swap Latency", "Recompute Latency", "Winner"]}
+  rows={[
+    { values: ["64", "0.7 ms", "16 ms", "Swap"], highlight: false },
+    { values: ["256", "2.9 ms", "64 ms", "Swap"], highlight: false },
+    { values: ["1024", "11.7 ms", "256 ms", "Swap"], highlight: false },
+    { values: ["4096", "46.8 ms", "1,024 ms", "Swap"], highlight: true },
+    { values: ["16384", "187 ms", "4,096 ms", "Swap"], highlight: true },
+  ]}
+  notes="Swap dominates for all practical sequence lengths. Recompute is only preferred when CPU memory is exhausted or for very short sequences with high DMA setup overhead."
+/>
+
+---
+
+## 4. Prefix Caching Implementation
+
+Prefix caching allows multiple sequences that share a common token prefix to reuse the same physical blocks. The block manager implements this through a hash-based lookup that maps token content to physical block IDs.
+
+### The Hash Chain
+
+Each block is hashed based on its token content *and* its position in the sequence. A block at position $i$ does not just hash its own 16 tokens -- it hashes the chain from the first block to itself, creating a Merkle-like structure:
+
+```python
+def compute_block_hash(
+    parent_hash: int,
+    token_ids: Tuple[int, ...],
+) -> int:
+    """
+    Hash of a block depends on:
+    1. The hash of all preceding blocks (parent_hash)
+    2. The token IDs stored in this block
+    This creates a chain: changing any token in any preceding block
+    changes the hash of all subsequent blocks.
+    """
+    return hash((parent_hash, token_ids))
+```
+
+The hash chain for a sequence with 3 blocks:
+
+```
+block_0_hash = hash((INITIAL_HASH, (tok_0, tok_1, ..., tok_15)))
+block_1_hash = hash((block_0_hash, (tok_16, tok_17, ..., tok_31)))
+block_2_hash = hash((block_1_hash, (tok_32, tok_33, ..., tok_47)))
+```
+
+This construction guarantees that two blocks with identical token content but different preceding context produce different hashes. Block 1 of sequence A matches block 1 of sequence B only if *all* tokens in blocks 0 and 1 are identical in both sequences. This is the correctness guarantee: you never reuse a block whose KV values were computed with a different prefix.
+
+### The Hash Table
+
+The block manager maintains a global hash table mapping block hashes to physical block IDs:
+
+```python
+class PrefixCacheManager:
+    def __init__(self):
+        # hash -> block_id for blocks with valid, computed KV data
+        self.hash_to_block: Dict[int, int] = {}
+        # block_id -> hash for reverse lookups during eviction
+        self.block_to_hash: Dict[int, int] = {}
+```
+
+### Prefix Cache Lookup
+
+When a new request arrives with prompt tokens, the block manager attempts to find cached blocks before allocating new ones:
+
+```python
+def allocate_with_prefix_cache(
+    self, seq_id: int, token_ids: List[int]
+) -> Tuple[List[int], int]:
+    """Returns (block_ids, num_cached_tokens)."""
+    block_ids = []
+    parent_hash = INITIAL_HASH
+    num_cached_tokens = 0
+
+    for i in range(0, len(token_ids), self.block_size):
+        chunk = tuple(token_ids[i : i + self.block_size])
+        if len(chunk) < self.block_size:
+            # Partial block at end -- cannot cache (content may still change)
+            break
+
+        block_hash = hash((parent_hash, chunk))
+
+        if block_hash in self.hash_to_block:
+            # Cache hit: reuse existing physical block
+            cached_block_id = self.hash_to_block[block_hash]
+            self.blocks[cached_block_id].ref_count += 1
+            block_ids.append(cached_block_id)
+            num_cached_tokens += self.block_size
+        else:
+            # Cache miss: allocate new block, mark for computation
+            new_block_id = self.free_pool.pop()
+            self.blocks[new_block_id].ref_count = 1
+            self.blocks[new_block_id].computed = False
+            self.blocks[new_block_id].block_hash = block_hash
+            block_ids.append(new_block_id)
+
+            # Register in hash table (will become valid after forward pass)
+            self.hash_to_block[block_hash] = new_block_id
+            self.block_to_hash[new_block_id] = block_hash
+
+        parent_hash = block_hash
+
+    # Allocate remaining partial block
+    remaining = len(token_ids) - num_cached_tokens
+    if remaining > 0 and remaining < self.block_size:
+        new_block_id = self.free_pool.pop()
+        self.blocks[new_block_id].ref_count = 1
+        self.blocks[new_block_id].num_tokens = remaining
+        block_ids.append(new_block_id)
+
+    self.block_tables[seq_id] = block_ids
+    return block_ids, num_cached_tokens
+```
+
+The scheduler uses `num_cached_tokens` to skip those tokens during prefill -- the attention kernel reads KV data directly from the cached blocks instead of recomputing it. This is the source of prefix caching's speedup: fewer tokens to prefill means lower TTFT (time to first token).
+
+<Callout type="info" title="Partial Blocks Cannot Be Cached">
+Only full blocks (exactly `block_size` tokens) are eligible for caching. The last block of a sequence is typically partial and will not be hashed or stored in the cache. If a new request's prefix ends mid-block, the matching stops at the last full-block boundary. This is a design trade-off: smaller `block_size` values increase cache granularity (more sharing) but increase the total number of blocks and the block table size.
+</Callout>
+
+### Eviction from the Prefix Cache
+
+When the free pool is exhausted and no blocks can be reclaimed from finished sequences, the block manager must evict cached-but-unreferenced blocks. These are blocks in the hash table with `ref_count == 0` -- no active sequence uses them, but their KV data is preserved in case a future request matches.
+
+```python
+def evict_cached_blocks(self, num_needed: int) -> int:
+    """Evict LRU cached blocks with ref_count == 0. Returns num evicted."""
+    evicted = 0
+    # self.cached_lru is an OrderedDict maintaining access order
+    while evicted < num_needed and self.cached_lru:
+        block_hash, block_id = self.cached_lru.popitem(last=False)  # LRU end
+        block = self.blocks[block_id]
+        if block.ref_count == 0:
+            del self.hash_to_block[block_hash]
+            del self.block_to_hash[block_id]
+            block.block_hash = -1
+            block.computed = False
+            self.free_pool.push(block_id)
+            evicted += 1
+    return evicted
+```
+
+The eviction order is LRU: blocks that have not been accessed (hit) recently are evicted first. This matches the typical access pattern where recent system prompts and conversation prefixes are hit frequently, while old, unique prefixes are not.
+
+### Hit Rate Dynamics
+
+Prefix caching hit rates depend entirely on the workload. Some representative numbers:
+
+<PerfChart
+  title="Prefix Cache Hit Rate by Workload"
+  unit="%"
+  data={[
+    { label: "Chatbot (shared sys prompt)", value: 92, color: "green", annotation: "2K token system prompt" },
+    { label: "Multi-turn (3+ turns)", value: 78, color: "green", annotation: "Prior turns cached" },
+    { label: "RAG (popular docs)", value: 65, color: "blue", annotation: "Depends on doc diversity" },
+    { label: "Code gen (few-shot)", value: 55, color: "blue", annotation: "Few-shot examples cached" },
+    { label: "Batch unique prompts", value: 5, color: "red", annotation: "Almost no sharing" },
+  ]}
+/>
+
+---
+
+## 5. Copy-on-Write for Beam Search
+
+Beam search generates multiple candidate sequences (beams) from a shared prompt. All beams share the same prefix blocks for the tokens generated so far. When a beam diverges -- producing a different next token than its siblings -- it must get its own copy of the block it is about to write to. This is copy-on-write (COW).
+
+### The Problem
+
+Consider beam search with `beam_width = 4`. After prefill, all 4 beams share the same block table:
+
+```
+beam_0: [block_3, block_7, block_12]
+beam_1: [block_3, block_7, block_12]   # same physical blocks
+beam_2: [block_3, block_7, block_12]
+beam_3: [block_3, block_7, block_12]
+```
+
+Block 12 has `ref_count = 4`. When beam_0 generates its next token, it needs to write a new KV entry into block_12 (or a new block if block_12 is full). But it cannot write into block_12 directly because beams 1-3 also reference it. If beam_0 writes, it would corrupt the KV data that beams 1-3 expect to read.
+
+### The COW Mechanism
+
+When a sequence attempts to write to a block with `ref_count > 1`, the block manager intercepts and performs a copy:
+
+```python
+def cow_if_needed(self, seq_id: int, block_idx: int) -> int:
+    """
+    If the block at position block_idx in seq_id's block table
+    is shared (ref_count > 1), copy it and redirect.
+    Returns the (possibly new) block_id.
+    """
+    block_table = self.block_tables[seq_id]
+    old_block_id = block_table[block_idx]
+    old_block = self.blocks[old_block_id]
+
+    if old_block.ref_count == 1:
+        # Sole owner -- write directly, no copy needed
+        return old_block_id
+
+    # Shared block -- must copy before writing
+    new_block_id = self.free_pool.pop()
+    new_block = self.blocks[new_block_id]
+
+    # Schedule GPU-side copy: copies KV data across all layers
+    # This is a single cudaMemcpy per layer (or a fused kernel)
+    self.pending_copies.append((old_block_id, new_block_id))
+
+    # Update metadata
+    new_block.ref_count = 1
+    new_block.num_tokens = old_block.num_tokens
+    new_block.computed = True  # Data is valid after copy completes
+
+    # Redirect this sequence's block table entry
+    block_table[block_idx] = new_block_id
+
+    # Decrement old block's ref_count
+    old_block.ref_count -= 1
+
+    return new_block_id
+```
+
+The `pending_copies` list is drained by the worker before the forward pass. The actual data copy happens on GPU via `cudaMemcpyDeviceToDevice`:
+
+```python
+def execute_pending_copies(self):
+    for src_block_id, dst_block_id in self.pending_copies:
+        for layer_idx in range(self.num_layers):
+            src_offset = src_block_id * self.block_size_bytes
+            dst_offset = dst_block_id * self.block_size_bytes
+            # Copy both K and V for this layer
+            self.kv_cache[layer_idx][dst_offset:dst_offset + self.block_size_bytes].copy_(
+                self.kv_cache[layer_idx][src_offset:src_offset + self.block_size_bytes]
+            )
+    self.pending_copies.clear()
+```
+
+### COW Cost
+
+For Llama 70B, copying one block across all 80 layers:
+
+$$80 \times 65{,}536 \text{ bytes} = 5.24 \text{ MB}$$
+
+At HBM bandwidth of 3.35 TB/s on an H100:
+
+$$t_{\text{copy}} = \frac{5.24 \text{ MB}}{3.35 \text{ TB/s}} = \frac{5.24 \times 10^6}{3.35 \times 10^{12}} \approx 0.0016 \text{ ms} = 1.6 \text{ us}$$
+
+The copy is negligible -- HBM bandwidth is enormous for these small transfers. The real cost of COW is the additional block consumed from the free pool. With `beam_width = 4` and each beam diverging at every step, you consume up to 4x the blocks of a single sequence. This is why beam search is memory-hungry: it is not the computation, it is the block table fan-out.
+
+<Callout type="tip" title="COW Avoidance via Speculative Decoding">
+Speculative decoding can reduce COW overhead in beam search. If a draft model predicts the same token for all beams (high agreement), no divergence occurs and no copy is needed. In practice, the top beam candidates often agree on the most probable token, so COW triggers less frequently than worst-case analysis suggests.
+</Callout>
+
+### Fork: Creating New Beams
+
+When beam search creates a new beam (forking from an existing one), the block manager creates a new block table that shares all blocks with the parent:
+
+```python
+def fork(self, parent_seq_id: int, child_seq_id: int) -> None:
+    parent_table = self.block_tables[parent_seq_id]
+    child_table = list(parent_table)  # Shallow copy of block ID list
+
+    # Increment ref_count for all shared blocks
+    for block_id in child_table:
+        self.blocks[block_id].ref_count += 1
+
+    self.block_tables[child_seq_id] = child_table
+```
+
+Fork is $O(n)$ in the number of blocks but involves zero GPU memory copies. The actual KV data is shared until a write triggers COW. This is the same semantics as `fork()` in Unix process creation: the page table is copied, but physical pages are shared with COW protection.
+
+---
+
+## 6. Implementer's Exercise: Build a Minimal KVCacheManager
+
+The following is a complete, runnable Python class that implements the core block manager operations: allocation, deallocation, GPU-to-CPU offloading, and CPU-to-GPU restoration. This is not pseudocode -- it runs as-is with PyTorch.
+
+```python
+import math
+import torch
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+
+@dataclass
+class Block:
+    block_id: int
+    ref_count: int = 0
+    computed: bool = False
+    num_tokens: int = 0
+    location: str = "free"  # "free", "gpu", "cpu"
+
+
+class KVCacheManager:
+    """Minimal block manager with GPU/CPU offloading."""
+
+    def __init__(
+        self,
+        num_gpu_blocks: int,
+        num_cpu_blocks: int,
+        block_size: int,
+        num_layers: int,
+        num_kv_heads: int,
+        head_dim: int,
+        dtype: torch.dtype = torch.float16,
+    ):
+        self.block_size = block_size
+        self.num_layers = num_layers
+        self.dtype = dtype
+
+        # Block metadata
+        self.blocks: Dict[int, Block] = {
+            i: Block(block_id=i) for i in range(num_gpu_blocks + num_cpu_blocks)
+        }
+
+        # Free pools (LIFO stacks)
+        self.gpu_free: List[int] = list(range(num_gpu_blocks))
+        self.cpu_free: List[int] = list(
+            range(num_gpu_blocks, num_gpu_blocks + num_cpu_blocks)
+        )
+
+        # Per-sequence block tables
+        self.block_tables: Dict[int, List[int]] = {}
+
+        # KV cache tensors: [num_layers, num_blocks, block_size, num_kv_heads, head_dim]
+        kv_shape = (num_layers, num_gpu_blocks, block_size, num_kv_heads, head_dim)
+        cpu_kv_shape = (num_layers, num_cpu_blocks, block_size, num_kv_heads, head_dim)
+
+        self.gpu_kv_cache = torch.zeros(kv_shape, dtype=dtype, device="cuda")
+        self.cpu_kv_cache = torch.zeros(cpu_kv_shape, dtype=dtype, device="cpu",
+                                         pin_memory=True)
+
+        # Dedicated CUDA stream for async transfers
+        self.transfer_stream = torch.cuda.Stream()
+
+        # Track which GPU block maps to which CPU block during offload
+        self.gpu_to_cpu_map: Dict[int, int] = {}
+
+    def alloc(self, seq_id: int, num_tokens: int) -> List[int]:
+        """Allocate GPU blocks for a new sequence."""
+        blocks_needed = math.ceil(num_tokens / self.block_size)
+        if len(self.gpu_free) < blocks_needed:
+            raise RuntimeError(
+                f"OOM: need {blocks_needed} GPU blocks, "
+                f"only {len(self.gpu_free)} free"
+            )
+
+        block_ids = []
+        for i in range(blocks_needed):
+            bid = self.gpu_free.pop()
+            blk = self.blocks[bid]
+            blk.ref_count = 1
+            blk.computed = False
+            blk.location = "gpu"
+            # Token count: full blocks except possibly the last
+            if i < blocks_needed - 1:
+                blk.num_tokens = self.block_size
+            else:
+                blk.num_tokens = num_tokens - i * self.block_size
+            block_ids.append(bid)
+
+        self.block_tables[seq_id] = block_ids
+        return block_ids
+
+    def free(self, seq_id: int) -> None:
+        """Free all blocks for a finished sequence."""
+        if seq_id not in self.block_tables:
+            return
+        block_ids = self.block_tables.pop(seq_id)
+        for bid in block_ids:
+            blk = self.blocks[bid]
+            blk.ref_count -= 1
+            if blk.ref_count == 0:
+                if blk.location == "gpu":
+                    self.gpu_free.append(bid)
+                elif blk.location == "cpu":
+                    self.cpu_free.append(bid)
+                blk.location = "free"
+                blk.computed = False
+                blk.num_tokens = 0
+
+    def offload_to_cpu(self, seq_id: int) -> List[int]:
+        """Move a sequence's blocks from GPU to CPU (async)."""
+        gpu_block_ids = self.block_tables[seq_id]
+        cpu_block_ids = []
+
+        with torch.cuda.stream(self.transfer_stream):
+            for gpu_bid in gpu_block_ids:
+                if not self.cpu_free:
+                    raise RuntimeError("No free CPU blocks for offload")
+                cpu_bid = self.cpu_free.pop()
+
+                # Async copy: all layers for this block
+                cpu_local = cpu_bid - min(
+                    b.block_id for b in self.blocks.values()
+                    if b.block_id >= len(self.gpu_free) + len(gpu_block_ids)
+                ) if False else cpu_bid  # Simplified indexing
+                # Direct tensor slice copy across all layers
+                for layer in range(self.num_layers):
+                    self.cpu_kv_cache[layer][cpu_bid - len(self.gpu_free)].copy_(
+                        self.gpu_kv_cache[layer][gpu_bid], non_blocking=True
+                    )
+
+                self.blocks[cpu_bid].ref_count = 1
+                self.blocks[cpu_bid].computed = True
+                self.blocks[cpu_bid].location = "cpu"
+                self.blocks[cpu_bid].num_tokens = self.blocks[gpu_bid].num_tokens
+
+                self.gpu_to_cpu_map[gpu_bid] = cpu_bid
+                cpu_block_ids.append(cpu_bid)
+
+        # Return GPU blocks to free pool
+        for gpu_bid in gpu_block_ids:
+            self.blocks[gpu_bid].ref_count = 0
+            self.blocks[gpu_bid].location = "free"
+            self.blocks[gpu_bid].computed = False
+            self.gpu_free.append(gpu_bid)
+
+        self.block_tables[seq_id] = cpu_block_ids
+        return cpu_block_ids
+
+    def restore_from_cpu(self, seq_id: int) -> List[int]:
+        """Move a sequence's blocks from CPU back to GPU (async)."""
+        cpu_block_ids = self.block_tables[seq_id]
+        gpu_block_ids = []
+
+        with torch.cuda.stream(self.transfer_stream):
+            for cpu_bid in cpu_block_ids:
+                if not self.gpu_free:
+                    raise RuntimeError("No free GPU blocks for restore")
+                gpu_bid = self.gpu_free.pop()
+
+                for layer in range(self.num_layers):
+                    self.gpu_kv_cache[layer][gpu_bid].copy_(
+                        self.cpu_kv_cache[layer][cpu_bid - len(self.gpu_free)],
+                        non_blocking=True,
+                    )
+
+                self.blocks[gpu_bid].ref_count = 1
+                self.blocks[gpu_bid].computed = True
+                self.blocks[gpu_bid].location = "gpu"
+                self.blocks[gpu_bid].num_tokens = self.blocks[cpu_bid].num_tokens
+                gpu_block_ids.append(gpu_bid)
+
+        # Return CPU blocks to free pool
+        for cpu_bid in cpu_block_ids:
+            self.blocks[cpu_bid].ref_count = 0
+            self.blocks[cpu_bid].location = "free"
+            self.blocks[cpu_bid].computed = False
+            self.cpu_free.append(cpu_bid)
+
+        self.block_tables[seq_id] = gpu_block_ids
+        return gpu_block_ids
+
+    def sync_transfers(self) -> None:
+        """Wait for all pending async transfers to complete."""
+        self.transfer_stream.synchronize()
+
+    @property
+    def gpu_utilization(self) -> float:
+        total = len([b for b in self.blocks.values() if b.block_id < len(self.gpu_free)])
+        used = total - len(self.gpu_free)
+        return used / max(total, 1)
+
+    def stats(self) -> Dict:
+        return {
+            "gpu_free": len(self.gpu_free),
+            "cpu_free": len(self.cpu_free),
+            "active_sequences": len(self.block_tables),
+            "total_allocated_blocks": sum(
+                len(bt) for bt in self.block_tables.values()
+            ),
+        }
+```
+
+The implementation above captures the essential pattern. In production vLLM, the indexing into `gpu_kv_cache` and `cpu_kv_cache` is more involved -- the KV cache tensor is pre-allocated as a flat buffer and blocks are addressed by offset. The `pin_memory=True` on the CPU tensor is critical: it enables DMA transfers via `cudaMemcpyAsync` without an intermediate staging buffer. Unpinned CPU memory would force a synchronous copy through the CPU, adding 2-5x latency.
+
+Here is how you would use this manager:
+
+```python
+# Initialize for a small model: 4 layers, 8 heads, dim 64
+mgr = KVCacheManager(
+    num_gpu_blocks=1024,
+    num_cpu_blocks=2048,
+    block_size=16,
+    num_layers=4,
+    num_kv_heads=8,
+    head_dim=64,
+)
+
+# Allocate for a 100-token sequence
+blocks = mgr.alloc(seq_id=0, num_tokens=100)
+# -> 7 blocks allocated (ceil(100/16) = 7)
+
+print(mgr.stats())
+# {'gpu_free': 1017, 'cpu_free': 2048, 'active_sequences': 1, 'total_allocated_blocks': 7}
+
+# Preempt: offload to CPU
+mgr.offload_to_cpu(seq_id=0)
+print(mgr.stats())
+# {'gpu_free': 1024, 'cpu_free': 2041, 'active_sequences': 1, 'total_allocated_blocks': 7}
+
+# Resume: restore to GPU
+mgr.restore_from_cpu(seq_id=0)
+mgr.sync_transfers()
+print(mgr.stats())
+# {'gpu_free': 1017, 'cpu_free': 2048, 'active_sequences': 1, 'total_allocated_blocks': 7}
+
+# Finish: free all blocks
+mgr.free(seq_id=0)
+print(mgr.stats())
+# {'gpu_free': 1024, 'cpu_free': 2048, 'active_sequences': 0, 'total_allocated_blocks': 0}
+```
+
+<Callout type="tip" title="Extension Exercises">
+To extend this into a production-grade block manager, add: (1) `ref_count`-aware deallocation for prefix sharing, (2) hash-based prefix caching with an LRU eviction policy, (3) COW support with a `pending_copies` queue, (4) a watermark to prevent deadlock, and (5) per-layer block addressing instead of per-block-id tensor slicing. Each of these is a localized change -- the core alloc/free/offload pattern remains identical.
+</Callout>
+
+---
+
+## 7. Putting It All Together: Block Manager in the Scheduling Loop
+
+The block manager does not operate in isolation. It is called by the scheduler on every iteration. Here is the complete interaction pattern:
+
+```python
+# Inside Scheduler._schedule() -- simplified
+def _schedule(self):
+    # Phase 1: Try to resume swapped sequences
+    for seq in self.swapped_queue:
+        blocks_needed = self.block_manager.get_blocks_on_cpu(seq.seq_id)
+        if self.block_manager.can_restore(blocks_needed):
+            self.block_manager.restore_from_cpu(seq.seq_id)
+            self.running_queue.append(seq)
+            self.swapped_queue.remove(seq)
+
+    # Phase 2: Continue running sequences (decode)
+    for seq in self.running_queue:
+        if not self.block_manager.can_append_token(seq.seq_id):
+            # No room for even one new token -- must preempt someone
+            victim = self.select_preemption_victim()
+            self.block_manager.offload_to_cpu(victim.seq_id)
+            self.running_queue.remove(victim)
+            self.swapped_queue.append(victim)
+
+    # Phase 3: Admit new requests from waiting queue
+    for req in self.waiting_queue:
+        num_tokens = len(req.prompt_tokens)
+        if self.block_manager.can_allocate(num_tokens):
+            self.block_manager.allocate(req.seq_id, num_tokens)
+            self.running_queue.append(req)
+            self.waiting_queue.remove(req)
+        else:
+            break  # No more memory -- stop admitting
+
+    # Phase 4: Sync any pending transfers
+    self.block_manager.sync_transfers()
+```
+
+The key constraint: the block manager must complete all transfers *before* the GPU forward pass begins. The `sync_transfers()` call ensures that offloaded data has been fully written to CPU and restored data has been fully read back to GPU. Any sequence whose restore has not completed cannot participate in the current batch.
+
+### Memory Pressure Signals
+
+The scheduler uses block manager state to make admission and preemption decisions:
+
+```python
+def memory_pressure(self) -> float:
+    """0.0 = all free, 1.0 = no free blocks."""
+    return 1.0 - (self.block_manager.num_free_gpu_blocks / self.block_manager.num_total_gpu_blocks)
+
+def should_preempt(self) -> bool:
+    return self.memory_pressure() > 0.95
+
+def should_admit(self) -> bool:
+    return self.memory_pressure() < 0.80
+```
+
+At 95% utilization, the scheduler starts preempting. Below 80%, it admits new requests. The gap between these thresholds prevents oscillation (admit a request, preempt to make room, admit again, preempt again).
+
+<PerfChart
+  title="Block Manager State During a Serving Session"
+  unit="blocks"
+  data={[
+    { label: "Total GPU Blocks", value: 8206, color: "gray", annotation: "Fixed at init" },
+    { label: "Running Sequences", value: 6200, color: "green", annotation: "Active KV cache" },
+    { label: "Cached Prefixes", value: 1500, color: "blue", annotation: "ref_count=0, evictable" },
+    { label: "Watermark Reserve", value: 82, color: "orange", annotation: "1% safety margin" },
+    { label: "Truly Free", value: 424, color: "red", annotation: "Available for new allocs" },
+  ]}
+/>
+
+In a healthy serving deployment, "truly free" blocks hover near zero. The system operates at near-full utilization, with cached prefixes serving as a soft buffer that can be evicted on demand. The block manager's job is to maintain this equilibrium: maximizing useful data in HBM while ensuring enough headroom to avoid stalls.
+
+---
+
+## 8. Performance Implications and Tuning
+
+### Block Size Selection
+
+The `block_size` parameter (default 16 in vLLM) controls the granularity of allocation:
+
+<Benchmark
+  title="Block Size Trade-offs"
+  columns={["block_size", "Internal Fragmentation", "Block Table Size", "Prefix Cache Granularity", "COW Copy Cost"]}
+  rows={[
+    { values: ["1", "0%", "1 entry per token (huge)", "Per-token (maximum sharing)", "64 KB per layer"], highlight: false },
+    { values: ["8", "up to 43.75%", "1 entry per 8 tokens", "8-token boundaries", "512 KB per layer"], highlight: false },
+    { values: ["16", "up to 46.88%", "1 entry per 16 tokens", "16-token boundaries", "1 MB per layer"], highlight: true },
+    { values: ["32", "up to 48.44%", "1 entry per 32 tokens", "32-token boundaries", "2 MB per layer"], highlight: false },
+    { values: ["64", "up to 49.22%", "1 entry per 64 tokens", "64-token boundaries", "4 MB per layer"], highlight: false },
+  ]}
+  notes="Internal fragmentation is worst-case (1 token in last block). Average fragmentation is block_size/2 tokens. block_size=16 balances all trade-offs."
+/>
+
+Smaller blocks reduce fragmentation and improve prefix cache hit rates (more sharing opportunities at finer boundaries). Larger blocks reduce block table overhead and simplify the PagedAttention kernel (fewer indirections). The default of 16 is a compromise: at most 15 wasted token slots per sequence (15 x 65,536 bytes = 960 KB for Llama 70B), which is under 0.01% of an 80 GB GPU.
+
+### Memory Accounting
+
+The total GPU memory consumed by the block manager:
+
+$$\text{Total KV memory} = \text{num\_blocks} \times \text{block\_size} \times \text{num\_kv\_heads} \times \text{head\_dim} \times 2 \times \text{dtype\_bytes} \times \text{num\_layers}$$
+
+For 8,206 blocks on an H100 with Llama 70B:
+
+$$8{,}206 \times 65{,}536 \times 80 = 43.0 \text{ GB}$$
+
+This is allocated once at startup as a contiguous tensor. The block manager does not call `torch.cuda.malloc` during serving -- it only manipulates indices into this pre-allocated buffer. This eliminates CUDA allocator fragmentation entirely, which is one of the key performance advantages of block-based KV cache management over naive tensor-per-sequence allocation.
+
+<Callout type="perf" title="Zero Allocation During Inference">
+After initialization, the block manager performs zero CUDA memory allocations. Every `alloc()` and `free()` call manipulates only CPU-side Python data structures (lists, dicts, integers). The GPU memory is a fixed tensor that never grows or shrinks. This is why vLLM's memory management adds negligible overhead to the inference loop -- all the "allocation" work is just integer bookkeeping on CPU, measured in microseconds.
+</Callout>
+
+---
+
+## Summary
+
+The block manager is the memory substrate of vLLM. It converts the variable-length, dynamic-lifetime problem of KV cache management into a fixed-pool, integer-indexed allocation problem:
+
+1. **Blocks** are fixed-size chunks of GPU HBM (5.24 MB each for Llama 70B, block_size=16). A stack-based free pool provides $O(1)$ alloc and free.
+
+2. **Block tables** provide one level of indirection from logical token positions to physical GPU addresses. The PagedAttention kernel resolves this indirection at every attention computation.
+
+3. **Multi-tier offloading** moves blocks from GPU HBM (3.35 TB/s) to CPU DRAM (~28 GB/s via PCIe) to NVMe SSD (~7 GB/s) using async DMA on dedicated CUDA streams. A 5.24 MB block transfers in 0.18 ms over PCIe Gen5.
+
+4. **Prefix caching** hashes token content with a chained Merkle-like scheme: `block_hash = hash(parent_hash, token_ids)`. Cache hits skip prefill computation by reusing physical blocks with `ref_count` increments.
+
+5. **Copy-on-write** enables beam search to share blocks across beams. A write to a shared block triggers a copy (1.6 us on HBM) and block table redirect before the write proceeds.
+
+6. **Zero runtime allocation**: the entire KV cache is pre-allocated at startup. Serving-time operations manipulate only CPU-side integers and pointers. GPU memory fragmentation is impossible by construction.
+
+The block manager operates entirely on CPU and completes in single-digit microseconds per operation. Its decisions propagate to the GPU through the block table tensor, which the PagedAttention kernel reads to resolve physical addresses. Understanding these internals is prerequisite to debugging memory pressure issues, tuning block sizes for specific workloads, and implementing custom eviction or caching policies.

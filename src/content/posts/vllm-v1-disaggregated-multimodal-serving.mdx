@@ -1,0 +1,1013 @@
+---
+title: "vLLM v1 Disaggregated Serving: The E/P/D/G Pipeline and Multimodal-First Architecture"
+author: "stanley-phoong"
+description: "How vLLM v1's architecture handles disaggregated encoding, prefill, decode, and generation phases. The OmniConnector for routing video/image/audio prompts differently from text, native CFG with companion requests, and the unified scheduler that treats all modalities as first-class citizens."
+publishDate: 2025-03-22
+category: vllm
+tags: [vllm-v1, disaggregated, multimodal, omniserve, cfg, video, encoding, pipeline]
+difficulty: expert
+readingTime: 32
+draft: false
+featured: true
+series: "vLLM v1 & Omni Internals"
+seriesOrder: 2
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+import MemoryLayout from '@/components/mdx/MemoryLayout.astro';
+
+vLLM v0 had two phases: prefill and decode. That was sufficient when the only input modality was text -- integer token IDs mapped to embedding vectors, run through transformer layers, and sampled autoregressively. vLLM v1 adds two more phases -- encoding and generation -- because multimodal inputs break the two-phase model. A 30-frame video clip at 256 patches per frame produces 7,680 visual tokens, each requiring a forward pass through a vision transformer before it ever touches the LLM. That encoding step has different compute characteristics, different memory requirements, and different optimal hardware compared to the LLM prefill that follows. Collapsing them into a single "prefill" phase wastes resources.
+
+This post covers the four-phase E/P/D/G pipeline, how the unified scheduler accounts for heterogeneous token costs, the KV cache implications of multimodal inputs that can exceed text KV usage by 100x, the inter-phase transfer mechanics, Classifier-Free Guidance via companion requests, and the data structures that hold a multimodal request together from ingestion to output.
+
+## The E/P/D/G Pipeline
+
+vLLM v1 decomposes inference into four discrete phases. Each phase can target a different GPU pool, enabling hardware specialization per workload type.
+
+<MemoryLayout
+  title="vLLM v1 Four-Phase Pipeline"
+  layout={[
+    { name: "E: Encode", power: "Vision/audio encoder forward pass", state: "Input: raw pixels/audio | Output: [num_tokens, d_model] embeddings", color: "#3b82f6" },
+    { name: "P: Process (Prefill)", power: "LLM prefill over all modality embeddings", state: "Input: merged token embeddings | Output: KV cache + first token logits", color: "#a371f7" },
+    { name: "D: Decode", power: "Autoregressive token generation", state: "Input: previous token | Output: next token logits (per step)", color: "#10b981" },
+    { name: "G: Generate (Post-process)", power: "Detokenization, stop condition checks, streaming", state: "Input: token IDs | Output: text/structured response", color: "#f59e0b" },
+  ]}
+/>
+
+### E Phase: Encoding
+
+The encode phase handles non-text modalities. Each modality has its own encoder architecture:
+
+- **Images**: A ViT (Vision Transformer) processes the image into patch embeddings. A 448x448 image at patch size 14 yields $(448/14)^2 = 1024$ patches. Each patch becomes a $d_{model}$-dimensional vector.
+- **Video**: Each frame is processed by the same ViT, then a temporal aggregation module (pooling, 3D convolution, or learned temporal attention) compresses across frames. 30 frames at 256 patches each = 7,680 raw patches. Temporal aggregation may reduce this to 3,840 or fewer tokens depending on the compression ratio.
+- **Audio**: A Whisper-style encoder processes mel spectrograms into chunk embeddings. 30 seconds of audio at 25ms chunks = 1,200 audio tokens.
+
+The encode phase is compute-bound in the same way LLM prefill is: large batch dimensions through transformer layers. But the model is different (ViT vs. LLM), the weight sizes are different (ViT-L is ~300M parameters vs. a 70B LLM), and the optimal GPU configuration is different.
+
+```python
+class EncodePhase:
+    """Runs modality-specific encoders on dedicated encoder GPUs."""
+
+    def __init__(self, vision_encoder: nn.Module, audio_encoder: nn.Module):
+        self.vision_encoder = vision_encoder   # e.g., SigLIP, InternViT
+        self.audio_encoder = audio_encoder     # e.g., Whisper encoder
+
+    def encode_image(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """
+        pixel_values: [batch, channels, height, width]
+        Returns: [batch, num_patches, d_model]
+
+        For a 448x448 image with patch_size=14:
+          num_patches = (448 // 14) ** 2 = 1024
+          output shape: [1, 1024, 4096]
+        """
+        with torch.no_grad():
+            embeddings = self.vision_encoder(pixel_values)
+        return embeddings  # [B, 1024, 4096] for ViT-L/14 projected to d=4096
+
+    def encode_video(self, frames: torch.Tensor) -> torch.Tensor:
+        """
+        frames: [batch, num_frames, channels, height, width]
+        Returns: [batch, num_visual_tokens, d_model]
+
+        30 frames, 256 patches each -> 7680 raw patch tokens
+        After temporal pooling (2x compression): 3840 tokens
+        """
+        B, T, C, H, W = frames.shape
+        # Encode each frame independently
+        flat_frames = frames.view(B * T, C, H, W)
+        patch_embeds = self.vision_encoder(flat_frames)  # [B*T, num_patches, d]
+        # Reshape: [B, T, num_patches, d]
+        _, N, D = patch_embeds.shape
+        patch_embeds = patch_embeds.view(B, T, N, D)
+        # Temporal aggregation: reduce T dimension
+        visual_tokens = self.temporal_pool(patch_embeds)  # [B, T*N//compress, D]
+        return visual_tokens
+
+    def encode_audio(self, mel_spectrogram: torch.Tensor) -> torch.Tensor:
+        """
+        mel_spectrogram: [batch, n_mels, time_steps]
+        Returns: [batch, num_audio_tokens, d_model]
+
+        30s audio at 16kHz -> 480,000 samples -> 1500 mel frames
+        Whisper encoder with 2x downsampling -> 750 audio tokens
+        """
+        return self.audio_encoder(mel_spectrogram)
+```
+
+The output of every encoder is the same shape: `[batch, num_tokens, d_model]`. This uniformity is the design principle that makes the rest of the pipeline modality-agnostic. Once encoding completes, the downstream LLM cannot distinguish whether a token originated from text, image, video, or audio -- they are all $d_{model}$-dimensional vectors.
+
+### P Phase: Process (Prefill)
+
+The process phase runs the LLM's prefill pass over the full merged sequence. At this point, text token embeddings (from the LLM's embedding table) and encoder-produced embeddings (from the E phase) are concatenated into a single sequence:
+
+```python
+def merge_multimodal_embeddings(
+    text_token_ids: torch.Tensor,       # [seq_len_text]
+    image_embeddings: torch.Tensor,      # [num_image_tokens, d_model]
+    video_embeddings: torch.Tensor,      # [num_video_tokens, d_model]
+    audio_embeddings: torch.Tensor,      # [num_audio_tokens, d_model]
+    placeholder_positions: dict,         # {modality: list of insertion indices}
+    embedding_table: nn.Embedding,
+) -> torch.Tensor:
+    """
+    Merge all modalities into one embedding sequence for the LLM.
+
+    Example sequence after merge:
+    [BOS] [text...] [IMG_0] [IMG_1] ... [IMG_1023] [text...] [VID_0] ... [VID_3839] [text...] [EOS]
+
+    Total tokens = text_tokens + 1024 (image) + 3840 (video) = text + 4864 multimodal
+    """
+    # Embed text tokens through the LLM's embedding table
+    text_embeds = embedding_table(text_token_ids)  # [seq_len_text, d_model]
+
+    # Build merged sequence by inserting multimodal embeddings at placeholder positions
+    merged = torch.zeros(total_seq_len, d_model, device=text_embeds.device)
+    text_ptr = 0
+    for pos in range(total_seq_len):
+        if pos in placeholder_positions['image']:
+            idx = placeholder_positions['image'].index(pos)
+            merged[pos] = image_embeddings[idx]
+        elif pos in placeholder_positions['video']:
+            idx = placeholder_positions['video'].index(pos)
+            merged[pos] = video_embeddings[idx]
+        elif pos in placeholder_positions['audio']:
+            idx = placeholder_positions['audio'].index(pos)
+            merged[pos] = audio_embeddings[idx]
+        else:
+            merged[pos] = text_embeds[text_ptr]
+            text_ptr += 1
+
+    return merged  # [total_seq_len, d_model]
+```
+
+The prefill pass then processes this merged sequence through all LLM layers, producing the KV cache and the first output token logits. The total prefill cost is proportional to the merged sequence length -- and for multimodal inputs, that length is dominated by the visual/audio tokens.
+
+### D Phase: Decode
+
+The decode phase is identical to standard text-only decode: one token per step per request, reading the KV cache and appending a new KV entry. The key difference for multimodal requests is the KV cache is much larger because it includes entries for all the visual/audio tokens from prefill.
+
+### G Phase: Generate (Post-process)
+
+The generation phase handles detokenization, streaming output assembly, stop condition evaluation, and structured output validation (JSON schema conformance, grammar-constrained generation). This phase is CPU-bound and runs on the host, not the GPU.
+
+<Callout type="perf" title="Phase-Optimal Hardware">
+Each phase has different optimal hardware. The E phase benefits from GPUs with high FLOPS-per-dollar for vision encoders (mid-tier GPUs work well since ViTs are small). The P phase needs high-memory GPUs for long merged sequences. The D phase needs high memory bandwidth for KV cache reads. The G phase is pure CPU. Running all four on the same A100 wastes 75% of the hardware 75% of the time.
+</Callout>
+
+### Concrete Pipeline Trace: Video Prompt
+
+Walk through a concrete request: a user sends a 30-frame video clip (720p, 30fps = 1 second of video) with a 50-token text prompt: "Describe what happens in this video."
+
+<Benchmark
+  title="Pipeline Trace: 30-Frame Video + 50-Token Text Prompt"
+  columns={["Phase", "Input", "Compute", "Output", "Time (A100)"]}
+  rows={[
+    { values: ["E: Encode", "30 frames x 256 patches", "ViT-L forward pass, temporal pool", "3,840 visual tokens x 4096d", "18ms"], highlight: false },
+    { values: ["Transfer E->P", "3,840 x 4096 x 2B (FP16)", "62 MB over NVLink", "Embeddings on LLM GPU", "0.2ms"], highlight: false },
+    { values: ["P: Prefill", "3,840 visual + 50 text = 3,890 tokens", "Full LLM forward pass (70B)", "KV cache + first token logits", "145ms"], highlight: true },
+    { values: ["D: Decode (per step)", "1 token + KV read", "LLM forward, 1 token batch dim", "Next token logits", "28ms"], highlight: false },
+    { values: ["G: Generate", "Token ID", "Detokenize, stream, stop check", "UTF-8 text chunk", "0.1ms"], highlight: false },
+  ]}
+  notes="Timings for Llama 70B on A100 80GB SXM, NVLink interconnect between encoder and LLM GPUs"
+/>
+
+Total time to first token (TTFT): 18ms (encode) + 0.2ms (transfer) + 145ms (prefill) = 163.2ms. Each subsequent token: 28ms. For a 200-token response, total latency is $163.2 + (200 \times 28) = 5,763$ ms.
+
+Compare this to a text-only request with 3,890 tokens of text: TTFT would be ~145ms (just prefill, no encode phase). The encode phase adds 18.2ms -- about 12.5% overhead. The cost is not the encoding itself; it is the 3,840 extra KV cache entries that inflate every subsequent decode step.
+
+## Multimodal Token Handling
+
+The unification point for all modalities is the embedding space: every token, regardless of origin, becomes a vector of shape `[d_model]` before entering the transformer. But the path to that vector differs drastically per modality.
+
+### Text Tokens
+
+Text is the simplest case. The tokenizer converts a string into integer IDs. The embedding table maps each ID to a learned $d_{model}$-dimensional vector:
+
+```python
+# Text token pipeline
+text = "Describe what happens in this video."
+token_ids = tokenizer.encode(text)  # [15496, 644, 8741, 287, 428, 2008, 13]
+# 7 tokens -> embedding lookup -> [7, 4096]
+embeddings = embedding_table(torch.tensor(token_ids))  # nn.Embedding(vocab_size, 4096)
+```
+
+Cost: one embedding lookup per token. This is a single gather operation from a `[vocab_size, d_model]` table. For a 32K vocabulary at d=4096 in FP16, the table is $32768 \times 4096 \times 2 = 256$ MB. The lookup itself is negligible -- a few microseconds for any reasonable token count.
+
+### Image Tokens
+
+Images require a full forward pass through a vision encoder:
+
+```python
+# Image token pipeline
+image = load_image("photo.jpg")                  # PIL Image
+pixel_values = image_processor(image)             # [1, 3, 448, 448] normalized tensor
+patch_embeddings = vision_encoder(pixel_values)   # ViT forward pass
+# Output: [1, 1024, 1024] (ViT hidden dim)
+projected = projection_layer(patch_embeddings)    # Linear(1024, 4096)
+# Output: [1, 1024, 4096] -- matches LLM d_model
+```
+
+Cost per image: one ViT forward pass. For ViT-L/14 (304M parameters), a single 448x448 image takes ~4ms on an A100. The 1,024 output tokens each carry $4096 \times 2 = 8,192$ bytes in FP16, so the total embedding tensor is $1024 \times 8192 = 8$ MB.
+
+### Video Tokens
+
+Video multiplies the image cost by the frame count, then applies temporal aggregation:
+
+```python
+# Video token pipeline
+frames = extract_frames(video, fps=1, max_frames=30)  # [30, 3, 224, 224]
+# Encode each frame through ViT
+per_frame = vision_encoder(frames)          # [30, 256, 1024]
+# Reshape to [1, 30, 256, 1024] for temporal processing
+temporal_input = per_frame.unsqueeze(0)
+# Temporal aggregation: 3D avg pooling with stride 2 along time
+pooled = temporal_pool(temporal_input)      # [1, 15, 256, 1024]
+# Flatten spatial+temporal: [1, 3840, 1024]
+flat = pooled.view(1, -1, 1024)
+# Project to LLM dimension
+projected = projection_layer(flat)          # [1, 3840, 4096]
+```
+
+Cost: 30 ViT forward passes (parallelized as a single batch) plus the temporal aggregation. On an A100, the batched ViT pass for 30 frames takes ~15ms. The output is 3,840 tokens at $4096 \times 2 = 8,192$ bytes each: $3840 \times 8192 = 31.5$ MB of embeddings.
+
+### Audio Tokens
+
+Audio uses a specialized encoder (typically Whisper-style):
+
+```python
+# Audio token pipeline
+waveform = load_audio("speech.wav", sr=16000)   # [1, 480000] (30 seconds)
+mel = compute_mel_spectrogram(waveform)          # [1, 80, 3000] (80 mel bins, 3000 frames)
+audio_embeddings = whisper_encoder(mel)          # [1, 1500, 1024] (2x downsampling)
+projected = projection_layer(audio_embeddings)   # [1, 1500, 4096]
+```
+
+Cost: one Whisper encoder forward pass. For Whisper-medium (769M parameters), 30 seconds of audio takes ~12ms on an A100. Output: 1,500 tokens, $1500 \times 8192 = 12.3$ MB.
+
+### The Cost Asymmetry
+
+Here is the critical point: 1 text token is not equivalent to 1 image patch in compute cost. The embedding lookup for a text token costs effectively zero FLOPS. Encoding a single image patch through ViT-L costs approximately:
+
+$$\text{FLOPs per patch} \approx 2 \times \text{params} \times 1 = 2 \times 304 \times 10^6 \div 1024 \approx 594,000 \text{ FLOPs}$$
+
+But that is the per-patch amortized cost. The actual cost is the full ViT forward pass, which is billed once per image regardless of downstream token count. The scheduler must reason about these costs differently.
+
+<Benchmark
+  title="Per-Token Cost by Modality (Amortized)"
+  columns={["Modality", "Tokens Produced", "Encoder FLOPS", "Embed Bytes", "Effective Cost vs. Text"]}
+  rows={[
+    { values: ["Text", "1", "0 (lookup)", "8,192 B", "1x (baseline)"], highlight: false },
+    { values: ["Image (448x448)", "1,024", "~180 GFLOPS (ViT-L)", "8 MB", "~175,000x per image"], highlight: true },
+    { values: ["Video (30 frames)", "3,840", "~5.4 TFLOPS (30x ViT)", "31.5 MB", "~1,400x per token"], highlight: true },
+    { values: ["Audio (30s)", "1,500", "~460 GFLOPS (Whisper-M)", "12.3 MB", "~306,000x per clip"], highlight: false },
+  ]}
+  notes="FLOPS are encoder-only. All modalities incur identical cost during LLM prefill/decode once embedded."
+/>
+
+## The Unified Scheduler
+
+vLLM v1's scheduler must make per-iteration decisions about which requests to admit, and multimodal requests break the simple "count tokens, check budget" heuristic that worked for text-only serving.
+
+### The Problem: Heterogeneous Token Costs
+
+In text-only vLLM, the scheduler budget is straightforward: `max_num_batched_tokens = 8192` means the forward pass processes at most 8,192 tokens. Each decode request costs 1 token; each prefill costs its prompt length. A prefill with 4,000 tokens and 100 decode requests (100 tokens) fits within budget (4,100 total).
+
+Multimodal breaks this because the *encode* cost is not captured by the LLM token budget. Consider two requests arriving simultaneously:
+
+- **Request A**: 500 text tokens (pure text)
+- **Request B**: 50 text tokens + 1 image (1,024 visual tokens after encoding)
+
+In terms of LLM prefill tokens, Request A costs 500 and Request B costs $50 + 1024 = 1074$. But Request B also requires a ViT forward pass that consumes ~4ms of GPU time and ~180 GFLOPS of compute. If encoding runs on the same GPU as the LLM, the scheduler must account for the encode cost in its budget.
+
+### Compute-Weighted Scheduling
+
+vLLM v1 introduces a **compute weight** per modality. The scheduler's token budget is denominated in "effective compute tokens" rather than raw token count:
+
+```python
+class MultimodalScheduler:
+    def __init__(self, config):
+        self.max_effective_tokens = config.max_num_batched_tokens
+        # Compute weight relative to 1 text token's LLM prefill cost
+        self.encode_weights = {
+            'text': 1.0,       # baseline: 1 text token = 1 effective token
+            'image': 0.0,      # if encoding on separate GPU pool: no LLM cost
+            'video': 0.0,      # same: offloaded to encoder pool
+            'audio': 0.0,      # same: offloaded to encoder pool
+        }
+        # If encoding on same GPU, image patches cost more than text tokens
+        # in the prefill pass. But the LLM sees them as equal once embedded.
+        self.prefill_weights = {
+            'text': 1.0,
+            'image_token': 1.0,   # after encoding, same cost as text in LLM
+            'video_token': 1.0,
+            'audio_token': 1.0,
+        }
+
+    def compute_request_cost(self, request: MultimodalRequest) -> float:
+        """Compute the effective token cost of a request."""
+        cost = 0.0
+        # Text tokens
+        cost += len(request.text_tokens) * self.prefill_weights['text']
+        # Multimodal tokens (already encoded or pending encoding)
+        if request.encoding_complete:
+            cost += request.num_image_tokens * self.prefill_weights['image_token']
+            cost += request.num_video_tokens * self.prefill_weights['video_token']
+            cost += request.num_audio_tokens * self.prefill_weights['audio_token']
+        else:
+            # Encoding not yet done -- cost depends on whether E phase
+            # runs on this GPU or a separate pool
+            cost += request.num_image_tokens * self.encode_weights['image']
+            cost += request.num_video_tokens * self.encode_weights['video']
+            cost += request.num_audio_tokens * self.encode_weights['audio']
+        return cost
+```
+
+### Scheduling Decision Example
+
+Consider a batch with these pending requests:
+
+<Benchmark
+  title="Scheduling Decision: Mixed Modality Batch"
+  columns={["Request", "Text Tokens", "Multimodal Tokens", "Encoding Status", "Effective LLM Tokens"]}
+  rows={[
+    { values: ["Decode batch (100 reqs)", "100 (1 each)", "0", "N/A", "100"], highlight: false },
+    { values: ["Text prefill #1", "2,048", "0", "N/A", "2,048"], highlight: false },
+    { values: ["Image request #2", "50", "1,024 (image)", "Complete", "1,074"], highlight: true },
+    { values: ["Video request #3", "30", "7,680 (video)", "Complete", "7,710"], highlight: true },
+    { values: ["Total if all admitted", "2,228", "8,704", "--", "10,932"], highlight: false },
+  ]}
+  notes="Budget: max_effective_tokens = 8,192. Video request #3 alone (7,710 effective tokens) nearly exhausts the budget."
+/>
+
+With a budget of 8,192 effective tokens, the scheduler must choose. The 100 decode requests consume 100 tokens (non-negotiable -- active requests must continue). Remaining budget: 8,092.
+
+The video request costs 7,710 tokens. If admitted, only 382 tokens remain -- not enough for any other prefill. The scheduler must weigh: admit the video request (serving one user, consuming 94% of budget) or admit the text prefill + image request (serving two users, consuming $2048 + 1074 = 3122$ tokens, 38% of budget).
+
+```python
+def schedule_iteration(self):
+    budget = self.max_effective_tokens
+    scheduled = []
+
+    # Phase 1: Decode -- always runs, 1 token per active request
+    for req in self.running_queue:
+        budget -= 1
+        scheduled.append(ScheduleDecodeAction(req))
+
+    # Phase 2: Prefill -- admit requests by priority until budget exhausted
+    for req in self.waiting_queue:
+        cost = self.compute_request_cost(req)
+        if cost <= budget:
+            budget -= cost
+            scheduled.append(SchedulePrefillAction(req, num_tokens=cost))
+        elif self.enable_chunked_prefill and budget > self.min_chunk_size:
+            # Chunk: prefill partial, resume next iteration
+            chunk_tokens = min(cost, budget)
+            budget -= chunk_tokens
+            scheduled.append(SchedulePrefillAction(req, num_tokens=chunk_tokens))
+            break
+        else:
+            break  # No more budget
+
+    return SchedulerOutput(scheduled)
+```
+
+<Callout type="warning" title="Video Requests Can Starve Text">
+A single video request with 7,680 visual tokens can block all other prefills for an entire iteration. In high-throughput deployments, this means video requests should be scheduled during low-load periods or routed to dedicated GPU pools. The scheduler can implement priority classes to prevent starvation: text-only requests get a guaranteed minimum budget fraction.
+</Callout>
+
+### Chunked Prefill for Multimodal
+
+Chunked prefill becomes critical for multimodal requests. A 7,680-token video prefill would monopolize the budget if processed in a single iteration. Chunking it into 2,048-token slices across 4 iterations lets decode requests continue with acceptable time-between-tokens:
+
+<PerfChart
+  title="Decode TBT Impact: Unchunked vs Chunked Video Prefill"
+  unit="ms"
+  data={[
+    { label: "Decode-only (no prefill)", value: 28, color: "green", annotation: "baseline" },
+    { label: "+ Unchunked 7,680 video prefill", value: 195, color: "red", annotation: "6.9x regression" },
+    { label: "+ Chunked 2,048-token slices", value: 52, color: "blue", annotation: "1.9x regression" },
+    { label: "+ Chunked 1,024-token slices", value: 38, color: "cyan", annotation: "1.4x regression" },
+  ]}
+  baseline={0}
+/>
+
+The tradeoff: smaller chunks mean more iterations to complete the video prefill (higher TTFT for the video request), but lower TBT disruption for concurrent decode requests. In production, chunk size is tuned per deployment based on SLA requirements.
+
+## Classifier-Free Guidance (CFG) with Companion Requests
+
+Classifier-Free Guidance is a technique from diffusion models that has been adopted for guided LLM generation. The core idea: generate two outputs in parallel -- one conditioned on the full prompt (the "positive" or "conditional" output), and one conditioned on a null or negative prompt (the "unconditional" output). The final output blends them:
+
+$$x_{\text{guided}} = x_{\text{uncond}} + s \cdot (x_{\text{cond}} - x_{\text{uncond}})$$
+
+where $s$ is the guidance scale. When $s = 1$, the output equals $x_{\text{cond}}$ (standard generation). When $s > 1$, the model amplifies the difference between conditioned and unconditioned outputs, producing responses that more strongly reflect the prompt's intent. When $s = 0$, the output is purely unconditional.
+
+### Why CFG in LLM Serving?
+
+CFG is used in several production scenarios:
+
+1. **Image generation with language models**: Models that output image tokens (e.g., Chameleon, Emu) use CFG during image token generation.
+2. **Controlled text generation**: Steering outputs toward specific styles or away from undesired patterns.
+3. **Multimodal generation**: Ensuring generated outputs strongly condition on visual/audio inputs rather than defaulting to the language model's text-only prior.
+
+### The Companion Request Paradigm
+
+In vLLM v1, CFG is implemented through **companion requests**. For each primary request with CFG enabled, the system creates a shadow request (the companion) that runs the null/negative prompt. Both requests are processed in the same batch, sharing the same scheduling iteration:
+
+```python
+@dataclass
+class CFGRequest:
+    """A primary request paired with its unconditional companion."""
+    primary_request_id: str
+    companion_request_id: str
+    guidance_scale: float          # s > 1.0 for amplification
+    negative_prompt: Optional[str]  # None = empty/null prompt
+
+class CFGRequestPairer:
+    def create_companion(self, request: Request) -> tuple[Request, Request]:
+        """
+        Create a companion request for CFG.
+
+        The companion shares:
+          - Same max_tokens, temperature, stop conditions
+          - Same sequence structure (same position IDs after prefill)
+        The companion differs:
+          - Uses the negative_prompt (or empty string) as input
+          - Has its own KV cache (different prompt = different cache)
+        """
+        primary = request
+        primary.cfg_role = 'conditional'
+
+        companion = Request(
+            prompt=request.negative_prompt or "",  # empty string for null guidance
+            sampling_params=request.sampling_params.copy(),
+            cfg_role='unconditional',
+            paired_request_id=primary.request_id,
+        )
+        companion.request_id = f"{primary.request_id}_cfg_uncond"
+
+        # Link them for synchronized scheduling
+        primary.companion_id = companion.request_id
+        companion.companion_id = primary.request_id
+
+        return primary, companion
+
+    def combine_logits(
+        self,
+        cond_logits: torch.Tensor,    # [vocab_size]
+        uncond_logits: torch.Tensor,   # [vocab_size]
+        guidance_scale: float,
+    ) -> torch.Tensor:
+        """
+        Apply CFG formula to produce guided logits.
+
+        guided = uncond + scale * (cond - uncond)
+               = (1 - scale) * uncond + scale * cond
+
+        At scale=1.0: guided = cond (no guidance effect)
+        At scale=2.0: guided = 2*cond - uncond (amplified conditioning)
+        """
+        guided = uncond_logits + guidance_scale * (cond_logits - uncond_logits)
+        return guided
+```
+
+### Scheduling Companion Requests
+
+The scheduler must guarantee that paired requests run in the same iteration. If the primary decodes but the companion does not (or vice versa), the logit combination cannot happen at that step.
+
+```python
+def schedule_with_cfg(self):
+    """Schedule paired CFG requests together."""
+    scheduled = []
+    budget = self.max_effective_tokens
+
+    for req in self.running_queue:
+        if req.companion_id:
+            companion = self.get_request(req.companion_id)
+            # Both must fit, or neither runs this iteration
+            pair_cost = 2  # 1 decode token each
+            if pair_cost <= budget:
+                budget -= pair_cost
+                scheduled.append(ScheduleDecodeAction(req))
+                scheduled.append(ScheduleDecodeAction(companion))
+            else:
+                # Cannot fit pair -- skip both (rare, only if budget nearly empty)
+                continue
+        else:
+            # Non-CFG request: schedule normally
+            if budget >= 1:
+                budget -= 1
+                scheduled.append(ScheduleDecodeAction(req))
+
+    return scheduled
+```
+
+<Callout type="info" title="CFG Doubles Resource Usage">
+Every CFG request consumes 2x the KV cache (primary + companion), 2x the decode compute per step, and 2x the prefill cost (both prompts must be prefilled). A deployment with 50% CFG requests has 50% higher effective load than the same request volume without CFG. The scheduler must account for this in admission control.
+</Callout>
+
+### CFG with Multimodal Inputs
+
+When CFG is combined with multimodal inputs, the companion request typically uses the text prompt without the visual/audio inputs as the negative condition. This means:
+
+- **Primary request**: Full multimodal prompt (text + image/video/audio). Gets encoded through E phase, full prefill through P phase.
+- **Companion request**: Text-only negative prompt (or empty). Skips E phase entirely, shorter prefill.
+
+```python
+def create_multimodal_cfg_pair(request: MultimodalRequest):
+    """
+    Primary: "Describe this image in detail" + [IMAGE]
+    Companion: "Describe this image in detail" (no image) or "" (null prompt)
+
+    Primary prefill: 50 text + 1024 image = 1074 tokens
+    Companion prefill: 50 text tokens (or 1 token for null)
+    Total KV cache: 1074 + 50 = 1124 entries per layer
+    """
+    primary = request  # includes image embeddings
+    companion = Request(
+        prompt=request.negative_prompt or "",
+        images=[],     # no images for unconditional
+        videos=[],
+        audio=[],
+        sampling_params=request.sampling_params.copy(),
+        cfg_role='unconditional',
+    )
+    return primary, companion
+```
+
+The asymmetry is significant. The primary request's prefill cost is dominated by the 1,024 image tokens. The companion's prefill cost is just 50 text tokens (or 1 for null). But during decode, both generate 1 token per step, and the logit combination happens after both forward passes complete. The companion's decode KV cache is smaller (only 50 entries growing), so the companion decode is faster -- the primary decode is the bottleneck.
+
+## KV Cache for Multimodal
+
+The KV cache stores key and value projections for every token that has been processed through the LLM's attention layers. For each layer $l$ and each attention head $h$, a token at position $t$ contributes:
+
+$$\text{KV entry size} = 2 \times d_{head} \times \text{dtype\_bytes}$$
+
+The factor of 2 is for the K and V vectors. For a typical configuration:
+
+- $d_{head} = 128$ (standard for most modern LLMs)
+- $n_{heads} = 32$ (number of KV heads with GQA)
+- $n_{layers} = 80$ (for a 70B model)
+- dtype = FP16 (2 bytes)
+
+Per-token KV cache:
+
+$$\text{bytes per token} = 2 \times 128 \times 2 \times 32 \times 80 = 1,310,720 \text{ bytes} = 1.25 \text{ MB}$$
+
+<Callout type="danger" title="1.25 MB Per Token">
+Every single token -- text or multimodal -- occupies 1.25 MB of KV cache in a 70B model with 32 KV heads and 80 layers. This is the number that makes multimodal serving expensive: an image adds 1,024 tokens = 1.28 GB of KV cache. A video adds 3,840 tokens = 4.8 GB.
+</Callout>
+
+### Memory Math for Multimodal Requests
+
+Let us compute KV cache usage for different request types on Llama 70B:
+
+<Benchmark
+  title="KV Cache Memory by Request Type (Llama 70B, FP16, GQA 32 heads)"
+  columns={["Request Type", "Text Tokens", "Multimodal Tokens", "Total Tokens", "KV Cache Size"]}
+  rows={[
+    { values: ["Text only (2K prompt)", "2,048", "0", "2,048", "2.56 GB"], highlight: false },
+    { values: ["Text + 1 image", "512", "1,024", "1,536", "1.92 GB"], highlight: false },
+    { values: ["Text + 4K image", "512", "4,096", "4,608", "5.76 GB"], highlight: true },
+    { values: ["Text + 30-frame video", "50", "3,840", "3,890", "4.86 GB"], highlight: true },
+    { values: ["Text + 2min video (60fps)", "50", "30,720", "30,770", "38.46 GB"], highlight: true },
+    { values: ["Text + 30s audio", "100", "1,500", "1,600", "2.00 GB"], highlight: false },
+    { values: ["Full multimodal (img+vid+aud)", "100", "6,364", "6,464", "8.08 GB"], highlight: true },
+  ]}
+  notes="KV per token = 1.25 MB (2 * 128 * 2 bytes * 32 heads * 80 layers). Model weights not included."
+/>
+
+An A100 80GB loaded with a 70B model in FP16 (35GB weights) has ~45GB for KV cache. That is enough for:
+
+- **Text-only at 2K**: $45 / 2.56 = 17$ concurrent requests
+- **Image requests**: $45 / 1.92 = 23$ concurrent requests (shorter total sequence)
+- **Video requests (30 frames)**: $45 / 4.86 = 9$ concurrent requests
+- **2-minute video**: $45 / 38.46 = 1$ request (a single long video nearly fills the GPU)
+
+<PerfChart
+  title="Concurrent Requests vs. Request Type (A100 80GB, 70B FP16)"
+  unit="requests"
+  data={[
+    { label: "Text-only (2K)", value: 17, color: "green" },
+    { label: "Text + 1 image", value: 23, color: "blue" },
+    { label: "Text + 30-frame video", value: 9, color: "orange" },
+    { label: "Text + 4K image", value: 7, color: "red" },
+    { label: "Text + 2min video", value: 1, color: "red", annotation: "38.46 GB KV alone" },
+  ]}
+/>
+
+### Block Manager Under Multimodal Load
+
+vLLM's block manager allocates KV cache in fixed-size blocks (typically 16 tokens per block). For a multimodal request with 3,890 total tokens:
+
+$$\text{blocks needed} = \lceil 3890 / 16 \rceil = 244 \text{ blocks}$$
+
+Each block occupies $16 \times 1.25 \text{ MB} = 20$ MB. The 244 blocks consume $244 \times 20 = 4,880$ MB = 4.77 GB. At this scale, the block manager's allocation and deallocation overhead becomes non-trivial. Fragmention matters: if 244 blocks are scattered across the block pool, the memory is allocated but throughput does not improve because prefetch patterns are disrupted.
+
+```python
+def allocate_multimodal_kv_cache(
+    block_manager,
+    request: MultimodalRequest,
+) -> list[int]:
+    """
+    Allocate KV cache blocks for a multimodal request.
+
+    The total sequence includes text + all multimodal tokens.
+    The block manager does not distinguish modalities --
+    all tokens are equal-cost in the KV cache.
+    """
+    total_tokens = (
+        len(request.text_tokens) +
+        request.num_image_tokens +
+        request.num_video_tokens +
+        request.num_audio_tokens
+    )
+    blocks_needed = math.ceil(total_tokens / block_manager.block_size)
+
+    if block_manager.free_blocks >= blocks_needed:
+        block_ids = block_manager.allocate(blocks_needed)
+        return block_ids
+    else:
+        # Not enough memory -- request must wait or trigger preemption
+        raise InsufficientMemoryError(
+            f"Need {blocks_needed} blocks ({blocks_needed * block_manager.block_size_bytes / 1e9:.2f} GB), "
+            f"only {block_manager.free_blocks} available "
+            f"({block_manager.free_blocks * block_manager.block_size_bytes / 1e9:.2f} GB)"
+        )
+```
+
+<Callout type="tip" title="KV Cache Quantization Is More Impactful for Multimodal">
+Quantizing KV cache from FP16 to INT8 halves the per-token cost from 1.25 MB to 0.625 MB. For text-only at 2K tokens, this saves 1.28 GB per request. For a 30-frame video at 3,890 tokens, it saves 2.43 GB -- enough to fit 2 additional video requests on the same GPU. The relative benefit of KV quantization scales with token count, making it disproportionately valuable for multimodal workloads.
+</Callout>
+
+## Transfer Between Phases
+
+When the E/P/D/G phases run on different GPUs, data must move between them. The two critical transfers are: E-to-P (encoder embeddings to LLM GPU) and P-to-D (KV cache from prefill GPU to decode GPU).
+
+### E-to-P Transfer: Encoder Embeddings
+
+After the vision/audio encoder completes, the resulting embeddings must move to the GPU running the LLM prefill. The payload is:
+
+$$\text{Transfer size} = \text{num\_tokens} \times d_{model} \times \text{dtype\_bytes}$$
+
+<Benchmark
+  title="E-to-P Transfer Sizes and Latencies"
+  columns={["Modality", "Tokens", "d_model", "dtype", "Payload", "PCIe Gen5", "NVLink 4.0"]}
+  rows={[
+    { values: ["1 image", "1,024", "4,096", "FP16", "8 MB", "0.13 ms", "0.01 ms"], highlight: false },
+    { values: ["4K image", "4,096", "4,096", "FP16", "32 MB", "0.50 ms", "0.04 ms"], highlight: false },
+    { values: ["30-frame video", "3,840", "4,096", "FP16", "31.5 MB", "0.49 ms", "0.04 ms"], highlight: false },
+    { values: ["Video (raw, no pool)", "7,680", "4,096", "FP16", "62.9 MB", "0.98 ms", "0.08 ms"], highlight: true },
+    { values: ["30s audio", "1,500", "4,096", "FP16", "12.3 MB", "0.19 ms", "0.02 ms"], highlight: false },
+  ]}
+  notes="PCIe Gen5 x16: 64 GB/s bidirectional. NVLink 4.0: 900 GB/s bidirectional."
+/>
+
+E-to-P transfers are small. Even the worst case (7,680 raw video tokens) is 63 MB -- under 1ms on PCIe Gen5 and negligible on NVLink. This transfer is not a bottleneck.
+
+### P-to-D Transfer: KV Cache Migration
+
+After the prefill phase completes, the KV cache must migrate to the decode GPU pool. This is the expensive transfer. The payload is:
+
+$$\text{KV transfer size} = \text{num\_tokens} \times n_{layers} \times n_{kv\_heads} \times d_{head} \times 2 \times \text{dtype\_bytes}$$
+
+For our 70B model configuration and a video request with 3,890 total tokens:
+
+$$\text{KV size} = 3890 \times 80 \times 32 \times 128 \times 2 \times 2 = 5.09 \times 10^9 \text{ bytes} = 4.74 \text{ GB}$$
+
+```python
+def compute_kv_transfer_size(
+    num_tokens: int,
+    n_layers: int = 80,
+    n_kv_heads: int = 32,
+    d_head: int = 128,
+    dtype_bytes: int = 2,  # FP16
+) -> dict:
+    """Compute KV cache transfer payload and latency estimates."""
+    # K and V each: [n_layers, n_kv_heads, num_tokens, d_head]
+    kv_bytes = num_tokens * n_layers * n_kv_heads * d_head * 2 * dtype_bytes
+
+    return {
+        'bytes': kv_bytes,
+        'megabytes': kv_bytes / (1024 ** 2),
+        'gigabytes': kv_bytes / (1024 ** 3),
+        'pcie_gen5_ms': (kv_bytes / (64e9)) * 1000,    # 64 GB/s
+        'nvlink_4_ms': (kv_bytes / (900e9)) * 1000,     # 900 GB/s
+        'infiniband_400g_ms': (kv_bytes / (50e9)) * 1000, # 400 Gbps = 50 GB/s
+    }
+
+# Example: 30-frame video request
+result = compute_kv_transfer_size(num_tokens=3890)
+# bytes:       5,095,014,400 (4.74 GB)
+# pcie_gen5:   79.6 ms
+# nvlink_4:    5.7 ms
+# infiniband:  101.9 ms
+```
+
+<PerfChart
+  title="KV Cache Transfer Latency by Interconnect (3,890-token video request, 70B model)"
+  unit="ms"
+  data={[
+    { label: "NVLink 4.0 (900 GB/s)", value: 5.7, color: "green", annotation: "intra-node" },
+    { label: "PCIe Gen5 (64 GB/s)", value: 79.6, color: "orange", annotation: "intra-node" },
+    { label: "InfiniBand 400G (50 GB/s)", value: 101.9, color: "red", annotation: "inter-node" },
+    { label: "RoCE 100G (12.5 GB/s)", value: 407.6, color: "red", annotation: "inter-node" },
+  ]}
+  baseline={0}
+/>
+
+<Callout type="perf" title="KV Transfer Dominates Disaggregation Overhead">
+For a video request, the P-to-D KV transfer (4.74 GB) takes 5.7ms over NVLink but 80-100ms over PCIe or InfiniBand. This exceeds the encode phase itself (18ms) and approaches the prefill time (145ms). Disaggregated multimodal serving is only practical with NVLink-class interconnects between prefill and decode pools, or with KV cache compression that reduces the transfer by 4-8x.
+</Callout>
+
+### Optimizing Transfers
+
+Three techniques reduce the P-to-D transfer cost:
+
+**1. KV Cache Quantization**: Quantize from FP16 to INT4 before transfer, dequantize on the decode GPU. Reduces payload by 4x (4.74 GB to 1.19 GB). Transfer latency on NVLink drops from 5.7ms to 1.4ms. The quantization/dequantization cost (~0.5ms each on A100) is negligible compared to the transfer savings.
+
+**2. Pipelined Transfer**: Begin transferring KV cache for early layers while later layers are still being prefilled. The prefill processes layers sequentially, so layer 0's KV is ready ~1/80th of the way through prefill. Overlap transfer of layers 0-39 with prefill of layers 40-79.
+
+**3. Selective Transfer**: For some architectures, not all layers contribute equally. Transfer only the KV cache for layers that have high attention entropy (layers where the model actually attends to diverse positions). Layers with near-uniform attention can be recomputed cheaply on the decode side.
+
+```python
+class PipelinedKVTransfer:
+    """Transfer KV cache layer-by-layer as prefill progresses."""
+
+    def __init__(self, num_layers: int, transfer_stream: torch.cuda.Stream):
+        self.num_layers = num_layers
+        self.transfer_stream = transfer_stream
+        self.layers_transferred = 0
+
+    def on_layer_complete(self, layer_idx: int, kv_cache: torch.Tensor):
+        """Called after each layer's prefill completes."""
+        with torch.cuda.stream(self.transfer_stream):
+            # Async copy to decode GPU while next layer prefills on compute stream
+            self.decode_gpu_kv[layer_idx].copy_(kv_cache, non_blocking=True)
+            self.layers_transferred += 1
+
+    def transfer_complete(self) -> bool:
+        self.transfer_stream.synchronize()
+        return self.layers_transferred == self.num_layers
+```
+
+## Implementer's Exercise: Multimodal Request Data Structures
+
+Putting it all together. Here are the data structures that represent a multimodal request as it flows through the E/P/D/G pipeline:
+
+### Request Representation
+
+```python
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional
+
+class ModalityType(Enum):
+    TEXT = "text"
+    IMAGE = "image"
+    VIDEO = "video"
+    AUDIO = "audio"
+
+class RequestPhase(Enum):
+    WAITING = "waiting"           # queued, not yet processed
+    ENCODING = "encoding"         # E phase: running vision/audio encoder
+    ENCODED = "encoded"           # E phase complete, waiting for prefill
+    PREFILLING = "prefilling"     # P phase: LLM prefill in progress
+    DECODING = "decoding"         # D phase: autoregressive generation
+    GENERATING = "generating"     # G phase: post-processing output
+    FINISHED = "finished"
+
+@dataclass
+class ModalityInput:
+    """A single modality input (one image, one video, one audio clip)."""
+    modality: ModalityType
+    raw_data: bytes                          # raw file bytes
+    preprocessed: Optional[torch.Tensor]     # after image_processor / mel transform
+    encoded_embeddings: Optional[torch.Tensor] = None  # after E phase: [num_tokens, d_model]
+    num_tokens: int = 0                      # number of tokens this modality produces
+    placeholder_start: int = 0               # position in merged sequence
+
+@dataclass
+class MultimodalRequest:
+    """Complete request representation through all phases."""
+    request_id: str
+    prompt_text: str
+    text_token_ids: list[int] = field(default_factory=list)
+
+    # Multimodal inputs
+    images: list[ModalityInput] = field(default_factory=list)
+    videos: list[ModalityInput] = field(default_factory=list)
+    audio: list[ModalityInput] = field(default_factory=list)
+
+    # Phase tracking
+    phase: RequestPhase = RequestPhase.WAITING
+    encoding_complete: bool = False
+
+    # Merged sequence (populated after encoding)
+    merged_token_count: int = 0
+    merged_embeddings: Optional[torch.Tensor] = None  # [total_seq_len, d_model]
+
+    # KV cache allocation
+    kv_block_ids: list[int] = field(default_factory=list)
+    kv_blocks_allocated: int = 0
+
+    # CFG companion
+    cfg_enabled: bool = False
+    guidance_scale: float = 1.0
+    companion_request_id: Optional[str] = None
+    negative_prompt: Optional[str] = None
+
+    # Generation state
+    generated_token_ids: list[int] = field(default_factory=list)
+    generated_text: str = ""
+    is_finished: bool = False
+
+    @property
+    def total_multimodal_tokens(self) -> int:
+        return (
+            sum(img.num_tokens for img in self.images) +
+            sum(vid.num_tokens for vid in self.videos) +
+            sum(aud.num_tokens for aud in self.audio)
+        )
+
+    @property
+    def total_tokens(self) -> int:
+        return len(self.text_token_ids) + self.total_multimodal_tokens
+
+    @property
+    def kv_cache_bytes(self) -> int:
+        """Estimate KV cache size for this request (70B model defaults)."""
+        per_token = 2 * 128 * 2 * 32 * 80  # 1.25 MB
+        return self.total_tokens * per_token
+```
+
+### Pipeline Execution
+
+```python
+class MultimodalPipeline:
+    """Orchestrates a request through E/P/D/G phases."""
+
+    def __init__(self, encoder_pool, llm_pool, decode_pool):
+        self.encoder_pool = encoder_pool  # GPU pool for E phase
+        self.llm_pool = llm_pool          # GPU pool for P phase
+        self.decode_pool = decode_pool    # GPU pool for D phase
+
+    async def process_request(self, request: MultimodalRequest):
+        # === E Phase: Encode ===
+        request.phase = RequestPhase.ENCODING
+
+        for img in request.images:
+            img.preprocessed = self.image_processor(img.raw_data)
+            img.encoded_embeddings = await self.encoder_pool.encode_image(
+                img.preprocessed
+            )
+            img.num_tokens = img.encoded_embeddings.shape[0]  # e.g., 1024
+
+        for vid in request.videos:
+            vid.preprocessed = self.video_processor(vid.raw_data)
+            vid.encoded_embeddings = await self.encoder_pool.encode_video(
+                vid.preprocessed
+            )
+            vid.num_tokens = vid.encoded_embeddings.shape[0]  # e.g., 3840
+
+        for aud in request.audio:
+            aud.preprocessed = self.audio_processor(aud.raw_data)
+            aud.encoded_embeddings = await self.encoder_pool.encode_audio(
+                aud.preprocessed
+            )
+            aud.num_tokens = aud.encoded_embeddings.shape[0]  # e.g., 1500
+
+        request.encoding_complete = True
+        request.phase = RequestPhase.ENCODED
+
+        # === Transfer E -> P ===
+        # Move encoded embeddings to LLM GPU
+        all_embeddings = []
+        for modality_list in [request.images, request.videos, request.audio]:
+            for item in modality_list:
+                item.encoded_embeddings = item.encoded_embeddings.to(
+                    self.llm_pool.device, non_blocking=True
+                )
+                all_embeddings.append(item.encoded_embeddings)
+
+        # === Merge embeddings ===
+        request.merged_embeddings = merge_multimodal_embeddings(
+            text_token_ids=torch.tensor(request.text_token_ids),
+            image_embeddings=torch.cat([i.encoded_embeddings for i in request.images], dim=0) if request.images else torch.empty(0),
+            video_embeddings=torch.cat([v.encoded_embeddings for v in request.videos], dim=0) if request.videos else torch.empty(0),
+            audio_embeddings=torch.cat([a.encoded_embeddings for a in request.audio], dim=0) if request.audio else torch.empty(0),
+            placeholder_positions=self.compute_placeholder_positions(request),
+            embedding_table=self.llm_pool.model.embed_tokens,
+        )
+        request.merged_token_count = request.merged_embeddings.shape[0]
+
+        # === P Phase: Prefill ===
+        request.phase = RequestPhase.PREFILLING
+        kv_cache, first_logits = await self.llm_pool.prefill(
+            request.merged_embeddings,
+            request.kv_block_ids,
+        )
+
+        # === Transfer P -> D (if disaggregated) ===
+        if self.llm_pool.device != self.decode_pool.device:
+            await self.transfer_kv_cache(
+                kv_cache,
+                src=self.llm_pool.device,
+                dst=self.decode_pool.device,
+            )
+
+        # === D Phase: Decode ===
+        request.phase = RequestPhase.DECODING
+        first_token = sample(first_logits, request.sampling_params)
+        request.generated_token_ids.append(first_token)
+
+        while not request.is_finished:
+            # Scheduler includes this request in next decode batch
+            logits = await self.decode_pool.decode_step(
+                token_id=request.generated_token_ids[-1],
+                kv_block_ids=request.kv_block_ids,
+            )
+
+            # If CFG enabled, also get companion logits and combine
+            if request.cfg_enabled:
+                companion_logits = await self.get_companion_logits(request)
+                logits = combine_cfg_logits(
+                    logits, companion_logits, request.guidance_scale
+                )
+
+            next_token = sample(logits, request.sampling_params)
+            request.generated_token_ids.append(next_token)
+
+            # === G Phase: Generate (runs per-token) ===
+            request.phase = RequestPhase.GENERATING
+            text_chunk = self.tokenizer.decode(
+                [next_token], skip_special_tokens=True
+            )
+            request.generated_text += text_chunk
+
+            # Check stop conditions
+            if self.should_stop(request):
+                request.is_finished = True
+
+            request.phase = RequestPhase.DECODING  # back to D for next token
+
+        request.phase = RequestPhase.FINISHED
+        return request.generated_text
+```
+
+### Memory Layout of a Live Multimodal Request
+
+At peak memory usage (after prefill, during decode), a single multimodal request with a 30-frame video occupies:
+
+<MemoryLayout
+  title="GPU Memory: Single Video Request (70B, FP16)"
+  regions={[
+    { start: "0x0000000000", end: "0x0880000000", name: "Model Weights", size: "34 GB", color: "purple", notes: "70B parameters in FP16 (shared across all requests)" },
+    { start: "0x0880000000", end: "0x09A4F00000", name: "KV Cache (video request)", size: "4.86 GB", color: "red", notes: "3,890 tokens x 1.25 MB/token across 80 layers" },
+    { start: "0x09A4F00000", end: "0x09C6300000", name: "KV Cache (CFG companion)", size: "0.06 GB", color: "orange", notes: "50-token negative prompt x 1.25 MB/token" },
+    { start: "0x09C6300000", end: "0x0A00000000", name: "Activations + Workspace", size: "0.93 GB", color: "blue", notes: "Intermediate tensors, CUDA workspace" },
+    { start: "0x0A00000000", end: "0x0A40000000", name: "Free", size: "39.15 GB", color: "gray", notes: "Available for additional requests" },
+  ]}
+/>
+
+That leaves 39.15 GB free -- enough for approximately 8 more video requests of the same size, or 15 text-only requests at 2K tokens, or some mix. With KV quantization to INT8, the video request's KV cache drops from 4.86 GB to 2.43 GB, and 10 concurrent video requests become feasible.
+
+### End-to-End Latency Budget
+
+For a complete multimodal request with CFG:
+
+<Benchmark
+  title="End-to-End Latency: Video + CFG Request (200-token output)"
+  columns={["Component", "Duration", "Cumulative", "% of Total"]}
+  rows={[
+    { values: ["E: Video encoding (30 frames)", "18 ms", "18 ms", "0.3%"], highlight: false },
+    { values: ["Transfer E->P (31.5 MB, NVLink)", "0.04 ms", "18.04 ms", "< 0.1%"], highlight: false },
+    { values: ["P: Primary prefill (3,890 tokens)", "145 ms", "163.04 ms", "2.5%"], highlight: false },
+    { values: ["P: Companion prefill (50 tokens)", "4 ms", "167.04 ms", "0.1%"], highlight: false },
+    { values: ["Transfer P->D primary KV (4.86 GB, NVLink)", "5.4 ms", "172.44 ms", "0.1%"], highlight: false },
+    { values: ["Transfer P->D companion KV (0.06 GB, NVLink)", "0.07 ms", "172.51 ms", "< 0.1%"], highlight: false },
+    { values: ["D: Decode 200 tokens (primary + companion)", "5,600 ms", "5,772.51 ms", "96.9%"], highlight: true },
+    { values: ["G: Detokenize + stream 200 tokens", "2 ms", "5,774.51 ms", "< 0.1%"], highlight: false },
+    { values: ["Total", "5,774.51 ms", "--", "100%"], highlight: true },
+  ]}
+  notes="Decode dominates at 28ms/token x 200 tokens. CFG doubles decode cost (primary + companion forward pass per step)."
+/>
+
+Decode consumes 96.9% of total latency. This is the fundamental reality of autoregressive generation: the encoding, transfers, and prefill are one-time costs, but decode runs 200 times (once per output token). Every millisecond saved per decode step saves 200ms total. Optimizing the E phase (already 18ms) has negligible impact on end-to-end latency. The correct optimization targets for multimodal serving, in priority order:
+
+1. **Reduce per-step decode time**: smaller KV cache (quantization), faster attention kernels, speculative decoding
+2. **Reduce prefill time**: chunked prefill (for TBT, not total latency), FlashAttention for long multimodal sequences
+3. **Reduce visual token count**: more aggressive temporal pooling, spatial token merging, early visual token pruning
+4. **Overlap phases**: pipeline encoding with queued-request prefill, pipeline P-to-D transfer with early decode layers
+
+<Callout type="info" title="Token Reduction Compounds">
+Reducing visual tokens from 3,840 to 1,920 (2x compression) saves: 1,920 fewer tokens in prefill (~37ms), 1,920 fewer KV entries (2.4 GB less memory), shorter attention spans in every decode step (~3ms saved per step = 600ms over 200 tokens). The decode savings alone justify aggressive visual token compression even if it slightly reduces output quality.
+</Callout>
+
+## Conclusion
+
+vLLM v1's four-phase pipeline is a direct response to multimodal workloads breaking the two-phase prefill/decode model. The separation of encoding from prefill enables hardware specialization: cheap GPUs for vision encoders, expensive GPUs for LLM compute. The unified scheduler accounts for heterogeneous token costs but faces hard tradeoffs when a single video request can consume an entire iteration's budget. KV cache for multimodal inputs scales proportionally with visual/audio token count, and at 1.25 MB per token for a 70B model, a single video can consume 5-40 GB of KV cache depending on frame count and compression. Inter-phase transfers are bottlenecked by KV cache migration (gigabytes) rather than embedding transfer (megabytes), making NVLink-class interconnects mandatory for disaggregated multimodal serving. CFG with companion requests doubles all resource costs but is required for guided multimodal generation tasks.
+
+The numbers are clear: decode dominates end-to-end latency at 97%, KV cache dominates memory, and interconnect bandwidth dominates disaggregation overhead. Every design decision in the pipeline -- from temporal token pooling to KV quantization to chunked prefill scheduling -- exists to manage these three constraints.
