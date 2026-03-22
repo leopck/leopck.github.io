@@ -523,6 +523,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"frontier-research-grpo-algorithm-complete.mdx": {
+	id: "frontier-research-grpo-algorithm-complete.mdx";
+  slug: "frontier-research-grpo-algorithm-complete";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "frontier-research-hallucination-mitigation.mdx": {
 	id: "frontier-research-hallucination-mitigation.mdx";
   slug: "frontier-research-hallucination-mitigation";
@@ -817,6 +824,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"inference-timeline-transformer-fundamentals-for-systems.mdx": {
+	id: "inference-timeline-transformer-fundamentals-for-systems.mdx";
+  slug: "inference-timeline-transformer-fundamentals-for-systems";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "inference-timeline-vlm-serving-vit-paging.mdx": {
 	id: "inference-timeline-vlm-serving-vit-paging.mdx";
   slug: "inference-timeline-vlm-serving-vit-paging";
@@ -932,6 +946,13 @@ declare module 'astro:content' {
 "model-pruning-techniques-performance-accuracy-trade-offs-2019.mdx": {
 	id: "model-pruning-techniques-performance-accuracy-trade-offs-2019.mdx";
   slug: "model-pruning-techniques-performance-accuracy-trade-offs-2019";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"moe-masterclass-complete-gating-implementation.mdx": {
+	id: "moe-masterclass-complete-gating-implementation.mdx";
+  slug: "moe-masterclass-complete-gating-implementation";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -1251,9 +1272,23 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"transformer-anatomy-flash-attention-backward-pass.mdx": {
+	id: "transformer-anatomy-flash-attention-backward-pass.mdx";
+  slug: "transformer-anatomy-flash-attention-backward-pass";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "transformer-anatomy-gradient-flow-backprop.mdx": {
 	id: "transformer-anatomy-gradient-flow-backprop.mdx";
   slug: "transformer-anatomy-gradient-flow-backprop";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"transformer-anatomy-inference-engine-kv-cache-generation.mdx": {
+	id: "transformer-anatomy-inference-engine-kv-cache-generation.mdx";
+  slug: "transformer-anatomy-inference-engine-kv-cache-generation";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
