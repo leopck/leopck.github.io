@@ -278,6 +278,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"dataset-frontier-code-curation-dedup-quality.mdx": {
+	id: "dataset-frontier-code-curation-dedup-quality.mdx";
+  slug: "dataset-frontier-code-curation-dedup-quality";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "dataset-frontier-curation-dclm-fineweb.mdx": {
 	id: "dataset-frontier-curation-dclm-fineweb.mdx";
   slug: "dataset-frontier-curation-dclm-fineweb";
@@ -572,6 +579,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"inference-timeline-memory-pool-slab-allocators.mdx": {
+	id: "inference-timeline-memory-pool-slab-allocators.mdx";
+  slug: "inference-timeline-memory-pool-slab-allocators";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "inference-timeline-speculative-decoding-v2.mdx": {
 	id: "inference-timeline-speculative-decoding-v2.mdx";
   slug: "inference-timeline-speculative-decoding-v2";
@@ -775,6 +789,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"nvidia-dynamo-multimodel-gpu-sharing.mdx": {
+	id: "nvidia-dynamo-multimodel-gpu-sharing.mdx";
+  slug: "nvidia-dynamo-multimodel-gpu-sharing";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "nvidia-dynamo-planner-grove-gang-scheduling.mdx": {
 	id: "nvidia-dynamo-planner-grove-gang-scheduling.mdx";
   slug: "nvidia-dynamo-planner-grove-gang-scheduling";
@@ -925,6 +946,13 @@ declare module 'astro:content' {
 "transformer-anatomy-activation-functions-relu-gelu-silu.mdx": {
 	id: "transformer-anatomy-activation-functions-relu-gelu-silu.mdx";
   slug: "transformer-anatomy-activation-functions-relu-gelu-silu";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"transformer-anatomy-attention-masking-patterns.mdx": {
+	id: "transformer-anatomy-attention-masking-patterns.mdx";
+  slug: "transformer-anatomy-attention-masking-patterns";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
