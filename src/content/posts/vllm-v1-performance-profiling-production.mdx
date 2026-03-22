@@ -1,0 +1,1018 @@
+---
+title: "vLLM v1 Performance Profiling: Finding and Fixing Bottlenecks in Production"
+author: "stanley-phoong"
+description: "How to profile and debug vLLM v1 production deployments. Key metrics (e2e latency, TTFT, TBT, queue depth, GPU utilization, KV cache usage), Prometheus and Grafana dashboards, common pathologies with diagnostic patterns, and a complete monitoring implementation."
+publishDate: 2025-03-22
+category: vllm
+tags: [vllm-v1, profiling, production, metrics, prometheus, grafana, debugging]
+difficulty: expert
+readingTime: 30
+draft: false
+featured: false
+series: "vLLM v1 & Omni Internals"
+seriesOrder: 12
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+
+Running vLLM in production means more than just starting the server. You need to know when latency is degrading, why throughput dropped, whether the KV cache is thrashing, and how close you are to the GPU memory wall. vLLM v1 exposes a comprehensive metrics system through its OpenAI-compatible API, Prometheus endpoints, and internal logging. This post covers every metric that matters, how to build dashboards that surface problems before users notice, and the diagnostic patterns for the most common production pathologies.
+
+---
+
+## 1. The Metrics That Matter
+
+### The Latency Triad
+
+Three latency metrics define the user experience:
+
+**Time to First Token (TTFT)**: The time from request arrival to the first output token. This is what the user perceives as "how long before the model starts responding." It includes queue wait time plus prefill time:
+
+$$\text{TTFT} = T_{\text{queue}} + T_{\text{prefill}}$$
+
+**Time Between Tokens (TBT)**: The interval between consecutive output tokens during decode. This determines the streaming speed. Users notice TBT above 100ms as stuttering.
+
+$$\text{TBT} = T_{\text{decode\_step}} / \text{num\_tokens\_this\_step}$$
+
+**End-to-End Latency (E2E)**: The total time from request arrival to the last output token:
+
+$$\text{E2E} = \text{TTFT} + \text{TBT} \times \text{output\_length}$$
+
+<Benchmark
+  title="Latency Targets by Use Case"
+  columns={["Use Case", "TTFT Target", "TBT Target", "E2E Target", "Priority"]}
+  rows={[
+    { values: ["Chat (interactive)", "< 500ms", "< 50ms", "< 10s", "TTFT, TBT"], highlight: true },
+    { values: ["Code completion", "< 200ms", "< 30ms", "< 3s", "TTFT"], highlight: false },
+    { values: ["Batch processing", "< 5s", "< 100ms", "< 60s", "Throughput"], highlight: false },
+    { values: ["RAG pipeline", "< 1s", "< 80ms", "< 15s", "TTFT, E2E"], highlight: false },
+    { values: ["Agentic workflows", "< 2s", "< 100ms", "< 30s", "E2E"], highlight: false },
+  ]}
+  notes="Targets depend on the application. Interactive use cases prioritize TTFT and TBT. Batch processing prioritizes throughput."
+/>
+
+### Throughput Metrics
+
+**Tokens per second (TPS)**: The aggregate output token generation rate across all active requests:
+
+$$\text{TPS} = \frac{\text{total\_output\_tokens}}{\text{time\_window}}$$
+
+**Requests per second (RPS)**: The number of completed requests per second. This is throughput at the request level.
+
+**Batch utilization**: The fraction of the maximum batch size actually used during decode:
+
+$$\text{batch\_util} = \frac{\text{active\_sequences}}{\text{max\_num\_seqs}}$$
+
+### Resource Metrics
+
+**GPU utilization (SM occupancy)**: What fraction of GPU streaming multiprocessors are active. High utilization (&gt;80%) means the GPU is well-fed. Low utilization (&lt;50%) means the GPU is waiting for work.
+
+**KV cache utilization**: The fraction of allocated KV cache blocks that are in use:
+
+$$\text{kv\_util} = \frac{\text{used\_blocks}}{\text{total\_blocks}}$$
+
+When KV cache utilization hits 100%, new requests must wait until running requests complete and free blocks. This is the most common production bottleneck.
+
+**GPU memory utilization**: Total GPU memory in use vs. available. Should be close to 100% at startup (model weights + KV cache pre-allocation) and stable during operation.
+
+---
+
+## 2. vLLM's Metrics Endpoint
+
+### Built-in Prometheus Metrics
+
+vLLM v1 exports metrics via a `/metrics` HTTP endpoint in Prometheus format. The key metrics:
+
+```python
+# vLLM built-in metrics (from vllm/engine/metrics.py)
+
+# Latency metrics (histograms)
+vllm_e2e_request_latency_seconds       # End-to-end request latency
+vllm_time_to_first_token_seconds       # Time to first token
+vllm_time_per_output_token_seconds     # Inter-token latency (TBT)
+
+# Throughput counters
+vllm_prompt_tokens_total               # Total input tokens processed
+vllm_generation_tokens_total           # Total output tokens generated
+vllm_request_success_total             # Total successful requests
+
+# Queue metrics (gauges)
+vllm_num_requests_waiting              # Requests in queue
+vllm_num_requests_running              # Requests currently being processed
+vllm_num_requests_swapped              # Requests swapped to CPU
+
+# KV cache metrics (gauges)
+vllm_gpu_cache_usage_perc              # GPU KV cache utilization (0-1)
+vllm_cpu_cache_usage_perc              # CPU KV cache utilization (0-1)
+
+# GPU metrics (gauges)
+vllm_gpu_utilization                   # SM utilization (0-1)
+vllm_gpu_memory_usage_bytes            # Current GPU memory usage
+```
+
+### Scraping Configuration
+
+Prometheus scrape config for vLLM:
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: 'vllm'
+    scrape_interval: 5s
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+        - 'vllm-server-0:8000'
+        - 'vllm-server-1:8000'
+        - 'vllm-server-2:8000'
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        regex: '(.+):8000'
+        replacement: '$1'
+```
+
+### Custom Metrics Extension
+
+For production deployments, the built-in metrics are not enough. Here is a custom metrics collector:
+
+```python
+from prometheus_client import (
+    Histogram, Gauge, Counter, CollectorRegistry, generate_latest
+)
+import time
+
+class VLLMProductionMetrics:
+    """Extended metrics for production vLLM monitoring."""
+
+    def __init__(self, registry: CollectorRegistry = None):
+        self.registry = registry or CollectorRegistry()
+
+        # Latency percentiles (more granular than default)
+        self.ttft_histogram = Histogram(
+            'vllm_ttft_seconds',
+            'Time to first token',
+            buckets=[0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0],
+            registry=self.registry,
+        )
+
+        self.tbt_histogram = Histogram(
+            'vllm_tbt_seconds',
+            'Time between tokens',
+            buckets=[0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0],
+            registry=self.registry,
+        )
+
+        self.e2e_histogram = Histogram(
+            'vllm_e2e_seconds',
+            'End-to-end request latency',
+            buckets=[0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0],
+            registry=self.registry,
+        )
+
+        # Throughput
+        self.tokens_generated = Counter(
+            'vllm_output_tokens_total',
+            'Total output tokens generated',
+            registry=self.registry,
+        )
+
+        self.requests_completed = Counter(
+            'vllm_requests_completed_total',
+            'Total requests completed',
+            ['status'],  # success, error, timeout
+            registry=self.registry,
+        )
+
+        # Queue depth
+        self.queue_depth = Gauge(
+            'vllm_queue_depth',
+            'Number of requests waiting in queue',
+            registry=self.registry,
+        )
+
+        # KV cache
+        self.kv_cache_util = Gauge(
+            'vllm_kv_cache_utilization',
+            'KV cache utilization (0-1)',
+            registry=self.registry,
+        )
+
+        self.kv_cache_evictions = Counter(
+            'vllm_kv_cache_evictions_total',
+            'Total KV cache block evictions',
+            registry=self.registry,
+        )
+
+        # Batch metrics
+        self.batch_size_histogram = Histogram(
+            'vllm_decode_batch_size',
+            'Decode batch size per step',
+            buckets=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
+            registry=self.registry,
+        )
+
+        # Prefix cache
+        self.prefix_cache_hit_rate = Gauge(
+            'vllm_prefix_cache_hit_rate',
+            'Prefix cache hit rate (0-1)',
+            registry=self.registry,
+        )
+
+    def record_request(self, ttft, tbt_list, e2e, output_tokens, status='success'):
+        self.ttft_histogram.observe(ttft)
+        for tbt in tbt_list:
+            self.tbt_histogram.observe(tbt)
+        self.e2e_histogram.observe(e2e)
+        self.tokens_generated.inc(output_tokens)
+        self.requests_completed.labels(status=status).inc()
+
+    def export(self):
+        return generate_latest(self.registry)
+```
+
+---
+
+## 3. Grafana Dashboard Design
+
+### Dashboard Layout
+
+A production vLLM dashboard should have four rows:
+
+**Row 1: User-Facing Latency** -- what the user experiences
+**Row 2: System Health** -- GPU and memory state
+**Row 3: Queue and Scheduling** -- where bottlenecks form
+**Row 4: Cache Efficiency** -- KV cache and prefix cache hit rates
+
+### PromQL Queries
+
+The key dashboard panels and their queries:
+
+```yaml
+# Panel: TTFT P50/P95/P99
+- title: "Time to First Token"
+  queries:
+    - expr: histogram_quantile(0.50, rate(vllm_ttft_seconds_bucket[5m]))
+      legend: "P50"
+    - expr: histogram_quantile(0.95, rate(vllm_ttft_seconds_bucket[5m]))
+      legend: "P95"
+    - expr: histogram_quantile(0.99, rate(vllm_ttft_seconds_bucket[5m]))
+      legend: "P99"
+
+# Panel: TBT P50/P95
+- title: "Inter-Token Latency"
+  queries:
+    - expr: histogram_quantile(0.50, rate(vllm_tbt_seconds_bucket[5m]))
+      legend: "P50"
+    - expr: histogram_quantile(0.95, rate(vllm_tbt_seconds_bucket[5m]))
+      legend: "P95"
+
+# Panel: Throughput (tokens/sec)
+- title: "Output Token Throughput"
+  queries:
+    - expr: rate(vllm_output_tokens_total[1m])
+      legend: "tokens/sec"
+
+# Panel: KV Cache Utilization
+- title: "KV Cache Utilization"
+  queries:
+    - expr: vllm_kv_cache_utilization
+      legend: "Utilization"
+  thresholds:
+    - value: 0.9
+      color: yellow
+    - value: 0.98
+      color: red
+
+# Panel: Queue Depth
+- title: "Queue Depth"
+  queries:
+    - expr: vllm_queue_depth
+      legend: "Waiting requests"
+  thresholds:
+    - value: 10
+      color: yellow
+    - value: 50
+      color: red
+
+# Panel: Batch Size Distribution
+- title: "Decode Batch Size"
+  queries:
+    - expr: histogram_quantile(0.50, rate(vllm_decode_batch_size_bucket[5m]))
+      legend: "P50 batch size"
+    - expr: histogram_quantile(0.95, rate(vllm_decode_batch_size_bucket[5m]))
+      legend: "P95 batch size"
+
+# Panel: Prefix Cache Hit Rate
+- title: "Prefix Cache Hit Rate"
+  queries:
+    - expr: vllm_prefix_cache_hit_rate
+      legend: "Hit rate"
+```
+
+### Alert Rules
+
+```yaml
+# Prometheus alerting rules
+groups:
+  - name: vllm_alerts
+    rules:
+      - alert: HighTTFT
+        expr: histogram_quantile(0.95, rate(vllm_ttft_seconds_bucket[5m])) > 2.0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TTFT P95 exceeds 2 seconds"
+
+      - alert: KVCacheNearFull
+        expr: vllm_kv_cache_utilization > 0.95
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "KV cache utilization above 95%"
+
+      - alert: QueueBuildUp
+        expr: vllm_queue_depth > 50
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Request queue depth exceeds 50"
+
+      - alert: LowThroughput
+        expr: rate(vllm_output_tokens_total[5m]) < 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Output throughput below 100 tokens/sec"
+```
+
+---
+
+## 4. Common Pathologies and Diagnostics
+
+### Pathology 1: KV Cache Thrashing
+
+**Symptoms**: High P95 TTFT, low throughput, KV cache utilization oscillating between 90-100%.
+
+**Root cause**: More active sequences than KV cache capacity. The scheduler preempts running sequences (evicts their KV cache) to make room for new requests, then later recomputes the evicted KV cache when those sequences resume.
+
+**Diagnostic pattern**:
+```
+kv_cache_util > 0.95 AND kv_evictions_rate > 10/sec AND ttft_p95 > 3s
+```
+
+**Fix**: Reduce `max_num_seqs` to limit concurrency, or increase KV cache capacity by using a smaller model, quantized KV cache, or more GPUs.
+
+```python
+# Diagnostic script: detect KV cache thrashing
+def diagnose_kv_thrashing(metrics_history):
+    """Detect KV cache thrashing from metrics time series."""
+    kv_util = metrics_history['kv_cache_utilization']
+    evictions = metrics_history['kv_cache_evictions_rate']
+    ttft_p95 = metrics_history['ttft_p95']
+
+    thrashing = False
+    for i in range(len(kv_util)):
+        if kv_util[i] > 0.95 and evictions[i] > 10:
+            thrashing = True
+            break
+
+    if thrashing:
+        # Compute optimal max_num_seqs
+        avg_seq_len = metrics_history['avg_sequence_length'][-1]
+        total_blocks = metrics_history['total_kv_blocks'][-1]
+        block_size = 16  # tokens per block
+        blocks_per_seq = avg_seq_len / block_size
+        safe_max_seqs = int(total_blocks * 0.85 / blocks_per_seq)
+
+        return {
+            'diagnosis': 'KV cache thrashing',
+            'recommendation': f'Reduce max_num_seqs to {safe_max_seqs}',
+            'current_eviction_rate': evictions[-1],
+        }
+    return None
+```
+
+### Pathology 2: Prefill Starvation
+
+**Symptoms**: Very high TTFT (&gt;5s) but normal TBT. Queue depth steadily increasing.
+
+**Root cause**: Long-running decode sequences monopolize the GPU. New requests cannot begin prefill because continuous batching keeps running decode steps for existing sequences without pause.
+
+**Diagnostic pattern**:
+```
+ttft_p95 > 5s AND tbt_p50 < 50ms AND queue_depth > 20
+```
+
+**Fix**: Enable chunked prefill (which interleaves prefill chunks with decode steps) or reduce the maximum number of running sequences to create prefill windows.
+
+```python
+# vLLM configuration to fix prefill starvation
+# Option 1: Enable chunked prefill
+vllm_args = {
+    "enable_chunked_prefill": True,
+    "max_num_batched_tokens": 2048,  # Max tokens per step (prefill + decode)
+}
+
+# Option 2: Limit decode batch to create prefill windows
+vllm_args = {
+    "max_num_seqs": 64,      # Reduced from 256
+    "max_num_batched_tokens": 4096,
+}
+```
+
+### Pathology 3: GPU Underutilization
+
+**Symptoms**: Low throughput, low GPU utilization (&lt;50%), normal latency per token.
+
+**Root cause**: Batch sizes are too small. The GPU has capacity for more concurrent sequences but the scheduler is not filling the batch.
+
+**Diagnostic pattern**:
+```
+gpu_utilization < 0.50 AND batch_size_p50 < 8 AND queue_depth < 5
+```
+
+**Fix**: This usually means traffic is low. If traffic is actually high but batch sizes are small, check that `max_num_seqs` is set high enough and that KV cache capacity allows more concurrent sequences.
+
+### Pathology 4: Memory Leak
+
+**Symptoms**: GPU memory usage slowly increases over hours/days. Eventually OOM crash.
+
+**Root cause**: KV cache blocks not being freed for completed or failed requests. This can happen with custom request handlers that do not properly signal completion.
+
+**Diagnostic pattern**:
+```
+gpu_memory_usage steadily increasing AND requests_completed_total increasing normally
+```
+
+**Fix**: Check that all request completion paths (success, error, timeout, client disconnect) call the block manager's free method:
+
+```python
+class RequestLifecycleTracker:
+    """Ensure KV cache is freed on all exit paths."""
+
+    def __init__(self, block_manager):
+        self.block_manager = block_manager
+        self.active_requests = {}
+
+    def on_request_start(self, request_id, block_ids):
+        self.active_requests[request_id] = {
+            'block_ids': block_ids,
+            'start_time': time.time(),
+        }
+
+    def on_request_end(self, request_id, reason='success'):
+        if request_id in self.active_requests:
+            blocks = self.active_requests[request_id]['block_ids']
+            self.block_manager.free_blocks(blocks)
+            del self.active_requests[request_id]
+        else:
+            # Leak: request ended but was not tracked
+            print(f"WARNING: untracked request {request_id} ended")
+
+    def check_for_leaks(self, timeout_seconds=300):
+        """Find requests that have been running too long."""
+        now = time.time()
+        leaks = []
+        for req_id, info in self.active_requests.items():
+            if now - info['start_time'] > timeout_seconds:
+                leaks.append(req_id)
+        return leaks
+```
+
+### Pathology 5: Prefix Cache Misses
+
+**Symptoms**: High TTFT despite prefix caching being enabled. Prefix cache hit rate near 0%.
+
+**Root cause**: Requests do not share common prefixes (diverse system prompts, no prompt reuse), or the cache is too small to hold frequently used prefixes.
+
+**Diagnostic pattern**:
+```
+prefix_cache_hit_rate < 0.1 AND enable_prefix_caching = true
+```
+
+**Fix**: Standardize system prompts across requests. Group requests by system prompt and route them to the same vLLM instance. Increase KV cache size to hold more prefix blocks.
+
+<PerfChart
+  title="TTFT Impact of Prefix Cache Hit Rate (4K prompt, Llama 70B, H100)"
+  data={[
+    { label: "0% hit rate", value: 1200, color: "red", annotation: "Full prefill" },
+    { label: "25% hit", value: 920, color: "orange" },
+    { label: "50% hit", value: 640, color: "blue" },
+    { label: "75% hit", value: 360, color: "green" },
+    { label: "95% hit", value: 120, color: "green", annotation: "Near-instant" },
+  ]}
+  unit="ms TTFT"
+/>
+
+---
+
+## 5. CUDA-Level Profiling
+
+### Using torch.profiler
+
+For deeper analysis (identifying which kernels are slow), use PyTorch's built-in profiler:
+
+```python
+import torch
+from torch.profiler import profile, ProfilerActivity, tensorboard_trace_handler
+
+def profile_vllm_step(model_runner, input_data, output_dir="/tmp/vllm_profile"):
+    """Profile a single vLLM decode step."""
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(
+            wait=1,
+            warmup=3,
+            active=5,
+            repeat=1,
+        ),
+        on_trace_ready=tensorboard_trace_handler(output_dir),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+    ) as prof:
+        for step in range(9):  # wait(1) + warmup(3) + active(5)
+            model_runner.execute_model(input_data)
+            prof.step()
+
+    # Print summary
+    print(prof.key_averages().table(
+        sort_by="cuda_time_total",
+        row_limit=20,
+    ))
+```
+
+### Nsight Systems for Full GPU Timeline
+
+For the most detailed view, use NVIDIA Nsight Systems:
+
+```bash
+# Profile vLLM with Nsight Systems
+nsys profile \
+    --trace cuda,nvtx,osrt \
+    --cuda-memory-usage true \
+    --output /tmp/vllm_nsys \
+    python -m vllm.entrypoints.openai.api_server \
+        --model meta-llama/Llama-3-70B \
+        --tensor-parallel-size 8
+```
+
+### Key Patterns to Look For
+
+```python
+def analyze_profile(prof):
+    """Extract key performance indicators from profile."""
+    events = prof.key_averages()
+
+    analysis = {}
+
+    # 1. Attention kernel fraction
+    attn_time = sum(
+        e.cuda_time_total for e in events
+        if 'attention' in e.key.lower() or 'flash' in e.key.lower()
+    )
+    total_time = sum(e.cuda_time_total for e in events)
+    analysis['attention_fraction'] = attn_time / total_time
+
+    # 2. GEMM fraction (FFN and projections)
+    gemm_time = sum(
+        e.cuda_time_total for e in events
+        if 'gemm' in e.key.lower() or 'mm' in e.key.lower()
+    )
+    analysis['gemm_fraction'] = gemm_time / total_time
+
+    # 3. Communication fraction (all-reduce)
+    comm_time = sum(
+        e.cuda_time_total for e in events
+        if 'nccl' in e.key.lower() or 'all_reduce' in e.key.lower()
+    )
+    analysis['communication_fraction'] = comm_time / total_time
+
+    # 4. GPU idle gaps
+    analysis['gpu_idle_fraction'] = 1.0 - (attn_time + gemm_time + comm_time) / total_time
+
+    return analysis
+```
+
+---
+
+## 6. Load Testing
+
+### Benchmarking Script
+
+```python
+import asyncio
+import aiohttp
+import time
+import json
+from dataclasses import dataclass, field
+
+@dataclass
+class RequestResult:
+    ttft: float = 0.0
+    tbt_list: list = field(default_factory=list)
+    e2e: float = 0.0
+    output_tokens: int = 0
+    error: str = ""
+
+async def send_request(session, url, prompt, max_tokens=256):
+    """Send a single request and measure latencies."""
+    result = RequestResult()
+    payload = {
+        "model": "meta-llama/Llama-3-70B",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "stream": True,
+    }
+
+    start = time.perf_counter()
+    first_token_time = None
+    last_token_time = start
+    token_count = 0
+
+    try:
+        async with session.post(
+            f"{url}/v1/chat/completions",
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=120),
+        ) as resp:
+            async for line in resp.content:
+                line = line.decode('utf-8').strip()
+                if not line.startswith('data: '):
+                    continue
+                data = line[6:]
+                if data == '[DONE]':
+                    break
+
+                chunk = json.loads(data)
+                if chunk['choices'][0]['delta'].get('content'):
+                    now = time.perf_counter()
+                    token_count += 1
+
+                    if first_token_time is None:
+                        first_token_time = now
+                        result.ttft = now - start
+                    else:
+                        result.tbt_list.append(now - last_token_time)
+
+                    last_token_time = now
+
+        result.e2e = time.perf_counter() - start
+        result.output_tokens = token_count
+
+    except Exception as e:
+        result.error = str(e)
+        result.e2e = time.perf_counter() - start
+
+    return result
+
+
+async def load_test(url, prompts, concurrency=10, total_requests=100):
+    """Run a load test against a vLLM server."""
+    semaphore = asyncio.Semaphore(concurrency)
+    results = []
+
+    async def bounded_request(session, prompt):
+        async with semaphore:
+            return await send_request(session, url, prompt)
+
+    async with aiohttp.ClientSession() as session:
+        tasks = [
+            bounded_request(session, prompts[i % len(prompts)])
+            for i in range(total_requests)
+        ]
+        results = await asyncio.gather(*tasks)
+
+    return results
+
+
+def analyze_results(results):
+    """Compute statistics from load test results."""
+    successful = [r for r in results if not r.error]
+    failed = [r for r in results if r.error]
+
+    ttfts = [r.ttft for r in successful]
+    e2es = [r.e2e for r in successful]
+    all_tbts = [t for r in successful for t in r.tbt_list]
+    total_tokens = sum(r.output_tokens for r in successful)
+
+    ttfts.sort()
+    e2es.sort()
+    all_tbts.sort()
+
+    def percentile(arr, p):
+        if not arr:
+            return 0
+        idx = int(len(arr) * p / 100)
+        return arr[min(idx, len(arr) - 1)]
+
+    total_time = max(r.e2e for r in results) if results else 0
+
+    return {
+        'total_requests': len(results),
+        'successful': len(successful),
+        'failed': len(failed),
+        'ttft_p50': percentile(ttfts, 50),
+        'ttft_p95': percentile(ttfts, 95),
+        'ttft_p99': percentile(ttfts, 99),
+        'tbt_p50': percentile(all_tbts, 50),
+        'tbt_p95': percentile(all_tbts, 95),
+        'e2e_p50': percentile(e2es, 50),
+        'e2e_p95': percentile(e2es, 95),
+        'throughput_tps': total_tokens / total_time if total_time > 0 else 0,
+        'throughput_rps': len(successful) / total_time if total_time > 0 else 0,
+    }
+```
+
+### Test Scenarios
+
+```python
+# Scenario 1: Latency under low load
+# Goal: measure baseline TTFT and TBT
+low_load = {
+    "concurrency": 1,
+    "total_requests": 50,
+    "prompt_length": 512,
+    "max_tokens": 256,
+}
+
+# Scenario 2: Throughput at saturation
+# Goal: find maximum sustainable throughput
+saturation = {
+    "concurrency": 64,
+    "total_requests": 500,
+    "prompt_length": 512,
+    "max_tokens": 256,
+}
+
+# Scenario 3: Long prompts
+# Goal: measure TTFT scaling with prompt length
+long_prompts = {
+    "concurrency": 8,
+    "total_requests": 50,
+    "prompt_length": 8192,
+    "max_tokens": 256,
+}
+
+# Scenario 4: Long outputs
+# Goal: measure sustained decode performance
+long_outputs = {
+    "concurrency": 16,
+    "total_requests": 50,
+    "prompt_length": 256,
+    "max_tokens": 4096,
+}
+
+# Scenario 5: Burst traffic
+# Goal: measure queue behavior under sudden load
+burst = {
+    "concurrency": 128,   # 2x normal
+    "total_requests": 200,
+    "prompt_length": 512,
+    "max_tokens": 256,
+}
+```
+
+---
+
+## 7. Production Configuration Tuning
+
+### Key Configuration Parameters
+
+```python
+# vLLM server configuration for production
+config = {
+    # Model
+    "model": "meta-llama/Llama-3-70B-Instruct",
+    "tensor_parallel_size": 8,
+    "dtype": "auto",  # Uses BF16 on Ampere+
+
+    # Batch configuration
+    "max_num_seqs": 256,           # Max concurrent sequences
+    "max_num_batched_tokens": 8192, # Max tokens per scheduler step
+    "max_model_len": 8192,         # Max sequence length
+
+    # KV cache
+    "gpu_memory_utilization": 0.90, # Fraction of GPU memory for KV cache
+    "enable_prefix_caching": True,
+    "block_size": 16,
+
+    # Chunked prefill
+    "enable_chunked_prefill": True,
+    "max_num_batched_tokens": 2048, # Smaller chunks for better TBT
+
+    # CUDA graphs
+    "enforce_eager": False,         # Enable CUDA graphs
+
+    # Quantization (optional)
+    # "quantization": "awq",
+    # "kv_cache_dtype": "fp8_e5m2",
+}
+```
+
+### Tuning Procedure
+
+```python
+def tune_vllm_config(
+    target_ttft_p95: float,
+    target_tbt_p95: float,
+    target_throughput: float,
+    gpu_memory_gb: float,
+    model_size_gb: float,
+):
+    """Recommend vLLM configuration based on targets."""
+    # Available memory for KV cache
+    kv_memory = gpu_memory_gb * 0.90 - model_size_gb  # GB
+
+    # KV cache size per token per layer (Llama 70B, FP16)
+    # 2 * num_kv_heads * head_dim * 2 bytes = 2 * 8 * 128 * 2 = 4096 bytes
+    kv_bytes_per_token_per_layer = 4096
+    num_layers = 80
+    kv_bytes_per_token = kv_bytes_per_token_per_layer * num_layers  # ~320KB
+
+    # Total tokens we can cache
+    max_cached_tokens = int(kv_memory * 1e9 / kv_bytes_per_token)
+
+    # Tokens per sequence (average)
+    avg_seq_tokens = 2048  # Typical for chat
+
+    # Max concurrent sequences
+    max_seqs = max_cached_tokens // avg_seq_tokens
+
+    config = {
+        "max_num_seqs": min(max_seqs, 512),
+        "gpu_memory_utilization": 0.90,
+    }
+
+    # If TTFT target is tight, enable chunked prefill with small chunks
+    if target_ttft_p95 < 1.0:
+        config["enable_chunked_prefill"] = True
+        config["max_num_batched_tokens"] = 2048
+
+    # If TBT target is tight, limit batch size
+    if target_tbt_p95 < 0.05:
+        config["max_num_seqs"] = min(config["max_num_seqs"], 64)
+
+    return config
+```
+
+---
+
+## 8. Automated Anomaly Detection
+
+```python
+import numpy as np
+from collections import deque
+
+class MetricAnomalyDetector:
+    """Detect anomalies in vLLM metrics using rolling statistics."""
+
+    def __init__(self, window_size: int = 100, z_threshold: float = 3.0):
+        self.window_size = window_size
+        self.z_threshold = z_threshold
+        self.metric_windows = {}
+
+    def observe(self, metric_name: str, value: float) -> dict:
+        """Record a metric value and check for anomalies."""
+        if metric_name not in self.metric_windows:
+            self.metric_windows[metric_name] = deque(maxlen=self.window_size)
+
+        window = self.metric_windows[metric_name]
+
+        result = {"anomaly": False, "metric": metric_name, "value": value}
+
+        if len(window) >= 20:  # Need minimum samples
+            mean = np.mean(window)
+            std = np.std(window)
+
+            if std > 0:
+                z_score = (value - mean) / std
+                if abs(z_score) > self.z_threshold:
+                    result["anomaly"] = True
+                    result["z_score"] = z_score
+                    result["mean"] = mean
+                    result["std"] = std
+                    result["direction"] = "high" if z_score > 0 else "low"
+
+        window.append(value)
+        return result
+
+    def check_correlations(self):
+        """Check for correlated anomalies that indicate specific issues."""
+        correlations = []
+
+        kv_util = self.metric_windows.get('kv_cache_utilization', [])
+        ttft = self.metric_windows.get('ttft_p95', [])
+
+        if len(kv_util) > 20 and len(ttft) > 20:
+            kv_arr = np.array(list(kv_util)[-20:])
+            ttft_arr = np.array(list(ttft)[-20:])
+
+            if np.corrcoef(kv_arr, ttft_arr)[0, 1] > 0.8:
+                correlations.append({
+                    'pattern': 'kv_cache_ttft_correlation',
+                    'diagnosis': 'KV cache pressure is increasing TTFT',
+                    'action': 'Reduce max_num_seqs or add GPU capacity',
+                })
+
+        return correlations
+```
+
+---
+
+## 9. Complete Production Monitoring Setup
+
+```python
+import threading
+import time
+
+class VLLMMonitor:
+    """
+    Complete production monitoring for vLLM.
+    Combines metrics collection, anomaly detection, and alerting.
+    """
+
+    def __init__(self, vllm_engine, alert_callback=None):
+        self.engine = vllm_engine
+        self.metrics = VLLMProductionMetrics()
+        self.detector = MetricAnomalyDetector()
+        self.alert_callback = alert_callback or self._default_alert
+        self._running = False
+
+    def start(self, interval_seconds=5):
+        """Start periodic metric collection."""
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._collection_loop,
+            args=(interval_seconds,),
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        self._thread.join()
+
+    def _collection_loop(self, interval):
+        while self._running:
+            try:
+                self._collect_and_analyze()
+            except Exception as e:
+                print(f"Metric collection error: {e}")
+            time.sleep(interval)
+
+    def _collect_and_analyze(self):
+        """Collect metrics from vLLM engine and check for anomalies."""
+        # Get engine stats
+        stats = self.engine.get_stats()
+
+        # Update gauges
+        self.metrics.queue_depth.set(stats.get('num_waiting', 0))
+        self.metrics.kv_cache_util.set(stats.get('gpu_cache_usage', 0))
+
+        # Check for anomalies
+        for metric_name, value in stats.items():
+            if isinstance(value, (int, float)):
+                result = self.detector.observe(metric_name, value)
+                if result['anomaly']:
+                    self.alert_callback(result)
+
+        # Check for correlated anomalies
+        correlations = self.detector.check_correlations()
+        for corr in correlations:
+            self.alert_callback(corr)
+
+    def _default_alert(self, alert):
+        print(f"ALERT: {alert}")
+
+    def get_health_report(self):
+        """Generate a comprehensive health report."""
+        stats = self.engine.get_stats()
+        return {
+            'status': 'healthy' if stats.get('gpu_cache_usage', 0) < 0.95 else 'degraded',
+            'kv_cache_utilization': stats.get('gpu_cache_usage', 0),
+            'queue_depth': stats.get('num_waiting', 0),
+            'active_sequences': stats.get('num_running', 0),
+            'gpu_utilization': stats.get('gpu_utilization', 0),
+        }
+```
+
+<Callout type="tip" title="Start with Three Panels">
+If you are setting up monitoring for the first time, start with just three Grafana panels: TTFT P95, KV cache utilization, and queue depth. These three metrics surface 90% of production issues. Add more panels as you encounter specific problems.
+</Callout>
+
+---
+
+## Reviewer Agent Challenges
+
+1. **Build an auto-tuner**: Implement a `VLLMAutoTuner` that takes a target SLO (TTFT P95 &lt; 1s, TBT P95 &lt; 50ms) and automatically adjusts `max_num_seqs` and `max_num_batched_tokens` based on observed metrics. The tuner should run a binary search over configuration space, measure performance at each point using the load testing framework, and converge on the optimal configuration within 10 iterations.
+
+2. **Implement trace-based root cause analysis**: When a specific request has high TTFT, trace backward through the metrics to identify the cause. Was it queue wait (high queue depth at request arrival time)? Was it KV cache miss (no prefix cache hit)? Was it prefill contention (long prompt competing with decode batch)? Build a `RequestDiagnostics` class that takes a request ID and returns a structured root cause analysis.
+
+3. **Predict SLO violations before they happen**: Using the rolling metric windows, implement a `SLOPredictor` that uses linear extrapolation of KV cache utilization and queue depth trends to predict when SLO violations will occur in the next 5 minutes. If a violation is predicted, the system should proactively reduce `max_num_seqs` to prevent it.

@@ -292,6 +292,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"dataset-frontier-data-contamination-detection.mdx": {
+	id: "dataset-frontier-data-contamination-detection.mdx";
+  slug: "dataset-frontier-data-contamination-detection";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "dataset-frontier-data-mixing-optimal-proportions.mdx": {
 	id: "dataset-frontier-data-mixing-optimal-proportions.mdx";
   slug: "dataset-frontier-data-mixing-optimal-proportions";
@@ -299,9 +306,30 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"dataset-frontier-data-scaling-law-how-much.mdx": {
+	id: "dataset-frontier-data-scaling-law-how-much.mdx";
+  slug: "dataset-frontier-data-scaling-law-how-much";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "dataset-frontier-evaluation-benchmarks.mdx": {
 	id: "dataset-frontier-evaluation-benchmarks.mdx";
   slug: "dataset-frontier-evaluation-benchmarks";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"dataset-frontier-instruction-tuning-data.mdx": {
+	id: "dataset-frontier-instruction-tuning-data.mdx";
+  slug: "dataset-frontier-instruction-tuning-data";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"dataset-frontier-multilingual-cross-lingual.mdx": {
+	id: "dataset-frontier-multilingual-cross-lingual.mdx";
+  slug: "dataset-frontier-multilingual-cross-lingual";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -460,6 +488,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"frontier-research-embodied-ai-world-models.mdx": {
+	id: "frontier-research-embodied-ai-world-models.mdx";
+  slug: "frontier-research-embodied-ai-world-models";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "frontier-research-lightning-attention-linear-scaling.mdx": {
 	id: "frontier-research-lightning-attention-linear-scaling.mdx";
   slug: "frontier-research-lightning-attention-linear-scaling";
@@ -477,6 +512,13 @@ declare module 'astro:content' {
 "frontier-research-multimodal-fusion-architectures.mdx": {
 	id: "frontier-research-multimodal-fusion-architectures.mdx";
   slug: "frontier-research-multimodal-fusion-architectures";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"frontier-research-open-problems-2026.mdx": {
+	id: "frontier-research-open-problems-2026.mdx";
+  slug: "frontier-research-open-problems-2026";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -579,9 +621,30 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"inference-timeline-autoscaling-signals-warm-pools.mdx": {
+	id: "inference-timeline-autoscaling-signals-warm-pools.mdx";
+  slug: "inference-timeline-autoscaling-signals-warm-pools";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "inference-timeline-batched-gemm-throughput.mdx": {
 	id: "inference-timeline-batched-gemm-throughput.mdx";
   slug: "inference-timeline-batched-gemm-throughput";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"inference-timeline-cuda-graph-decode-optimization.mdx": {
+	id: "inference-timeline-cuda-graph-decode-optimization.mdx";
+  slug: "inference-timeline-cuda-graph-decode-optimization";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"inference-timeline-dynamic-batching-orca-sarathi.mdx": {
+	id: "inference-timeline-dynamic-batching-orca-sarathi.mdx";
+  slug: "inference-timeline-dynamic-batching-orca-sarathi";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -600,6 +663,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"inference-timeline-kernel-autotuning-compile.mdx": {
+	id: "inference-timeline-kernel-autotuning-compile.mdx";
+  slug: "inference-timeline-kernel-autotuning-compile";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "inference-timeline-long-context-serving-ring-offload.mdx": {
 	id: "inference-timeline-long-context-serving-ring-offload.mdx";
   slug: "inference-timeline-long-context-serving-ring-offload";
@@ -614,9 +684,44 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"inference-timeline-model-loading-cold-start.mdx": {
+	id: "inference-timeline-model-loading-cold-start.mdx";
+  slug: "inference-timeline-model-loading-cold-start";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"inference-timeline-multi-model-serving-switching.mdx": {
+	id: "inference-timeline-multi-model-serving-switching.mdx";
+  slug: "inference-timeline-multi-model-serving-switching";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"inference-timeline-prefill-decode-optimization.mdx": {
+	id: "inference-timeline-prefill-decode-optimization.mdx";
+  slug: "inference-timeline-prefill-decode-optimization";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"inference-timeline-request-preemption-priority.mdx": {
+	id: "inference-timeline-request-preemption-priority.mdx";
+  slug: "inference-timeline-request-preemption-priority";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "inference-timeline-speculative-decoding-v2.mdx": {
 	id: "inference-timeline-speculative-decoding-v2.mdx";
   slug: "inference-timeline-speculative-decoding-v2";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"inference-timeline-structured-output-acceleration.mdx": {
+	id: "inference-timeline-structured-output-acceleration.mdx";
+  slug: "inference-timeline-structured-output-acceleration";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -782,6 +887,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"nvidia-dynamo-blackwell-gb200-integration.mdx": {
+	id: "nvidia-dynamo-blackwell-gb200-integration.mdx";
+  slug: "nvidia-dynamo-blackwell-gb200-integration";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "nvidia-dynamo-fault-tolerance-canary-health.mdx": {
 	id: "nvidia-dynamo-fault-tolerance-canary-health.mdx";
   slug: "nvidia-dynamo-fault-tolerance-canary-health";
@@ -820,6 +932,13 @@ declare module 'astro:content' {
 "nvidia-dynamo-multimodel-gpu-sharing.mdx": {
 	id: "nvidia-dynamo-multimodel-gpu-sharing.mdx";
   slug: "nvidia-dynamo-multimodel-gpu-sharing";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"nvidia-dynamo-observability-tracing-metrics.mdx": {
+	id: "nvidia-dynamo-observability-tracing-metrics.mdx";
+  slug: "nvidia-dynamo-observability-tracing-metrics";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -992,6 +1111,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"transformer-anatomy-dropout-regularization.mdx": {
+	id: "transformer-anatomy-dropout-regularization.mdx";
+  slug: "transformer-anatomy-dropout-regularization";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "transformer-anatomy-gradient-flow-backprop.mdx": {
 	id: "transformer-anatomy-gradient-flow-backprop.mdx";
   slug: "transformer-anatomy-gradient-flow-backprop";
@@ -1030,6 +1156,20 @@ declare module 'astro:content' {
 "transformer-anatomy-multi-token-prediction-heads.mdx": {
 	id: "transformer-anatomy-multi-token-prediction-heads.mdx";
   slug: "transformer-anatomy-multi-token-prediction-heads";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"transformer-anatomy-rotary-position-complete-derivation.mdx": {
+	id: "transformer-anatomy-rotary-position-complete-derivation.mdx";
+  slug: "transformer-anatomy-rotary-position-complete-derivation";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"transformer-anatomy-sparse-attention-patterns.mdx": {
+	id: "transformer-anatomy-sparse-attention-patterns.mdx";
+  slug: "transformer-anatomy-sparse-attention-patterns";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -1118,9 +1258,51 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"vllm-v1-multi-lora-adapter-scheduling.mdx": {
+	id: "vllm-v1-multi-lora-adapter-scheduling.mdx";
+  slug: "vllm-v1-multi-lora-adapter-scheduling";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "vllm-v1-omniconnector-multimodal-lifecycle.mdx": {
 	id: "vllm-v1-omniconnector-multimodal-lifecycle.mdx";
   slug: "vllm-v1-omniconnector-multimodal-lifecycle";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"vllm-v1-performance-profiling-production.mdx": {
+	id: "vllm-v1-performance-profiling-production.mdx";
+  slug: "vllm-v1-performance-profiling-production";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"vllm-v1-prefix-caching-hash-eviction.mdx": {
+	id: "vllm-v1-prefix-caching-hash-eviction.mdx";
+  slug: "vllm-v1-prefix-caching-hash-eviction";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"vllm-v1-rejection-sampler-cfg.mdx": {
+	id: "vllm-v1-rejection-sampler-cfg.mdx";
+  slug: "vllm-v1-rejection-sampler-cfg";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"vllm-v1-speculative-decoding-integration.mdx": {
+	id: "vllm-v1-speculative-decoding-integration.mdx";
+  slug: "vllm-v1-speculative-decoding-integration";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"vllm-v1-structured-output-grammar-engine.mdx": {
+	id: "vllm-v1-structured-output-grammar-engine.mdx";
+  slug: "vllm-v1-structured-output-grammar-engine";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">

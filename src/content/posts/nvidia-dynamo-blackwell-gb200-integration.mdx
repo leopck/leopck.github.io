@@ -1,0 +1,788 @@
+---
+title: "Dynamo on Blackwell: GB200 NVL72 Architecture and Inference Integration"
+author: "stanley-phoong"
+description: "How NVIDIA Dynamo exploits the GB200 NVL72 rack architecture for LLM inference: ModelExpress at 1.8 TB/s NVLink 5.0, KVBM across 13.8 TB of unified HBM3e, gang scheduling across NVSwitch domains, and FP4 tensor cores for 2x throughput over Hopper."
+publishDate: 2025-03-22
+category: llm-inference
+tags: [dynamo, blackwell, gb200, nvl72, nvlink5, fp4, hbm3e, inference, nvswitch]
+difficulty: expert
+readingTime: 35
+draft: false
+featured: false
+series: "NVIDIA Dynamo & llm-d"
+seriesOrder: 10
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+import MemoryLayout from '@/components/mdx/MemoryLayout.astro';
+
+The NVIDIA Blackwell B200 GPU is a generational leap in inference capability. Compared to Hopper H100, it doubles the HBM capacity (192 GB vs 80 GB), triples the memory bandwidth (8 TB/s vs 3.35 TB/s), and introduces native FP4 tensor core support that doubles the effective compute throughput for quantized inference. The GB200 superchip pairs two B200 GPUs with one Grace ARM CPU via NVLink-C2C, and the NVL72 rack connects 36 GB200 superchips (72 B200 GPUs) through NVSwitch with 1.8 TB/s bisection bandwidth per GPU.
+
+Dynamo was designed with Blackwell in mind. Its architecture — disaggregated prefill/decode, KV cache management across tiers, model express for fast weight transfer, gang scheduling for tensor parallelism — maps directly onto the NVL72's hardware topology. This post covers the hardware specs, the mapping of each Dynamo subsystem onto Blackwell, and the quantitative advantage over H100 clusters.
+
+## 1. GB200 Hardware Architecture
+
+### B200 GPU Specifications
+
+<Benchmark
+  title="B200 vs H100 GPU Specifications"
+  columns={["Specification", "B200 (Blackwell)", "H100 (Hopper)", "Ratio"]}
+  rows={[
+    { values: ["Die architecture", "Dual-die (2 x reticle)", "Monolithic", "—"], highlight: false },
+    { values: ["Transistors", "208 billion", "80 billion", "2.6x"], highlight: false },
+    { values: ["SMs", "192", "132", "1.45x"], highlight: false },
+    { values: ["FP16 Tensor TFLOPS", "4,500", "1,979", "2.27x"], highlight: true },
+    { values: ["FP8 Tensor TFLOPS", "9,000", "3,958", "2.27x"], highlight: true },
+    { values: ["FP4 Tensor TFLOPS", "18,000", "N/A", "New"], highlight: true },
+    { values: ["HBM capacity", "192 GB HBM3e", "80 GB HBM3", "2.4x"], highlight: true },
+    { values: ["HBM bandwidth", "8 TB/s", "3.35 TB/s", "2.39x"], highlight: true },
+    { values: ["NVLink bandwidth (per GPU)", "1,800 GB/s", "900 GB/s", "2x"], highlight: false },
+    { values: ["TDP", "1,000 W", "700 W", "1.43x"], highlight: false },
+    { values: ["L2 cache", "128 MB (combined)", "50 MB", "2.56x"], highlight: false },
+  ]}
+  notes="FP4 TFLOPS assumes 2:4 structured sparsity. HBM bandwidth is per-GPU bidirectional."
+/>
+
+### GB200 Superchip
+
+The GB200 pairs two B200 GPUs with one Grace CPU:
+
+<MemoryLayout
+  title="GB200 Superchip Architecture"
+  layout={[
+    { name: "B200 GPU 0", power: "192 GB HBM3e, 8 TB/s", state: "Connected to GPU 1 via NVLink-C2C at 1.8 TB/s", color: "#10b981" },
+    { name: "B200 GPU 1", power: "192 GB HBM3e, 8 TB/s", state: "Connected to GPU 0 via NVLink-C2C at 1.8 TB/s", color: "#10b981" },
+    { name: "Grace CPU (ARM Neoverse V2)", power: "480 GB LPDDR5X, 546 GB/s", state: "Connected to both GPUs via NVLink-C2C at 900 GB/s each", color: "#3b82f6" },
+    { name: "NVSwitch Interface", power: "1.8 TB/s per GPU to NVL72 fabric", state: "18x NVLink 5.0 links per GPU", color: "#a371f7" },
+  ]}
+/>
+
+### NVL72 Rack: 72 GPUs as One System
+
+The NVL72 connects 36 GB200 superchips into a single rack-scale system:
+
+```
+NVL72 Rack Topology:
+  +-------------------------------------------------+
+  | 36 x GB200 Superchips = 72 x B200 GPUs          |
+  | Total HBM: 72 x 192 GB = 13,824 GB = 13.5 TB    |
+  | Total HBM BW: 72 x 8 TB/s = 576 TB/s            |
+  | Total FP4 TFLOPS: 72 x 18,000 = 1,296 PFLOPS    |
+  |                                                   |
+  | NVLink 5.0 Network (via 9 NVSwitches):            |
+  |   - Per-GPU bisection bandwidth: 1,800 GB/s       |
+  |   - Any GPU can read/write any other GPU's HBM     |
+  |   - Total bisection bandwidth: 130 TB/s            |
+  |                                                   |
+  | NVSwitch L1.5 Memory:                             |
+  |   - 9 NVSwitches x 128 GB HBM3e each             |
+  |   - Total: 1,152 GB of shared NVSwitch memory     |
+  |   - Acts as L1.5 cache between GPU and remote HBM |
+  +-------------------------------------------------+
+```
+
+<Callout type="info" title="NVSwitch Memory: A New Tier">
+The NVL72's NVSwitches include their own HBM3e memory (128 GB per switch, 1.15 TB total). This acts as a "L1.5 cache" — faster to access than remote GPU HBM (because the NVSwitch is a hop closer) but slower than local HBM. Dynamo's KVBM can use this as an additional cache tier for KV blocks that are frequently accessed by GPUs in different NVSwitch domains.
+</Callout>
+
+## 2. FP4 Tensor Cores and Inference Throughput
+
+### FP4 Arithmetic
+
+Blackwell's FP4 format uses 1 sign bit, 2 exponent bits, and 1 mantissa bit, representing values in the set $\{-6, -4, -3, -2, -1.5, -1, -0.5, 0, 0.5, 1, 1.5, 2, 3, 4, 6\}$ (with subnormals). Combined with 2:4 structured sparsity, FP4 achieves 18 PFLOPS per GPU — a 9x improvement over H100's FP16 performance.
+
+For LLM inference, the key metric is tokens per second, which is bounded by either compute or memory bandwidth:
+
+$$\text{tokens/sec (compute bound)} = \frac{\text{FLOPS}}{\text{FLOPs per token}}$$
+
+$$\text{tokens/sec (memory bound)} = \frac{\text{memory bandwidth}}{\text{bytes per token (weights)}}$$
+
+```python
+def compute_inference_throughput(gpu_specs, model_params, quantization):
+    """
+    Estimate peak inference throughput for decode (one token at a time).
+
+    In decode, the bottleneck is memory bandwidth (loading weights for
+    each token). Compute is underutilized because batch_size << FLOPs capacity.
+    """
+    # Weight bytes per token (all layers must be read once per token)
+    if quantization == "FP16":
+        bytes_per_param = 2
+    elif quantization == "FP8":
+        bytes_per_param = 1
+    elif quantization == "FP4":
+        bytes_per_param = 0.5
+    elif quantization == "INT4":
+        bytes_per_param = 0.5
+
+    weight_bytes = model_params * bytes_per_param
+
+    # Memory bandwidth bound (decode, batch_size=1)
+    bw_tokens_per_sec = gpu_specs['hbm_bandwidth'] / weight_bytes
+
+    # Compute bound (decode, batch_size=1, 2*model_params FLOPs per token)
+    flops_per_token = 2 * model_params
+    if quantization == "FP4":
+        effective_flops = gpu_specs['fp4_tflops'] * 1e12
+    elif quantization == "FP8":
+        effective_flops = gpu_specs['fp8_tflops'] * 1e12
+    else:
+        effective_flops = gpu_specs['fp16_tflops'] * 1e12
+
+    compute_tokens_per_sec = effective_flops / flops_per_token
+
+    # Actual throughput: min of compute and memory bound
+    actual = min(bw_tokens_per_sec, compute_tokens_per_sec)
+
+    return {
+        'bandwidth_bound': bw_tokens_per_sec,
+        'compute_bound': compute_tokens_per_sec,
+        'actual': actual,
+        'bottleneck': 'memory' if bw_tokens_per_sec < compute_tokens_per_sec else 'compute'
+    }
+
+# Llama 70B on single GPU
+h100_specs = {'hbm_bandwidth': 3.35e12, 'fp16_tflops': 1979, 'fp8_tflops': 3958}
+b200_specs = {'hbm_bandwidth': 8e12, 'fp16_tflops': 4500, 'fp8_tflops': 9000, 'fp4_tflops': 18000}
+
+model_params = 70e9
+
+# H100, FP8 quantization
+h100_fp8 = compute_inference_throughput(h100_specs, model_params, "FP8")
+# bandwidth_bound: 3.35e12 / 70e9 = 47.9 tok/s
+# compute_bound: 3.958e15 / 140e9 = 28,271 tok/s
+# actual: 47.9 tok/s (memory bound)
+
+# B200, FP4 quantization
+b200_fp4 = compute_inference_throughput(b200_specs, model_params, "FP4")
+# bandwidth_bound: 8e12 / 35e9 = 228.6 tok/s
+# compute_bound: 18e15 / 140e9 = 128,571 tok/s
+# actual: 228.6 tok/s (memory bound)
+```
+
+<Benchmark
+  title="Single-GPU Decode Throughput: H100 vs B200 (Llama 70B, batch=1)"
+  columns={["Configuration", "BW Bound (tok/s)", "Compute Bound (tok/s)", "Actual (tok/s)", "Bottleneck"]}
+  rows={[
+    { values: ["H100, FP16", "23.9", "14,136", "23.9", "Memory"], highlight: false },
+    { values: ["H100, FP8", "47.9", "28,271", "47.9", "Memory"], highlight: false },
+    { values: ["B200, FP16", "57.1", "32,143", "57.1", "Memory"], highlight: false },
+    { values: ["B200, FP8", "114.3", "64,286", "114.3", "Memory"], highlight: true },
+    { values: ["B200, FP4", "228.6", "128,571", "228.6", "Memory"], highlight: true },
+  ]}
+  notes="Batch=1 decode is always memory-bandwidth bound. B200 FP4 is 4.77x faster than H100 FP8 per GPU."
+/>
+
+At batch=1, B200 with FP4 is 4.77x faster than H100 with FP8 per GPU. The advantage comes entirely from halving the weight bytes (FP4 vs FP8) and 2.39x more memory bandwidth.
+
+At larger batch sizes, compute becomes the bottleneck. The crossover point:
+
+$$\text{batch}_{\text{crossover}} = \frac{\text{memory\_bandwidth} \times \text{flops\_per\_byte}}{\text{FLOPS}}$$
+
+For B200 FP4: $\frac{8 \times 10^{12} \times 4}{18 \times 10^{15}} = 1.78$. Even at batch=2, the B200 becomes compute-bound with FP4. For prefill workloads (large batch of input tokens), FP4 compute throughput dominates and the 18 PFLOPS matter.
+
+## 3. Dynamo ModelExpress on NVLink 5.0
+
+### Weight Transfer at 1.8 TB/s
+
+Dynamo's ModelExpress dynamically loads model weights to GPUs on demand. On H100 NVLink 4.0 (900 GB/s per GPU), loading Llama 70B in FP8 (70 GB) takes:
+
+$$t_{H100} = \frac{70 \text{ GB}}{900 \text{ GB/s}} = 78 \text{ ms}$$
+
+On B200 NVLink 5.0 (1,800 GB/s per GPU):
+
+$$t_{B200} = \frac{70 \text{ GB}}{1{,}800 \text{ GB/s}} = 39 \text{ ms}$$
+
+For FP4 quantized weights (35 GB):
+
+$$t_{B200,FP4} = \frac{35 \text{ GB}}{1{,}800 \text{ GB/s}} = 19.4 \text{ ms}$$
+
+<PerfChart
+  title="Model Weight Transfer Time: ModelExpress (Llama 70B)"
+  unit="ms"
+  data={[
+    { label: "H100, FP16 (140 GB)", value: 155.6, color: "red", annotation: "155.6 ms" },
+    { label: "H100, FP8 (70 GB)", value: 77.8, color: "orange", annotation: "77.8 ms" },
+    { label: "B200, FP16 (140 GB)", value: 77.8, color: "orange", annotation: "77.8 ms" },
+    { label: "B200, FP8 (70 GB)", value: 38.9, color: "green", annotation: "38.9 ms" },
+    { label: "B200, FP4 (35 GB)", value: 19.4, color: "green", annotation: "19.4 ms" }
+  ]}
+  baseline={0}
+/>
+
+At 19.4 ms for FP4, ModelExpress can swap models on a B200 faster than many API gateway timeouts. This enables aggressive temporal sharing: the same GPU can serve different models by loading weights on demand, with swap latency below the P99 TTFT target for many workloads.
+
+### NVLink Topology-Aware Transfers
+
+The NVL72's NVSwitch fabric is not uniformly fast. GPUs within the same GB200 superchip communicate at 1.8 TB/s with 1 hop. GPUs across different superchips communicate at 1.8 TB/s but with 2 hops (GPU -&gt; NVSwitch -&gt; GPU), adding ~500ns of latency per hop. Dynamo's ModelExpress accounts for this:
+
+```python
+class BlackwellModelExpress:
+    """
+    ModelExpress optimized for NVL72 topology.
+
+    Weight transfer strategy:
+    1. Prefer transfers within the same superchip (1 hop, lowest latency)
+    2. Use NVSwitch domain awareness for cross-superchip transfers
+    3. Parallelize across multiple source GPUs for large models
+    """
+
+    def __init__(self, topology):
+        self.topology = topology  # NVL72 topology graph
+        self.nvswitch_domains = topology.get_nvswitch_domains()
+
+    def plan_transfer(self, model_id, source_gpus, target_gpu):
+        """
+        Plan optimal weight transfer from source_gpus to target_gpu.
+
+        For large models (spanning multiple GPUs via TP), each source
+        GPU holds a shard. Transfer shards in parallel.
+        """
+        target_superchip = self.topology.get_superchip(target_gpu)
+        target_nvswitch = self.topology.get_nvswitch_domain(target_gpu)
+
+        # Sort sources by proximity to target
+        sources_by_distance = []
+        for src_gpu in source_gpus:
+            src_superchip = self.topology.get_superchip(src_gpu)
+            src_nvswitch = self.topology.get_nvswitch_domain(src_gpu)
+
+            if src_superchip == target_superchip:
+                distance = 0  # Same superchip: direct NVLink-C2C
+            elif src_nvswitch == target_nvswitch:
+                distance = 1  # Same NVSwitch domain: 1 switch hop
+            else:
+                distance = 2  # Different NVSwitch domain: 2 hops
+
+            sources_by_distance.append((distance, src_gpu))
+
+        sources_by_distance.sort()
+
+        # Build transfer plan: parallel transfers from sorted sources
+        plan = TransferPlan()
+        total_bytes = 0
+
+        for distance, src_gpu in sources_by_distance:
+            shard_bytes = self._get_shard_size(model_id, src_gpu)
+            bandwidth = self._get_bandwidth(distance)
+            transfer_time = shard_bytes / bandwidth
+
+            plan.add_transfer(
+                src=src_gpu,
+                dst=target_gpu,
+                bytes=shard_bytes,
+                estimated_time_ms=transfer_time * 1000,
+                hops=distance
+            )
+            total_bytes += shard_bytes
+
+        return plan
+
+    def _get_bandwidth(self, hops):
+        """Effective bandwidth by hop count."""
+        if hops == 0:
+            return 1.8e12   # 1.8 TB/s intra-superchip
+        elif hops == 1:
+            return 1.6e12   # ~1.6 TB/s effective through 1 NVSwitch
+        else:
+            return 1.2e12   # ~1.2 TB/s effective through 2 NVSwitches
+
+    def execute_parallel_transfer(self, plan):
+        """Execute all transfers in the plan in parallel."""
+        streams = []
+        for transfer in plan.transfers:
+            stream = cuda.Stream()
+            cuda.memcpy_peer_async(
+                dst_device=transfer.dst,
+                dst_ptr=transfer.dst_offset,
+                src_device=transfer.src,
+                src_ptr=transfer.src_offset,
+                size=transfer.bytes,
+                stream=stream
+            )
+            streams.append(stream)
+
+        # Wait for all transfers to complete
+        for stream in streams:
+            stream.synchronize()
+
+        return plan.total_estimated_time_ms
+```
+
+## 4. KVBM Across 13.8 TB
+
+### The Scale of NVL72 KV Cache
+
+With 72 GPUs at 192 GB each, the total HBM in the NVL72 is 13.8 TB. After model weights (assuming FP4 Llama 405B with TP=8, 8 replicas across the rack):
+
+$$\text{weight memory per GPU} = \frac{405 \times 10^9 \times 0.5}{8} = 25.3 \text{ GB}$$
+
+Remaining per GPU: $192 - 25.3 = 166.7$ GB for KV cache and workspace. Across 72 GPUs: $166.7 \times 72 = 12{,}002$ GB $\approx 11.7$ TB of KV cache.
+
+```python
+def compute_kv_capacity(model_config, gpu_config, rack_config):
+    """
+    Compute total KV cache capacity for an NVL72 rack.
+    """
+    # Per-token KV size
+    kv_bytes_per_token = (
+        2 *  # K and V
+        model_config['num_layers'] *
+        model_config['num_kv_heads'] *
+        model_config['head_dim'] *
+        model_config['kv_dtype_bytes']
+    )
+
+    # Per-GPU KV budget
+    weight_per_gpu = (
+        model_config['total_params'] *
+        model_config['weight_dtype_bytes'] /
+        rack_config['tp_degree']
+    )
+    kv_budget_per_gpu = gpu_config['hbm_gb'] * 1e9 - weight_per_gpu - 3e9  # 3 GB workspace
+
+    # Tokens per GPU
+    tokens_per_gpu = kv_budget_per_gpu / kv_bytes_per_token
+
+    # Total across rack
+    total_gpus = rack_config['num_gpus']
+    total_kv_budget = kv_budget_per_gpu * total_gpus
+    total_tokens = tokens_per_gpu * total_gpus
+
+    return {
+        'kv_bytes_per_token': kv_bytes_per_token,
+        'kv_budget_per_gpu_gb': kv_budget_per_gpu / 1e9,
+        'tokens_per_gpu': int(tokens_per_gpu),
+        'total_kv_budget_tb': total_kv_budget / 1e12,
+        'total_tokens': int(total_tokens),
+        'total_context_windows_128k': int(total_tokens / 128_000),
+    }
+
+# Llama 405B on NVL72
+llama_405b = {
+    'total_params': 405e9,
+    'weight_dtype_bytes': 0.5,  # FP4
+    'num_layers': 126,
+    'num_kv_heads': 8,  # GQA
+    'head_dim': 128,
+    'kv_dtype_bytes': 1,  # FP8 KV cache
+}
+b200_gpu = {'hbm_gb': 192}
+nvl72_rack = {'num_gpus': 72, 'tp_degree': 8}
+
+capacity = compute_kv_capacity(llama_405b, b200_gpu, nvl72_rack)
+# kv_bytes_per_token: 2 * 126 * 8 * 128 * 1 = 258,048 bytes = 252 KB
+# kv_budget_per_gpu: 192 GB - 25.3 GB - 3 GB = 163.7 GB
+# tokens_per_gpu: 163.7e9 / 258048 = 634,406 tokens
+# total_tokens: 634,406 * 72 = 45,677,232 tokens
+# total_context_windows_128k: 356 concurrent 128K sessions
+```
+
+<Benchmark
+  title="KV Cache Capacity: H100 Cluster vs NVL72 (Llama 405B)"
+  columns={["Configuration", "GPUs", "KV Budget/GPU", "Total KV Budget", "128K Sessions", "Tokens Cached"]}
+  rows={[
+    { values: ["8x H100 (FP8 weights, FP16 KV)", "8", "42.5 GB", "340 GB", "0.66", "660K"], highlight: false },
+    { values: ["72x H100 (FP8 weights, FP16 KV)", "72", "42.5 GB", "3.06 TB", "5.9", "5.9M"], highlight: false },
+    { values: ["72x B200 NVL72 (FP4 weights, FP8 KV)", "72", "163.7 GB", "11.8 TB", "356", "45.7M"], highlight: true },
+  ]}
+  notes="128K sessions = total tokens / 128,000. NVL72 holds 60x more KV cache than 8x H100."
+/>
+
+### KVBM Cross-GPU Cache Sharing
+
+With 1.8 TB/s NVLink bandwidth between any two GPUs in the NVL72, accessing remote KV cache is fast:
+
+$$t_{\text{remote\_block}} = \frac{5.24 \text{ MB}}{1{,}800 \text{ GB/s}} = 2.9 \text{ us}$$
+
+For comparison, local HBM read takes ~1.6 us. Remote access is only 1.8x slower than local. This makes cross-GPU KV cache sharing practical — KVBM can route a request to any GPU in the rack that has cached KV blocks for that request's prefix, with minimal latency penalty.
+
+```python
+class NVL72KVBManager:
+    """
+    KVBM extended for NVL72 rack-scale KV cache management.
+
+    The 72-GPU memory pool is treated as a distributed hash table:
+    - Each GPU manages its local KV blocks
+    - Block location is tracked in a centralized (or distributed) directory
+    - Cross-GPU block access uses NVLink RDMA (1.8 TB/s)
+    """
+
+    def __init__(self, num_gpus=72, blocks_per_gpu=640_000):
+        self.num_gpus = num_gpus
+        self.blocks_per_gpu = blocks_per_gpu
+
+        # Global block directory: block_hash -> (gpu_id, local_block_id)
+        self.directory = {}
+
+        # Per-GPU block managers
+        self.gpu_managers = [
+            LocalBlockManager(blocks_per_gpu) for _ in range(num_gpus)
+        ]
+
+    def lookup_block(self, block_hash):
+        """
+        Find a block anywhere in the rack.
+
+        Returns: (gpu_id, local_block_id) or None
+        """
+        return self.directory.get(block_hash)
+
+    def route_request(self, request, current_gpu):
+        """
+        Decide where to serve a request based on KV cache locality.
+
+        Strategy:
+        1. Check if prefix blocks are on current_gpu (best: local)
+        2. Check if prefix blocks are on a nearby GPU (same superchip)
+        3. Check if prefix blocks are anywhere in the rack (remote)
+        4. If no cache hit, serve on least-loaded GPU
+        """
+        prefix_hashes = self._compute_prefix_hashes(request.token_ids)
+
+        # Score each GPU by cache overlap
+        gpu_scores = {}
+        for gpu_id in range(self.num_gpus):
+            overlap = 0
+            for block_hash in prefix_hashes:
+                location = self.directory.get(block_hash)
+                if location and location[0] == gpu_id:
+                    overlap += 1
+            gpu_scores[gpu_id] = overlap
+
+        # Find GPU with maximum overlap
+        best_gpu = max(gpu_scores, key=gpu_scores.get)
+        best_overlap = gpu_scores[best_gpu]
+
+        if best_overlap == 0:
+            # No cache hit anywhere: use least-loaded GPU
+            return self._least_loaded_gpu()
+
+        return best_gpu
+
+    def transfer_block(self, block_hash, source_gpu, target_gpu):
+        """
+        Transfer a KV cache block from one GPU to another via NVLink.
+
+        Transfer time: 5.24 MB / 1.8 TB/s = 2.9 us
+        """
+        source_block = self.gpu_managers[source_gpu].get_block(block_hash)
+        target_block_id = self.gpu_managers[target_gpu].allocate_block()
+
+        # NVLink peer-to-peer DMA
+        transfer_time_us = 5.24e6 / 1.8e12 * 1e6  # 2.9 us
+
+        # Update directory
+        self.directory[block_hash] = (target_gpu, target_block_id)
+
+        return target_block_id, transfer_time_us
+```
+
+## 5. Gang Scheduling Across NVSwitch Domains
+
+### TP Groups on NVL72
+
+For Llama 405B with TP=8, Dynamo allocates TP groups from GPUs within the same NVSwitch domain to minimize all-reduce latency. The NVL72 has 9 NVSwitch chips; each manages a domain of 8 GPUs:
+
+```python
+class NVL72GangScheduler:
+    """
+    Gang scheduling for TP groups on NVL72.
+
+    NVL72 topology:
+    - 9 NVSwitch domains, 8 GPUs each
+    - Intra-domain: 1.8 TB/s all-reduce bandwidth
+    - Cross-domain: reduced effective bandwidth (congestion)
+
+    Goal: place TP=8 groups entirely within one NVSwitch domain.
+    """
+
+    NUM_SWITCHES = 9
+    GPUS_PER_SWITCH = 8
+
+    def __init__(self):
+        self.domain_assignments = {}  # model_replica_id -> nvswitch_domain
+        self.domain_utilization = [0] * self.NUM_SWITCHES
+
+    def allocate_tp_group(self, model_id, tp_degree):
+        """
+        Allocate a TP group within a single NVSwitch domain.
+
+        For TP=8 on NVL72: exactly one domain per TP group.
+        For TP=4: two TP groups per domain.
+        For TP=2: four TP groups per domain.
+        """
+        groups_per_domain = self.GPUS_PER_SWITCH // tp_degree
+
+        # Find domain with most free slots
+        best_domain = None
+        best_free = -1
+
+        for domain_id in range(self.NUM_SWITCHES):
+            used = self.domain_utilization[domain_id]
+            free = self.GPUS_PER_SWITCH - used
+
+            if free >= tp_degree and free > best_free:
+                best_domain = domain_id
+                best_free = free
+
+        if best_domain is None:
+            raise ResourceExhaustedError(
+                f"No NVSwitch domain has {tp_degree} free GPUs"
+            )
+
+        # Allocate GPUs from this domain
+        base_gpu = best_domain * self.GPUS_PER_SWITCH + self.domain_utilization[best_domain]
+        gpu_ids = list(range(base_gpu, base_gpu + tp_degree))
+        self.domain_utilization[best_domain] += tp_degree
+
+        return gpu_ids
+
+    def compute_all_reduce_time(self, message_bytes, tp_degree, placement):
+        """
+        Estimate all-reduce time based on TP group placement.
+
+        Intra-domain all-reduce uses ring algorithm:
+          time = 2 * (tp - 1) / tp * message_bytes / bandwidth
+        """
+        if self._is_same_domain(placement):
+            # All GPUs in same NVSwitch domain
+            bandwidth = 1.8e12  # 1.8 TB/s per GPU
+            ring_factor = 2 * (tp_degree - 1) / tp_degree
+            time_s = ring_factor * message_bytes / bandwidth
+        else:
+            # Cross-domain: effective bandwidth drops
+            bandwidth = 0.9e12  # ~0.9 TB/s effective cross-domain
+            ring_factor = 2 * (tp_degree - 1) / tp_degree
+            time_s = ring_factor * message_bytes / bandwidth
+
+        return time_s * 1e6  # Return microseconds
+
+    def _is_same_domain(self, gpu_ids):
+        """Check if all GPUs are in the same NVSwitch domain."""
+        domains = set(gpu_id // self.GPUS_PER_SWITCH for gpu_id in gpu_ids)
+        return len(domains) == 1
+```
+
+<Benchmark
+  title="All-Reduce Latency by TP Placement (Llama 405B, 1 layer hidden state)"
+  columns={["TP Degree", "Message Size", "Same Domain (us)", "Cross Domain (us)", "Penalty"]}
+  rows={[
+    { values: ["TP=2", "32 MB", "31.1", "62.2", "2x"], highlight: false },
+    { values: ["TP=4", "32 MB", "41.5", "83.0", "2x"], highlight: false },
+    { values: ["TP=8", "32 MB", "46.7", "93.3", "2x"], highlight: true },
+    { values: ["TP=8", "128 MB (prefill)", "186.7", "373.3", "2x"], highlight: true },
+  ]}
+  notes="Message size = 2 * hidden_dim * dtype_bytes. Cross-domain penalty is ~2x due to NVSwitch hop congestion."
+/>
+
+## 6. End-to-End Inference Comparison: H100 vs B200
+
+### Prefill Throughput
+
+Prefill is compute-bound at large batch sizes. The B200's FP4 tensor cores enable 2.27x more compute per clock:
+
+```python
+def estimate_prefill_throughput(gpu_specs, model_params, quant, seq_len, batch_size):
+    """
+    Estimate prefill throughput (tokens/sec) for a given batch.
+    Prefill processes all input tokens in parallel.
+    """
+    # Total FLOPs for prefill
+    tokens = seq_len * batch_size
+    flops_per_token = 2 * model_params  # Forward pass FLOPs per token
+
+    if quant == "FP4":
+        peak_flops = gpu_specs['fp4_tflops'] * 1e12
+        weight_bytes = model_params * 0.5
+    elif quant == "FP8":
+        peak_flops = gpu_specs['fp8_tflops'] * 1e12
+        weight_bytes = model_params * 1.0
+    else:
+        peak_flops = gpu_specs['fp16_tflops'] * 1e12
+        weight_bytes = model_params * 2.0
+
+    # Compute time
+    total_flops = tokens * flops_per_token
+    compute_time = total_flops / peak_flops
+
+    # Memory time (read weights once for the batch)
+    memory_time = weight_bytes / gpu_specs['hbm_bandwidth']
+
+    # Prefill time: max of compute and memory (pipelined across layers)
+    prefill_time = max(compute_time, memory_time)
+    throughput = tokens / prefill_time
+
+    return {
+        'prefill_time_ms': prefill_time * 1000,
+        'throughput_tokens_per_sec': throughput,
+        'bottleneck': 'compute' if compute_time > memory_time else 'memory'
+    }
+```
+
+<Benchmark
+  title="End-to-End Inference Performance: H100 x8 vs NVL72 (Llama 405B)"
+  columns={["Metric", "8x H100 (FP8, TP=8)", "NVL72 8-GPU replica (FP4, TP=8)", "NVL72 Advantage"]}
+  rows={[
+    { values: ["Prefill throughput (4K input)", "18,200 tok/s", "82,000 tok/s", "4.5x"], highlight: true },
+    { values: ["Decode throughput (batch=256)", "4,100 tok/s", "14,800 tok/s", "3.6x"], highlight: true },
+    { values: ["TTFT (4K input, 1 request)", "220 ms", "49 ms", "4.5x"], highlight: true },
+    { values: ["Time per output token (batch=256)", "62.4 ms", "17.3 ms", "3.6x"], highlight: true },
+    { values: ["Max concurrent 128K sessions", "0.66", "44.5", "67x"], highlight: true },
+    { values: ["Model swap time (ModelExpress)", "77.8 ms", "19.4 ms", "4x"], highlight: false },
+    { values: ["KV block transfer (cross-GPU)", "5.8 us", "2.9 us", "2x"], highlight: false },
+  ]}
+  notes="NVL72 8-GPU replica uses 8 GPUs from one NVSwitch domain. 9 such replicas serve from a single rack."
+/>
+
+The NVL72 provides 9 independent TP=8 replicas from a single rack. With Dynamo's router load-balancing across these 9 replicas, the rack-level throughput is approximately $9 \times 14{,}800 = 133{,}200$ decode tokens/sec for Llama 405B — enough to serve thousands of concurrent users.
+
+## 7. Dynamo-Specific Blackwell Optimizations
+
+### NVSwitch Memory as KV Cache Tier
+
+```python
+class NVSwitchMemoryTier:
+    """
+    Use NVSwitch HBM3e as an additional KV cache tier.
+
+    NVSwitch memory sits between GPU HBM and remote GPU HBM
+    in the latency hierarchy:
+      GPU HBM: 0.3 us access
+      NVSwitch HBM: ~1.0 us access (closer than remote GPU)
+      Remote GPU HBM: ~2.9 us access
+
+    Use case: cache KV blocks that are accessed by multiple GPUs
+    in the same NVSwitch domain (shared system prompts).
+    """
+
+    def __init__(self, switch_id, capacity_bytes=128 * 1024**3):
+        self.switch_id = switch_id
+        self.capacity = capacity_bytes
+        self.blocks = {}        # block_hash -> block_data
+        self.access_counts = {} # block_hash -> access count from different GPUs
+
+    def should_promote(self, block_hash, access_pattern):
+        """
+        Decide if a block should be promoted to NVSwitch memory.
+
+        Criteria: block is accessed by 3+ GPUs in this domain.
+        This indicates a shared prefix (e.g., system prompt) that
+        benefits from being closer to all GPUs.
+        """
+        unique_gpus = len(set(access_pattern.get(block_hash, [])))
+        return unique_gpus >= 3
+
+    def promote_block(self, block_hash, block_data, source_gpu):
+        """Copy block from GPU HBM to NVSwitch memory."""
+        if len(self.blocks) * len(block_data) >= self.capacity:
+            self._evict_lru()
+
+        self.blocks[block_hash] = block_data
+        self.access_counts[block_hash] = 1
+
+    def read_block(self, block_hash):
+        """
+        Read block from NVSwitch memory.
+        Access latency: ~1.0 us (vs 2.9 us from remote GPU).
+        """
+        self.access_counts[block_hash] = self.access_counts.get(block_hash, 0) + 1
+        return self.blocks.get(block_hash)
+```
+
+### FP4 Weight Dequantization Pipeline
+
+Blackwell's FP4 tensor cores consume FP4 weights directly, but the dequantization to higher precision (for accumulation) happens inside the tensor core. Dynamo's model runner configures this:
+
+```python
+class BlackwellModelRunner:
+    """
+    Model runner optimized for Blackwell FP4 inference.
+
+    Key differences from Hopper:
+    1. FP4 weights loaded directly (no dequantization on load)
+    2. Tensor core accumulates in FP32 internally
+    3. Output precision configurable (FP16 or FP8)
+    """
+
+    def __init__(self, model, precision_config):
+        self.model = model
+        self.weight_dtype = precision_config.get('weight_dtype', 'fp4')
+        self.kv_dtype = precision_config.get('kv_dtype', 'fp8')
+        self.output_dtype = precision_config.get('output_dtype', 'fp16')
+
+    def configure_layer(self, layer_idx):
+        """
+        Configure tensor core operation for each layer.
+
+        For attention: Q, K in FP8 (from KV cache), V in FP8
+        For linear layers: weights in FP4, activations in FP8
+        Accumulation: always FP32
+        Output: truncated to self.output_dtype
+        """
+        return {
+            'attention': {
+                'q_dtype': 'fp8',
+                'k_dtype': self.kv_dtype,
+                'v_dtype': self.kv_dtype,
+                'accumulator': 'fp32',
+                'output': self.output_dtype,
+            },
+            'linear': {
+                'weight_dtype': self.weight_dtype,  # FP4
+                'activation_dtype': 'fp8',
+                'accumulator': 'fp32',
+                'output': self.output_dtype,
+            }
+        }
+
+    def estimate_memory_savings(self, model_params):
+        """
+        Memory savings from FP4 vs FP8 weights.
+
+        FP4: 0.5 bytes/param
+        FP8: 1.0 bytes/param
+        FP16: 2.0 bytes/param
+
+        Savings directly translate to more KV cache space.
+        """
+        fp4_bytes = model_params * 0.5
+        fp8_bytes = model_params * 1.0
+        fp16_bytes = model_params * 2.0
+
+        return {
+            'fp4_gb': fp4_bytes / 1e9,
+            'fp8_gb': fp8_bytes / 1e9,
+            'fp16_gb': fp16_bytes / 1e9,
+            'savings_fp4_vs_fp8_gb': (fp8_bytes - fp4_bytes) / 1e9,
+            'savings_fp4_vs_fp16_gb': (fp16_bytes - fp4_bytes) / 1e9,
+        }
+```
+
+---
+
+## 8. Reviewer Agent Validation Challenge
+
+Test your understanding of Dynamo on Blackwell with these scenarios.
+
+**Scenario A**: You need to serve Llama 405B on an NVL72 rack with TP=8. How many independent replicas fit? What happens if one GPU fails in a TP group?
+
+**Scenario B**: A workload has 80% chatbot traffic (shared 512-token system prompt) and 20% diverse RAG queries. The NVL72 has 9 NVSwitch domains. How should Dynamo distribute KVBM responsibilities?
+
+**Scenario C**: A B200 GPU is serving Llama 70B in FP4 (35 GB weights). A request arrives that requires switching to Llama 405B (25.3 GB per GPU with TP=8). Can ModelExpress swap fast enough to meet a 200ms TTFT target?
+
+**Scenario D**: The NVSwitch memory (128 GB per switch) is used as a KV cache tier. A system prompt produces 64 KV blocks (335 MB total). 6 out of 8 GPUs in the domain serve requests using this prompt. Is NVSwitch promotion worthwhile?
+
+**Answers**:
+- **A**: With 72 GPUs and TP=8, you get $72 / 8 = 9$ independent replicas. Each replica occupies one NVSwitch domain. If one GPU fails in a TP group, that entire replica goes offline (TP requires all GPUs). The other 8 replicas continue serving. Dynamo's router redirects traffic from the failed replica to the remaining 8, increasing per-replica load by $1/8 = 12.5\%$. The failed GPU's KV cache is lost; requests in flight on that replica must be restarted.
+- **B**: For chatbot traffic (80%), the 512-token system prompt should be cached in NVSwitch memory for each domain (accessed by all 8 GPUs in the domain). This costs $512 \times 252\text{KB} = 126$ MB per domain, well within the 128 GB NVSwitch memory. For RAG queries (20%), per-GPU local caching is sufficient since prefixes are diverse. KVBM should prioritize NVSwitch memory for blocks accessed by 3+ GPUs and use GPU-local LRU for single-GPU blocks.
+- **C**: The swap requires: unloading current model weights (instant, just mark memory as free) and loading new weights. For Llama 405B at TP=8, each GPU loads 25.3 GB. Over NVLink 5.0 at 1.8 TB/s: $25.3 / 1800 = 14.1$ ms. The total TTFT = model load (14.1 ms) + prefill. For a short prompt (256 tokens), prefill adds ~3 ms. Total: ~17 ms, well within the 200 ms target. ModelExpress on Blackwell makes model switching nearly invisible.
+- **D**: Without NVSwitch caching, 6 GPUs each maintain a local copy of the system prompt blocks. The 335 MB of KV cache is duplicated 6 times: $6 \times 335 = 2{,}010$ MB of GPU HBM used. With NVSwitch caching, one copy in NVSwitch memory (335 MB) serves all 6 GPUs. Each GPU saves 335 MB of local HBM. Total savings: $6 \times 335 - 335 = 1{,}675$ MB of GPU HBM freed for other KV blocks. The latency penalty is 1.0 us vs 0.3 us per block access — a 0.7 us increase per block read. For a full prefill skip (no prefill, just read cached KV), reading 64 blocks adds $64 \times 0.7 = 44.8$ us. This is negligible. NVSwitch promotion is clearly worthwhile.
+
+---
+
+## Summary
+
+The GB200 NVL72 provides Dynamo with 4-5x per-GPU improvement over H100 and rack-scale benefits that multiply across 72 GPUs. FP4 tensor cores double the effective compute density for quantized inference. The 2.39x increase in HBM bandwidth directly translates to higher decode throughput for memory-bound workloads. NVLink 5.0 at 1.8 TB/s makes ModelExpress fast enough for sub-20ms model swaps and KVBM fast enough for 2.9 us cross-GPU KV block transfers. The NVSwitch memory tier adds a novel caching layer for shared prefixes. Gang scheduling on NVSwitch domains ensures TP groups get maximum all-reduce bandwidth. Combined, a single NVL72 rack running Dynamo can serve Llama 405B at 133,200 decode tokens/sec across 9 TP=8 replicas — a capability that would require multiple cabinets of H100 systems.

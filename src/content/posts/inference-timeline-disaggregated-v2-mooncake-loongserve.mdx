@@ -1,0 +1,746 @@
+---
+title: "Disaggregated Serving v2: Mooncake KV-Centric Architecture and LoongServe Elastic SP"
+author: "stanley-phoong"
+description: "Beyond Splitwise and DistServe: Mooncake treats KV cache as a first-class citizen stored in distributed memory pools. LoongServe introduces elastic sequence parallelism that dynamically adjusts parallelism per request based on context length. MemServe provides a unified memory pool across serving instances. Implementation details and performance analysis for each system."
+publishDate: 2025-03-22
+category: llm-inference
+tags: [disaggregated-serving, mooncake, loongserve, memserve, kv-cache, sequence-parallelism]
+difficulty: expert
+readingTime: 34
+draft: false
+featured: false
+series: "Inference Optimization Timeline"
+seriesOrder: 32
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+
+Splitwise and DistServe established the first generation of disaggregated LLM serving: separate prefill and decode GPU pools, with KV cache transferred between them after prefill completes. This architecture improved throughput by 1.5-2x over co-located serving, but it introduced a fundamental bottleneck: the KV cache transfer. For a 128K context on Llama 70B with GQA (8 KV heads, 128 head dim, 80 layers), the KV cache is $2 \times 80 \times 8 \times 128 \times 128000 \times 2 = 41.9\text{ GB}$. Transferring this over InfiniBand NDR (400 Gbps = 50 GB/s) takes 838ms, which is added directly to the time-to-first-token.
+
+The second generation of disaggregated serving addresses this by rethinking where KV cache lives and how it moves.
+
+## Mooncake: KV Cache as First-Class Citizen
+
+Mooncake (Moonshot AI, 2024) inverts the architecture: instead of transferring KV cache between prefill and decode workers, it stores KV cache in a distributed memory pool that both phases access directly.
+
+### Architecture Overview
+
+```
+Traditional Disaggregated:
+  Client -> Prefill GPU -> [KV transfer] -> Decode GPU -> Client
+  KV cache lives on whichever GPU currently owns it
+
+Mooncake:
+  Client -> Prefill GPU -> KVCache Store -> Decode GPU -> Client
+            writes KV ->  distributed   <- reads KV
+                          memory pool
+```
+
+The KVCache Store is a distributed key-value store (not to be confused with the attention KV cache itself) that maps `(request_id, layer_idx, token_range)` to KV cache blocks. It uses a combination of:
+
+1. **CPU DRAM** on each node (large, cheap, ~200 GB/s per socket)
+2. **GPU HBM** as a cache tier (fast, limited, 3.35 TB/s)
+3. **RDMA-accessible NIC buffers** for cross-node access
+
+```python
+class MooncakeKVStore:
+    """Distributed KV cache store with tiered storage."""
+
+    def __init__(self, nodes, block_size=16, kv_head_dim=128, num_kv_heads=8):
+        self.nodes = nodes
+        self.block_size = block_size  # Tokens per block
+        self.kv_head_dim = kv_head_dim
+        self.num_kv_heads = num_kv_heads
+
+        # Per-node storage tiers
+        self.gpu_cache = {}   # node_id -> {block_key -> GPU tensor}
+        self.cpu_cache = {}   # node_id -> {block_key -> CPU tensor (pinned)}
+        self.block_index = {}  # block_key -> (node_id, tier, address)
+
+        # Block key format: (request_id, layer_idx, block_idx)
+        # block_idx = token_position // block_size
+
+    def block_bytes(self, num_layers):
+        """Size of one KV cache block."""
+        # K and V for all layers, all KV heads, block_size tokens
+        return (2 * num_layers * self.num_kv_heads *
+                self.kv_head_dim * self.block_size * 2)  # FP16
+
+    def write_kv_block(self, request_id, layer_idx, block_idx,
+                        k_data, v_data, target_node=None):
+        """Write a KV cache block to the store.
+        Called by prefill workers after computing attention."""
+
+        block_key = (request_id, layer_idx, block_idx)
+
+        if target_node is None:
+            # Place block on the node that will decode this request
+            target_node = self._get_decode_node(request_id)
+
+        # Try GPU tier first (fastest access during decode)
+        if self._gpu_has_space(target_node):
+            self._write_gpu(target_node, block_key, k_data, v_data)
+            self.block_index[block_key] = (target_node, "gpu", None)
+        else:
+            # Fall back to CPU pinned memory
+            self._write_cpu(target_node, block_key, k_data, v_data)
+            self.block_index[block_key] = (target_node, "cpu", None)
+
+    def read_kv_block(self, block_key, requesting_gpu):
+        """Read a KV cache block for decode attention.
+        Transparently handles cross-tier and cross-node access."""
+
+        node_id, tier, _ = self.block_index[block_key]
+
+        if tier == "gpu" and node_id == requesting_gpu.node_id:
+            # Same node, GPU tier: direct GPU memory access (~3 TB/s)
+            return self._read_local_gpu(node_id, block_key)
+
+        elif tier == "cpu" and node_id == requesting_gpu.node_id:
+            # Same node, CPU tier: PCIe transfer (~32 GB/s PCIe 5.0)
+            return self._read_local_cpu(node_id, block_key)
+
+        else:
+            # Cross-node: RDMA transfer (~50 GB/s InfiniBand NDR)
+            return self._read_remote(node_id, block_key, requesting_gpu)
+```
+
+### Prefill-Store-Decode Pipeline
+
+The key difference from Splitwise: KV cache is written to the store incrementally during prefill, not transferred in bulk after prefill completes.
+
+```python
+class MooncakePrefillWorker:
+    """Prefill worker that streams KV cache to the store during computation."""
+
+    def __init__(self, model, kv_store):
+        self.model = model
+        self.kv_store = kv_store
+        self.num_layers = model.config.num_hidden_layers
+
+    def prefill(self, request_id, input_ids):
+        """Run prefill and stream KV cache blocks to the store."""
+        hidden_states = self.model.embed(input_ids)
+        seq_len = input_ids.shape[1]
+        block_size = self.kv_store.block_size
+
+        for layer_idx in range(self.num_layers):
+            # Compute attention for this layer
+            hidden_states, k, v = self.model.layers[layer_idx](
+                hidden_states, return_kv=True
+            )
+
+            # Stream KV blocks to store in the background
+            # This overlaps with the next layer's computation
+            num_blocks = (seq_len + block_size - 1) // block_size
+            for block_idx in range(num_blocks):
+                start = block_idx * block_size
+                end = min(start + block_size, seq_len)
+                self.kv_store.write_kv_block(
+                    request_id, layer_idx, block_idx,
+                    k[:, :, start:end, :],
+                    v[:, :, start:end, :],
+                )
+                # write_kv_block uses RDMA put (async, non-blocking)
+
+        # By the time prefill finishes, most KV blocks are already
+        # in the store. No bulk transfer needed.
+        logits = self.model.output_head(hidden_states)
+        return logits[:, -1, :]
+```
+
+<Callout type="perf">
+Mooncake's streaming KV write overlaps with prefill computation. For a 128K context with 80 layers, prefill takes approximately 8 seconds on H100. The KV cache (41.9 GB) streams out at RDMA speeds (50 GB/s) requiring only 838ms of transfer time, which is fully hidden behind the 8s of prefill compute. Compare this to Splitwise where the 838ms transfer happens after prefill completes, adding directly to TTFT.
+</Callout>
+
+### KV Cache Placement Policy
+
+Mooncake's placement policy decides where each KV block should live based on access patterns:
+
+```python
+class KVPlacementPolicy:
+    """Decide where to place KV cache blocks for minimum decode latency."""
+
+    def __init__(self, cluster_topology):
+        self.topology = cluster_topology
+
+    def place_blocks(self, request_id, num_layers, seq_len,
+                      decode_node_id):
+        """Determine placement for all blocks of a request."""
+        block_size = 16
+        num_blocks = (seq_len + block_size - 1) // block_size
+
+        placements = {}
+        gpu_budget = self._get_gpu_budget(decode_node_id)
+
+        for layer_idx in range(num_layers):
+            for block_idx in range(num_blocks):
+                block_key = (request_id, layer_idx, block_idx)
+
+                # Priority 1: hot blocks (recent tokens, first tokens) on GPU
+                is_recent = block_idx >= num_blocks - 4  # Last 64 tokens
+                is_sink = block_idx == 0  # Attention sink (first tokens)
+
+                if (is_recent or is_sink) and gpu_budget > 0:
+                    placements[block_key] = (decode_node_id, "gpu")
+                    gpu_budget -= 1
+                else:
+                    # Priority 2: same-node CPU
+                    placements[block_key] = (decode_node_id, "cpu")
+
+        return placements
+```
+
+<Benchmark
+  title="KV Cache Access Latency by Placement Tier"
+  columns={["Tier", "Bandwidth", "Latency (16 tokens, GQA-8)", "Latency (full layer)"]}
+  rows={[
+    { values: ["Local GPU HBM", "3.35 TB/s", "0.001 ms", "0.12 ms"], highlight: true },
+    { values: ["Local CPU DRAM (pinned)", "32 GB/s (PCIe 5)", "0.13 ms", "1.3 ms"], highlight: false },
+    { values: ["Remote GPU (RDMA)", "50 GB/s (IB NDR)", "0.08 ms", "0.84 ms"], highlight: false },
+    { values: ["Remote CPU (RDMA)", "25 GB/s", "0.16 ms", "1.68 ms"], highlight: false },
+  ]}
+/>
+
+## LoongServe: Elastic Sequence Parallelism
+
+LoongServe (2024) addresses a different problem: how to handle requests with wildly different context lengths (e.g., 1K tokens vs 128K tokens) on the same cluster without wasting GPU resources.
+
+The core idea: **elastic sequence parallelism** (Elastic SP). Instead of using a fixed parallelism degree for all requests, LoongServe dynamically assigns more GPUs to longer-context requests and fewer GPUs to shorter ones.
+
+### Sequence Parallelism for Attention
+
+Standard sequence parallelism splits the sequence dimension across GPUs. For attention with sequence length $S$ split across $P$ GPUs:
+
+- Each GPU holds $S/P$ tokens' Q, K, V
+- Each GPU computes local attention for its $S/P$ query tokens against all $S$ key-value tokens
+- This requires each GPU to have access to the full K, V (via all-gather or ring attention)
+
+```python
+class ElasticSequenceParallel:
+    """Elastic sequence parallelism: assign different SP degrees per request."""
+
+    def __init__(self, total_gpus, min_sp=1, max_sp=8):
+        self.total_gpus = total_gpus
+        self.min_sp = min_sp
+        self.max_sp = max_sp
+
+    def assign_sp_degree(self, seq_len):
+        """Determine SP degree based on context length."""
+        # Heuristic: longer context needs more parallelism
+        # because attention compute scales as O(S^2) and
+        # KV cache scales as O(S), which may not fit on one GPU
+
+        if seq_len <= 4096:
+            return 1  # Single GPU is fine
+        elif seq_len <= 16384:
+            return 2  # Split across 2 GPUs
+        elif seq_len <= 65536:
+            return 4
+        else:
+            return 8  # 128K+ needs 8 GPUs
+
+    def schedule_requests(self, pending_requests):
+        """Assign GPU groups to requests based on their SP needs."""
+        assignments = []
+        available_gpus = list(range(self.total_gpus))
+
+        # Sort by SP degree (large first for bin-packing)
+        sorted_requests = sorted(
+            pending_requests,
+            key=lambda r: self.assign_sp_degree(r.seq_len),
+            reverse=True,
+        )
+
+        for req in sorted_requests:
+            sp_degree = self.assign_sp_degree(req.seq_len)
+
+            if len(available_gpus) >= sp_degree:
+                # Assign a contiguous group of GPUs
+                gpu_group = available_gpus[:sp_degree]
+                available_gpus = available_gpus[sp_degree:]
+                assignments.append((req, gpu_group, sp_degree))
+
+        return assignments
+```
+
+### Dynamic SP Adjustment
+
+The key innovation: LoongServe can change the SP degree of a running request. If a 128K-context request starts with SP=8 during prefill (compute-bound, needs parallelism) but then transitions to decode (bandwidth-bound, less parallelism needed), LoongServe can shrink its SP degree and free GPUs for other requests.
+
+```python
+class LoongServeScheduler:
+    """Scheduler that dynamically adjusts SP degrees."""
+
+    def __init__(self, cluster):
+        self.cluster = cluster
+        self.active_requests = {}  # request_id -> (gpu_group, sp_degree)
+
+    def rebalance(self):
+        """Periodically rebalance SP assignments based on current phases."""
+        adjustments = []
+
+        for req_id, (gpu_group, sp_degree) in self.active_requests.items():
+            req = self._get_request(req_id)
+
+            if req.phase == "prefill":
+                # Prefill: compute-bound, benefit from high SP
+                optimal_sp = self._optimal_prefill_sp(req.seq_len)
+            else:
+                # Decode: bandwidth-bound, less SP needed
+                # but KV cache must fit in aggregate HBM
+                kv_size = self._kv_cache_size(req)
+                optimal_sp = self._optimal_decode_sp(kv_size)
+
+            if optimal_sp != sp_degree:
+                adjustments.append((req_id, sp_degree, optimal_sp))
+
+        # Execute adjustments: migrate KV cache blocks between GPUs
+        for req_id, old_sp, new_sp in adjustments:
+            self._adjust_sp(req_id, old_sp, new_sp)
+
+    def _adjust_sp(self, req_id, old_sp, new_sp):
+        """Change the SP degree of a running request.
+        This requires redistributing KV cache blocks."""
+        old_group = self.active_requests[req_id][0]
+
+        if new_sp < old_sp:
+            # Shrinking: gather KV cache to fewer GPUs
+            new_group = old_group[:new_sp]
+            freed_gpus = old_group[new_sp:]
+
+            # Migrate KV blocks from freed GPUs to remaining ones
+            for freed_gpu in freed_gpus:
+                blocks = self._get_blocks_on_gpu(req_id, freed_gpu)
+                target_gpu = self._select_migration_target(new_group, blocks)
+                self._migrate_blocks(blocks, freed_gpu, target_gpu)
+
+            # Return freed GPUs to the pool
+            self.cluster.return_gpus(freed_gpus)
+
+        elif new_sp > old_sp:
+            # Expanding: spread KV cache across more GPUs
+            extra_gpus = self.cluster.allocate_gpus(new_sp - old_sp)
+            new_group = old_group + extra_gpus
+
+            # Redistribute KV blocks evenly across new group
+            self._redistribute_blocks(req_id, new_group)
+
+        self.active_requests[req_id] = (new_group[:new_sp], new_sp)
+
+    def _optimal_decode_sp(self, kv_cache_size_gb):
+        """Minimum SP degree to fit KV cache in aggregate HBM."""
+        gpu_hbm_gb = 80  # H100
+        # Reserve 60% of HBM for model weights and activations
+        kv_budget_per_gpu = gpu_hbm_gb * 0.4  # 32 GB per GPU for KV
+
+        sp_needed = max(1, int(
+            kv_cache_size_gb / kv_budget_per_gpu + 0.5
+        ))
+        return min(sp_needed, 8)
+```
+
+### Ring Attention for Elastic SP
+
+LoongServe uses ring attention to distribute the attention computation across the SP group without materializing the full K, V on each GPU:
+
+```python
+class RingAttentionSP:
+    """Ring attention for elastic sequence parallelism."""
+
+    def __init__(self, sp_group, sp_rank, sp_size):
+        self.sp_group = sp_group  # NCCL communicator
+        self.sp_rank = sp_rank
+        self.sp_size = sp_size
+
+    def forward(self, q_local, k_local, v_local, causal=True):
+        """Ring attention: each GPU holds S/P tokens.
+        K,V blocks are rotated through the ring."""
+
+        chunk_size = q_local.shape[2]  # Local sequence length
+        total_seq = chunk_size * self.sp_size
+
+        # Local Q queries against all K,V (received via ring)
+        output = torch.zeros_like(q_local)
+        lse = torch.full(
+            (q_local.shape[0], q_local.shape[1], chunk_size, 1),
+            float("-inf"), device=q_local.device
+        )
+
+        # Current K, V block (starts with local)
+        k_block = k_local
+        v_block = v_local
+
+        for step in range(self.sp_size):
+            # Source rank for this K,V block
+            src_rank = (self.sp_rank - step) % self.sp_size
+            block_start = src_rank * chunk_size
+
+            # Apply causal mask: only attend to positions <= query position
+            if causal:
+                q_start = self.sp_rank * chunk_size
+                if block_start > q_start + chunk_size:
+                    # This entire K,V block is in the future, skip
+                    pass
+                else:
+                    # Compute partial attention
+                    partial_out, partial_lse = flash_attn_partial(
+                        q_local, k_block, v_block,
+                        causal=(src_rank == self.sp_rank),
+                    )
+                    # Online softmax merge
+                    output, lse = merge_attention_outputs(
+                        output, lse, partial_out, partial_lse
+                    )
+            else:
+                partial_out, partial_lse = flash_attn_partial(
+                    q_local, k_block, v_block, causal=False
+                )
+                output, lse = merge_attention_outputs(
+                    output, lse, partial_out, partial_lse
+                )
+
+            # Ring rotation: send K,V to next rank, receive from previous
+            if step < self.sp_size - 1:
+                k_block = ring_send_recv(k_block, self.sp_group)
+                v_block = ring_send_recv(v_block, self.sp_group)
+
+        return output
+```
+
+<PerfChart
+  title="LoongServe SP Degree vs Request Context Length (8-GPU Node)"
+  type="bar"
+  data={{
+    labels: ["1K ctx", "4K ctx", "16K ctx", "64K ctx", "128K ctx"],
+    datasets: [
+      {
+        label: "Optimal SP Degree (Prefill)",
+        data: [1, 1, 2, 4, 8],
+        backgroundColor: "#339af0"
+      },
+      {
+        label: "Optimal SP Degree (Decode)",
+        data: [1, 1, 1, 2, 4],
+        backgroundColor: "#51cf66"
+      }
+    ]
+  }}
+/>
+
+## MemServe: Unified Memory Pool
+
+MemServe (2024) extends disaggregated serving with a unified memory abstraction that spans GPU HBM, CPU DRAM, and NVMe storage across all nodes in the cluster.
+
+### Memory Hierarchy as a Cache
+
+MemServe treats the entire cluster's memory as a hierarchy with different access latencies:
+
+```python
+class MemServePool:
+    """Unified memory pool spanning GPU, CPU, and NVMe across nodes."""
+
+    TIER_CONFIG = {
+        "local_gpu": {"bw_gbps": 3350, "latency_us": 0.5, "capacity_gb": 80},
+        "local_cpu": {"bw_gbps": 200, "latency_us": 2.0, "capacity_gb": 512},
+        "remote_gpu": {"bw_gbps": 50, "latency_us": 5.0, "capacity_gb": 80},
+        "remote_cpu": {"bw_gbps": 25, "latency_us": 10.0, "capacity_gb": 512},
+        "local_nvme": {"bw_gbps": 7, "latency_us": 50.0, "capacity_gb": 4000},
+    }
+
+    def __init__(self, cluster_nodes):
+        self.nodes = cluster_nodes
+        self.block_table = {}  # block_id -> (node, tier, offset)
+        self.usage_tracker = {}  # block_id -> last_access_time
+
+    def allocate_kv_blocks(self, request_id, num_blocks, preferred_node):
+        """Allocate KV cache blocks with tiered placement."""
+        blocks = []
+
+        for i in range(num_blocks):
+            # Try tiers in order of access speed
+            for tier in ["local_gpu", "local_cpu", "remote_gpu",
+                         "remote_cpu", "local_nvme"]:
+                node = preferred_node if tier.startswith("local") else self._find_remote_node(tier)
+                if self._has_capacity(node, tier):
+                    block_id = self._allocate_block(request_id, i, node, tier)
+                    blocks.append(block_id)
+                    break
+
+        return blocks
+
+    def promote_block(self, block_id, target_tier):
+        """Move a block to a faster tier (e.g., CPU -> GPU)."""
+        current_node, current_tier, _ = self.block_table[block_id]
+
+        if self._tier_speed(target_tier) <= self._tier_speed(current_tier):
+            return  # Already at target or faster tier
+
+        # Allocate in target tier
+        new_offset = self._alloc_in_tier(current_node, target_tier)
+
+        # Copy data
+        self._copy_block(block_id, current_tier, target_tier, new_offset)
+
+        # Update index
+        self.block_table[block_id] = (current_node, target_tier, new_offset)
+
+    def evict_block(self, block_id, target_tier):
+        """Move a block to a slower tier to free space."""
+        current_node, current_tier, _ = self.block_table[block_id]
+        new_offset = self._alloc_in_tier(current_node, target_tier)
+        self._copy_block(block_id, current_tier, target_tier, new_offset)
+        self._free_in_tier(current_node, current_tier, block_id)
+        self.block_table[block_id] = (current_node, target_tier, new_offset)
+```
+
+### Prefetch-Aware Decode
+
+MemServe's decode workers prefetch KV cache blocks from slower tiers before they are needed:
+
+```python
+class MemServePrefetcher:
+    """Prefetch KV cache blocks ahead of the decode attention computation."""
+
+    def __init__(self, memory_pool, lookahead_layers=2):
+        self.pool = memory_pool
+        self.lookahead = lookahead_layers
+        self.prefetch_stream = torch.cuda.Stream()
+
+    def prefetch_for_layer(self, request_id, layer_idx):
+        """Prefetch KV blocks for layers ahead of current computation."""
+        target_layers = range(
+            layer_idx + 1,
+            min(layer_idx + 1 + self.lookahead, self.total_layers)
+        )
+
+        with torch.cuda.stream(self.prefetch_stream):
+            for future_layer in target_layers:
+                blocks = self.pool.get_blocks(request_id, future_layer)
+                for block in blocks:
+                    node, tier, _ = self.pool.block_table[block]
+                    if tier != "local_gpu":
+                        # Async promote to GPU
+                        self.pool.promote_block(block, "local_gpu")
+
+    def decode_with_prefetch(self, model, request_id, input_token):
+        """Decode step with layer-ahead prefetching."""
+        hidden = model.embed(input_token)
+
+        for layer_idx in range(model.num_layers):
+            # Start prefetching for upcoming layers
+            self.prefetch_for_layer(request_id, layer_idx)
+
+            # Compute current layer (KV blocks should be on GPU by now)
+            hidden = model.layers[layer_idx](
+                hidden, kv_blocks=self.pool.get_blocks(request_id, layer_idx)
+            )
+
+        return model.output_head(hidden)
+```
+
+<Benchmark
+  title="Disaggregated Serving v1 vs v2 (Llama 70B, 128K Context)"
+  columns={["System", "TTFT (ms)", "ITL (ms)", "Throughput (tok/s)", "KV Transfer Overhead"]}
+  rows={[
+    { values: ["Co-located (vLLM)", "8200", "42", "3200", "N/A (no transfer)"], highlight: false },
+    { values: ["Splitwise (v1)", "9040", "34", "4500", "+840ms (bulk)"], highlight: false },
+    { values: ["DistServe (v1)", "8850", "35", "4800", "+650ms (pipelined)"], highlight: false },
+    { values: ["Mooncake (v2)", "8250", "35", "5200", "+50ms (streaming)"], highlight: true },
+    { values: ["LoongServe (v2, SP=4)", "4800", "38", "4600", "N/A (distributed)"], highlight: true },
+    { values: ["MemServe (v2)", "8400", "33", "5500", "+200ms (prefetched)"], highlight: true },
+  ]}
+/>
+
+## Mooncake's KV-Centric Routing
+
+Instead of routing requests based on GPU utilization (as in traditional load balancers), Mooncake routes based on KV cache locality: send a request to the node that already has relevant KV cache from previous turns or shared prefixes.
+
+```python
+class KVAwareRouter:
+    """Route requests to nodes with maximum KV cache reuse."""
+
+    def __init__(self, kv_store, nodes):
+        self.kv_store = kv_store
+        self.nodes = nodes
+        # Prefix hash table: maps prefix hash -> node_id with cached KV
+        self.prefix_index = {}
+
+    def route(self, request):
+        """Select the best node for a new request."""
+        prompt_tokens = request.prompt_token_ids
+
+        # Check for prefix cache hits
+        best_node = None
+        best_hit_length = 0
+
+        for prefix_len in range(len(prompt_tokens), 0, -16):
+            prefix_hash = self._hash_prefix(prompt_tokens[:prefix_len])
+            if prefix_hash in self.prefix_index:
+                node_id = self.prefix_index[prefix_hash]
+                # Verify the cache still exists
+                if self.kv_store.has_prefix(node_id, prefix_hash):
+                    best_node = node_id
+                    best_hit_length = prefix_len
+                    break
+
+        if best_node is not None:
+            # Route to node with cached prefix
+            # Only need to prefill tokens[best_hit_length:]
+            request.skip_prefill_tokens = best_hit_length
+            return best_node
+        else:
+            # No cache hit: route to least-loaded node
+            return self._least_loaded_node()
+
+    def _hash_prefix(self, token_ids):
+        """Hash a token prefix for cache lookup."""
+        import hashlib
+        token_bytes = bytes(token_ids)
+        return hashlib.sha256(token_bytes).hexdigest()[:16]
+```
+
+<PerfChart
+  title="KV Cache Hit Rate vs Multi-Turn Conversation Length"
+  type="line"
+  data={{
+    labels: ["Turn 1", "Turn 2", "Turn 3", "Turn 4", "Turn 5", "Turn 10", "Turn 20"],
+    datasets: [
+      {
+        label: "Mooncake (KV-aware routing)",
+        data: [0, 85, 88, 90, 91, 93, 95],
+        borderColor: "#51cf66"
+      },
+      {
+        label: "Splitwise (random routing)",
+        data: [0, 12, 15, 18, 20, 25, 30],
+        borderColor: "#ff6b6b"
+      },
+      {
+        label: "DistServe (hash routing)",
+        data: [0, 65, 70, 72, 74, 78, 82],
+        borderColor: "#339af0"
+      }
+    ]
+  }}
+/>
+
+## Performance Comparison: Three Architectural Choices
+
+Each system makes a different fundamental choice about where KV cache lives:
+
+<Benchmark
+  title="Architectural Comparison"
+  columns={["System", "KV Location", "Transfer Model", "Best For", "Limitation"]}
+  rows={[
+    { values: ["Splitwise", "On prefill/decode GPU", "Bulk transfer post-prefill", "Short context, simple deployment", "Transfer latency at long context"], highlight: false },
+    { values: ["Mooncake", "Distributed memory pool", "Streaming write during prefill", "Long context, multi-turn", "Memory pool management complexity"], highlight: true },
+    { values: ["LoongServe", "Distributed across SP group", "No transfer (in-place)", "Variable context lengths", "SP rebalancing overhead"], highlight: true },
+    { values: ["MemServe", "Tiered (GPU/CPU/NVMe)", "Prefetch + promote", "Large-scale, heterogeneous", "Tier management overhead"], highlight: false },
+  ]}
+/>
+
+```python
+def compare_architectures(seq_len, num_layers=80, num_kv_heads=8,
+                          head_dim=128):
+    """Compare KV cache transfer overhead across architectures."""
+    # KV cache size for this context
+    kv_bytes = 2 * num_layers * num_kv_heads * head_dim * seq_len * 2  # FP16
+    kv_gb = kv_bytes / 1e9
+
+    # Prefill time (compute-bound, scales with seq_len^2 for attention)
+    prefill_ms = 0.05 * seq_len  # Rough estimate for H100
+
+    # Transfer costs
+    ib_bw_gbps = 50  # InfiniBand NDR
+    pcie_bw_gbps = 32  # PCIe 5.0
+
+    splitwise_transfer = kv_gb / ib_bw_gbps * 1000  # ms
+    mooncake_overhead = 50  # ms (streaming, mostly hidden)
+    loongserve_overhead = 0  # No transfer (distributed from start)
+    memserve_overhead = min(kv_gb / pcie_bw_gbps * 1000 * 0.1, 200)  # Partial prefetch miss
+
+    return {
+        "kv_cache_gb": kv_gb,
+        "prefill_ms": prefill_ms,
+        "splitwise_ttft": prefill_ms + splitwise_transfer,
+        "mooncake_ttft": prefill_ms + mooncake_overhead,
+        "loongserve_ttft": prefill_ms / 4 + loongserve_overhead,  # SP=4 parallel prefill
+        "memserve_ttft": prefill_ms + memserve_overhead,
+    }
+```
+
+<PerfChart
+  title="TTFT vs Context Length by Architecture (Llama 70B, H100)"
+  type="line"
+  data={{
+    labels: ["4K", "16K", "32K", "64K", "128K", "256K"],
+    datasets: [
+      {
+        label: "Co-located (baseline)",
+        data: [200, 800, 1600, 3200, 8200, 22000],
+        borderColor: "#868e96"
+      },
+      {
+        label: "Splitwise (v1)",
+        data: [210, 860, 1780, 3650, 9040, 24500],
+        borderColor: "#ff6b6b"
+      },
+      {
+        label: "Mooncake (v2)",
+        data: [205, 810, 1620, 3260, 8250, 22100],
+        borderColor: "#51cf66"
+      },
+      {
+        label: "LoongServe SP=4 (v2)",
+        data: [200, 400, 600, 1200, 4800, 12000],
+        borderColor: "#339af0"
+      }
+    ]
+  }}
+/>
+
+<Callout type="info">
+LoongServe with SP=4 achieves the lowest TTFT at long contexts because it parallelizes the prefill computation itself, not just the KV transfer. The prefill time is divided by the SP degree (minus communication overhead). At 128K context, LoongServe processes prefill 2-3x faster than single-GPU prefill, while Mooncake optimizes only the KV transfer step.
+</Callout>
+
+## The Full Disaggregated v2 Stack
+
+A production deployment combining these techniques:
+
+```python
+class DisaggregatedV2Stack:
+    """Complete disaggregated serving v2 stack."""
+
+    def __init__(self, cluster):
+        self.cluster = cluster
+        self.kv_store = MooncakeKVStore(cluster.nodes)
+        self.router = KVAwareRouter(self.kv_store, cluster.nodes)
+        self.scheduler = LoongServeScheduler(cluster)
+        self.memory_pool = MemServePool(cluster.nodes)
+
+    def handle_request(self, request):
+        # 1. Route based on KV cache locality
+        target_node = self.router.route(request)
+
+        # 2. Determine SP degree based on context length
+        sp_degree = self.scheduler.assign_sp_degree(request.seq_len)
+
+        # 3. Prefill with streaming KV write
+        if sp_degree == 1:
+            kv = self._prefill_single(request, target_node)
+        else:
+            kv = self._prefill_sp(request, target_node, sp_degree)
+
+        # 4. Transition to decode with SP adjustment
+        decode_sp = self.scheduler.optimal_decode_sp(request)
+        if decode_sp != sp_degree:
+            self.scheduler.adjust_sp(request.id, sp_degree, decode_sp)
+
+        # 5. Decode with prefetch-aware KV access
+        return self._decode_loop(request, decode_sp)
+```
+
+The second generation of disaggregated serving eliminates the KV cache transfer bottleneck through three complementary strategies: streaming writes (Mooncake), distributed computation (LoongServe), and tiered caching (MemServe). Each addresses the problem at a different layer of the system stack, and production deployments increasingly combine elements from all three.

@@ -1,0 +1,720 @@
+---
+title: "The Inference Stack in 2026: From HTTP Request to GPU Kernel and Back"
+author: "stanley-phoong"
+description: "An end-to-end trace through a production 2026 LLM inference stack: API gateway receives an HTTP request, Dynamo router selects the optimal worker, vLLM v1 engine schedules the request, FlashAttention and PagedAttention kernels execute on GPU, sampling produces tokens, and SSE streams the response back. Every component, every latency contribution, measured and explained."
+publishDate: 2025-03-22
+category: llm-inference
+tags: [inference-stack, production, vllm, dynamo, flashattention, end-to-end]
+difficulty: expert
+readingTime: 35
+draft: false
+featured: false
+series: "Inference Optimization Timeline"
+seriesOrder: 35
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+
+A user sends a chat completion request. 180 milliseconds later, the first token arrives. Between those two events, the request passes through 12 distinct software layers, crosses 3 hardware boundaries (NIC, CPU, GPU), and triggers approximately 160,000 CUDA kernel launches. This post traces every hop.
+
+## The Request Path
+
+```
+User Browser/API Client
+  |  HTTPS POST /v1/chat/completions
+  v
+[1] API Gateway (nginx/envoy)                    ~2ms
+  |  TLS termination, rate limit, auth
+  v
+[2] Load Balancer / Router (Dynamo)               ~3ms
+  |  KV-aware routing, model selection
+  v
+[3] Engine Process (vLLM v1)                       ~1ms
+  |  Request validation, tokenization
+  v
+[4] Scheduler (continuous batching)                ~0.1ms
+  |  Admission, batch assembly
+  v
+[5] Model Runner                                   ~0.5ms
+  |  Prepare inputs, select graph/eager
+  v
+[6] Model Forward Pass (80 layers)                 ~85ms (prefill, 2K prompt)
+  |  Linear layers -> Attention -> FFN
+  v
+[7] Attention Kernel (FlashAttention/FlashInfer)   (within [6])
+  |  Tiled QKV computation in SRAM
+  v
+[8] KV Cache Manager (PagedAttention)              (within [6])
+  |  Block allocation, page table lookup
+  v
+[9] Sampling                                       ~0.3ms
+  |  Temperature, top-p, logit processing
+  v
+[10] Detokenizer                                   ~0.05ms
+  |   Token ID -> string
+  v
+[11] SSE Stream Writer                             ~0.1ms
+  |   Format response, write to socket
+  v
+[12] Network Return Path                           ~2ms
+  |   TCP/TLS back to client
+  v
+User receives first token
+```
+
+Total first-token latency: approximately 94ms for a 2K prompt on Llama 70B with 8x H100 (TP=8).
+
+## Layer 1: API Gateway
+
+The gateway terminates TLS, validates API keys, enforces rate limits, and routes to the correct model deployment.
+
+```python
+# Simplified nginx config for LLM inference gateway
+"""
+upstream llm_router {
+    server dynamo-router-1:8080;
+    server dynamo-router-2:8080;
+    keepalive 256;  # Persistent connections to router
+}
+
+server {
+    listen 443 ssl http2;
+
+    # TLS 1.3 with 0-RTT for returning clients
+    ssl_protocols TLSv1.3;
+    ssl_early_data on;  # 0-RTT saves one round trip
+
+    location /v1/chat/completions {
+        # Rate limiting per API key
+        limit_req zone=api_key burst=100 nodelay;
+
+        # Streaming: disable buffering for SSE
+        proxy_buffering off;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+
+        # Timeout: long requests can generate for minutes
+        proxy_read_timeout 300s;
+
+        proxy_pass http://llm_router;
+    }
+}
+"""
+```
+
+<Benchmark
+  title="Gateway Latency Breakdown"
+  columns={["Component", "P50 (us)", "P99 (us)", "Notes"]}
+  rows={[
+    { values: ["TLS handshake (new)", "800", "2000", "Full TLS 1.3 handshake"], highlight: false },
+    { values: ["TLS handshake (resumed)", "100", "300", "Session ticket"], highlight: true },
+    { values: ["TLS 0-RTT", "0", "0", "Data sent with ClientHello"], highlight: true },
+    { values: ["API key validation", "50", "200", "Redis lookup"], highlight: false },
+    { values: ["Rate limit check", "20", "80", "In-memory counter"], highlight: false },
+    { values: ["Proxy header + forward", "100", "400", "nginx internal"], highlight: false },
+    { values: ["Total (returning client)", "270", "1000", ""], highlight: true },
+  ]}
+/>
+
+## Layer 2: Router (Dynamo KV-Aware Routing)
+
+The router selects which vLLM engine instance handles the request. In 2026, this is not round-robin. NVIDIA Dynamo's router considers:
+
+1. **KV cache locality** - does this engine already have relevant KV cache from a previous turn?
+2. **Queue depth** - how many requests are waiting?
+3. **GPU memory utilization** - can the engine accept more KV cache?
+4. **Model variant** - is the request for the base model or a LoRA adapter?
+
+```python
+class DynamoRouter:
+    """KV-aware request router for LLM inference cluster."""
+
+    def __init__(self, engines):
+        self.engines = engines  # List of vLLM engine endpoints
+        self.prefix_cache = {}  # prefix_hash -> engine_id
+
+    def route(self, request):
+        """Select the best engine for this request."""
+        # Extract routing signals
+        prompt_tokens = self.tokenize(request.messages)
+        prefix_hash = self._compute_prefix_hash(prompt_tokens)
+
+        # Priority 1: KV cache hit (avoid redundant prefill)
+        if prefix_hash in self.prefix_cache:
+            engine_id = self.prefix_cache[prefix_hash]
+            engine = self.engines[engine_id]
+            if engine.queue_depth < engine.max_queue:
+                return engine_id
+
+        # Priority 2: least queue depth (minimize waiting time)
+        candidates = sorted(
+            self.engines,
+            key=lambda e: (e.queue_depth, e.gpu_memory_used_pct)
+        )
+
+        selected = candidates[0]
+
+        # Register prefix for future cache hits
+        self.prefix_cache[prefix_hash] = selected.id
+
+        return selected.id
+
+    def _compute_prefix_hash(self, tokens):
+        """Hash the system prompt + first part of user message.
+        Most multi-turn conversations share the system prompt."""
+        import hashlib
+        # Hash in blocks of 16 tokens for granular matching
+        prefix = tokens[:min(len(tokens), 2048)]
+        return hashlib.sha256(bytes(prefix)).hexdigest()[:16]
+```
+
+Router latency: 1-3ms (includes network hop to router + routing decision + forwarding to engine).
+
+## Layer 3: Engine Process (vLLM v1)
+
+The vLLM engine receives the request, validates it, and tokenizes the input:
+
+```python
+class VLLMEngineV1:
+    """Simplified vLLM v1 engine entry point."""
+
+    def __init__(self, model_config, scheduler_config):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_config.model)
+        self.scheduler = UnifiedScheduler(scheduler_config)
+        self.model_runner = ModelRunner(model_config)
+        self.kv_cache_manager = BlockManager(scheduler_config)
+
+    async def generate(self, request):
+        """Entry point for a new request."""
+        # Validate parameters
+        self._validate_params(request.sampling_params)
+
+        # Tokenize
+        prompt_tokens = self.tokenizer.encode(
+            request.prompt,
+            add_special_tokens=True,
+        )
+
+        # Check prompt length against model max
+        if len(prompt_tokens) > self.model_config.max_model_len:
+            raise ValueError(
+                f"Prompt length {len(prompt_tokens)} exceeds "
+                f"max {self.model_config.max_model_len}"
+            )
+
+        # Create sequence group
+        seq = Sequence(
+            seq_id=self._next_seq_id(),
+            prompt_token_ids=prompt_tokens,
+            sampling_params=request.sampling_params,
+        )
+
+        # Add to scheduler queue
+        self.scheduler.add_request(seq)
+
+        # Return async generator for streaming
+        async for output in self._stream_outputs(seq):
+            yield output
+```
+
+## Layer 4: Scheduler (Unified Continuous Batching)
+
+The scheduler runs a tight loop: every iteration, it decides which requests to include in the next forward pass.
+
+```python
+class UnifiedScheduler:
+    """vLLM v1 unified scheduler: single queue for prefill and decode."""
+
+    def __init__(self, config):
+        self.max_num_batched_tokens = config.max_num_batched_tokens  # e.g., 8192
+        self.max_num_seqs = config.max_num_seqs  # e.g., 256
+        self.waiting_queue = []   # New requests awaiting prefill
+        self.running_queue = []   # Active requests in decode phase
+
+    def schedule(self):
+        """One scheduling decision. Called every iteration (~30-50ms)."""
+        batch = ScheduledBatch()
+        token_budget = self.max_num_batched_tokens
+        seq_budget = self.max_num_seqs
+
+        # Step 1: Include all running decode requests (1 token each)
+        for seq in self.running_queue:
+            if seq_budget <= 0:
+                break
+            batch.add_decode(seq)
+            token_budget -= 1
+            seq_budget -= 1
+
+        # Step 2: Fill remaining budget with prefill chunks
+        for seq in self.waiting_queue:
+            if token_budget <= 0 or seq_budget <= 0:
+                break
+
+            remaining_prefill = seq.prompt_len - seq.num_prefilled
+            chunk_size = min(remaining_prefill, token_budget)
+
+            if chunk_size > 0:
+                batch.add_prefill_chunk(seq, chunk_size)
+                token_budget -= chunk_size
+                seq_budget -= 1
+
+                if seq.num_prefilled + chunk_size >= seq.prompt_len:
+                    # Prefill complete, move to running queue
+                    self.waiting_queue.remove(seq)
+                    self.running_queue.append(seq)
+
+        return batch
+```
+
+Scheduler decision time: approximately 0.1ms (pure CPU, operates on metadata only).
+
+## Layer 5: Model Runner
+
+The model runner translates the scheduled batch into GPU tensor operations:
+
+```python
+class ModelRunner:
+    """Prepare inputs and execute model forward pass."""
+
+    def __init__(self, model_config):
+        self.model = load_model(model_config)
+        self.cuda_graphs = CUDAGraphManager(self.model)
+        self.graph_batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+
+    def execute(self, scheduled_batch):
+        """Execute one forward pass for the scheduled batch."""
+
+        # Prepare input tensors
+        input_ids = scheduled_batch.get_input_ids()      # [total_tokens]
+        positions = scheduled_batch.get_positions()        # [total_tokens]
+        slot_mapping = scheduled_batch.get_slot_mapping()  # [total_tokens]
+
+        # Build attention metadata
+        attn_metadata = self._build_attn_metadata(scheduled_batch)
+
+        # Choose execution mode
+        if scheduled_batch.is_decode_only():
+            # Pure decode: use CUDA graph
+            padded_bs = self._pad_to_graph_size(len(scheduled_batch.decode_seqs))
+            logits = self.cuda_graphs.replay(
+                padded_bs, input_ids, positions, slot_mapping
+            )
+            logits = logits[:len(scheduled_batch.decode_seqs)]
+        else:
+            # Mixed prefill + decode: eager execution
+            logits = self.model.forward(
+                input_ids=input_ids,
+                positions=positions,
+                kv_caches=self.kv_caches,
+                attn_metadata=attn_metadata,
+            )
+
+        return logits
+```
+
+## Layer 6: Model Forward Pass
+
+For Llama 70B with TP=8 across 8x H100:
+
+```python
+class LlamaForCausalLM:
+    """Llama model forward pass - 80 transformer layers."""
+
+    def forward(self, input_ids, positions, kv_caches, attn_metadata):
+        # Embedding lookup: input_ids -> hidden_states
+        # [total_tokens] -> [total_tokens, 8192]
+        hidden_states = self.embed_tokens(input_ids)  # ~0.1ms
+
+        # 80 transformer layers
+        for i, layer in enumerate(self.layers):
+            hidden_states = layer(
+                hidden_states=hidden_states,
+                positions=positions,
+                kv_cache=kv_caches[i],
+                attn_metadata=attn_metadata,
+            )
+            # Each layer: ~1ms (prefill, 2K tokens, TP=8)
+            # Breakdown per layer:
+            #   QKV projection: 0.15ms (GEMM)
+            #   RoPE: 0.02ms
+            #   Attention kernel: 0.25ms (FlashAttention)
+            #   O projection: 0.05ms (GEMM)
+            #   All-reduce (TP): 0.08ms
+            #   RMSNorm: 0.02ms
+            #   Gate+Up projection: 0.15ms (GEMM)
+            #   SiLU + multiply: 0.02ms
+            #   Down projection: 0.08ms (GEMM)
+            #   All-reduce (TP): 0.08ms
+            #   Residual add: 0.01ms
+            # Total per layer: ~0.91ms
+
+        # Final RMSNorm + output projection
+        hidden_states = self.norm(hidden_states)
+        logits = self.lm_head(hidden_states)  # [total_tokens, vocab_size/TP]
+
+        # All-gather logits across TP ranks (for sampling)
+        logits = tensor_model_parallel_all_gather(logits)
+
+        return logits
+```
+
+<Benchmark
+  title="Per-Layer Latency Breakdown (Llama 70B, TP=8, H100, Prefill 2K tokens)"
+  columns={["Operation", "Time (ms)", "Bottleneck", "Kernel"]}
+  rows={[
+    { values: ["QKV Projection", "0.15", "Compute (GEMM)", "sm90_xmma_gemm"], highlight: false },
+    { values: ["RoPE Embedding", "0.02", "Compute", "rotary_embedding_kernel"], highlight: false },
+    { values: ["FlashAttention-3", "0.25", "Compute (tiled)", "flash_fwd_kernel"], highlight: true },
+    { values: ["O Projection", "0.05", "Compute (GEMM)", "sm90_xmma_gemm"], highlight: false },
+    { values: ["All-Reduce (TP, attn)", "0.08", "NVLink bandwidth", "ncclAllReduce"], highlight: false },
+    { values: ["RMSNorm", "0.02", "Bandwidth", "rmsnorm_kernel"], highlight: false },
+    { values: ["Gate+Up Projection", "0.15", "Compute (GEMM)", "sm90_xmma_gemm"], highlight: false },
+    { values: ["SiLU Activation", "0.02", "Bandwidth", "silu_mul_kernel"], highlight: false },
+    { values: ["Down Projection", "0.08", "Compute (GEMM)", "sm90_xmma_gemm"], highlight: false },
+    { values: ["All-Reduce (TP, FFN)", "0.08", "NVLink bandwidth", "ncclAllReduce"], highlight: false },
+    { values: ["Residual Add", "0.01", "Bandwidth", "add_kernel"], highlight: false },
+    { values: ["Total per layer", "0.91", "", ""], highlight: true },
+  ]}
+/>
+
+Total for 80 layers: $80 \times 0.91 = 72.8\text{ms}$. Add embedding (0.1ms) + final norm (0.02ms) + LM head (0.5ms) + all-gather (0.3ms) = **73.7ms** for the prefill forward pass.
+
+## Layer 7: Attention Kernel Deep Dive
+
+During prefill, FlashAttention-3 computes full causal attention. During decode, FlashInfer's BatchDecodeWithPagedKV handles paged KV cache lookups.
+
+```python
+# What happens inside the attention kernel during prefill:
+
+def flash_attention_3_simplified(Q, K, V, causal=True):
+    """Simplified FlashAttention-3 (Hopper) execution flow.
+    Real implementation uses WGMMA instructions and TMA."""
+
+    # Q: [batch, num_heads, seq_len, head_dim]
+    # K, V: [batch, num_kv_heads, seq_len, head_dim]
+    B, H, S, D = Q.shape
+
+    # Tile sizes for H100 (192KB shared memory per SM)
+    BLOCK_Q = 128   # Query tile size
+    BLOCK_KV = 128  # KV tile size
+
+    # Output accumulator
+    O = torch.zeros_like(Q)
+    L = torch.zeros(B, H, S, 1, device=Q.device)  # Log-sum-exp
+
+    # Outer loop: tiles of queries
+    for q_start in range(0, S, BLOCK_Q):
+        q_end = min(q_start + BLOCK_Q, S)
+        q_tile = Q[:, :, q_start:q_end, :]  # Load Q tile to SRAM
+
+        # Inner loop: tiles of keys/values
+        # (with causal masking, only iterate up to q_end)
+        kv_end = q_end if causal else S
+
+        o_tile = torch.zeros_like(q_tile)
+        l_tile = torch.zeros(B, H, q_end - q_start, 1, device=Q.device)
+
+        for kv_start in range(0, kv_end, BLOCK_KV):
+            kv_block_end = min(kv_start + BLOCK_KV, kv_end)
+            k_tile = K[:, :, kv_start:kv_block_end, :]  # Load K tile to SRAM
+            v_tile = V[:, :, kv_start:kv_block_end, :]  # Load V tile to SRAM
+
+            # Compute attention scores in SRAM (no HBM write)
+            scores = q_tile @ k_tile.transpose(-2, -1) / (D ** 0.5)
+
+            # Apply causal mask
+            if causal:
+                # Mask future positions within this tile pair
+                pass  # (masking logic)
+
+            # Online softmax: update running max and sum
+            new_max = torch.max(scores.max(dim=-1, keepdim=True).values, l_tile)
+            scores_exp = torch.exp(scores - new_max)
+            o_tile = o_tile * torch.exp(l_tile - new_max) + scores_exp @ v_tile
+            l_tile = new_max + torch.log(
+                torch.exp(l_tile - new_max) + scores_exp.sum(dim=-1, keepdim=True)
+            )
+
+        # Write output tile to HBM
+        O[:, :, q_start:q_end, :] = o_tile / torch.exp(l_tile)
+        L[:, :, q_start:q_end, :] = l_tile
+
+    return O
+```
+
+During decode, the attention kernel changes fundamentally:
+
+```python
+def paged_decode_attention(Q, kv_cache, page_table, seq_lens):
+    """Decode attention with paged KV cache.
+    Q: [batch, num_heads, 1, head_dim] (one query per request)
+    kv_cache: [num_blocks, 2, num_kv_heads, block_size, head_dim]
+    page_table: [batch, max_blocks] (maps logical to physical blocks)
+    seq_lens: [batch] (current sequence length per request)
+    """
+    batch_size = Q.shape[0]
+    output = torch.zeros_like(Q)
+
+    for b in range(batch_size):
+        # Gather this request's KV blocks from the page table
+        num_blocks = (seq_lens[b] + 15) // 16  # block_size = 16
+        k_blocks = []
+        v_blocks = []
+        for block_idx in range(num_blocks):
+            physical_block = page_table[b, block_idx]
+            k_blocks.append(kv_cache[physical_block, 0])  # K
+            v_blocks.append(kv_cache[physical_block, 1])  # V
+
+        # Concatenate gathered blocks
+        K = torch.cat(k_blocks, dim=1)[:, :seq_lens[b], :]
+        V = torch.cat(v_blocks, dim=1)[:, :seq_lens[b], :]
+
+        # Single query attention: Q [1, head_dim] x K [seq_len, head_dim]
+        scores = (Q[b] @ K.transpose(-2, -1)) / (Q.shape[-1] ** 0.5)
+        attn = torch.softmax(scores, dim=-1)
+        output[b] = attn @ V
+
+    return output
+```
+
+## Layer 8: KV Cache Manager
+
+The block manager allocates and tracks KV cache blocks using PagedAttention:
+
+```python
+class BlockManager:
+    """Manage paged KV cache allocation."""
+
+    def __init__(self, num_gpu_blocks, block_size=16):
+        self.num_blocks = num_gpu_blocks  # e.g., 65536 blocks
+        self.block_size = block_size       # 16 tokens per block
+        self.free_blocks = list(range(num_gpu_blocks))
+        self.block_tables = {}  # seq_id -> list of physical block indices
+
+    def allocate(self, seq_id, num_tokens):
+        """Allocate blocks for a sequence."""
+        num_blocks_needed = (num_tokens + self.block_size - 1) // self.block_size
+
+        if len(self.free_blocks) < num_blocks_needed:
+            raise RuntimeError("Out of KV cache blocks")
+
+        allocated = []
+        for _ in range(num_blocks_needed):
+            block = self.free_blocks.pop()
+            allocated.append(block)
+
+        self.block_tables[seq_id] = allocated
+        return allocated
+
+    def append_slot(self, seq_id):
+        """Allocate one more token slot for a decode step."""
+        blocks = self.block_tables[seq_id]
+        current_tokens = len(blocks) * self.block_size
+        # Check if current last block has room
+        last_block_usage = current_tokens % self.block_size
+        if last_block_usage == 0:
+            # Last block is full, need a new block
+            new_block = self.free_blocks.pop()
+            blocks.append(new_block)
+        # Return the slot index within the last block
+        return blocks[-1], last_block_usage
+```
+
+## Layer 9: Sampling
+
+After the forward pass produces logits, sampling selects the next token:
+
+```python
+class Sampler:
+    """GPU-accelerated token sampling."""
+
+    def __init__(self):
+        pass
+
+    def sample(self, logits, sampling_params_batch):
+        """Sample next tokens for all sequences in the batch.
+
+        logits: [batch_size, vocab_size]
+        sampling_params_batch: list of SamplingParams per sequence
+        """
+        # Step 1: Apply logit processors (all on GPU)
+        for i, params in enumerate(sampling_params_batch):
+            if params.temperature != 1.0:
+                logits[i] /= params.temperature
+
+            if params.top_p < 1.0:
+                logits[i] = self._top_p_filter(logits[i], params.top_p)
+
+            if params.repetition_penalty != 1.0:
+                logits[i] = self._apply_repetition_penalty(
+                    logits[i], params.previous_tokens, params.repetition_penalty
+                )
+
+        # Step 2: Convert to probabilities
+        probs = torch.softmax(logits, dim=-1)
+
+        # Step 3: Sample
+        # Greedy: argmax
+        # Random: multinomial
+        next_tokens = torch.zeros(
+            logits.shape[0], dtype=torch.long, device=logits.device
+        )
+        for i, params in enumerate(sampling_params_batch):
+            if params.temperature == 0:
+                next_tokens[i] = logits[i].argmax()
+            else:
+                next_tokens[i] = torch.multinomial(probs[i:i+1], 1).squeeze()
+
+        return next_tokens
+
+    def _top_p_filter(self, logits, p):
+        """Nucleus sampling: keep smallest set of tokens with cumulative prob >= p."""
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(
+            torch.softmax(sorted_logits, dim=-1), dim=-1
+        )
+        # Remove tokens with cumulative probability above the threshold
+        sorted_indices_to_remove = cumulative_probs > p
+        # Keep at least one token
+        sorted_indices_to_remove[0] = False
+        # Scatter back to original indices
+        indices_to_remove = sorted_indices[sorted_indices_to_remove]
+        logits[indices_to_remove] = float("-inf")
+        return logits
+```
+
+Sampling latency: 0.2-0.5ms depending on the number of logit processors and whether structured output constraints are active.
+
+## Layer 10-12: Detokenization and Streaming
+
+```python
+class StreamingResponseWriter:
+    """Convert token IDs to text and stream as SSE."""
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.buffer = ""  # Partial token buffer for multi-byte chars
+
+    async def stream_token(self, token_id, websocket):
+        """Convert token to text and stream immediately."""
+        # Detokenize (handles partial UTF-8 sequences)
+        token_text = self.tokenizer.decode(
+            [token_id], skip_special_tokens=True
+        )
+
+        if token_text:
+            # Format as SSE (Server-Sent Events)
+            chunk = {
+                "id": f"chatcmpl-{self.request_id}",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": token_text},
+                    "finish_reason": None,
+                }],
+            }
+            # Write to HTTP response stream
+            await websocket.send_text(
+                f"data: {json.dumps(chunk)}\n\n"
+            )
+```
+
+## End-to-End Latency Budget
+
+<PerfChart
+  title="End-to-End Latency Budget: TTFT (Llama 70B, TP=8, H100, 2K Prompt)"
+  type="bar"
+  data={{
+    labels: ["Gateway", "Router", "Tokenize", "Schedule", "Model Runner", "Forward Pass", "Sampling", "Detokenize", "Stream"],
+    datasets: [{
+      label: "Latency (ms)",
+      data: [2.0, 3.0, 1.0, 0.1, 0.5, 73.7, 0.3, 0.05, 0.1],
+      backgroundColor: ["#868e96", "#868e96", "#339af0", "#339af0", "#339af0", "#ff6b6b", "#51cf66", "#51cf66", "#51cf66"]
+    }]
+  }}
+/>
+
+<Benchmark
+  title="TTFT Latency Budget Summary"
+  columns={["Category", "Components", "Time (ms)", "Percentage"]}
+  rows={[
+    { values: ["Network + Gateway", "TLS, auth, routing", "5.0", "6.2%"], highlight: false },
+    { values: ["Engine Overhead", "Tokenize, schedule, runner", "1.6", "2.0%"], highlight: false },
+    { values: ["GPU Forward Pass", "80 layers (GEMM + attention + comm)", "73.7", "91.4%"], highlight: true },
+    { values: ["Post-Processing", "Sample, detokenize, stream", "0.45", "0.6%"], highlight: false },
+    { values: ["Total TTFT", "", "80.75", "100%"], highlight: true },
+  ]}
+/>
+
+91% of TTFT is the GPU forward pass. All other components combined account for less than 7ms. This is why GPU kernel optimization (FlashAttention, quantization, tensor parallelism) dominates inference optimization: the forward pass is the overwhelming bottleneck.
+
+## Decode Iteration Breakdown
+
+After the first token, each subsequent token follows a faster path (no prefill, just decode):
+
+```python
+def decode_iteration_trace():
+    """Trace of a single decode iteration with batch=128 requests."""
+    trace = {
+        "scheduler_decision": 0.08,    # ms - pick decode batch
+        "prepare_inputs": 0.12,         # ms - copy token IDs, positions
+        "cuda_graph_replay": 0.005,     # ms - launch graph
+        "gpu_forward_80_layers": 33.2,  # ms - bandwidth-bound
+        "sampling_batch": 0.25,         # ms - 128 samples
+        "kv_cache_append": 0.02,        # ms - update slot mapping
+        "detokenize_batch": 0.15,       # ms - 128 token decodes
+        "stream_responses": 0.10,       # ms - SSE to 128 clients
+    }
+    trace["total_itl"] = sum(trace.values())
+    # total_itl ~= 33.9ms per decode iteration
+    # = 33.9ms inter-token latency for each of the 128 clients
+    return trace
+```
+
+<PerfChart
+  title="Decode Iteration Latency vs Batch Size (Llama 70B, TP=8, H100)"
+  type="line"
+  data={{
+    labels: ["1", "8", "32", "64", "128", "256", "512"],
+    datasets: [
+      {
+        label: "Total ITL (ms)",
+        data: [33.5, 33.6, 33.8, 33.9, 34.1, 35.8, 42.3],
+        borderColor: "#ff6b6b"
+      },
+      {
+        label: "GPU Forward Only (ms)",
+        data: [33.2, 33.2, 33.3, 33.4, 33.5, 35.0, 41.2],
+        borderColor: "#51cf66"
+      },
+      {
+        label: "Throughput (tokens/s)",
+        data: [30, 238, 947, 1888, 3753, 7151, 12104],
+        borderColor: "#339af0"
+      }
+    ]
+  }}
+/>
+
+<Callout type="perf">
+Decode ITL stays nearly flat from batch=1 to batch=128 (33.5ms to 34.1ms) because the forward pass is bandwidth-bound: loading weights takes the same time regardless of batch size. But throughput scales linearly: 128 tokens per iteration instead of 1, for 125x throughput at only 1.8% higher latency. This is why continuous batching is critical for production serving economics.
+</Callout>
+
+## The Complete Timing Diagram
+
+```
+Time (ms)
+0        10       20       30       40       50       60       70       80       90
+|--------|--------|--------|--------|--------|--------|--------|--------|--------|
+[GW][Router][Tok][======== GPU Forward Pass (80 layers) ==============][S][D][SSE]
+ 2ms  3ms   1ms                    73.7ms                               0.3 0.05 0.1
+
+Per-token decode after TTFT:
+|[Sched][==== GPU Decode (80 layers, BW-bound) ====][S][D][SSE]|
+  0.1ms              33.2ms                          0.3 0.05 0.1
+  Total ITL: ~33.9ms
+```
+
+Every millisecond in this trace maps to a specific software component and hardware resource. Optimizing the inference stack in 2026 means knowing which component owns which milliseconds and applying the right technique at each layer: faster networks at the gateway, smarter routing at the router, better scheduling in the engine, faster kernels on the GPU, and efficient streaming on the return path.

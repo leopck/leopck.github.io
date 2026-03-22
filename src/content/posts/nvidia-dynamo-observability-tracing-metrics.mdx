@@ -1,0 +1,1182 @@
+---
+title: "Dynamo Observability: Distributed Tracing, Metrics, and Latency Alerting"
+author: "stanley-phoong"
+description: "Tracing a request through Dynamo's full pipeline — router, scheduler, worker, attention, sampling — using OpenTelemetry. Covers key metrics (TTFT, TBT, queue depth, cache hit rate, preemption rate), Prometheus exporters, Grafana dashboards, and SLO-based alert rules."
+publishDate: 2025-03-22
+category: llm-inference
+tags: [dynamo, observability, tracing, opentelemetry, prometheus, grafana, metrics, slo, alerting]
+difficulty: expert
+readingTime: 33
+draft: false
+featured: false
+series: "NVIDIA Dynamo & llm-d"
+seriesOrder: 11
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+
+An LLM inference request in Dynamo traverses six components: the API gateway, the KV-aware router, the per-worker scheduler, the model runner, the attention kernel, and the sampler. Each component introduces latency, and the interactions between them create performance behaviors that are invisible without distributed tracing. A request that takes 500ms to first token might be spending 300ms waiting in a scheduler queue, 50ms in prefill, and 150ms blocked on a KV cache swap. Without per-span timing, all you see is "TTFT = 500ms" and no way to diagnose the bottleneck.
+
+Dynamo integrates OpenTelemetry tracing with custom LLM-specific spans and metrics. Every request generates a trace with spans for each processing stage, and the metrics pipeline exports TTFT, time-between-tokens (TBT), queue depth, cache hit rate, and preemption rate to Prometheus for real-time monitoring and alerting.
+
+## 1. Request Lifecycle: The Trace Anatomy
+
+### End-to-End Request Flow
+
+A single request in Dynamo passes through these stages:
+
+```
+Client -> API Gateway -> Router -> Scheduler Queue -> Prefill -> Decode Loop -> Response Stream
+                                                                    |
+                                      Each decode step:             v
+                                      Scheduler tick -> Forward pass -> All-reduce -> Sampling -> Token emit
+```
+
+The trace captures each stage as a span:
+
+```python
+from opentelemetry import trace
+from opentelemetry.trace import StatusCode
+import time
+
+
+class DynamoTracer:
+    """
+    OpenTelemetry tracer for Dynamo request lifecycle.
+
+    Each request generates a trace with the following span hierarchy:
+
+    [request]                          # Root span: full request lifecycle
+      [routing]                        # Router decision: which worker?
+        [kv_cache_lookup]              # KV-aware cache hit check
+        [load_balance]                 # Load balancing decision
+      [scheduling]                     # Time in scheduler queue
+        [queue_wait]                   # Wait time before scheduling
+        [budget_allocation]            # Token budget allocation
+      [prefill]                        # Prefill phase
+        [kv_cache_alloc]              # KV block allocation
+        [model_forward_prefill]       # Model forward pass (prefill)
+          [attention_prefill]         # Attention computation
+          [ffn_prefill]               # FFN computation
+        [sampling_prefill]            # First token sampling
+      [decode]                         # Decode phase (repeated per token)
+        [model_forward_decode]        # Model forward pass (decode step)
+          [attention_decode]          # Paged attention
+          [all_reduce]                # TP all-reduce
+          [ffn_decode]                # FFN
+        [sampling_decode]             # Token sampling
+        [token_emit]                  # SSE/streaming emit
+    """
+
+    def __init__(self):
+        self.tracer = trace.get_tracer("dynamo-inference", "1.0.0")
+
+    def trace_request(self, request):
+        """Create the root span for a request."""
+        return self.tracer.start_as_current_span(
+            "request",
+            attributes={
+                "request.id": request.request_id,
+                "request.model": request.model_id,
+                "request.prompt_tokens": len(request.prompt_tokens),
+                "request.max_output_tokens": request.max_tokens,
+                "request.adapter_id": request.adapter_id or "none",
+                "request.temperature": request.temperature,
+                "request.stream": request.stream,
+            }
+        )
+
+    def trace_routing(self, request, router_state):
+        """Span for routing decision."""
+        return self.tracer.start_as_current_span(
+            "routing",
+            attributes={
+                "routing.strategy": router_state.strategy,
+                "routing.candidates": len(router_state.candidate_workers),
+                "routing.kv_cache_hit": router_state.cache_hit,
+                "routing.selected_worker": router_state.selected_worker_id,
+                "routing.selection_reason": router_state.reason,
+            }
+        )
+
+    def trace_scheduling(self, request_id, queue_depth):
+        """Span for time spent in scheduler queue."""
+        return self.tracer.start_as_current_span(
+            "scheduling",
+            attributes={
+                "scheduling.queue_depth_at_entry": queue_depth,
+                "scheduling.request_id": request_id,
+            }
+        )
+
+    def trace_prefill(self, request_id, prompt_length, cached_tokens):
+        """Span for prefill phase."""
+        return self.tracer.start_as_current_span(
+            "prefill",
+            attributes={
+                "prefill.prompt_tokens": prompt_length,
+                "prefill.cached_tokens": cached_tokens,
+                "prefill.new_tokens": prompt_length - cached_tokens,
+                "prefill.cache_hit_rate": cached_tokens / max(prompt_length, 1),
+            }
+        )
+
+    def trace_decode_step(self, step_number, batch_size):
+        """Span for a single decode step."""
+        return self.tracer.start_as_current_span(
+            "decode_step",
+            attributes={
+                "decode.step": step_number,
+                "decode.batch_size": batch_size,
+            }
+        )
+
+    def trace_attention(self, layer_idx, seq_len, num_kv_blocks):
+        """Span for attention kernel execution."""
+        return self.tracer.start_as_current_span(
+            "attention",
+            attributes={
+                "attention.layer": layer_idx,
+                "attention.seq_len": seq_len,
+                "attention.kv_blocks": num_kv_blocks,
+            }
+        )
+
+    def trace_all_reduce(self, message_bytes, tp_degree):
+        """Span for tensor parallel all-reduce."""
+        return self.tracer.start_as_current_span(
+            "all_reduce",
+            attributes={
+                "all_reduce.message_bytes": message_bytes,
+                "all_reduce.tp_degree": tp_degree,
+            }
+        )
+```
+
+### Trace-Annotated Request Handler
+
+A complete request handler with tracing at every stage:
+
+```python
+class TracedRequestHandler:
+    """
+    Request handler with full OpenTelemetry tracing.
+
+    Every processing stage creates a child span with relevant attributes.
+    Timing is automatic (span start/end).
+    """
+
+    def __init__(self, router, scheduler, model_runner, tracer):
+        self.router = router
+        self.scheduler = scheduler
+        self.model_runner = model_runner
+        self.tracer = tracer
+        self.metrics = DynamoMetrics()
+
+    async def handle_request(self, request):
+        """Process a request with full tracing."""
+        request_start = time.monotonic()
+
+        with self.tracer.trace_request(request) as root_span:
+            try:
+                # Phase 1: Routing
+                with self.tracer.trace_routing(request, self.router.state) as route_span:
+                    route_start = time.monotonic()
+                    worker_id = self.router.route(request)
+                    route_time_ms = (time.monotonic() - route_start) * 1000
+                    route_span.set_attribute("routing.latency_ms", route_time_ms)
+                    self.metrics.routing_latency.observe(route_time_ms)
+
+                # Phase 2: Queue + Scheduling
+                with self.tracer.trace_scheduling(request.request_id, self.scheduler.queue_depth) as sched_span:
+                    queue_entry_time = time.monotonic()
+                    self.metrics.queue_depth.set(self.scheduler.queue_depth)
+
+                    schedule_result = await self.scheduler.schedule_request(request, worker_id)
+
+                    queue_time_ms = (time.monotonic() - queue_entry_time) * 1000
+                    sched_span.set_attribute("scheduling.queue_time_ms", queue_time_ms)
+                    sched_span.set_attribute("scheduling.assigned_tokens", schedule_result.num_tokens)
+                    self.metrics.queue_wait_time.observe(queue_time_ms)
+
+                # Phase 3: Prefill
+                cached_tokens = schedule_result.cached_prefix_tokens
+                prompt_length = len(request.prompt_tokens)
+
+                with self.tracer.trace_prefill(request.request_id, prompt_length, cached_tokens) as prefill_span:
+                    prefill_start = time.monotonic()
+
+                    prefill_output = await self.model_runner.prefill(
+                        request, schedule_result
+                    )
+
+                    prefill_time_ms = (time.monotonic() - prefill_start) * 1000
+                    prefill_span.set_attribute("prefill.time_ms", prefill_time_ms)
+                    prefill_span.set_attribute("prefill.tokens_per_sec",
+                        (prompt_length - cached_tokens) / (prefill_time_ms / 1000))
+
+                    self.metrics.prefill_latency.observe(prefill_time_ms)
+                    self.metrics.prefix_cache_hit_rate.observe(
+                        cached_tokens / max(prompt_length, 1)
+                    )
+
+                # TTFT: time from request start to first token
+                ttft_ms = (time.monotonic() - request_start) * 1000
+                root_span.set_attribute("request.ttft_ms", ttft_ms)
+                self.metrics.ttft.observe(ttft_ms)
+
+                # Emit first token
+                first_token = prefill_output.sampled_token
+                yield first_token
+
+                # Phase 4: Decode loop
+                decode_step = 0
+                prev_token_time = time.monotonic()
+
+                while not self._is_complete(prefill_output, decode_step, request):
+                    with self.tracer.trace_decode_step(decode_step, self.scheduler.current_batch_size):
+                        decode_start = time.monotonic()
+
+                        decode_output = await self.model_runner.decode_step(request)
+
+                        decode_time_ms = (time.monotonic() - decode_start) * 1000
+
+                        # Time between tokens
+                        tbt_ms = (time.monotonic() - prev_token_time) * 1000
+                        prev_token_time = time.monotonic()
+                        self.metrics.tbt.observe(tbt_ms)
+
+                        yield decode_output.sampled_token
+                        decode_step += 1
+
+                # Request complete
+                total_time_ms = (time.monotonic() - request_start) * 1000
+                output_tokens = decode_step + 1  # Including first token
+
+                root_span.set_attribute("request.total_time_ms", total_time_ms)
+                root_span.set_attribute("request.output_tokens", output_tokens)
+                root_span.set_attribute("request.tokens_per_sec",
+                    output_tokens / (total_time_ms / 1000))
+                root_span.set_status(StatusCode.OK)
+
+                self.metrics.request_duration.observe(total_time_ms)
+                self.metrics.output_tokens.observe(output_tokens)
+
+            except Exception as e:
+                root_span.set_status(StatusCode.ERROR, str(e))
+                root_span.record_exception(e)
+                self.metrics.request_errors.inc()
+                raise
+```
+
+## 2. Key Metrics and Prometheus Exporters
+
+### Metric Definitions
+
+```python
+from prometheus_client import (
+    Histogram, Gauge, Counter, Summary, CollectorRegistry
+)
+
+
+class DynamoMetrics:
+    """
+    Prometheus metrics for Dynamo inference serving.
+
+    Organized by category:
+    - Latency: TTFT, TBT, prefill time, decode step time
+    - Throughput: tokens/sec, requests/sec
+    - Resource: queue depth, KV cache utilization, GPU utilization
+    - Cache: prefix cache hit rate, adapter cache hit rate
+    - Errors: preemptions, OOM events, timeouts
+    """
+
+    def __init__(self, registry=None):
+        self.registry = registry or CollectorRegistry()
+        self._init_latency_metrics()
+        self._init_throughput_metrics()
+        self._init_resource_metrics()
+        self._init_cache_metrics()
+        self._init_error_metrics()
+
+    def _init_latency_metrics(self):
+        """Latency distributions with percentile-aware buckets."""
+
+        # TTFT: Time to first token
+        # Buckets optimized for LLM serving: 10ms to 30s
+        ttft_buckets = [
+            10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 30000
+        ]
+        self.ttft = Histogram(
+            'dynamo_ttft_milliseconds',
+            'Time to first token in milliseconds',
+            ['model', 'worker_id'],
+            buckets=ttft_buckets,
+            registry=self.registry
+        )
+
+        # TBT: Time between tokens (decode latency per token)
+        tbt_buckets = [5, 10, 20, 30, 50, 75, 100, 150, 200, 500]
+        self.tbt = Histogram(
+            'dynamo_tbt_milliseconds',
+            'Time between consecutive output tokens',
+            ['model', 'worker_id'],
+            buckets=tbt_buckets,
+            registry=self.registry
+        )
+
+        # Prefill latency
+        self.prefill_latency = Histogram(
+            'dynamo_prefill_milliseconds',
+            'Prefill computation time',
+            ['model', 'worker_id', 'quantization'],
+            buckets=[10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+            registry=self.registry
+        )
+
+        # Queue wait time
+        self.queue_wait_time = Histogram(
+            'dynamo_queue_wait_milliseconds',
+            'Time request spent waiting in scheduler queue',
+            ['model', 'worker_id'],
+            buckets=[0.1, 1, 5, 10, 50, 100, 500, 1000, 5000],
+            registry=self.registry
+        )
+
+        # Routing latency
+        self.routing_latency = Histogram(
+            'dynamo_routing_milliseconds',
+            'Router decision latency',
+            ['model', 'routing_strategy'],
+            buckets=[0.01, 0.05, 0.1, 0.5, 1, 5, 10],
+            registry=self.registry
+        )
+
+        # Total request duration
+        self.request_duration = Histogram(
+            'dynamo_request_duration_milliseconds',
+            'Total request duration from arrival to last token',
+            ['model'],
+            buckets=[100, 500, 1000, 2000, 5000, 10000, 30000, 60000],
+            registry=self.registry
+        )
+
+    def _init_throughput_metrics(self):
+        """Throughput counters."""
+
+        self.tokens_generated = Counter(
+            'dynamo_tokens_generated_total',
+            'Total output tokens generated',
+            ['model', 'worker_id'],
+            registry=self.registry
+        )
+
+        self.tokens_prefilled = Counter(
+            'dynamo_tokens_prefilled_total',
+            'Total prompt tokens prefilled',
+            ['model', 'worker_id'],
+            registry=self.registry
+        )
+
+        self.requests_completed = Counter(
+            'dynamo_requests_completed_total',
+            'Total requests completed successfully',
+            ['model'],
+            registry=self.registry
+        )
+
+        self.output_tokens = Histogram(
+            'dynamo_output_tokens_per_request',
+            'Number of output tokens per request',
+            ['model'],
+            buckets=[1, 10, 50, 100, 200, 500, 1000, 2000, 4000],
+            registry=self.registry
+        )
+
+    def _init_resource_metrics(self):
+        """Resource utilization gauges."""
+
+        self.queue_depth = Gauge(
+            'dynamo_scheduler_queue_depth',
+            'Number of requests in scheduler queue',
+            ['model', 'worker_id'],
+            registry=self.registry
+        )
+
+        self.batch_size = Gauge(
+            'dynamo_current_batch_size',
+            'Number of requests in current batch',
+            ['model', 'worker_id'],
+            registry=self.registry
+        )
+
+        self.kv_cache_utilization = Gauge(
+            'dynamo_kv_cache_utilization',
+            'Fraction of KV cache blocks in use',
+            ['worker_id', 'tier'],
+            registry=self.registry
+        )
+
+        self.gpu_memory_used_bytes = Gauge(
+            'dynamo_gpu_memory_used_bytes',
+            'GPU HBM memory used in bytes',
+            ['worker_id', 'category'],
+            registry=self.registry
+        )
+
+        self.active_adapters = Gauge(
+            'dynamo_active_lora_adapters',
+            'Number of LoRA adapters currently loaded on GPU',
+            ['worker_id'],
+            registry=self.registry
+        )
+
+    def _init_cache_metrics(self):
+        """Cache performance metrics."""
+
+        self.prefix_cache_hit_rate = Histogram(
+            'dynamo_prefix_cache_hit_rate',
+            'Prefix cache hit rate per request',
+            ['model', 'worker_id'],
+            buckets=[0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 1.0],
+            registry=self.registry
+        )
+
+        self.prefix_cache_blocks_evicted = Counter(
+            'dynamo_prefix_cache_evictions_total',
+            'Total prefix cache block evictions',
+            ['worker_id'],
+            registry=self.registry
+        )
+
+        self.adapter_cache_loads = Counter(
+            'dynamo_adapter_cache_loads_total',
+            'Total adapter loads from CPU to GPU',
+            ['worker_id'],
+            registry=self.registry
+        )
+
+        self.adapter_cache_evictions = Counter(
+            'dynamo_adapter_cache_evictions_total',
+            'Total adapter evictions from GPU',
+            ['worker_id'],
+            registry=self.registry
+        )
+
+    def _init_error_metrics(self):
+        """Error and degradation counters."""
+
+        self.request_errors = Counter(
+            'dynamo_request_errors_total',
+            'Total request errors by type',
+            ['model', 'error_type'],
+            registry=self.registry
+        )
+
+        self.preemptions = Counter(
+            'dynamo_preemptions_total',
+            'Total request preemptions (KV cache pressure)',
+            ['model', 'worker_id'],
+            registry=self.registry
+        )
+
+        self.oom_events = Counter(
+            'dynamo_oom_events_total',
+            'Total out-of-memory events',
+            ['worker_id'],
+            registry=self.registry
+        )
+```
+
+### Metrics Collection Loop
+
+```python
+class MetricsCollector:
+    """
+    Background metrics collection from Dynamo workers.
+
+    Runs every 5 seconds. Pulls metrics from each worker
+    and updates Prometheus gauges.
+    """
+
+    def __init__(self, workers, metrics):
+        self.workers = workers
+        self.metrics = metrics
+
+    async def collect_loop(self, interval_sec=5):
+        """Main collection loop."""
+        while True:
+            for worker in self.workers:
+                stats = await worker.get_stats()
+                self._update_gauges(worker.worker_id, stats)
+
+            await asyncio.sleep(interval_sec)
+
+    def _update_gauges(self, worker_id, stats):
+        """Update Prometheus gauges from worker stats."""
+
+        self.metrics.queue_depth.labels(
+            model=stats['model_id'], worker_id=worker_id
+        ).set(stats['queue_depth'])
+
+        self.metrics.batch_size.labels(
+            model=stats['model_id'], worker_id=worker_id
+        ).set(stats['current_batch_size'])
+
+        self.metrics.kv_cache_utilization.labels(
+            worker_id=worker_id, tier='gpu'
+        ).set(stats['kv_cache_gpu_utilization'])
+
+        self.metrics.kv_cache_utilization.labels(
+            worker_id=worker_id, tier='cpu'
+        ).set(stats['kv_cache_cpu_utilization'])
+
+        self.metrics.gpu_memory_used_bytes.labels(
+            worker_id=worker_id, category='weights'
+        ).set(stats['gpu_memory_weights'])
+
+        self.metrics.gpu_memory_used_bytes.labels(
+            worker_id=worker_id, category='kv_cache'
+        ).set(stats['gpu_memory_kv_cache'])
+
+        self.metrics.gpu_memory_used_bytes.labels(
+            worker_id=worker_id, category='activations'
+        ).set(stats['gpu_memory_activations'])
+
+        self.metrics.active_adapters.labels(
+            worker_id=worker_id
+        ).set(stats['active_adapters'])
+```
+
+## 3. Grafana Dashboards
+
+### Dashboard Configuration
+
+```python
+class DynamoGrafanaDashboards:
+    """
+    Grafana dashboard definitions for Dynamo monitoring.
+
+    Three dashboards:
+    1. Overview: TTFT/TBT distributions, throughput, error rate
+    2. Worker detail: per-worker resource utilization, batch dynamics
+    3. Cache analysis: prefix cache and adapter cache performance
+    """
+
+    @staticmethod
+    def overview_dashboard():
+        """
+        Overview dashboard panels.
+
+        Row 1: TTFT distribution, TBT distribution, throughput
+        Row 2: Queue depth, batch size, error rate
+        Row 3: Request duration heatmap
+        """
+        return {
+            'title': 'Dynamo Inference Overview',
+            'panels': [
+                {
+                    'title': 'TTFT Distribution (P50/P95/P99)',
+                    'type': 'timeseries',
+                    'queries': [
+                        'histogram_quantile(0.50, rate(dynamo_ttft_milliseconds_bucket[5m]))',
+                        'histogram_quantile(0.95, rate(dynamo_ttft_milliseconds_bucket[5m]))',
+                        'histogram_quantile(0.99, rate(dynamo_ttft_milliseconds_bucket[5m]))',
+                    ],
+                    'unit': 'ms',
+                    'thresholds': [
+                        {'value': 200, 'color': 'green'},
+                        {'value': 500, 'color': 'yellow'},
+                        {'value': 1000, 'color': 'red'},
+                    ],
+                },
+                {
+                    'title': 'TBT Distribution (P50/P95/P99)',
+                    'type': 'timeseries',
+                    'queries': [
+                        'histogram_quantile(0.50, rate(dynamo_tbt_milliseconds_bucket[5m]))',
+                        'histogram_quantile(0.95, rate(dynamo_tbt_milliseconds_bucket[5m]))',
+                        'histogram_quantile(0.99, rate(dynamo_tbt_milliseconds_bucket[5m]))',
+                    ],
+                    'unit': 'ms',
+                    'thresholds': [
+                        {'value': 30, 'color': 'green'},
+                        {'value': 50, 'color': 'yellow'},
+                        {'value': 100, 'color': 'red'},
+                    ],
+                },
+                {
+                    'title': 'Output Throughput',
+                    'type': 'timeseries',
+                    'queries': [
+                        'sum(rate(dynamo_tokens_generated_total[1m]))',
+                    ],
+                    'unit': 'tokens/sec',
+                },
+                {
+                    'title': 'Scheduler Queue Depth',
+                    'type': 'timeseries',
+                    'queries': [
+                        'dynamo_scheduler_queue_depth',
+                    ],
+                    'unit': 'requests',
+                },
+                {
+                    'title': 'Current Batch Size',
+                    'type': 'timeseries',
+                    'queries': [
+                        'dynamo_current_batch_size',
+                    ],
+                    'unit': 'requests',
+                },
+                {
+                    'title': 'Error Rate',
+                    'type': 'timeseries',
+                    'queries': [
+                        'sum(rate(dynamo_request_errors_total[5m]))',
+                    ],
+                    'unit': 'errors/sec',
+                },
+            ]
+        }
+
+    @staticmethod
+    def cache_dashboard():
+        """
+        Cache analysis dashboard panels.
+        """
+        return {
+            'title': 'Dynamo Cache Analysis',
+            'panels': [
+                {
+                    'title': 'Prefix Cache Hit Rate (Moving Average)',
+                    'type': 'timeseries',
+                    'queries': [
+                        'histogram_quantile(0.50, rate(dynamo_prefix_cache_hit_rate_bucket[5m]))',
+                    ],
+                    'unit': 'ratio (0-1)',
+                },
+                {
+                    'title': 'KV Cache Utilization by Tier',
+                    'type': 'timeseries',
+                    'queries': [
+                        'dynamo_kv_cache_utilization{tier="gpu"}',
+                        'dynamo_kv_cache_utilization{tier="cpu"}',
+                    ],
+                    'unit': 'ratio (0-1)',
+                },
+                {
+                    'title': 'Prefix Cache Evictions/sec',
+                    'type': 'timeseries',
+                    'queries': [
+                        'rate(dynamo_prefix_cache_evictions_total[5m])',
+                    ],
+                    'unit': 'evictions/sec',
+                },
+                {
+                    'title': 'Adapter Cache Activity',
+                    'type': 'timeseries',
+                    'queries': [
+                        'rate(dynamo_adapter_cache_loads_total[5m])',
+                        'rate(dynamo_adapter_cache_evictions_total[5m])',
+                    ],
+                    'unit': 'operations/sec',
+                },
+            ]
+        }
+```
+
+## 4. SLO-Based Alert Rules
+
+### Alert Rule Definitions
+
+```yaml
+# Dynamo SLO Alert Rules (Prometheus alerting rules)
+
+groups:
+  - name: dynamo_slo_alerts
+    rules:
+
+      # Alert: TTFT P99 exceeds SLO
+      - alert: DynamoTTFTP99High
+        expr: |
+          histogram_quantile(0.99,
+            rate(dynamo_ttft_milliseconds_bucket{model=~".+"}[5m])
+          ) > 500
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TTFT P99 exceeds 500ms for {{ $labels.model }}"
+          description: >
+            The 99th percentile time-to-first-token for model
+            {{ $labels.model }} is {{ $value }}ms, exceeding the
+            500ms SLO threshold for 2+ minutes.
+          runbook: "Check scheduler queue depth and prefill latency."
+
+      # Alert: TTFT P99 critical
+      - alert: DynamoTTFTP99Critical
+        expr: |
+          histogram_quantile(0.99,
+            rate(dynamo_ttft_milliseconds_bucket{model=~".+"}[5m])
+          ) > 2000
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "TTFT P99 critical: {{ $value }}ms for {{ $labels.model }}"
+          description: >
+            TTFT P99 exceeded 2000ms. Likely causes: queue saturation,
+            KV cache exhaustion, or model loading delays.
+
+      # Alert: TBT P99 exceeds SLO
+      - alert: DynamoTBTP99High
+        expr: |
+          histogram_quantile(0.99,
+            rate(dynamo_tbt_milliseconds_bucket{model=~".+"}[5m])
+          ) > 100
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TBT P99 exceeds 100ms for {{ $labels.model }}"
+          description: >
+            Time between tokens P99 is {{ $value }}ms. Users experience
+            this as stuttering output. Check batch size and preemption rate.
+
+      # Alert: Queue depth growing
+      - alert: DynamoQueueDepthHigh
+        expr: |
+          dynamo_scheduler_queue_depth > 50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Scheduler queue depth is {{ $value }} on worker {{ $labels.worker_id }}"
+          description: >
+            Queue depth exceeding 50 for 5+ minutes indicates insufficient
+            serving capacity. Consider scaling up or enabling request shedding.
+
+      # Alert: High preemption rate
+      - alert: DynamoPreemptionRateHigh
+        expr: |
+          rate(dynamo_preemptions_total[5m]) > 1
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Preemption rate is {{ $value }}/sec on worker {{ $labels.worker_id }}"
+          description: >
+            Preemptions indicate KV cache pressure. Requests are being
+            evicted and must restart prefill. Reduce max_tokens or batch size.
+
+      # Alert: Prefix cache hit rate drop
+      - alert: DynamoPrefixCacheHitRateLow
+        expr: |
+          histogram_quantile(0.50,
+            rate(dynamo_prefix_cache_hit_rate_bucket[10m])
+          ) < 0.3
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "Prefix cache hit rate below 30% for {{ $labels.model }}"
+          description: >
+            Low cache hit rate means most requests are paying full prefill
+            cost. This may be normal for diverse workloads, or may indicate
+            cache thrashing due to insufficient KV cache capacity.
+
+      # Alert: KV cache near full
+      - alert: DynamoKVCacheNearFull
+        expr: |
+          dynamo_kv_cache_utilization{tier="gpu"} > 0.95
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "KV cache GPU utilization at {{ $value }} on worker {{ $labels.worker_id }}"
+          description: >
+            KV cache utilization above 95% means new requests will be
+            queued or existing requests preempted. Immediate action needed.
+
+      # Alert: OOM events
+      - alert: DynamoOOMEvent
+        expr: |
+          increase(dynamo_oom_events_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "OOM event on worker {{ $labels.worker_id }}"
+          description: >
+            Out-of-memory event detected. Worker may be in degraded state.
+            Check memory configuration and reduce batch limits.
+```
+
+### SLO Compliance Calculator
+
+```python
+class SLOComplianceTracker:
+    """
+    Track SLO compliance over time windows.
+
+    SLOs:
+    - TTFT P99 < 500ms (warning), < 200ms (target)
+    - TBT P99 < 100ms (warning), < 50ms (target)
+    - Error rate < 0.1% (target)
+    - Availability > 99.9% (target)
+    """
+
+    def __init__(self):
+        self.ttft_window = SlidingWindow(window_seconds=300)  # 5-minute window
+        self.tbt_window = SlidingWindow(window_seconds=300)
+        self.error_count = 0
+        self.total_requests = 0
+
+    def record_request(self, ttft_ms, tbt_values_ms, had_error):
+        """Record metrics for a completed request."""
+        self.ttft_window.add(ttft_ms)
+        for tbt in tbt_values_ms:
+            self.tbt_window.add(tbt)
+
+        self.total_requests += 1
+        if had_error:
+            self.error_count += 1
+
+    def get_compliance(self):
+        """Compute current SLO compliance."""
+        ttft_p99 = self.ttft_window.percentile(99)
+        ttft_p50 = self.ttft_window.percentile(50)
+        tbt_p99 = self.tbt_window.percentile(99)
+        tbt_p50 = self.tbt_window.percentile(50)
+
+        error_rate = (
+            self.error_count / max(self.total_requests, 1)
+        )
+
+        return {
+            'ttft_p50_ms': ttft_p50,
+            'ttft_p99_ms': ttft_p99,
+            'ttft_target_met': ttft_p99 < 200,
+            'ttft_warning_met': ttft_p99 < 500,
+            'tbt_p50_ms': tbt_p50,
+            'tbt_p99_ms': tbt_p99,
+            'tbt_target_met': tbt_p99 < 50,
+            'tbt_warning_met': tbt_p99 < 100,
+            'error_rate': error_rate,
+            'error_slo_met': error_rate < 0.001,
+        }
+```
+
+## 5. Trace Analysis: Diagnosing Performance Issues
+
+### Common Patterns
+
+```python
+class TraceAnalyzer:
+    """
+    Analyze traces to identify performance bottlenecks.
+
+    Pattern matching on span durations to classify issues.
+    """
+
+    def classify_slow_request(self, trace):
+        """
+        Given a slow request trace, classify the bottleneck.
+
+        Returns the dominant latency contributor.
+        """
+        spans = trace.get_spans()
+
+        ttft = trace.root_span.attributes.get('request.ttft_ms', 0)
+        queue_time = self._get_span_duration(spans, 'scheduling')
+        prefill_time = self._get_span_duration(spans, 'prefill')
+        routing_time = self._get_span_duration(spans, 'routing')
+
+        # Classify based on dominant component
+        total_before_first_token = queue_time + prefill_time + routing_time
+
+        if queue_time / max(total_before_first_token, 1) > 0.6:
+            return BottleneckDiagnosis(
+                category="queue_saturation",
+                dominant_span="scheduling",
+                dominant_pct=queue_time / total_before_first_token * 100,
+                recommendation=(
+                    "Reduce queue depth by scaling workers or enabling "
+                    "request shedding. Current queue time: "
+                    f"{queue_time:.0f}ms of {ttft:.0f}ms TTFT."
+                )
+            )
+
+        if prefill_time / max(total_before_first_token, 1) > 0.7:
+            cached_tokens = trace.get_attribute('prefill.cached_tokens', 0)
+            prompt_tokens = trace.get_attribute('prefill.prompt_tokens', 0)
+            cache_hit = cached_tokens / max(prompt_tokens, 1)
+
+            if cache_hit < 0.1:
+                return BottleneckDiagnosis(
+                    category="prefill_no_cache",
+                    dominant_span="prefill",
+                    dominant_pct=prefill_time / total_before_first_token * 100,
+                    recommendation=(
+                        f"Prefill dominates TTFT ({prefill_time:.0f}ms). "
+                        f"Cache hit rate is {cache_hit:.1%}. "
+                        "Consider prefix caching or prompt optimization."
+                    )
+                )
+            else:
+                return BottleneckDiagnosis(
+                    category="prefill_compute_bound",
+                    dominant_span="prefill",
+                    dominant_pct=prefill_time / total_before_first_token * 100,
+                    recommendation=(
+                        f"Prefill is compute-bound despite {cache_hit:.1%} cache hit. "
+                        "Consider chunked prefill or disaggregated prefill/decode."
+                    )
+                )
+
+        # Check decode-phase issues
+        decode_spans = [s for s in spans if s.name == 'decode_step']
+        if decode_spans:
+            tbt_values = [s.duration_ms for s in decode_spans]
+            avg_tbt = sum(tbt_values) / len(tbt_values)
+            max_tbt = max(tbt_values)
+
+            if max_tbt > 3 * avg_tbt:
+                # Spike in decode latency: likely preemption or cache swap
+                spike_steps = [
+                    s for s in decode_spans if s.duration_ms > 2 * avg_tbt
+                ]
+                return BottleneckDiagnosis(
+                    category="decode_latency_spike",
+                    dominant_span="decode_step",
+                    dominant_pct=0,
+                    recommendation=(
+                        f"Decode latency spikes detected: max {max_tbt:.0f}ms "
+                        f"vs avg {avg_tbt:.0f}ms. {len(spike_steps)} spikes "
+                        "detected. Check for KV cache swaps or preemption events."
+                    )
+                )
+
+        return BottleneckDiagnosis(
+            category="balanced",
+            dominant_span="none",
+            dominant_pct=0,
+            recommendation="No single bottleneck dominates. Request is balanced."
+        )
+
+    def _get_span_duration(self, spans, span_name):
+        """Get duration of a named span in milliseconds."""
+        for span in spans:
+            if span.name == span_name:
+                return span.duration_ms
+        return 0
+```
+
+<Benchmark
+  title="Typical Bottleneck Distribution by Workload"
+  columns={["Workload", "Queue Wait", "Routing", "Prefill", "Decode", "Primary Bottleneck"]}
+  rows={[
+    { values: ["Chatbot (512 prefix, high traffic)", "45%", "2%", "8%", "45%", "Queue saturation"], highlight: false },
+    { values: ["Long context RAG (8K prefix)", "5%", "1%", "82%", "12%", "Prefill compute"], highlight: true },
+    { values: ["Code gen (short prefix, long output)", "3%", "1%", "5%", "91%", "Decode throughput"], highlight: true },
+    { values: ["Multi-model (adapter switching)", "15%", "8%", "22%", "55%", "Mixed"], highlight: false },
+  ]}
+  notes="Percentages show fraction of total request time. Measured across 10K requests per workload."
+/>
+
+## 6. Overhead of Observability
+
+Tracing and metrics collection add overhead. The critical question: how much does observability cost in terms of serving performance?
+
+<Benchmark
+  title="Observability Overhead (Llama 70B, TP=4, batch=128)"
+  columns={["Observability Level", "Per-Token Overhead (us)", "TTFT Impact (ms)", "Throughput Impact"]
+  }
+  rows={[
+    { values: ["None (baseline)", "0", "0", "0%"], highlight: false },
+    { values: ["Metrics only (Prometheus counters)", "0.3", "0.01", "0.001%"], highlight: false },
+    { values: ["Metrics + request-level spans", "1.8", "0.05", "0.007%"], highlight: false },
+    { values: ["Full tracing (per-layer spans)", "12.5", "0.4", "0.05%"], highlight: false },
+    { values: ["Full tracing + span export (OTLP gRPC)", "45.0", "1.2", "0.18%"], highlight: true },
+  ]}
+  notes="Span export is the dominant cost. Use sampling (1-10% of requests) for full tracing in production."
+/>
+
+<Callout type="tip" title="Sampling Strategy">
+In production, trace every request at the metrics level (counters and histograms: 0.001% overhead) but only generate full span traces for 1-10% of requests. Use head-based sampling (decision made at request arrival) to ensure complete traces. Tail-based sampling (decide after the request completes based on latency) captures more interesting traces but requires buffering all spans temporarily.
+</Callout>
+
+### Sampling Configuration
+
+```python
+class DynamoTraceSampler:
+    """
+    Adaptive trace sampling for production.
+
+    Base rate: 1% of requests get full traces.
+    Elevated rate for:
+    - Slow requests (TTFT > P95): 100% traced
+    - Errors: 100% traced
+    - New models (first hour after deployment): 10% traced
+    """
+
+    def __init__(self, base_rate=0.01):
+        self.base_rate = base_rate
+        self.elevated_models = {}
+
+    def should_trace(self, request, predicted_ttft_ms=None):
+        """Decide whether to create a full trace for this request."""
+
+        # Always trace errors (decided retroactively via tail-based sampling)
+        # This is handled by the span processor, not here
+
+        # Elevated sampling for new models
+        if request.model_id in self.elevated_models:
+            return random.random() < 0.10
+
+        # Predicted slow requests: always trace
+        if predicted_ttft_ms and predicted_ttft_ms > 500:
+            return True
+
+        # Base rate sampling
+        return random.random() < self.base_rate
+
+    def register_new_model(self, model_id, duration_hours=1):
+        """Enable elevated sampling for a newly deployed model."""
+        expiry = time.monotonic() + duration_hours * 3600
+        self.elevated_models[model_id] = expiry
+
+    def cleanup_expired(self):
+        """Remove expired elevated sampling entries."""
+        now = time.monotonic()
+        self.elevated_models = {
+            mid: exp for mid, exp in self.elevated_models.items()
+            if exp > now
+        }
+```
+
+## 7. Trace-Annotated Request: Complete Example
+
+```python
+class FullyTracedDynamoRequest:
+    """
+    Example: a complete request traced through Dynamo.
+
+    This shows the span hierarchy and attributes for a
+    typical chatbot request with prefix caching.
+    """
+
+    @staticmethod
+    def example_trace():
+        """
+        Request: "What is the capital of France?"
+        Model: llama-70b
+        System prompt: 512 tokens (cached)
+        User prompt: 12 tokens
+        Output: 45 tokens
+
+        Trace structure:
+        """
+        return {
+            'trace_id': 'a1b2c3d4e5f6...',
+            'spans': [
+                {
+                    'name': 'request',
+                    'duration_ms': 1842,
+                    'attributes': {
+                        'request.id': 'req-abc-123',
+                        'request.model': 'llama-70b',
+                        'request.prompt_tokens': 524,
+                        'request.output_tokens': 45,
+                        'request.ttft_ms': 42.3,
+                        'request.tokens_per_sec': 24.9,
+                    },
+                    'children': [
+                        {
+                            'name': 'routing',
+                            'duration_ms': 0.8,
+                            'attributes': {
+                                'routing.strategy': 'kv_aware',
+                                'routing.kv_cache_hit': True,
+                                'routing.selected_worker': 'worker-3',
+                                'routing.selection_reason': 'prefix_match_512_tokens',
+                            }
+                        },
+                        {
+                            'name': 'scheduling',
+                            'duration_ms': 5.2,
+                            'attributes': {
+                                'scheduling.queue_depth_at_entry': 12,
+                                'scheduling.queue_time_ms': 5.2,
+                            }
+                        },
+                        {
+                            'name': 'prefill',
+                            'duration_ms': 36.3,
+                            'attributes': {
+                                'prefill.prompt_tokens': 524,
+                                'prefill.cached_tokens': 512,
+                                'prefill.new_tokens': 12,
+                                'prefill.cache_hit_rate': 0.977,
+                                'prefill.time_ms': 36.3,
+                                # 12 tokens prefilled in 36.3ms
+                                # (includes overhead; actual compute is ~2ms for 12 tokens)
+                            }
+                        },
+                        {
+                            'name': 'decode',
+                            'duration_ms': 1800,
+                            'attributes': {
+                                'decode.total_steps': 45,
+                                'decode.avg_tbt_ms': 40.0,
+                                'decode.p99_tbt_ms': 48.2,
+                            },
+                            # 45 child decode_step spans omitted for brevity
+                        },
+                    ]
+                }
+            ]
+        }
+```
+
+<PerfChart
+  title="TTFT Breakdown: Example Chatbot Request (524 prompt tokens, 512 cached)"
+  unit="ms"
+  data={[
+    { label: "Routing", value: 0.8, color: "green", annotation: "0.8 ms" },
+    { label: "Queue wait", value: 5.2, color: "orange", annotation: "5.2 ms" },
+    { label: "Prefill (12 new tokens)", value: 36.3, color: "blue", annotation: "36.3 ms" },
+    { label: "Total TTFT", value: 42.3, color: "#a371f7", annotation: "42.3 ms" }
+  ]}
+  baseline={0}
+/>
+
+Without prefix caching, the prefill would process all 524 tokens (~85ms). With caching, only 12 tokens are prefilled (36.3ms including overhead). TTFT drops from ~91ms to 42.3ms — a 2.15x improvement, directly visible in the trace.
+
+---
+
+## 8. Reviewer Agent Validation Challenge
+
+Test your understanding of Dynamo observability with these scenarios.
+
+**Scenario A**: A production alert fires: `DynamoTTFTP99High` for model `llama-70b`. The P99 TTFT is 780ms. The Grafana dashboard shows queue depth at 45, batch size at 256, and prefix cache hit rate at 0.92. Where is the bottleneck?
+
+**Scenario B**: The trace analyzer classifies a request as `decode_latency_spike`. The trace shows 200 decode steps with average TBT of 38ms, but steps 87-89 have TBTs of 180ms, 220ms, and 160ms. What caused the spike?
+
+**Scenario C**: Full tracing with OTLP export is enabled for 100% of requests. Throughput drops from 5,100 tok/s to 5,091 tok/s. The team wants per-layer attention spans for debugging. What is the expected additional overhead?
+
+**Scenario D**: The SLO compliance tracker reports `tbt_target_met: False` (P99 TBT = 62ms, target 50ms) but `tbt_warning_met: True` (P99 TBT = 62ms, warning threshold 100ms). The error rate is 0.02%. What action should be taken?
+
+**Answers**:
+- **A**: Queue depth at 45 indicates queuing is contributing significantly to TTFT. With a batch size of 256 and TBT of ~40ms, each scheduler tick takes ~40ms. A request at position 45 in the queue waits approximately $45 / 256 \times 40 = 7$ ms (if all fit in one batch) to $45 \times 40 / 256 \approx 7$ ms. But if the batch is full, the request waits for the next scheduler tick: potentially 40ms per tick. The actual bottleneck is likely a combination of queue wait (~200-300ms at 45 depth under heavy load) and prefill time for non-cached portions. The 0.92 cache hit rate is good, but the 8% miss at 4K prompt length still costs ~65ms of prefill. To reduce P99 TTFT, scale up workers to reduce queue depth below 20.
+- **B**: Three consecutive high-TBT decode steps (180, 220, 160ms) suggest a KV cache swap event. At step 87, the KV cache was likely exhausted, triggering preemption of a lower-priority request. The preemption involves swapping KV blocks to CPU (the 180ms), and steps 88-89 suffer from cache pressure as blocks are reallocated. Check the `dynamo_preemptions_total` counter — it should show an increment at the same timestamp. Also check `dynamo_kv_cache_utilization` — it should be at or near 1.0 around the time of the spike.
+- **C**: Full tracing at 100% adds 45 us per token (0.18% throughput impact). Per-layer attention spans add approximately 80 spans per forward pass (80 layers), each costing ~1-2 us for span creation. Total additional cost: $80 \times 1.5 = 120$ us per decode step. At 38ms per decode step, this is $120 / 38{,}000 = 0.32\%$ additional overhead. Combined with the existing 0.18%, total overhead would be ~0.5%. Throughput would drop from 5,100 to approximately 5,075 tok/s. For production, use 1% sampling with per-layer spans instead.
+- **D**: The P99 TBT of 62ms exceeds the 50ms target but is within the 100ms warning threshold. The error rate of 0.02% is well within the 0.1% target. This is a yellow state: investigate but do not page. The likely cause is batch size spikes causing occasional slow decode iterations. Actions: (1) Review the TBT histogram for the tail — is it a smooth curve or bimodal? Bimodal suggests intermittent preemptions. (2) If smooth, reduce the batch size limit slightly (e.g., from 256 to 224) to trade throughput for latency. (3) If bimodal, increase KV cache allocation to reduce preemption events.
+
+---
+
+## Summary
+
+Dynamo's observability stack provides three layers of visibility: OpenTelemetry tracing with per-component spans (routing, scheduling, prefill, decode), Prometheus metrics with LLM-specific histograms (TTFT, TBT, cache hit rates), and Grafana dashboards with SLO-based alerting. The tracing overhead ranges from 0.001% (metrics only) to 0.18% (full traces with export), making production tracing feasible with appropriate sampling. The trace analyzer automates bottleneck classification into queue saturation, prefill-bound, decode-bound, and latency spike categories, each with actionable recommendations. SLO compliance tracking with two-tier thresholds (target and warning) enables graduated response to performance degradation.
