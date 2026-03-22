@@ -411,6 +411,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"frontier-research-constitutional-ai-dpo-alternatives.mdx": {
+	id: "frontier-research-constitutional-ai-dpo-alternatives.mdx";
+  slug: "frontier-research-constitutional-ai-dpo-alternatives";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "frontier-research-lightning-attention-linear-scaling.mdx": {
 	id: "frontier-research-lightning-attention-linear-scaling.mdx";
   slug: "frontier-research-lightning-attention-linear-scaling";
@@ -418,9 +425,23 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"frontier-research-policy-of-thoughts-test-time.mdx": {
+	id: "frontier-research-policy-of-thoughts-test-time.mdx";
+  slug: "frontier-research-policy-of-thoughts-test-time";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "frontier-research-reasoning-scaling-laws.mdx": {
 	id: "frontier-research-reasoning-scaling-laws.mdx";
   slug: "frontier-research-reasoning-scaling-laws";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"frontier-research-reward-model-engineering.mdx": {
+	id: "frontier-research-reward-model-engineering.mdx";
+  slug: "frontier-research-reward-model-engineering";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -484,6 +505,13 @@ declare module 'astro:content' {
 "inference-time-compute-scaling-chain-of-thought.mdx": {
 	id: "inference-time-compute-scaling-chain-of-thought.mdx";
   slug: "inference-time-compute-scaling-chain-of-thought";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"inference-timeline-speculative-decoding-v2.mdx": {
+	id: "inference-timeline-speculative-decoding-v2.mdx";
+  slug: "inference-timeline-speculative-decoding-v2";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -799,6 +827,13 @@ declare module 'astro:content' {
 "tokenization-bpe-from-first-principles.mdx": {
 	id: "tokenization-bpe-from-first-principles.mdx";
   slug: "tokenization-bpe-from-first-principles";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"transformer-anatomy-learning-rate-schedules.mdx": {
+	id: "transformer-anatomy-learning-rate-schedules.mdx";
+  slug: "transformer-anatomy-learning-rate-schedules";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
