@@ -285,6 +285,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"dataset-frontier-evaluation-benchmarks.mdx": {
+	id: "dataset-frontier-evaluation-benchmarks.mdx";
+  slug: "dataset-frontier-evaluation-benchmarks";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "dataset-frontier-preference-data-dpo-rlhf.mdx": {
 	id: "dataset-frontier-preference-data-dpo-rlhf.mdx";
   slug: "dataset-frontier-preference-data-dpo-rlhf";
@@ -446,6 +453,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"frontier-research-multimodal-fusion-architectures.mdx": {
+	id: "frontier-research-multimodal-fusion-architectures.mdx";
+  slug: "frontier-research-multimodal-fusion-architectures";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "frontier-research-policy-of-thoughts-test-time.mdx": {
 	id: "frontier-research-policy-of-thoughts-test-time.mdx";
   slug: "frontier-research-policy-of-thoughts-test-time";
@@ -540,6 +554,13 @@ declare module 'astro:content' {
 "inference-timeline-batched-gemm-throughput.mdx": {
 	id: "inference-timeline-batched-gemm-throughput.mdx";
   slug: "inference-timeline-batched-gemm-throughput";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"inference-timeline-fp8-inference-implementation.mdx": {
+	id: "inference-timeline-fp8-inference-implementation.mdx";
+  slug: "inference-timeline-fp8-inference-implementation";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -712,6 +733,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"nvidia-dynamo-fault-tolerance-canary-health.mdx": {
+	id: "nvidia-dynamo-fault-tolerance-canary-health.mdx";
+  slug: "nvidia-dynamo-fault-tolerance-canary-health";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "nvidia-dynamo-kv-aware-routing-inference-os.mdx": {
 	id: "nvidia-dynamo-kv-aware-routing-inference-os.mdx";
   slug: "nvidia-dynamo-kv-aware-routing-inference-os";
@@ -722,6 +750,13 @@ declare module 'astro:content' {
 "nvidia-dynamo-kvbm-multi-tier-offloading.mdx": {
 	id: "nvidia-dynamo-kvbm-multi-tier-offloading.mdx";
   slug: "nvidia-dynamo-kvbm-multi-tier-offloading";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"nvidia-dynamo-llmd-declarative-framework.mdx": {
+	id: "nvidia-dynamo-llmd-declarative-framework.mdx";
+  slug: "nvidia-dynamo-llmd-declarative-framework";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -880,9 +915,30 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"transformer-anatomy-gradient-flow-backprop.mdx": {
+	id: "transformer-anatomy-gradient-flow-backprop.mdx";
+  slug: "transformer-anatomy-gradient-flow-backprop";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "transformer-anatomy-learning-rate-schedules.mdx": {
 	id: "transformer-anatomy-learning-rate-schedules.mdx";
   slug: "transformer-anatomy-learning-rate-schedules";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"transformer-anatomy-training-loop.mdx": {
+	id: "transformer-anatomy-training-loop.mdx";
+  slug: "transformer-anatomy-training-loop";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"transformer-anatomy-weight-initialization.mdx": {
+	id: "transformer-anatomy-weight-initialization.mdx";
+  slug: "transformer-anatomy-weight-initialization";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">

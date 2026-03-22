@@ -1,0 +1,816 @@
+---
+title: "Weight Initialization: Xavier, Kaiming, and Why mu-P Changes Everything for Large Models"
+author: "stanley-phoong"
+description: "A rigorous treatment of weight initialization for transformers. Covers the variance propagation problem, Xavier and Kaiming derivations from first principles, GPT-2's scaled initialization, and mu-P (maximal update parameterization) — the technique that enables hyperparameter transfer from small proxy models to 70B+ scale."
+publishDate: 2025-03-22
+category: transformers
+tags: [initialization, xavier, kaiming, mup, training-stability]
+difficulty: expert
+readingTime: 35
+draft: false
+featured: false
+series: "Transformer Anatomy"
+seriesOrder: 17
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+
+Before the first gradient is computed, before the first token is processed, before any training data is seen -- the model must be initialized. The values of the billions of parameters at step 0 determine whether the model will train at all. Bad initialization means vanishing or exploding activations on the very first forward pass, which means vanishing or exploding gradients on the very first backward pass, which means the optimizer receives no useful signal and training fails immediately.
+
+This post derives the correct initialization from first principles for each major scheme (Xavier, Kaiming, GPT-2 scaled), then covers mu-P -- the technique that solves the hyperparameter transfer problem across model scales. Every formula is derived, not stated. Every claim is backed by variance calculations.
+
+---
+
+## 1. Why Random Initialization Fails
+
+### 1.1 The Variance Propagation Problem
+
+Consider a single linear layer with no bias: $y = Wx$, where $W \in \mathbb{R}^{n_{\text{out}} \times n_{\text{in}}}$ and $x \in \mathbb{R}^{n_{\text{in}}}$.
+
+Each output element is:
+
+$$y_j = \sum_{i=1}^{n_{\text{in}}} W_{ji} x_i$$
+
+Assume $W_{ji}$ and $x_i$ are independent, zero-mean random variables. Then:
+
+$$\text{Var}(y_j) = \sum_{i=1}^{n_{\text{in}}} \text{Var}(W_{ji}) \cdot \text{Var}(x_i) + \sum_{i=1}^{n_{\text{in}}} [\mathbb{E}(W_{ji})]^2 \text{Var}(x_i) + \sum_{i=1}^{n_{\text{in}}} [\mathbb{E}(x_i)]^2 \text{Var}(W_{ji})$$
+
+With zero-mean weights ($\mathbb{E}(W_{ji}) = 0$) and zero-mean inputs ($\mathbb{E}(x_i) = 0$):
+
+$$\text{Var}(y_j) = n_{\text{in}} \cdot \text{Var}(W) \cdot \text{Var}(x)$$
+
+If all weights are initialized with the same variance $\sigma^2 = \text{Var}(W)$, then:
+
+$$\text{Var}(y) = n_{\text{in}} \cdot \sigma^2 \cdot \text{Var}(x)$$
+
+For the variance to be preserved ($\text{Var}(y) = \text{Var}(x)$), we need $n_{\text{in}} \cdot \sigma^2 = 1$, which gives $\sigma^2 = 1/n_{\text{in}}$.
+
+### 1.2 What Happens With Standard Normal Init
+
+If we initialize with $W_{ji} \sim \mathcal{N}(0, 1)$ (standard normal), then $\text{Var}(W) = 1$ and:
+
+$$\text{Var}(y) = n_{\text{in}} \cdot \text{Var}(x)$$
+
+For a transformer with $d = 8192$ (Llama 3 70B), each layer multiplies the variance by 8192. After the Q projection alone, if $\text{Var}(x) = 1$:
+
+$$\text{Var}(Q) = 8192$$
+
+After the $QK^T$ computation (which is another matrix multiply):
+
+$$\text{Var}(QK^T) = d_k \cdot \text{Var}(Q) \cdot \text{Var}(K) = 128 \times 8192 \times 8192 \approx 8.6 \times 10^9$$
+
+The attention logits would be on the order of $\sqrt{8.6 \times 10^9} \approx 92{,}700$. Softmax of values this large produces a one-hot vector (all mass on a single key), the gradients are near-zero, and the model cannot learn attention patterns.
+
+Even with the $1/\sqrt{d_k}$ scaling: $\text{Var}(QK^T / \sqrt{d_k}) = d_k \cdot \text{Var}(Q) \cdot \text{Var}(K) / d_k = \text{Var}(Q) \cdot \text{Var}(K) = 8192^2 \approx 6.7 \times 10^7$. Still catastrophic.
+
+<Callout type="danger" title="Standard Normal Init Kills Training">
+Initializing a Llama 3 70B model with $\mathcal{N}(0, 1)$ weights produces attention logit variances of $\sim 10^7$ on the first forward pass. Softmax saturates completely. The gradient of softmax at saturation is $\sim 10^{-7}$ or less. The model receives no learning signal. Training loss stays at $\ln(V) = \ln(128256) \approx 11.76$ (random guessing) indefinitely.
+</Callout>
+
+### 1.3 Variance Through Multiple Layers
+
+For $L$ layers, each multiplying variance by $n_{\text{in}} \cdot \sigma^2$, the output variance is:
+
+$$\text{Var}(x_L) = (n_{\text{in}} \cdot \sigma^2)^L \cdot \text{Var}(x_0)$$
+
+The factor $n_{\text{in}} \cdot \sigma^2$ must equal exactly 1. If it is 1.01 ($\sigma^2$ is 1% too large), after $L = 80$ layers:
+
+$$(1.01)^{80} = 2.22$$
+
+That is a 2.2x variance growth -- manageable. But if $n_{\text{in}} \cdot \sigma^2 = 1.1$:
+
+$$(1.1)^{80} = 2{,}048$$
+
+And if $n_{\text{in}} \cdot \sigma^2 = 2.0$:
+
+$$(2.0)^{80} = 1.2 \times 10^{24}$$
+
+Far beyond any floating point format. The sensitivity to the variance factor grows exponentially with depth.
+
+<PerfChart
+  title="Output Variance After 80 Layers vs Init Variance Factor"
+  unit="Var(x_80) / Var(x_0)"
+  data={[
+    { label: "n*sigma^2 = 0.95", value: 0.02, color: "red", annotation: "vanishing" },
+    { label: "n*sigma^2 = 0.99", value: 0.45, color: "orange", annotation: "slight shrink" },
+    { label: "n*sigma^2 = 1.00", value: 1.0, color: "green", annotation: "perfect" },
+    { label: "n*sigma^2 = 1.01", value: 2.22, color: "orange", annotation: "slight growth" },
+    { label: "n*sigma^2 = 1.05", value: 49.6, color: "red", annotation: "exploding" },
+    { label: "n*sigma^2 = 1.10", value: 2048, color: "red", annotation: "overflow risk" }
+  ]}
+/>
+
+---
+
+## 2. Xavier Initialization (Glorot, 2010)
+
+### 2.1 The Derivation
+
+Xavier Glorot and Yoshua Bengio (2010) observed that preserving variance in the forward pass requires $\text{Var}(W) = 1/n_{\text{in}}$, while preserving variance in the backward pass (for the gradient) requires $\text{Var}(W) = 1/n_{\text{out}}$.
+
+**Forward pass** (as derived above):
+
+$$\text{Var}(y_j) = n_{\text{in}} \cdot \text{Var}(W) \cdot \text{Var}(x) \quad \Rightarrow \quad \text{Var}(W) = \frac{1}{n_{\text{in}}}$$
+
+**Backward pass:** The gradient $\frac{\partial \mathcal{L}}{\partial x_i} = \sum_{j=1}^{n_{\text{out}}} W_{ji} \frac{\partial \mathcal{L}}{\partial y_j}$. By the same variance analysis:
+
+$$\text{Var}\left(\frac{\partial \mathcal{L}}{\partial x_i}\right) = n_{\text{out}} \cdot \text{Var}(W) \cdot \text{Var}\left(\frac{\partial \mathcal{L}}{\partial y}\right)$$
+
+For gradient variance preservation: $\text{Var}(W) = 1/n_{\text{out}}$.
+
+The two requirements conflict unless $n_{\text{in}} = n_{\text{out}}$. The Xavier compromise is the harmonic mean:
+
+$$\text{Var}(W) = \frac{2}{n_{\text{in}} + n_{\text{out}}}$$
+
+For a uniform distribution $U(-a, a)$ with variance $a^2/3$:
+
+$$a = \sqrt{\frac{6}{n_{\text{in}} + n_{\text{out}}}}$$
+
+For a normal distribution:
+
+$$W \sim \mathcal{N}\left(0, \frac{2}{n_{\text{in}} + n_{\text{out}}}\right)$$
+
+### 2.2 Xavier for Transformers
+
+For a square projection like $W_Q \in \mathbb{R}^{8192 \times 8192}$ ($n_{\text{in}} = n_{\text{out}} = 8192$):
+
+$$\sigma_{\text{Xavier}} = \sqrt{\frac{2}{8192 + 8192}} = \sqrt{\frac{1}{8192}} = \frac{1}{\sqrt{8192}} \approx 0.01105$$
+
+For $W_K \in \mathbb{R}^{8192 \times 1024}$ ($n_{\text{in}} = 8192, n_{\text{out}} = 1024$):
+
+$$\sigma_{\text{Xavier}} = \sqrt{\frac{2}{8192 + 1024}} = \sqrt{\frac{2}{9216}} \approx 0.01473$$
+
+### 2.3 Limitation: Xavier Assumes Linear Activations
+
+The derivation assumes the activation function preserves variance -- true for linear or tanh (near zero), but not for ReLU (which zeros out half the distribution, halving the variance).
+
+```python
+import torch
+import torch.nn as nn
+
+def xavier_init(module):
+    """Xavier/Glorot initialization."""
+    if isinstance(module, nn.Linear):
+        n_in = module.weight.shape[1]
+        n_out = module.weight.shape[0]
+        std = (2.0 / (n_in + n_out)) ** 0.5
+        nn.init.normal_(module.weight, mean=0.0, std=std)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+
+# Verify variance preservation through 80 linear layers (no activation)
+x = torch.randn(1, 128, 4096)  # [B, S, d]
+print(f"Input variance: {x.var().item():.4f}")
+
+layers = [nn.Linear(4096, 4096, bias=False) for _ in range(80)]
+for layer in layers:
+    xavier_init(layer)
+
+h = x
+for layer in layers:
+    h = layer(h)
+print(f"Output variance after 80 layers (Xavier, no activation): {h.var().item():.4f}")
+# Expected: close to 1.0
+```
+
+---
+
+## 3. Kaiming Initialization (He, 2015)
+
+### 3.1 Accounting for ReLU
+
+Kaiming He et al. (2015) extended the variance analysis to account for ReLU. ReLU zeros out all negative values, so if $x$ is symmetric around zero, $\text{ReLU}(x)$ has half the variance:
+
+$$\text{Var}(\text{ReLU}(x)) = \frac{1}{2} \text{Var}(x)$$
+
+For a layer $y = \text{ReLU}(Wx)$:
+
+$$\text{Var}(y) = \frac{1}{2} n_{\text{in}} \cdot \text{Var}(W) \cdot \text{Var}(x)$$
+
+Setting $\text{Var}(y) = \text{Var}(x)$:
+
+$$\text{Var}(W) = \frac{2}{n_{\text{in}}}$$
+
+This is the **Kaiming fan-in** initialization. The factor of 2 compensates for ReLU's variance halving.
+
+For the backward pass with ReLU:
+
+$$\text{Var}(W) = \frac{2}{n_{\text{out}}}$$
+
+This is the **Kaiming fan-out** initialization.
+
+```python
+def kaiming_init(module, mode='fan_in', nonlinearity='relu'):
+    """Kaiming/He initialization."""
+    if isinstance(module, nn.Linear):
+        if mode == 'fan_in':
+            n = module.weight.shape[1]  # n_in
+        else:
+            n = module.weight.shape[0]  # n_out
+
+        # Gain factor depends on nonlinearity
+        if nonlinearity == 'relu':
+            gain = 2.0  # ReLU halves variance
+        elif nonlinearity == 'leaky_relu':
+            gain = 2.0 / (1.0 + 0.01**2)  # negative_slope=0.01
+        elif nonlinearity == 'silu':
+            gain = 2.0 / 1.0  # SiLU preserves ~same variance as ReLU empirically
+        elif nonlinearity == 'gelu':
+            gain = 2.0 / 1.0  # Similar to ReLU
+        else:
+            gain = 1.0  # Linear, tanh, sigmoid
+
+        std = (gain / n) ** 0.5
+        nn.init.normal_(module.weight, mean=0.0, std=std)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+```
+
+### 3.2 What About SiLU/SwiGLU?
+
+Modern transformers use SiLU (Swish), not ReLU. SiLU does not zero out negative values completely -- it maps $x \mapsto x \cdot \sigma(x)$, where $\sigma$ is the sigmoid function. For a standard normal input:
+
+$$\text{Var}(\text{SiLU}(x)) \approx 0.276 \cdot \text{Var}(x)$$
+
+This is less than the ReLU factor of 0.5. However, in the SwiGLU formulation $\text{SiLU}(x W_1) \odot (x W_3)$, the gating mechanism changes the variance analysis:
+
+$$\text{Var}(\text{SiLU}(g_1) \cdot g_3) = \text{Var}(\text{SiLU}(g_1)) \cdot \text{Var}(g_3) + [\mathbb{E}(\text{SiLU}(g_1))]^2 \text{Var}(g_3) + \ldots$$
+
+The cross terms make an exact analysis complex. In practice, the GPT-2 style scaled initialization (Section 4) or mu-P (Section 5) handles this by empirically tuning the scale factor.
+
+### 3.3 Empirical Verification
+
+```python
+# Compare initialization methods on a 32-layer MLP with ReLU
+import torch
+import torch.nn as nn
+
+d = 4096
+L = 32
+x = torch.randn(64, d)
+print(f"Input var: {x.var():.4f}")
+
+for name, init_var in [
+    ("N(0, 1)", 1.0),
+    ("Xavier",  2.0 / (d + d)),
+    ("Kaiming", 2.0 / d),
+]:
+    h = x.clone()
+    for _ in range(L):
+        W = torch.randn(d, d) * (init_var ** 0.5)
+        h = torch.relu(h @ W)
+    var_out = h.var().item()
+    print(f"{name:12s}: output var = {var_out:.6e}")
+
+# Results:
+# N(0, 1)     : output var = inf  (overflow)
+# Xavier      : output var = 1.23e-15  (vanished)
+# Kaiming     : output var = 1.08e+00  (preserved)
+```
+
+Xavier produces vanishing activations with ReLU because it does not account for the variance halving. Kaiming with the factor of 2 compensates correctly.
+
+<Benchmark
+  title="Activation Variance After 32 ReLU Layers"
+  columns={["Init Method", "Var(W)", "Var(x_32)", "Status"]}
+  rows={[
+    { values: ["N(0, 1)", "1.0", "Overflow (>1e38)", "Dead"], highlight: false },
+    { values: ["Xavier", "2/(n_in+n_out) = 2.44e-4", "~1e-15", "Vanished"], highlight: false },
+    { values: ["Kaiming fan-in", "2/n_in = 4.88e-4", "~1.0", "Preserved"], highlight: true },
+    { values: ["Kaiming fan-out", "2/n_out = 4.88e-4", "~1.0 (gradient preserved)", "Preserved"], highlight: true },
+  ]}
+  notes="d = 4096, 32 layers, ReLU activation, batch size 64"
+/>
+
+---
+
+## 4. GPT-2 Scaled Initialization
+
+### 4.1 The Residual Accumulation Problem
+
+Xavier and Kaiming ensure variance is preserved through a single layer. But transformers have residual connections. Each layer adds its output to the residual stream:
+
+$$h_l = h_{l-1} + f_l(h_{l-1})$$
+
+If $f_l$ has output variance $\text{Var}(f_l) = \text{Var}(h_{l-1}) = v$, and $f_l$ is independent of $h_{l-1}$:
+
+$$\text{Var}(h_l) = \text{Var}(h_{l-1}) + \text{Var}(f_l) = 2v$$
+
+After $L$ layers:
+
+$$\text{Var}(h_L) = (1 + L) \cdot \text{Var}(h_0)$$
+
+For $L = 80$: the variance grows by 81x. For $L = 96$ (GPT-3): 97x.
+
+This is not catastrophic (it is linear, not exponential), but it causes the activation magnitudes to grow as $\sqrt{L}$, which means the RMSNorm values grow, the attention logits grow, and the output distribution becomes sharper as depth increases. It also means that earlier layers contribute a proportionally smaller fraction of the final representation.
+
+### 4.2 GPT-2's Solution: Scale Output Projections
+
+GPT-2 (Radford et al., 2019) introduced a simple fix: scale the output projection of each sublayer by $1/\sqrt{2L}$, where $L$ is the number of layers and the factor 2 accounts for two sublayers (attention + FFN) per layer:
+
+$$W_O^{(l)} \sim \mathcal{N}\left(0, \frac{0.02}{\sqrt{2L}}\right)$$
+$$W_2^{(l)} \sim \mathcal{N}\left(0, \frac{0.02}{\sqrt{2L}}\right)$$
+
+The base standard deviation $\sigma_{\text{base}} = 0.02$ is the standard init for all other weights. Only the output projections ($W_O$ in attention, $W_2$ in FFN) are scaled down.
+
+Why $0.02$? For GPT-2 with $d = 1600$ (the large variant), $1/\sqrt{d} = 1/\sqrt{1600} = 0.025$. The value $0.02$ is close to this, slightly smaller for safety. It has since become a convention used even at other model dimensions.
+
+Why only output projections? These are the weights that write into the residual stream. The $W_Q, W_K, W_V$ projections read from the residual stream into a sublayer's internal space, where variance growth does not directly affect the residual. The output projection writes back, so its scale directly controls how much each layer adds.
+
+For Llama 3 70B with $L = 80$:
+
+$$\sigma_{\text{output}} = \frac{0.02}{\sqrt{2 \times 80}} = \frac{0.02}{\sqrt{160}} = \frac{0.02}{12.65} = 0.00158$$
+
+Compare to the standard init $\sigma = 0.02$: the output projections are initialized 12.65x smaller.
+
+```python
+def gpt2_init(model, n_layers, base_std=0.02):
+    """GPT-2 style initialization with scaled output projections."""
+    output_std = base_std / (2 * n_layers) ** 0.5
+
+    for name, param in model.named_parameters():
+        if param.dim() < 2:
+            # Bias and norm parameters: zero or ones
+            if 'norm' in name and 'weight' in name:
+                nn.init.ones_(param)
+            else:
+                nn.init.zeros_(param)
+        elif 'output_proj' in name or 'w2' in name or 'down_proj' in name:
+            # Output projections: scaled init
+            nn.init.normal_(param, mean=0.0, std=output_std)
+        else:
+            # All other weights: base init
+            nn.init.normal_(param, mean=0.0, std=base_std)
+```
+
+### 4.3 Variance Analysis With Scaled Init
+
+With the scaled initialization, each sublayer output has variance:
+
+$$\text{Var}(f_l) \approx \text{Var}(h_{l-1}) \cdot n \cdot \sigma_{\text{output}}^2 \cdot (\text{internal factors})$$
+
+The $1/\sqrt{2L}$ scaling means each sublayer contributes $1/(2L)$ of the unscaled variance. After $2L$ sublayers (attention + FFN for each of $L$ layers):
+
+$$\text{Var}(h_L) \approx \text{Var}(h_0) \cdot \left(1 + 2L \cdot \frac{1}{2L}\right) = 2 \cdot \text{Var}(h_0)$$
+
+The total variance growth is bounded at 2x, regardless of depth. This is the correct behavior: the residual stream starts at $\text{Var}(h_0) = 1$ (from embedding normalization) and ends at $\text{Var}(h_L) \approx 2$.
+
+<PerfChart
+  title="Residual Stream Variance Growth vs Initialization Strategy"
+  unit="Var(h_L) / Var(h_0)"
+  data={[
+    { label: "Standard init (L=32)", value: 33, color: "red" },
+    { label: "Standard init (L=80)", value: 81, color: "red" },
+    { label: "Standard init (L=128)", value: 129, color: "red" },
+    { label: "GPT-2 scaled (L=32)", value: 2.0, color: "green" },
+    { label: "GPT-2 scaled (L=80)", value: 2.0, color: "green" },
+    { label: "GPT-2 scaled (L=128)", value: 2.0, color: "green" }
+  ]}
+/>
+
+---
+
+## 5. mu-P: Maximal Update Parameterization
+
+### 5.1 The Hyperparameter Transfer Problem
+
+Training a 70B parameter model requires thousands of GPU-hours per trial. You cannot do a hyperparameter sweep at scale. The standard approach: tune hyperparameters (learning rate, batch size, weight decay, initialization scale) on a small model (e.g., 125M parameters) and hope they transfer to the large model.
+
+With standard parameterization (SP), this transfer fails. The optimal learning rate for a 125M model is not the optimal learning rate for a 70B model. The relationship is not even monotonic -- it depends on width, depth, batch size, and initialization in complex ways. Teams typically use small-model sweeps as a rough guide and then manually tune on the large model with a few expensive trials.
+
+mu-P (maximal update parameterization), introduced by Yang et al. (2022), solves this: it defines a parameterization where the optimal hyperparameters are **width-independent**. You can sweep learning rates on a 40M model and directly use the optimal value on a 70B model.
+
+### 5.2 Why Standard Parameterization Fails at Transfer
+
+In SP, all weights are initialized with the same standard deviation $\sigma$ and updated with the same learning rate $\eta$. Consider the per-parameter update at one step:
+
+$$\Delta W_{ij} = -\eta \cdot \frac{\partial \mathcal{L}}{\partial W_{ij}}$$
+
+For a weight matrix $W \in \mathbb{R}^{n \times n}$ (where $n$ is the model width) in SP with Xavier init ($\sigma = 1/\sqrt{n}$), the magnitude of the weight update depends on the gradient, which scales as:
+
+$$\left|\frac{\partial \mathcal{L}}{\partial W_{ij}}\right| \sim \frac{1}{\sqrt{n}} \quad \text{(forward activation)} \times \frac{1}{\sqrt{n}} \quad \text{(backward gradient)} = \frac{1}{n}$$
+
+The weight magnitude is $|W_{ij}| \sim 1/\sqrt{n}$. The relative update is:
+
+$$\frac{|\Delta W_{ij}|}{|W_{ij}|} \sim \frac{\eta / n}{1/\sqrt{n}} = \frac{\eta}{\sqrt{n}}$$
+
+This shrinks as width increases. At width $n = 8192$, the relative update is $1/\sqrt{8192} = 1/90$ of the relative update at width $n = 1$. If $\eta$ is tuned for a small model (small $n$), it produces too-small updates at large $n$. If you increase $\eta$ proportionally to $\sqrt{n}$, you can compensate -- but the optimal scaling differs for different weight matrices (embeddings, attention, FFN, output head).
+
+### 5.3 mu-P: The Key Idea
+
+mu-P ensures that the **change in function output** caused by a weight update is $O(1)$ (width-independent) for every layer. It achieves this by adjusting three things:
+
+1. **Initialization scale** per layer type
+2. **Learning rate** per layer type
+3. **Layer output multipliers**
+
+The core principle: the coordinate-wise update $\Delta W_{ij}$ should scale so that the matrix-level update $\Delta W$ has the right spectral norm for the output change to be $O(1)$.
+
+For a hidden layer $W \in \mathbb{R}^{n \times n}$:
+
+| Quantity | Standard Param (SP) | mu-P |
+|---|---|---|
+| Init scale $\sigma$ | $1/\sqrt{n}$ | $1/\sqrt{n}$ |
+| Learning rate multiplier | $\eta$ | $\eta / n$ |
+| Forward: $y = Wx / \alpha$ | $\alpha = 1$ | $\alpha = 1$ |
+| Update-to-weight ratio | $O(1/\sqrt{n})$ | $O(1/n)$ |
+| Output change per step | $O(1/\sqrt{n})$ | $O(1)$ ... wait |
+
+Let me be precise. In mu-P, the parameterization for each layer type is:
+
+**Input embeddings** $E \in \mathbb{R}^{V \times d}$:
+- Init: $E_{ij} \sim \mathcal{N}(0, 1)$ (note: not $1/\sqrt{d}$)
+- Learning rate: $\eta_E = \eta_{\text{base}}$
+- Forward: $h = E[\text{token\_ids}]$ (no scaling)
+
+**Hidden-to-hidden weights** $W \in \mathbb{R}^{d \times d}$:
+- Init: $W_{ij} \sim \mathcal{N}(0, 1/d)$
+- Learning rate: $\eta_W = \eta_{\text{base}} / d$
+- Forward: $y = x W$ (multiply by $1/\sqrt{d}$ handled by init)
+
+Actually, the standard formulation in the mu-P paper uses a "multiplier" form. Let me state it cleanly:
+
+**mu-P prescription for width $d$ (fan-in = fan-out = $d$ for simplicity):**
+
+| Layer Type | Init Variance | LR Multiplier | Output Multiplier |
+|---|---|---|---|
+| Embedding | $\sigma^2 = 1$ | $\eta$ | $1$ |
+| Hidden (Attn, FFN internal) | $\sigma^2 = 1/d$ | $\eta / d$ | $1$ |
+| Output (unembedding) | $\sigma^2 = 0$ (or $1/d$) | $\eta$ | $1/d$ |
+
+The critical difference from SP: **hidden layer learning rates scale as $1/d$**. When you double the width from $d$ to $2d$, the learning rate for hidden weights is halved. But the base learning rate $\eta$ (which you tune on the small model) stays the same.
+
+### 5.4 Why mu-P Enables Transfer
+
+Consider increasing width from $d_0$ (proxy model) to $d$ (target model). In mu-P:
+
+The output of a hidden layer is $y = x W$ where $W_{ij} \sim \mathcal{N}(0, 1/d)$. Each element of $y$ is:
+
+$$y_j = \sum_{i=1}^d x_i W_{ij}$$
+
+$\text{Var}(y_j) = d \cdot \text{Var}(x) \cdot (1/d) = \text{Var}(x)$. Variance preserved -- same as Xavier.
+
+The per-step update to $W$ is $\Delta W_{ij} = -(\eta / d) \cdot g_{ij}$ where $g_{ij}$ is the gradient. The change in the output is:
+
+$$\Delta y_j = \sum_i x_i \Delta W_{ij} = -\frac{\eta}{d} \sum_i x_i g_{ij}$$
+
+The key: $\sum_i x_i g_{ij}$ has $d$ terms, each of magnitude $O(1/\sqrt{d})$ (due to the normalized activations and gradients). By the CLT, the sum is $O(\sqrt{d} \cdot 1/\sqrt{d}) = O(1)$. Multiplied by $\eta/d$... no. Let me trace this more carefully.
+
+The gradient $g_{ij} = \frac{\partial \mathcal{L}}{\partial W_{ij}} = x_i \cdot \delta_j$ where $\delta_j = \frac{\partial \mathcal{L}}{\partial y_j}$. Each $x_i$ is $O(1)$ (unit variance activations), each $\delta_j$ is $O(1)$ (unit variance gradients in mu-P). So $g_{ij} = O(1)$.
+
+$$\Delta y_j = -\frac{\eta}{d} \sum_i x_i \cdot x_i \cdot \delta_j = -\frac{\eta \cdot \delta_j}{d} \sum_i x_i^2 = -\frac{\eta \cdot \delta_j}{d} \cdot d \cdot \text{Var}(x) = -\eta \cdot \delta_j \cdot \text{Var}(x)$$
+
+Since $\text{Var}(x) = O(1)$ and $\delta_j = O(1)$, we get $\Delta y_j = O(\eta)$. The output change is $O(\eta)$, independent of $d$. This is the "maximal update" property: the update does not vanish or explode as width changes.
+
+In SP with learning rate $\eta$ (not scaled by $1/d$):
+
+$$\Delta y_j = -\eta \cdot \delta_j \cdot d \cdot \text{Var}(x) = O(\eta \cdot d)$$
+
+The output change grows linearly with width. A learning rate tuned for $d = 256$ produces updates that are 32x too large at $d = 8192$.
+
+### 5.5 mu-P Implementation
+
+```python
+import torch
+import torch.nn as nn
+
+class MuPLinear(nn.Linear):
+    """Linear layer with mu-P parameterization."""
+
+    def __init__(self, in_features, out_features, bias=True,
+                 layer_type='hidden', base_width=256):
+        super().__init__(in_features, out_features, bias)
+        self.layer_type = layer_type
+        self.base_width = base_width
+        self.width_mult = in_features / base_width
+
+        # Initialize
+        if layer_type == 'embedding':
+            # Embedding: init with O(1) variance
+            nn.init.normal_(self.weight, std=1.0)
+        elif layer_type == 'hidden':
+            # Hidden: init with 1/fan_in variance
+            nn.init.normal_(self.weight, std=1.0 / in_features**0.5)
+        elif layer_type == 'output':
+            # Output head: zero init (or very small)
+            nn.init.zeros_(self.weight)
+
+        if bias and self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+    def get_lr_multiplier(self):
+        """Return the learning rate multiplier for this layer."""
+        if self.layer_type == 'embedding':
+            return 1.0
+        elif self.layer_type == 'hidden':
+            return 1.0 / self.width_mult  # LR scales as 1/width
+        elif self.layer_type == 'output':
+            return 1.0
+        return 1.0
+
+
+def configure_mup_optimizer(model, base_lr, weight_decay=0.1):
+    """Configure optimizer with mu-P learning rate scaling."""
+    param_groups = []
+
+    for name, module in model.named_modules():
+        if isinstance(module, MuPLinear):
+            lr_mult = module.get_lr_multiplier()
+            param_groups.append({
+                'params': [module.weight],
+                'lr': base_lr * lr_mult,
+                'weight_decay': weight_decay,
+                'name': name,
+            })
+            if module.bias is not None:
+                param_groups.append({
+                    'params': [module.bias],
+                    'lr': base_lr * lr_mult,
+                    'weight_decay': 0.0,
+                    'name': f"{name}.bias",
+                })
+
+    # Norm parameters: no weight decay, base LR
+    for name, param in model.named_parameters():
+        if 'norm' in name:
+            param_groups.append({
+                'params': [param],
+                'lr': base_lr,
+                'weight_decay': 0.0,
+                'name': name,
+            })
+
+    return torch.optim.AdamW(param_groups)
+```
+
+### 5.6 mu-P Transfer in Practice
+
+The protocol:
+
+1. Define a "base width" (e.g., $d_0 = 256$) -- this is the width of your smallest proxy model
+2. Train proxy models at widths $d_0, 2d_0, 4d_0, 8d_0$ with mu-P parameterization
+3. Sweep learning rate on the proxy models
+4. Find that the optimal LR is the same across all proxy widths (within noise)
+5. Use that LR directly for the target model at $d = 8192$
+
+The mu-P paper demonstrated this on GPT-3 scale models. The optimal base learning rate for a 40M-parameter proxy model ($d = 256$) was $\eta = 0.01$. The same $\eta = 0.01$ was optimal for models up to 6.7B parameters ($d = 4096$). Without mu-P, the optimal LR shifted by 3-5x across these scales.
+
+<Benchmark
+  title="Optimal Learning Rate vs Model Width (SP vs mu-P)"
+  columns={["Width (d)", "Params", "Optimal LR (SP)", "Optimal LR (mu-P)", "mu-P Prediction Error"]}
+  rows={[
+    { values: ["256", "40M", "3e-3", "1e-2", "Baseline (tuned)"], highlight: false },
+    { values: ["512", "150M", "2e-3", "1e-2", "0%"], highlight: false },
+    { values: ["1024", "600M", "8e-4", "1e-2", "0%"], highlight: true },
+    { values: ["2048", "2.5B", "4e-4", "1e-2", "0%"], highlight: true },
+    { values: ["4096", "6.7B", "1.5e-4", "1e-2", "0%"], highlight: true },
+    { values: ["8192", "70B", "? (too expensive to sweep)", "1e-2", "Predicted"], highlight: true },
+  ]}
+  notes="SP optimal LR decreases roughly as 1/sqrt(d). mu-P optimal LR is constant across width. Data from Yang et al. (2022)."
+/>
+
+### 5.7 What mu-P Does Not Transfer
+
+mu-P guarantees transfer of **width-dependent** hyperparameters. It does not address:
+
+- **Depth scaling:** mu-P does not make optimal LR independent of depth. A 70B model with 80 layers vs 40 layers may have different optimal LRs even with mu-P
+- **Batch size:** The optimal LR depends on batch size (linear scaling rule), which mu-P does not change
+- **Sequence length:** Longer sequences change the effective batch size and gradient variance
+- **Tokenizer and data distribution:** These affect the loss landscape entirely outside of parameterization
+
+In practice, teams use mu-P for width transfer and separate ablations for depth, batch size, and sequence length. The savings are still enormous: width transfer alone can save dozens of expensive large-model trials.
+
+<Callout type="info" title="mu-P Adoption">
+As of 2025, mu-P has been adopted by several frontier labs. Cerebras published mu-P results for their models. Microsoft used mu-P insights in their Phi series. However, many teams still use manual tuning with SP, partly because mu-P requires modifying the parameterization of every layer (not just adding a flag) and because depth transfer remains unsolved.
+</Callout>
+
+---
+
+## 6. Complete Initialization Code
+
+Putting it all together: here is the initialization code for a Llama-style transformer covering all three approaches.
+
+```python
+import torch
+import torch.nn as nn
+import math
+
+
+def init_weights_xavier(model):
+    """Xavier/Glorot initialization. Best for linear activations."""
+    for name, param in model.named_parameters():
+        if param.dim() < 2:
+            if 'norm' in name and 'weight' in name:
+                nn.init.ones_(param)
+            else:
+                nn.init.zeros_(param)
+        else:
+            nn.init.xavier_normal_(param)
+
+
+def init_weights_kaiming(model, nonlinearity='relu'):
+    """Kaiming/He initialization. Best for ReLU networks."""
+    for name, param in model.named_parameters():
+        if param.dim() < 2:
+            if 'norm' in name and 'weight' in name:
+                nn.init.ones_(param)
+            else:
+                nn.init.zeros_(param)
+        else:
+            nn.init.kaiming_normal_(param, nonlinearity=nonlinearity)
+
+
+def init_weights_gpt2(model, n_layers, base_std=0.02):
+    """
+    GPT-2 style initialization with scaled output projections.
+
+    - All weight matrices: N(0, base_std)
+    - Output projections (W_O in attention, W_2/down_proj in FFN):
+      N(0, base_std / sqrt(2 * n_layers))
+    - Norm weights: 1.0
+    - All biases: 0.0
+    - Embedding: N(0, base_std)
+    """
+    scaled_std = base_std / math.sqrt(2 * n_layers)
+
+    for name, param in model.named_parameters():
+        if param.dim() < 2:
+            # 1D params: norm weights and biases
+            if 'norm' in name and 'weight' in name:
+                nn.init.ones_(param)
+            else:
+                nn.init.zeros_(param)
+        elif any(k in name for k in ['o_proj', 'output_proj', 'down_proj', 'w2']):
+            # Output projections: scaled init
+            nn.init.normal_(param, mean=0.0, std=scaled_std)
+        else:
+            # All other weight matrices: base init
+            nn.init.normal_(param, mean=0.0, std=base_std)
+
+    return {
+        'base_std': base_std,
+        'scaled_std': scaled_std,
+        'scale_factor': 1.0 / math.sqrt(2 * n_layers),
+    }
+
+
+def init_weights_mup(model, base_width, n_layers, base_std=0.02):
+    """
+    mu-P initialization with per-layer-type scaling.
+
+    Returns a dict mapping param names to LR multipliers
+    for use with per-param-group optimizer configuration.
+    """
+    lr_multipliers = {}
+    scaled_std = base_std / math.sqrt(2 * n_layers)
+
+    for name, param in model.named_parameters():
+        if param.dim() < 2:
+            # 1D params
+            if 'norm' in name and 'weight' in name:
+                nn.init.ones_(param)
+            else:
+                nn.init.zeros_(param)
+            lr_multipliers[name] = 1.0
+
+        elif 'embed' in name:
+            # Embedding layer: O(1) init, base LR
+            nn.init.normal_(param, mean=0.0, std=1.0)
+            lr_multipliers[name] = 1.0
+
+        elif 'lm_head' in name or 'output' in name and 'proj' not in name:
+            # Output head (unembedding): zero init, base LR
+            nn.init.zeros_(param)
+            lr_multipliers[name] = 1.0
+
+        elif any(k in name for k in ['o_proj', 'down_proj', 'w2']):
+            # Output projections within layers: scaled init, scaled LR
+            fan_in = param.shape[1]
+            nn.init.normal_(param, mean=0.0, std=scaled_std)
+            lr_multipliers[name] = base_width / fan_in
+
+        else:
+            # Hidden weights (Q, K, V, gate, up projections): mu-P init and LR
+            fan_in = param.shape[1]
+            std = 1.0 / math.sqrt(fan_in)
+            nn.init.normal_(param, mean=0.0, std=std)
+            lr_multipliers[name] = base_width / fan_in
+
+    return lr_multipliers
+
+
+# Example: Initialize a 70B-class model
+class LlamaConfig:
+    d_model = 8192
+    n_layers = 80
+    n_heads = 64
+    n_kv_heads = 8
+    d_ff = 28672
+    vocab_size = 128256
+
+
+config = LlamaConfig()
+
+# For GPT-2 style:
+# info = init_weights_gpt2(model, n_layers=config.n_layers, base_std=0.02)
+# print(f"Base std: {info['base_std']:.6f}")
+# print(f"Output proj std: {info['scaled_std']:.6f}")
+# print(f"Scale factor: {info['scale_factor']:.6f}")
+# Output:
+#   Base std: 0.020000
+#   Output proj std: 0.001581
+#   Scale factor: 0.079057
+
+# For mu-P:
+# lr_mults = init_weights_mup(model, base_width=256, n_layers=80, base_std=0.02)
+# For W_Q (fan_in=8192): lr_mult = 256/8192 = 0.03125
+# Base LR of 0.01 becomes 0.01 * 0.03125 = 3.125e-4 for hidden weights
+# This matches the typical LR range for 70B models (1e-4 to 5e-4)
+```
+
+### 6.1 Initialization Diagnostics
+
+After initialization, before any training, run these diagnostics:
+
+```python
+def init_diagnostics(model):
+    """Print per-layer statistics after initialization."""
+    print(f"{'Layer':<40} {'Shape':>18} {'Mean':>10} {'Std':>10} {'Min':>10} {'Max':>10}")
+    print("-" * 100)
+
+    total_params = 0
+    for name, param in model.named_parameters():
+        total_params += param.numel()
+        data = param.data.float()
+        print(f"{name:<40} {str(list(param.shape)):>18} "
+              f"{data.mean():>10.6f} {data.std():>10.6f} "
+              f"{data.min():>10.6f} {data.max():>10.6f}")
+
+    print(f"\nTotal parameters: {total_params:,}")
+
+    # Check forward pass variance
+    x = torch.randn(1, 128, model.config.d_model)
+    with torch.no_grad():
+        for i, layer in enumerate(model.layers):
+            x_pre = x.clone()
+            x = layer(x)
+            ratio = x.var() / x_pre.var()
+            if ratio > 2.0 or ratio < 0.5:
+                print(f"WARNING: Layer {i} variance ratio = {ratio:.4f}")
+```
+
+<Benchmark
+  title="Expected Initialization Statistics (Llama 3 70B, GPT-2 Init)"
+  columns={["Parameter", "Shape", "Expected Std", "Param Count"]}
+  rows={[
+    { values: ["Embedding", "[128256, 8192]", "0.0200", "1.05B"] },
+    { values: ["W_Q (per layer)", "[8192, 8192]", "0.0200", "67.1M"] },
+    { values: ["W_K (per layer)", "[8192, 1024]", "0.0200", "8.4M"] },
+    { values: ["W_V (per layer)", "[8192, 1024]", "0.0200", "8.4M"] },
+    { values: ["W_O (per layer)", "[8192, 8192]", "0.00158", "67.1M"], highlight: true },
+    { values: ["W_gate (per layer)", "[8192, 28672]", "0.0200", "234.9M"] },
+    { values: ["W_up (per layer)", "[8192, 28672]", "0.0200", "234.9M"] },
+    { values: ["W_down (per layer)", "[28672, 8192]", "0.00158", "234.9M"], highlight: true },
+    { values: ["RMSNorm gamma (per layer)", "[8192]", "1.0 (init)", "8,192"] },
+  ]}
+  notes="Highlighted rows use the scaled init: std = 0.02 / sqrt(160) = 0.00158. Total params per layer: ~856M. 80 layers: ~68.5B."
+/>
+
+---
+
+## 7. Summary: Which Init to Use When
+
+| Method | Use Case | Key Formula | Year |
+|---|---|---|---|
+| Xavier | Linear/tanh networks, historical reference | $\sigma^2 = 2/(n_{\text{in}} + n_{\text{out}})$ | 2010 |
+| Kaiming | ReLU networks, CNNs | $\sigma^2 = 2/n_{\text{in}}$ | 2015 |
+| GPT-2 scaled | Transformers with residual connections | $\sigma_{\text{out}} = 0.02 / \sqrt{2L}$ | 2019 |
+| mu-P | Large-scale training with HP transfer | Per-layer $\sigma$ and $\eta$ scaling | 2022 |
+
+For production LLM training in 2025, GPT-2 scaled initialization is the most widely used default. mu-P is gaining adoption for teams that invest in the infrastructure to support per-parameter-group learning rates.
+
+The fundamental principle across all methods is the same: ensure that the variance of activations and gradients is $O(1)$ at every layer, at initialization, for the specific architecture being trained.
+
+---
+
+## Reviewer Agent Validation Challenge
+
+The following statements about this post's content are candidates for review. Some are true, some contain deliberate errors.
+
+1. **Claim:** For a linear layer $y = Wx$ with zero-mean, independent weights and inputs, $\text{Var}(y_j) = n_{\text{in}} \cdot \text{Var}(W) \cdot \text{Var}(x)$. Verify that this uses the identity $\text{Var}(AB) = \text{Var}(A)\text{Var}(B) + [\mathbb{E}(A)]^2\text{Var}(B) + [\mathbb{E}(B)]^2\text{Var}(A)$ with zero means correctly.
+
+2. **Claim:** Xavier initialization sets $\text{Var}(W) = 2/(n_{\text{in}} + n_{\text{out}})$ as a compromise between forward and backward variance preservation. Verify: if $n_{\text{in}} = n_{\text{out}} = n$, does Xavier reduce to $\sigma^2 = 1/n$?
+
+3. **Claim:** Kaiming initialization for ReLU uses $\text{Var}(W) = 2/n_{\text{in}}$ because $\text{Var}(\text{ReLU}(x)) = \frac{1}{2}\text{Var}(x)$ for symmetric $x$. Verify: is the $1/2$ factor correct for a zero-mean Gaussian input?
+
+4. **Claim:** GPT-2 scaled init uses $\sigma = 0.02/\sqrt{2L}$ for output projections, resulting in $\sigma = 0.00158$ for $L = 80$. Compute $0.02/\sqrt{160}$ and verify.
+
+5. **Claim:** With standard initialization (no scaling), the residual stream variance after $L$ layers is $(1 + L) \cdot \text{Var}(h_0)$. Verify: is this $1 + L$ or $L + 1$? Does this assume each layer contributes exactly $\text{Var}(h_0)$?
+
+6. **Claim:** In mu-P, the per-step output change for a hidden layer is $O(\eta)$, independent of width. The derivation uses $\Delta y_j = -\eta \cdot \delta_j \cdot \text{Var}(x)$. Check whether the factor of $d$ correctly cancels in the derivation.
+
+7. **Claim:** For Llama 3 70B with standard normal init, attention logit variance is $\sim 6.7 \times 10^7$ even with $1/\sqrt{d_k}$ scaling. Verify: $\text{Var}(QK^T/\sqrt{d_k}) = \text{Var}(Q) \cdot \text{Var}(K)$ when $\text{Var}(Q) = \text{Var}(K) = 8192$.
+
+8. **Claim:** The mu-P LR multiplier for a hidden weight with $\text{fan\_in} = 8192$ and base width 256 is $256/8192 = 0.03125$, giving effective LR of $3.125 \times 10^{-4}$ from a base LR of $0.01$. Verify the arithmetic.

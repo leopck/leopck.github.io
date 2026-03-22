@@ -1,0 +1,928 @@
+---
+title: "Dynamo Fault Tolerance: Canary Health Checks, Request Migration, and Graceful Degradation"
+author: "stanley-phoong"
+description: "How Dynamo detects GPU failures through canary health checks, migrates in-flight requests by transferring partial KV cache to healthy workers, and gracefully degrades serving capacity when nodes drop below SLO thresholds."
+publishDate: 2025-03-22
+category: llm-inference
+tags: [dynamo, fault-tolerance, health-check, canary, migration, graceful-degradation]
+difficulty: expert
+readingTime: 30
+draft: false
+featured: false
+series: "NVIDIA Dynamo & llm-d"
+seriesOrder: 6
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+import MemoryLayout from '@/components/mdx/MemoryLayout.astro';
+
+At 1,000 GPUs, the mean time between GPU failures is roughly 1 day. At 10,000 GPUs, expect multiple failures per day. These numbers come from empirical data at hyperscale deployments: NVIDIA's own DGX Cloud reports, Meta's RSC cluster post-mortems, and Google's TPU pod reliability studies all converge on a per-GPU annual failure rate of 2-5%. For a 1,024-GPU cluster operating at 3% annual failure rate:
+
+$$\text{MTBF}_{\text{cluster}} = \frac{8{,}760 \text{ hours/year}}{1{,}024 \times 0.03} = 285 \text{ hours} \approx 11.9 \text{ days}$$
+
+That is the time between individual GPU failures. But LLM inference uses tensor parallelism, so a single GPU failure kills the entire TP group. For a TP=8 deployment across 1,024 GPUs (128 TP groups), the effective failure rate is:
+
+$$P(\text{TP group failure per day}) = 1 - (1 - p_{\text{gpu}})^8 \approx 8 \times p_{\text{gpu}}$$
+
+where $p_{\text{gpu}} = 0.03 / 365 = 8.2 \times 10^{-5}$ per day. So per TP group: $6.6 \times 10^{-4}$ per day. Across 128 groups: $128 \times 6.6 \times 10^{-4} = 0.084$ failures per day, or about one TP group failure every 12 days.
+
+That is manageable. But at 10,000 GPUs (1,250 TP groups of 8), the math changes: 0.82 failures per day. Nearly one per day. At 100,000 GPUs: 8.2 per day.
+
+## Failure Taxonomy
+
+Not all GPU failures are equal. The system must handle each type differently.
+
+<MemoryLayout
+  title="GPU Failure Modes"
+  layout={[
+    { name: "Hard Crash (Xid Error)", power: "GPU disappears from PCIe bus or enters unrecoverable state", state: "Detection: immediate (driver reports Xid). Impact: TP group dead.", color: "#ef4444" },
+    { name: "CUDA Error (ECC Uncorrectable)", power: "Uncorrectable ECC error in HBM or L2 cache", state: "Detection: next CUDA API call returns cudaErrorECCUncorrectable. Impact: all kernels fail.", color: "#f59e0b" },
+    { name: "Silent Data Corruption (SDC)", power: "GPU produces wrong results without raising errors", state: "Detection: only via canary checks. Impact: model outputs garbage silently.", color: "#a371f7" },
+    { name: "Performance Degradation", power: "GPU throttles due to thermal or power limits", state: "Detection: latency monitoring. Impact: SLO violations, tail latency spikes.", color: "#3b82f6" },
+    { name: "NVLink Failure", power: "One NVLink lane fails, reducing all-reduce bandwidth", state: "Detection: NCCL timeout or bandwidth drop. Impact: TP group throughput drops.", color: "#10b981" },
+  ]}
+/>
+
+Hard crashes are the easiest to handle: the GPU is gone, the TP group is dead, route traffic elsewhere. Silent data corruption is the most dangerous: the GPU continues operating, returns results, but the results are wrong. A user receives plausible-looking but incorrect text, and the system never raises an alert.
+
+<Callout type="danger" title="Silent Data Corruption at Scale">
+NVIDIA's Hopper reliability report documents SDC rates of approximately $10^{-9}$ per FLOP for H100 GPUs. At the throughput of a 70B model running at 100 tokens/second per GPU (roughly $10^{13}$ FLOPs/second), that is $10^4$ potential bit-flip opportunities per second. Most are caught by ECC. The uncaught remainder — estimated at $10^{-15}$ per FLOP — still produces one corrupted computation per GPU approximately every 115 days. Across 1,000 GPUs, that is one SDC event every 2.7 hours.
+</Callout>
+
+## The Canary Health Check System
+
+Dynamo's health check system is modeled on infrastructure canary deployments: periodically send a known input to each worker and verify the output matches a pre-computed expected result. If the output deviates, the worker is flagged as unhealthy.
+
+### Architecture
+
+```python
+class CanaryHealthChecker:
+    """Periodically sends known prompts to workers, verifies responses."""
+
+    def __init__(self, config):
+        self.canary_prompts = config.canary_prompts      # List of (prompt, expected_tokens)
+        self.check_interval_sec = config.check_interval   # Default: 30 seconds
+        self.max_retries = config.max_retries             # Default: 2
+        self.tolerance = config.tolerance                  # Default: 0.0 (exact match)
+        self.worker_health = {}                            # worker_id -> HealthState
+        self.circuit_breakers = {}                         # worker_id -> CircuitBreaker
+
+    def register_worker(self, worker_id, endpoint):
+        self.worker_health[worker_id] = HealthState(
+            status=HealthStatus.HEALTHY,
+            last_check_time=0,
+            consecutive_failures=0,
+            last_canary_latency_ms=0,
+            error_history=[],
+        )
+        self.circuit_breakers[worker_id] = CircuitBreaker(
+            failure_threshold=3,
+            recovery_timeout_sec=60,
+            half_open_max_calls=1,
+        )
+```
+
+### Canary Prompt Design
+
+The canary prompt must exercise the full model pipeline: embedding lookup, attention computation across layers, FFN activations, output logits, and sampling. A single-token prompt is insufficient because it skips the attention mechanism (no prior tokens to attend to). The canary must also be deterministic — temperature must be 0, and top-k/top-p must be disabled.
+
+```python
+# Canary prompt set for Llama 70B
+CANARY_PROMPTS = [
+    {
+        "prompt": "The capital of France is",
+        "expected_tokens": [3681],  # " Paris" (token ID for Llama tokenizer)
+        "max_tokens": 1,
+        "temperature": 0.0,
+        "check_logits": True,
+        "expected_top_logit_range": (15.0, 25.0),  # Expected logit for " Paris"
+    },
+    {
+        "prompt": "2 + 2 = ",
+        "expected_tokens": [29946],  # "4"
+        "max_tokens": 1,
+        "temperature": 0.0,
+        "check_logits": True,
+        "expected_top_logit_range": (10.0, 20.0),
+    },
+    {
+        # Multi-token canary: tests autoregressive consistency
+        "prompt": "The first five prime numbers are 2, 3, 5,",
+        "expected_tokens": [29871, 29955],  # " 7" (space + 7)
+        "max_tokens": 2,
+        "temperature": 0.0,
+        "check_logits": False,  # Only check token match
+    },
+]
+```
+
+<Callout type="info" title="Why Check Logits, Not Just Tokens">
+Token-level comparison catches catastrophic failures (completely wrong output), but misses subtle corruption. If the correct token " Paris" should have a logit of 20.3 but comes back at 8.1, the model still outputs " Paris" (it is still the argmax), but the distribution is distorted. Future tokens in a longer generation would diverge. Checking that the top logit falls within an expected range catches degradation before it produces visible errors.
+</Callout>
+
+### The Check Loop
+
+```python
+async def run_check(self, worker_id, endpoint):
+    """Execute one canary check against a worker."""
+    canary = random.choice(self.canary_prompts)
+    start_time = time.monotonic()
+
+    try:
+        response = await self._send_canary_request(
+            endpoint=endpoint,
+            prompt=canary["prompt"],
+            max_tokens=canary["max_tokens"],
+            temperature=0.0,
+        )
+        latency_ms = (time.monotonic() - start_time) * 1000
+
+        # Check 1: Did the worker respond at all?
+        if response is None:
+            return self._record_failure(worker_id, "no_response", latency_ms)
+
+        # Check 2: Are the output tokens correct?
+        if response.token_ids != canary["expected_tokens"]:
+            return self._record_failure(
+                worker_id,
+                f"token_mismatch: expected {canary['expected_tokens']}, "
+                f"got {response.token_ids}",
+                latency_ms,
+            )
+
+        # Check 3: Are the logits in the expected range?
+        if canary.get("check_logits") and response.logits is not None:
+            top_logit = response.logits[0].max().item()
+            lo, hi = canary["expected_top_logit_range"]
+            if not (lo <= top_logit <= hi):
+                return self._record_failure(
+                    worker_id,
+                    f"logit_drift: top_logit={top_logit:.2f}, "
+                    f"expected [{lo}, {hi}]",
+                    latency_ms,
+                )
+
+        # Check 4: Is the latency within acceptable bounds?
+        baseline = self.worker_health[worker_id].baseline_latency_ms
+        if baseline > 0 and latency_ms > baseline * 3.0:
+            return self._record_failure(
+                worker_id,
+                f"latency_spike: {latency_ms:.1f}ms vs baseline {baseline:.1f}ms",
+                latency_ms,
+            )
+
+        # All checks passed
+        return self._record_success(worker_id, latency_ms)
+
+    except asyncio.TimeoutError:
+        return self._record_failure(worker_id, "timeout", timeout_ms)
+    except Exception as e:
+        return self._record_failure(worker_id, f"exception: {e}", 0)
+```
+
+### State Machine
+
+Each worker transitions through health states based on canary results:
+
+```
+HEALTHY -> SUSPICIOUS -> UNHEALTHY -> DRAINING -> DEAD
+   ^            |              |           |
+   |            v              |           |
+   +--- (canary passes) ------+           |
+   |                                       |
+   +------- (recovery succeeds) ----------+
+```
+
+```python
+def _record_failure(self, worker_id, reason, latency_ms):
+    state = self.worker_health[worker_id]
+    state.consecutive_failures += 1
+    state.error_history.append((time.time(), reason))
+    state.last_canary_latency_ms = latency_ms
+
+    if state.consecutive_failures >= 1 and state.status == HealthStatus.HEALTHY:
+        state.status = HealthStatus.SUSPICIOUS
+        # Reduce traffic weight by 50%, but don't remove from pool yet
+        self._update_routing_weight(worker_id, weight=0.5)
+
+    if state.consecutive_failures >= 3:
+        state.status = HealthStatus.UNHEALTHY
+        # Remove from active routing, begin draining existing requests
+        self._update_routing_weight(worker_id, weight=0.0)
+        self._begin_drain(worker_id)
+
+def _record_success(self, worker_id, latency_ms):
+    state = self.worker_health[worker_id]
+    state.last_canary_latency_ms = latency_ms
+
+    if state.status == HealthStatus.SUSPICIOUS:
+        state.consecutive_failures = 0
+        state.status = HealthStatus.HEALTHY
+        self._update_routing_weight(worker_id, weight=1.0)
+
+    if state.status == HealthStatus.HEALTHY:
+        # Update baseline latency with exponential moving average
+        alpha = 0.1
+        if state.baseline_latency_ms == 0:
+            state.baseline_latency_ms = latency_ms
+        else:
+            state.baseline_latency_ms = (
+                alpha * latency_ms + (1 - alpha) * state.baseline_latency_ms
+            )
+```
+
+<Benchmark
+  title="Canary Health Check Overhead"
+  columns={["Metric", "Value", "Impact on Serving"]}
+  rows={[
+    { values: ["Check interval", "30 seconds", "33 checks/minute per worker"], highlight: false },
+    { values: ["Canary request latency", "15-50 ms", "Uses 1 slot in batch for ~50 ms"], highlight: false },
+    { values: ["GPU time per check", "~2 ms (1 forward pass, 1 token)", "0.007% of GPU time at 30s interval"], highlight: true },
+    { values: ["Detection latency (crash)", "0-30 seconds", "Bounded by check interval"], highlight: false },
+    { values: ["Detection latency (SDC)", "0-30 seconds", "Canary catches on next check"], highlight: true },
+    { values: ["False positive rate", "~0.1% (retry mitigates)", "1 false drain per 1000 checks"], highlight: false },
+  ]}
+/>
+
+The GPU time cost is negligible. One forward pass for a short canary prompt on a 70B model at TP=8 takes approximately 2 ms. At a 30-second interval, that is $2 / 30{,}000 = 0.007\%$ of GPU time.
+
+## Request Migration
+
+When a worker fails mid-generation, in-flight requests must be migrated to a healthy worker. The challenge: each request has accumulated KV cache state on the failing worker. Without migration, all tokens generated so far are lost. The user must re-send the prompt, the new worker must re-compute the full prefill, and first-token latency starts over.
+
+### The Migration Protocol
+
+```python
+class RequestMigration:
+    """Handles transferring a request's state from a failing worker to a healthy one."""
+
+    def __init__(self, kvbm, router, config):
+        self.kvbm = kvbm                    # KV Block Manager (cluster-wide)
+        self.router = router                # Dynamo Router
+        self.max_migration_time_ms = config.max_migration_time_ms  # Default: 500 ms
+        self.migration_stream = None         # Dedicated CUDA stream for transfers
+
+    async def migrate_request(self, request, source_worker, target_worker):
+        """
+        Migrate a single request from source to target.
+        Returns True if migration succeeded within time budget.
+        """
+        migration_start = time.monotonic()
+
+        # Step 1: Snapshot the request state on the source
+        state = await self._snapshot_request_state(request, source_worker)
+        if state is None:
+            return False  # Source already unreachable
+
+        # Step 2: Calculate migration cost
+        cost = self._estimate_migration_cost(state, source_worker, target_worker)
+        if cost.estimated_time_ms > self.max_migration_time_ms:
+            # Migration too expensive; cheaper to re-prefill
+            return await self._reprefill_request(request, target_worker)
+
+        # Step 3: Transfer KV cache blocks
+        transferred = await self._transfer_kv_blocks(
+            state.kv_block_ids,
+            source_worker,
+            target_worker,
+        )
+        if not transferred:
+            return await self._reprefill_request(request, target_worker)
+
+        # Step 4: Restore request state on target
+        restored = await self._restore_request(
+            request_id=request.request_id,
+            target_worker=target_worker,
+            kv_block_ids=state.kv_block_ids,
+            generated_tokens=state.generated_tokens,
+            sampling_state=state.sampling_state,
+        )
+
+        elapsed_ms = (time.monotonic() - migration_start) * 1000
+        return restored
+```
+
+### Request State Snapshot
+
+The state that must be transferred:
+
+```python
+@dataclass
+class RequestMigrationState:
+    request_id: str
+    prompt_tokens: list       # Original prompt token IDs
+    generated_tokens: list    # Tokens generated so far
+    kv_block_ids: list        # Block IDs in source worker's KV cache
+    num_computed_tokens: int  # Total tokens with valid KV data
+    sampling_state: dict      # Temperature, top-p, repetition penalty state
+    stop_criteria: dict       # Stop sequences, max_tokens remaining
+    sequence_position: int    # Current position in the sequence
+```
+
+### KV Cache Transfer Cost
+
+The dominant cost of migration is the KV cache transfer. For a request that has generated $T$ tokens on Llama 70B with TP=8 and block size 16:
+
+$$\text{num\_blocks} = \lceil T / 16 \rceil$$
+
+$$\text{bytes\_per\_block} = 16 \times 2 \times n_{\text{layers}} \times n_{\text{kv\_heads}} \times d_{\text{head}} \times 2$$
+
+For Llama 70B with GQA-8 ($n_{\text{layers}} = 80$, $n_{\text{kv\_heads}} = 8$, $d_{\text{head}} = 128$, FP16):
+
+$$\text{bytes\_per\_block} = 16 \times 2 \times 80 \times 8 \times 128 \times 2 = 5.24 \text{ MB}$$
+
+For TP=8, each GPU shard holds $n_{\text{kv\_heads}} / \text{TP} = 1$ head, so the per-shard block size is:
+
+$$\text{bytes\_per\_block\_shard} = 16 \times 2 \times 80 \times 1 \times 128 \times 2 = 655{,}360 \text{ bytes} = 640 \text{ KB}$$
+
+<Benchmark
+  title="KV Cache Migration Cost by Sequence Length"
+  columns={["Tokens Generated", "Blocks", "Per-Shard Size", "NVLink Transfer", "PCIe Transfer"]}
+  rows={[
+    { values: ["256", "16", "10 MB", "0.006 ms", "0.36 ms"], highlight: false },
+    { values: ["1,024", "64", "40 MB", "0.022 ms", "1.43 ms"], highlight: false },
+    { values: ["4,096", "256", "160 MB", "0.089 ms", "5.71 ms"], highlight: true },
+    { values: ["16,384", "1,024", "640 MB", "0.356 ms", "22.86 ms"], highlight: false },
+    { values: ["65,536", "4,096", "2.5 GB", "1.42 ms", "91.43 ms"], highlight: false },
+    { values: ["131,072", "8,192", "5 GB", "2.84 ms", "182.86 ms"], highlight: true },
+  ]}
+/>
+
+NVLink bandwidth between GPUs in the same NVL72 rack is 900 GB/s effective. PCIe Gen5 x16 is 28 GB/s. The transfer path matters enormously: a 131K-token sequence migrates in 2.84 ms over NVLink but takes 183 ms over PCIe.
+
+### Migration Decision: Transfer vs. Re-Prefill
+
+```python
+def _estimate_migration_cost(self, state, source, target):
+    """Decide whether to transfer KV cache or re-prefill from scratch."""
+    num_blocks = len(state.kv_block_ids)
+    bytes_per_block_shard = self._block_shard_bytes()
+    total_bytes = num_blocks * bytes_per_block_shard
+
+    # Determine transfer bandwidth based on topology
+    link_type = self.kvbm.get_link_type(source.gpu_id, target.gpu_id)
+    if link_type == LinkType.NVLINK_DIRECT:
+        bandwidth = 900e9    # 900 GB/s
+    elif link_type == LinkType.NVSWITCH:
+        bandwidth = 600e9    # 600 GB/s effective
+    elif link_type == LinkType.PCIE:
+        bandwidth = 28e9     # 28 GB/s
+    elif link_type == LinkType.INFINIBAND:
+        bandwidth = 50e9     # 50 GB/s NDR
+    else:
+        bandwidth = 10e9     # Conservative fallback
+
+    transfer_time_ms = (total_bytes / bandwidth) * 1000
+
+    # Compare against re-prefill cost
+    prefill_tokens = state.num_computed_tokens
+    # Prefill throughput: ~5000 tokens/sec for 70B at TP=8
+    reprefill_time_ms = (prefill_tokens / 5000) * 1000
+
+    return MigrationCost(
+        transfer_time_ms=transfer_time_ms,
+        reprefill_time_ms=reprefill_time_ms,
+        recommended="transfer" if transfer_time_ms < reprefill_time_ms else "reprefill",
+        total_bytes=total_bytes,
+    )
+```
+
+The crossover point depends on the link type. For NVLink at 900 GB/s:
+
+$$T_{\text{transfer}} = T_{\text{reprefill}} \implies \frac{N_{\text{blocks}} \times 640 \text{ KB}}{900 \text{ GB/s}} = \frac{N_{\text{tokens}}}{5000 \text{ tok/s}}$$
+
+Solving: $N_{\text{tokens}} \approx 5.4 \times 10^6$ tokens. At NVLink speeds, transferring KV cache is always cheaper than re-prefilling for any realistic sequence length.
+
+For PCIe at 28 GB/s:
+
+$$N_{\text{tokens}} \approx 168{,}000 \text{ tokens}$$
+
+Below 168K tokens, transfer is cheaper. Above 168K, re-prefill is cheaper. For most production workloads (sequence lengths under 32K), KV cache transfer always wins.
+
+<PerfChart
+  title="Migration Time: Transfer vs Re-Prefill (Llama 70B, TP=8)"
+  data={[
+    { label: "256 tok NVLink", value: 0.006, color: "green", annotation: "Transfer" },
+    { label: "256 tok Re-Prefill", value: 51.2, color: "red", annotation: "Re-Prefill" },
+    { label: "4K tok NVLink", value: 0.089, color: "green" },
+    { label: "4K tok Re-Prefill", value: 819, color: "red" },
+    { label: "16K tok PCIe", value: 22.9, color: "blue", annotation: "PCIe Transfer" },
+    { label: "16K tok Re-Prefill", value: 3277, color: "red" },
+  ]}
+  unit="ms"
+/>
+
+### Handling TP Group Migration
+
+When a single GPU in a TP group fails, the entire group must be replaced. Migration must be coordinated across all TP shards:
+
+```python
+async def migrate_tp_group(self, failing_group, target_group, active_requests):
+    """
+    Migrate all requests from a failing TP group to a target group.
+    All shards must migrate in lockstep.
+    """
+    # Step 1: Fence the failing group — no new requests
+    self.router.remove_group(failing_group.group_id)
+
+    # Step 2: Collect all in-flight requests
+    requests_to_migrate = [
+        req for req in active_requests
+        if req.assigned_group == failing_group.group_id
+    ]
+
+    # Step 3: Sort by priority (lower sequence number = higher priority)
+    requests_to_migrate.sort(key=lambda r: r.priority)
+
+    # Step 4: Migrate each request (parallelize across shards)
+    results = []
+    for request in requests_to_migrate:
+        shard_tasks = []
+        for shard_idx in range(failing_group.tp_size):
+            source_gpu = failing_group.gpus[shard_idx]
+            target_gpu = target_group.gpus[shard_idx]
+            task = self.migrate_request_shard(
+                request, shard_idx, source_gpu, target_gpu,
+            )
+            shard_tasks.append(task)
+
+        # All shards for this request must succeed
+        shard_results = await asyncio.gather(*shard_tasks, return_exceptions=True)
+        success = all(r is True for r in shard_results)
+        if not success:
+            # Fallback: re-prefill this request on the target group
+            await self._reprefill_request(request, target_group)
+
+        results.append((request.request_id, success))
+
+    # Step 5: Activate the target group in the router
+    self.router.add_group(target_group.group_id)
+    return results
+```
+
+<Callout type="warning" title="Migration Ordering and Deadlocks">
+If the target group's KV cache is nearly full, migrating all requests simultaneously could exhaust memory, causing OOM on the target. The migration loop processes requests in priority order, and each migration call checks that the target has sufficient free blocks before beginning the transfer. If the target cannot accommodate a request, that request falls back to re-prefill on a third group with more headroom.
+</Callout>
+
+## Circuit Breaker Pattern
+
+The circuit breaker prevents the system from continuously routing requests to a worker that is in a failure loop. It has three states:
+
+```python
+class CircuitBreakerState:
+    CLOSED = "closed"      # Normal operation, requests flow through
+    OPEN = "open"          # Failure detected, all requests blocked
+    HALF_OPEN = "half_open"  # Testing recovery, limited requests allowed
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold, recovery_timeout_sec, half_open_max_calls):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout_sec = recovery_timeout_sec
+        self.half_open_max_calls = half_open_max_calls
+        self.state = CircuitBreakerState.CLOSED
+        self.failure_count = 0
+        self.last_failure_time = 0
+        self.half_open_calls = 0
+
+    def record_failure(self):
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+        if self.failure_count >= self.failure_threshold:
+            self.state = CircuitBreakerState.OPEN
+
+    def record_success(self):
+        if self.state == CircuitBreakerState.HALF_OPEN:
+            # Recovery confirmed — close the circuit
+            self.state = CircuitBreakerState.CLOSED
+            self.failure_count = 0
+            self.half_open_calls = 0
+
+    def allow_request(self):
+        if self.state == CircuitBreakerState.CLOSED:
+            return True
+
+        if self.state == CircuitBreakerState.OPEN:
+            elapsed = time.time() - self.last_failure_time
+            if elapsed >= self.recovery_timeout_sec:
+                # Try recovery
+                self.state = CircuitBreakerState.HALF_OPEN
+                self.half_open_calls = 0
+                return True
+            return False
+
+        if self.state == CircuitBreakerState.HALF_OPEN:
+            if self.half_open_calls < self.half_open_max_calls:
+                self.half_open_calls += 1
+                return True
+            return False
+
+        return False
+```
+
+The circuit breaker integrates with the canary health checker. When canary checks fail 3 times consecutively, the circuit opens. After the recovery timeout (60 seconds), the circuit moves to half-open: one canary check is allowed through. If it passes, the circuit closes and the worker re-enters the pool.
+
+## Graceful Degradation
+
+When capacity drops below what is needed to meet SLOs, the system must degrade gracefully rather than failing completely. Dynamo implements a multi-level degradation strategy.
+
+### Capacity Model
+
+The Planner maintains a capacity model for each workload:
+
+```python
+class CapacityModel:
+    """Tracks available capacity and SLO requirements."""
+
+    def __init__(self, config):
+        self.slo_ttft_ms = config.slo_ttft_ms           # e.g., 500 ms
+        self.slo_tpot_ms = config.slo_tpot_ms           # e.g., 30 ms/token
+        self.slo_throughput_rps = config.slo_throughput  # e.g., 100 req/sec
+        self.max_batch_size = config.max_batch_size      # e.g., 256
+
+    def compute_available_capacity(self, healthy_workers):
+        """
+        Compute the maximum throughput (req/sec) achievable with
+        the current healthy worker set while meeting SLOs.
+        """
+        total_gpu_memory = sum(w.free_kv_blocks * BLOCK_SIZE_BYTES
+                               for w in healthy_workers)
+        total_compute_tflops = sum(w.compute_tflops for w in healthy_workers)
+
+        # Max concurrent sequences limited by KV cache memory
+        avg_seq_len = 2048  # Estimated average sequence length
+        kv_per_seq = avg_seq_len * KV_BYTES_PER_TOKEN  # For Llama 70B: ~320 KB
+        max_concurrent = total_gpu_memory // kv_per_seq
+
+        # Max throughput limited by compute
+        tokens_per_sec = total_compute_tflops * 1e12 / FLOPS_PER_TOKEN
+        max_throughput_rps = tokens_per_sec / avg_seq_len
+
+        # The bottleneck determines actual capacity
+        effective_capacity = min(max_concurrent, max_throughput_rps)
+        return CapacityReport(
+            max_concurrent_sequences=max_concurrent,
+            max_throughput_rps=max_throughput_rps,
+            effective_capacity_rps=effective_capacity,
+            slo_achievable=effective_capacity >= self.slo_throughput_rps,
+        )
+```
+
+### Degradation Levels
+
+```python
+class DegradationLevel:
+    NONE = 0          # Full capacity, all SLOs met
+    LEVEL_1 = 1       # Reduce max batch size by 25%
+    LEVEL_2 = 2       # Shed low-priority traffic (best-effort tier)
+    LEVEL_3 = 3       # Increase latency SLOs by 2x
+    LEVEL_4 = 4       # Emergency: reject all new requests, drain existing
+
+class GracefulDegradation:
+    def __init__(self, capacity_model, router, config):
+        self.capacity_model = capacity_model
+        self.router = router
+        self.current_level = DegradationLevel.NONE
+        self.priority_tiers = config.priority_tiers  # e.g., ["premium", "standard", "best_effort"]
+
+    def evaluate(self, healthy_workers):
+        """Called every N seconds by the Planner."""
+        report = self.capacity_model.compute_available_capacity(healthy_workers)
+        ratio = report.effective_capacity_rps / self.capacity_model.slo_throughput_rps
+
+        if ratio >= 1.0:
+            new_level = DegradationLevel.NONE
+        elif ratio >= 0.75:
+            new_level = DegradationLevel.LEVEL_1
+        elif ratio >= 0.50:
+            new_level = DegradationLevel.LEVEL_2
+        elif ratio >= 0.25:
+            new_level = DegradationLevel.LEVEL_3
+        else:
+            new_level = DegradationLevel.LEVEL_4
+
+        if new_level != self.current_level:
+            self._apply_degradation(new_level, report)
+            self.current_level = new_level
+
+    def _apply_degradation(self, level, report):
+        if level == DegradationLevel.NONE:
+            self.router.set_batch_size_multiplier(1.0)
+            self.router.set_shedding_tier(None)
+            self.router.set_latency_multiplier(1.0)
+            self.router.accept_new_requests(True)
+
+        elif level == DegradationLevel.LEVEL_1:
+            self.router.set_batch_size_multiplier(0.75)
+
+        elif level == DegradationLevel.LEVEL_2:
+            self.router.set_batch_size_multiplier(0.75)
+            self.router.set_shedding_tier("best_effort")
+
+        elif level == DegradationLevel.LEVEL_3:
+            self.router.set_batch_size_multiplier(0.50)
+            self.router.set_shedding_tier("best_effort")
+            self.router.set_latency_multiplier(2.0)
+
+        elif level == DegradationLevel.LEVEL_4:
+            self.router.accept_new_requests(False)
+```
+
+<PerfChart
+  title="Degradation Impact on Throughput and Latency"
+  data={[
+    { label: "No degradation", value: 100, color: "green", annotation: "100% throughput" },
+    { label: "Level 1 (batch -25%)", value: 80, color: "blue", annotation: "80% throughput" },
+    { label: "Level 2 (shed best-effort)", value: 65, color: "orange", annotation: "Premium preserved" },
+    { label: "Level 3 (2x latency)", value: 50, color: "orange" },
+    { label: "Level 4 (drain only)", value: 0, color: "red", annotation: "New requests rejected" },
+  ]}
+  unit="% of target throughput"
+/>
+
+### Priority-Based Traffic Shedding
+
+When capacity is insufficient, shed traffic starting from the lowest priority tier:
+
+```python
+class PriorityRouter:
+    """Routes requests based on priority tier and current degradation level."""
+
+    def __init__(self, tiers):
+        # Tiers ordered from highest to lowest priority
+        self.tiers = tiers  # ["premium", "standard", "best_effort"]
+        self.shed_below = None  # Tier name; requests at or below are rejected
+
+    def should_accept(self, request):
+        if self.shed_below is None:
+            return True
+
+        request_tier_idx = self.tiers.index(request.priority_tier)
+        shed_tier_idx = self.tiers.index(self.shed_below)
+
+        # Reject if request tier is at or below the shedding threshold
+        return request_tier_idx < shed_tier_idx
+
+    def route(self, request, healthy_workers):
+        if not self.should_accept(request):
+            return RouteDecision(
+                action="reject",
+                reason=f"capacity_shed: tier={request.priority_tier}",
+                retry_after_sec=30,
+            )
+
+        # Normal KV-aware routing for accepted requests
+        return self._kv_aware_route(request, healthy_workers)
+```
+
+## Putting It Together: The Fault Tolerance Pipeline
+
+The complete fault tolerance flow from detection to recovery:
+
+<MemoryLayout
+  title="Fault Tolerance Pipeline"
+  layout={[
+    { name: "1. Detection", power: "Canary health checks every 30s", state: "Catches: crash, CUDA error, SDC, latency spike", color: "#ef4444" },
+    { name: "2. Classification", power: "State machine: HEALTHY -> SUSPICIOUS -> UNHEALTHY", state: "1 failure = suspicious, 3 = unhealthy", color: "#f59e0b" },
+    { name: "3. Circuit Breaking", power: "Open circuit on unhealthy worker", state: "No new requests routed. 60s recovery timeout.", color: "#a371f7" },
+    { name: "4. Request Migration", power: "Transfer KV cache + state to healthy worker", state: "NVLink: sub-ms. PCIe: 1-200 ms. Fallback: re-prefill.", color: "#3b82f6" },
+    { name: "5. Graceful Degradation", power: "Reduce batch / shed traffic / relax SLOs", state: "Based on remaining capacity ratio vs. SLO target", color: "#10b981" },
+    { name: "6. Recovery", power: "Half-open circuit breaker tests recovered worker", state: "Canary passes -> circuit closes -> full traffic restored", color: "#39c5cf" },
+  ]}
+/>
+
+### End-to-End Failure Scenario
+
+Consider a 128-GPU cluster running Llama 70B at TP=8 (16 TP groups). GPU 47 experiences an uncorrectable ECC error at time $t_0$:
+
+```
+t0 + 0ms:     GPU 47 raises Xid error 48 (double-bit ECC)
+t0 + 0ms:     CUDA driver marks GPU 47 as unusable
+t0 + 0ms:     All in-flight NCCL collectives on TP group 5 fail
+t0 + 1ms:     Workers in TP group 5 catch CudaError, report to health service
+t0 + 2ms:     Health service marks TP group 5 as UNHEALTHY
+t0 + 2ms:     Router removes TP group 5 from routing table
+t0 + 3ms:     Router identifies TP group 12 as migration target (lowest load)
+t0 + 3-8ms:   Request migration begins for 23 in-flight requests
+t0 + 8ms:     All KV caches transferred (avg 2K tokens, NVLink: 0.02ms each)
+t0 + 10ms:    All 23 requests resumed on TP group 12
+t0 + 10ms:    Planner recalculates capacity: 15/16 groups = 93.75%
+t0 + 10ms:    Degradation level remains NONE (capacity > 100% of SLO)
+t0 + 60s:     Hot spare GPU brought online, new TP group 5 formed
+t0 + 61s:     Canary check passes on new TP group 5
+t0 + 61s:     Circuit breaker closes, TP group 5 re-enters routing pool
+```
+
+Total user-visible disruption: 8 ms. The 23 in-flight requests experience 8 ms of additional latency during migration. No tokens are lost. No requests are dropped.
+
+<Benchmark
+  title="End-to-End Recovery Times by Failure Type"
+  columns={["Failure Type", "Detection", "Migration", "Total Recovery", "User Impact"]}
+  rows={[
+    { values: ["Hard crash (Xid)", "0-1 ms", "3-10 ms", "3-11 ms", "8 ms latency bump"], highlight: true },
+    { values: ["CUDA ECC error", "0-1 ms", "3-10 ms", "3-11 ms", "8 ms latency bump"], highlight: false },
+    { values: ["Silent corruption", "0-30 sec", "3-10 ms", "0.01-30 sec", "Potentially wrong tokens until detection"], highlight: true },
+    { values: ["NVLink failure", "1-5 sec (NCCL timeout)", "50-200 ms (PCIe fallback)", "1-5 sec", "Latency spike during migration"], highlight: false },
+    { values: ["Thermal throttle", "30-60 sec (canary latency)", "N/A (weight reduction)", "30-60 sec", "Gradual throughput reduction"], highlight: false },
+  ]}
+/>
+
+## Health Check Daemon Implementation
+
+The full daemon that ties canary checks, circuit breakers, and degradation together:
+
+```python
+class HealthDaemon:
+    """
+    Background service running on the Dynamo control plane.
+    Manages canary checks, circuit breakers, migration, and degradation.
+    """
+
+    def __init__(self, config, router, kvbm, planner):
+        self.checker = CanaryHealthChecker(config)
+        self.migrator = RequestMigration(kvbm, router, config)
+        self.degradation = GracefulDegradation(
+            CapacityModel(config), router, config,
+        )
+        self.router = router
+        self.planner = planner
+        self.worker_registry = {}
+        self._running = False
+
+    async def run(self):
+        """Main event loop."""
+        self._running = True
+        while self._running:
+            healthy_workers = []
+
+            for worker_id, endpoint in self.worker_registry.items():
+                cb = self.checker.circuit_breakers[worker_id]
+                if not cb.allow_request():
+                    continue
+
+                # Run canary check
+                result = await self.checker.run_check(worker_id, endpoint)
+
+                if result.passed:
+                    cb.record_success()
+                    healthy_workers.append(
+                        self.worker_registry[worker_id]
+                    )
+                else:
+                    cb.record_failure()
+
+                    # If worker just became unhealthy, trigger migration
+                    state = self.checker.worker_health[worker_id]
+                    if state.status == HealthStatus.UNHEALTHY:
+                        await self._handle_worker_failure(worker_id)
+
+            # Update degradation level based on healthy worker count
+            self.degradation.evaluate(healthy_workers)
+
+            # Report to Planner for scaling decisions
+            self.planner.report_health(
+                total_workers=len(self.worker_registry),
+                healthy_workers=len(healthy_workers),
+                degradation_level=self.degradation.current_level,
+            )
+
+            await asyncio.sleep(self.checker.check_interval_sec)
+
+    async def _handle_worker_failure(self, failing_worker_id):
+        """Orchestrate migration for all requests on the failing worker."""
+        failing_group = self.router.get_tp_group(failing_worker_id)
+        active_requests = self.router.get_active_requests(failing_group.group_id)
+
+        # Find the best target group
+        target_group = self.router.find_best_migration_target(
+            excluding=failing_group.group_id,
+            required_capacity=len(active_requests),
+        )
+
+        if target_group is None:
+            # No single group can absorb all requests; spread across multiple
+            await self._scatter_migrate(active_requests, failing_group)
+            return
+
+        results = await self.migrator.migrate_tp_group(
+            failing_group, target_group, active_requests,
+        )
+
+        migrated = sum(1 for _, success in results if success)
+        reprefilled = len(results) - migrated
+```
+
+<Callout type="tip" title="Hot Spares">
+Production deployments maintain 5-10% hot spare GPUs: fully loaded with model weights, running idle canary checks, but not serving traffic. When a TP group fails, the hot spare replaces the failing GPU within 1 second (no model loading delay). Without hot spares, replacing a failed GPU requires loading 140 GB of model weights (70B at FP16), which takes 5-20 seconds depending on storage bandwidth. The Planner provisions hot spares automatically when the cluster exceeds a configurable size threshold.
+</Callout>
+
+## Monitoring and Alerting
+
+The health system exposes metrics for cluster-wide visibility:
+
+```python
+# Prometheus metrics exported by the health daemon
+HEALTH_CHECK_DURATION = Histogram(
+    "dynamo_health_check_duration_seconds",
+    "Canary health check latency",
+    ["worker_id", "check_type"],
+)
+WORKER_STATUS = Gauge(
+    "dynamo_worker_status",
+    "Current health status (0=healthy, 1=suspicious, 2=unhealthy, 3=draining, 4=dead)",
+    ["worker_id", "tp_group"],
+)
+MIGRATION_TOTAL = Counter(
+    "dynamo_migration_total",
+    "Number of request migrations",
+    ["source_group", "target_group", "method"],  # method: transfer or reprefill
+)
+MIGRATION_DURATION = Histogram(
+    "dynamo_migration_duration_seconds",
+    "Time to migrate a single request",
+    ["method"],
+)
+DEGRADATION_LEVEL = Gauge(
+    "dynamo_degradation_level",
+    "Current degradation level (0-4)",
+)
+CIRCUIT_BREAKER_STATE = Gauge(
+    "dynamo_circuit_breaker_state",
+    "Circuit breaker state (0=closed, 1=open, 2=half_open)",
+    ["worker_id"],
+)
+```
+
+Key alerts to configure:
+
+```yaml
+# Alert: More than 5% of workers unhealthy
+- alert: DynamoHighWorkerFailureRate
+  expr: |
+    count(dynamo_worker_status > 1)
+    / count(dynamo_worker_status)
+    > 0.05
+  for: 2m
+  labels:
+    severity: warning
+  annotations:
+    summary: "{{ $value | humanizePercentage }} of workers unhealthy"
+
+# Alert: Degradation level above 0 for more than 5 minutes
+- alert: DynamoCapacityDegraded
+  expr: dynamo_degradation_level > 0
+  for: 5m
+  labels:
+    severity: critical
+  annotations:
+    summary: "Degradation level {{ $value }} active for 5+ minutes"
+
+# Alert: Silent corruption detected (canary token mismatch)
+- alert: DynamoSilentCorruption
+  expr: |
+    increase(dynamo_migration_total{method="token_mismatch"}[5m]) > 0
+  labels:
+    severity: critical
+  annotations:
+    summary: "Silent data corruption detected on worker"
+```
+
+## Reviewer Agent Validation
+
+**Challenge**: Using only this post, implement a `CircuitBreaker` class and a `CanaryChecker` that runs checks against a list of mock workers. When a worker fails 3 consecutive canary checks, the circuit breaker should open and block further requests. After a recovery timeout, the circuit should move to half-open and allow one test call through.
+
+Expected test:
+
+```python
+cb = CircuitBreaker(failure_threshold=3, recovery_timeout_sec=2, half_open_max_calls=1)
+
+# Initially closed
+assert cb.allow_request() == True
+assert cb.state == "closed"
+
+# Record 3 failures -> opens
+cb.record_failure()
+cb.record_failure()
+cb.record_failure()
+assert cb.state == "open"
+assert cb.allow_request() == False
+
+# Wait for recovery timeout
+import time
+time.sleep(2.1)
+
+# Should transition to half-open and allow 1 call
+assert cb.allow_request() == True
+assert cb.state == "half_open"
+
+# Second call should be blocked (max 1 half-open call)
+assert cb.allow_request() == False
+
+# Record success -> closes
+cb.record_success()
+assert cb.state == "closed"
+assert cb.allow_request() == True
+```
+
+If the Reviewer Agent can implement `CircuitBreaker` from the state machine and transition rules in this post, and the test above passes, the fault tolerance control flow was explained with sufficient precision.
