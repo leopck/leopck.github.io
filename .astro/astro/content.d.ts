@@ -292,6 +292,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"dataset-frontier-data-mixing-optimal-proportions.mdx": {
+	id: "dataset-frontier-data-mixing-optimal-proportions.mdx";
+  slug: "dataset-frontier-data-mixing-optimal-proportions";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "dataset-frontier-evaluation-benchmarks.mdx": {
 	id: "dataset-frontier-evaluation-benchmarks.mdx";
   slug: "dataset-frontier-evaluation-benchmarks";
@@ -575,6 +582,20 @@ declare module 'astro:content' {
 "inference-timeline-fp8-inference-implementation.mdx": {
 	id: "inference-timeline-fp8-inference-implementation.mdx";
   slug: "inference-timeline-fp8-inference-implementation";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"inference-timeline-inference-profiling-nsight-torch.mdx": {
+	id: "inference-timeline-inference-profiling-nsight-torch.mdx";
+  slug: "inference-timeline-inference-profiling-nsight-torch";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"inference-timeline-long-context-serving-ring-offload.mdx": {
+	id: "inference-timeline-long-context-serving-ring-offload.mdx";
+  slug: "inference-timeline-long-context-serving-ring-offload";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -974,6 +995,13 @@ declare module 'astro:content' {
 "transformer-anatomy-learning-rate-schedules.mdx": {
 	id: "transformer-anatomy-learning-rate-schedules.mdx";
   slug: "transformer-anatomy-learning-rate-schedules";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"transformer-anatomy-model-merging-ties-dare.mdx": {
+	id: "transformer-anatomy-model-merging-ties-dare.mdx";
+  slug: "transformer-anatomy-model-merging-ties-dare";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">

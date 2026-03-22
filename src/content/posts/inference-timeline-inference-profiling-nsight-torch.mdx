@@ -1,0 +1,1267 @@
+---
+title: "Inference Profiling: Nsight Systems, torch.profiler, and Finding Where Time Actually Goes"
+author: "stanley-phoong"
+description: "A practitioner's guide to profiling LLM inference workloads. Covers the full profiling stack -- Nsight Systems for system-level timelines, Nsight Compute for kernel-level analysis, and torch.profiler for Python-level tracing. Includes command-line recipes, profile interpretation, identification of common bottlenecks (scheduling gaps, memory fragmentation, NCCL stalls), and a complete profiling wrapper for vLLM."
+publishDate: 2025-03-22
+category: llm-inference
+tags: [profiling, nsight, torch-profiler, bottleneck, gpu-utilization]
+difficulty: expert
+readingTime: 36
+draft: false
+featured: false
+series: "Inference Optimization Timeline"
+seriesOrder: 29
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+
+Every inference optimization starts the same way: you think you know where the time goes, you are wrong, and the profiler shows you reality. The mental model -- "the GPU is doing matmuls, so it must be compute-bound" -- fails because inference workloads spend significant time on memory transfers, CPU-side scheduling, kernel launches, NCCL communication, and synchronization barriers that are invisible without instrumentation.
+
+This post covers the three profiling tools that matter for LLM inference: Nsight Systems (system-level timeline), Nsight Compute (single-kernel deep analysis), and `torch.profiler` (Python-integrated tracing). For each tool, the coverage includes: when to use it, the exact commands to capture a profile, how to read the output, and what the common bottleneck patterns look like. The final section builds a profiling wrapper for vLLM that captures inference traces with zero code changes to the serving engine.
+
+---
+
+## 1. The Profiling Stack: What Each Tool Measures
+
+<Benchmark
+  title="Profiling Tools Comparison"
+  columns={["Tool", "Scope", "Overhead", "When to Use", "Output Format"]}
+  rows={[
+    { values: ["Nsight Systems", "Full system timeline: CPU, GPU, NCCL, memory, NVTX", "1-5%", "First pass: where does time go?", ".nsys-rep (GUI) / .sqlite (analysis)"], highlight: true },
+    { values: ["Nsight Compute", "Single kernel: register usage, memory throughput, warp stalls", "10-100x (replays kernel)", "A specific kernel is slow, need to know why", ".ncu-rep (GUI)"], highlight: false },
+    { values: ["torch.profiler", "Python + CUDA ops: operator-level, memory timeline, stack traces", "5-15%", "PyTorch-specific analysis, TensorBoard integration", "Chrome trace JSON / TensorBoard"], highlight: true },
+    { values: ["CUPTI raw", "Low-level CUDA API tracing", "Variable", "Custom tooling, framework development", "Callbacks / buffers"], highlight: false },
+    { values: ["py-spy / cProfile", "Python CPU profiling only", "1-5%", "Suspected Python-level bottleneck", "Flamegraph / stats"], highlight: false },
+  ]}
+  notes="Overhead percentages are approximate and depend on the workload. Nsight Compute overhead is extreme because it replays each kernel multiple times to collect hardware counters."
+/>
+
+The workflow is always top-down:
+
+1. **Nsight Systems first**: Capture a system-level timeline. Identify whether the bottleneck is GPU compute, CPU scheduling, memory, or communication.
+2. **torch.profiler second**: If the bottleneck is in PyTorch operator dispatch or you need per-layer breakdowns, use torch.profiler for its operator-level detail.
+3. **Nsight Compute last**: If a specific CUDA kernel is the bottleneck and you need to understand its hardware utilization (occupancy, memory bandwidth, instruction throughput), profile that kernel alone with Nsight Compute.
+
+Never start with Nsight Compute. Its overhead is prohibitive (it replays each kernel tens of times), and without the system-level context from Nsight Systems, you will optimize a kernel that accounts for 3% of total time while the real bottleneck is CPU scheduling gaps.
+
+---
+
+## 2. Nsight Systems: The System Timeline
+
+### Capture Commands
+
+The basic capture command for an inference workload:
+
+```bash
+# Basic capture: CPU + GPU + CUDA API
+nsys profile \
+  --trace=cuda,nvtx,osrt,cudnn,cublas \
+  --output=inference_profile \
+  --force-overwrite=true \
+  python serve.py --model llama-3-70b --batch-size 8
+
+# With NCCL tracing (multi-GPU):
+nsys profile \
+  --trace=cuda,nvtx,osrt,cudnn,cublas,nccl \
+  --output=multi_gpu_profile \
+  --force-overwrite=true \
+  torchrun --nproc_per_node=4 serve.py --model llama-3-70b --tp 4
+
+# Delayed start: skip model loading, capture only inference
+nsys profile \
+  --trace=cuda,nvtx,osrt \
+  --delay=30 \
+  --duration=10 \
+  --output=steady_state \
+  python serve.py
+```
+
+Key flags:
+
+- `--trace=cuda,nvtx`: Always include CUDA API and NVTX markers. NVTX markers are annotations that frameworks (PyTorch, vLLM) insert to label regions of code.
+- `--delay=N`: Skip the first N seconds (model loading, warmup). Profile only the steady-state serving.
+- `--duration=N`: Capture for N seconds. Keep it short (5-30s) to keep the trace file manageable.
+- `--sample=cpu`: Add CPU sampling for Python stack traces (adds overhead but shows Python functions).
+- `--gpu-metrics-device=all`: Capture SM utilization, memory bandwidth, etc. at the GPU counter level.
+
+### Adding NVTX Markers to Your Code
+
+NVTX markers are labels you insert into the code to create named regions on the timeline. Without them, the Nsight Systems timeline shows raw CUDA kernels, and you have to guess which kernel belongs to which model layer.
+
+```python
+import torch
+import nvtx  # pip install nvtx
+
+class ProfiledAttention:
+    """Attention module with NVTX annotations for Nsight Systems."""
+
+    def __init__(self, layer_idx):
+        self.layer_idx = layer_idx
+
+    def forward(self, q, k, v, kv_cache):
+        with nvtx.annotate(f"layer_{self.layer_idx}_attention", color="blue"):
+            # QKV projection
+            with nvtx.annotate("qkv_proj"):
+                q = self.q_proj(q)
+                k = self.k_proj(k)
+                v = self.v_proj(v)
+
+            # KV cache update
+            with nvtx.annotate("kv_cache_update"):
+                k, v = kv_cache.update(k, v, self.layer_idx)
+
+            # Attention computation
+            with nvtx.annotate("flash_attn"):
+                out = flash_attn_func(q, k, v, causal=True)
+
+            # Output projection
+            with nvtx.annotate("o_proj"):
+                out = self.o_proj(out)
+
+        return out
+
+
+class ProfiledTransformerBlock:
+    """Transformer block with NVTX annotations."""
+
+    def __init__(self, layer_idx):
+        self.layer_idx = layer_idx
+        self.attention = ProfiledAttention(layer_idx)
+
+    def forward(self, hidden_states, kv_cache):
+        with nvtx.annotate(f"layer_{self.layer_idx}", color="green"):
+            # Pre-norm
+            with nvtx.annotate("input_layernorm"):
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+
+            # Attention
+            hidden_states = self.attention.forward(
+                hidden_states, hidden_states, hidden_states, kv_cache
+            )
+            hidden_states = residual + hidden_states
+
+            # FFN
+            with nvtx.annotate(f"layer_{self.layer_idx}_ffn", color="orange"):
+                residual = hidden_states
+                hidden_states = self.post_attention_layernorm(hidden_states)
+                hidden_states = self.mlp(hidden_states)
+                hidden_states = residual + hidden_states
+
+        return hidden_states
+```
+
+### Reading the Timeline
+
+Open the `.nsys-rep` file in Nsight Systems GUI (or use `nsys stats` for CLI analysis). The timeline shows:
+
+```
+nsys stats inference_profile.nsys-rep --report gputrace
+nsys stats inference_profile.nsys-rep --report cudaapisum
+nsys stats inference_profile.nsys-rep --report gpumemsizesum
+```
+
+The critical CLI reports:
+
+```bash
+# Top 10 GPU kernels by total time
+nsys stats inference_profile.nsys-rep --report gputrace \
+  --format csv | sort -t, -k4 -nr | head -20
+
+# CUDA API call summary (where CPU spends time)
+nsys stats inference_profile.nsys-rep --report cudaapisum
+
+# GPU memory operations (allocations, copies)
+nsys stats inference_profile.nsys-rep --report gpumemsizesum
+```
+
+<Benchmark
+  title="Typical nsys Stats Output: Top GPU Kernels (Llama 70B Decode, Batch 8)"
+  columns={["Kernel", "Count", "Total Time (ms)", "Avg Time (us)", "% of GPU Time"]}
+  rows={[
+    { values: ["ampere_fp16_s1688gemm_fp16_128x128_ldg8_...", "640", "52.3", "81.7", "38.2%"], highlight: true },
+    { values: ["flash_fwd_splitkv_kernel", "640", "28.1", "43.9", "20.5%"], highlight: true },
+    { values: ["ampere_fp16_s1688gemm_fp16_256x64_...", "320", "18.7", "58.4", "13.7%"], highlight: false },
+    { values: ["void at::native::vectorized_elementwise_...", "1920", "12.4", "6.5", "9.1%"], highlight: false },
+    { values: ["void at::native::layer_norm_kernel_...", "160", "4.8", "30.0", "3.5%"], highlight: false },
+    { values: ["ncclAllReduceRingLLKernel_sum_fp16", "80", "3.2", "40.0", "2.3%"], highlight: false },
+    { values: ["void rms_norm_kernel_...", "160", "2.9", "18.1", "2.1%"], highlight: false },
+    { values: ["Other (100+ kernel types)", "-", "14.6", "-", "10.6%"], highlight: false },
+  ]}
+  notes="640 GEMM calls = 80 layers x 4 GEMMs/layer (Q, K, V, O projections) x 2 (attention + FFN). 640 flash_attn calls = 80 layers x 8 batch items."
+/>
+
+The key insight from this profile: **GEMMs and attention together account for 72.4% of GPU time.** The remaining 27.6% is elementwise operations (SiLU activations, residual adds), layer norms, NCCL communication, and overhead. Optimizing GEMMs (via FP8, better tiling) and attention (via FlashAttention tuning, speculative decoding) gives the highest return.
+
+### Identifying the Four Common Bottleneck Patterns
+
+**Pattern 1: GPU Idle Gaps (CPU Scheduling Overhead)**
+
+On the timeline, you see alternating bands of GPU activity and silence. The GPU kernels finish, then nothing happens for 50-200us before the next kernel launches. This is the CPU-side Python/PyTorch overhead: moving between Python functions, running the PyTorch dispatcher, launching the next CUDA kernel.
+
+```
+Timeline:
+GPU:  [GEMM 80us][----gap 120us----][FlashAttn 44us][----gap 95us----][GEMM 58us]
+CPU:  [dispatch][python overhead......][dispatch][python overhead........][dispatch]
+```
+
+Diagnosis: compute the "GPU active percentage":
+
+```python
+def analyze_gpu_utilization(nsys_sqlite_path):
+    """Parse nsys SQLite export to compute GPU active percentage.
+
+    The GPU is 'active' when at least one kernel is running.
+    The gap time is when no kernel is executing.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(nsys_sqlite_path)
+
+    # Get all GPU kernel intervals
+    query = """
+        SELECT start, end
+        FROM CUPTI_ACTIVITY_KIND_KERNEL
+        ORDER BY start
+    """
+    kernels = conn.execute(query).fetchall()
+
+    if not kernels:
+        return {"active_pct": 0, "total_gap_ms": 0}
+
+    # Merge overlapping intervals (multiple SMs run concurrently)
+    merged = []
+    current_start, current_end = kernels[0]
+    for start, end in kernels[1:]:
+        if start <= current_end:
+            current_end = max(current_end, end)
+        else:
+            merged.append((current_start, current_end))
+            current_start, current_end = start, end
+    merged.append((current_start, current_end))
+
+    total_active = sum(end - start for start, end in merged)
+    total_wall = merged[-1][1] - merged[0][0]
+
+    # Compute gaps
+    gaps = []
+    for i in range(1, len(merged)):
+        gap = merged[i][0] - merged[i-1][1]
+        gaps.append(gap)
+
+    total_gap = sum(gaps)
+    avg_gap = total_gap / len(gaps) if gaps else 0
+
+    conn.close()
+
+    return {
+        "active_pct": total_active / total_wall * 100,
+        "total_gap_ms": total_gap / 1e6,
+        "avg_gap_us": avg_gap / 1e3,
+        "num_gaps": len(gaps),
+        "total_wall_ms": total_wall / 1e6,
+    }
+```
+
+<PerfChart
+  title="GPU Active Time: Decode Phase"
+  unit="%"
+  data={[
+    { label: "Eager mode (no optimization)", value: 42, color: "red", annotation: "58% idle due to Python/dispatch" },
+    { label: "torch.compile", value: 68, color: "orange", annotation: "Fused kernels reduce gaps" },
+    { label: "CUDA Graphs", value: 89, color: "green", annotation: "Near-zero launch overhead" },
+    { label: "CUDA Graphs + custom kernels", value: 94, color: "cyan", annotation: "Fused attention + GEMM" }
+  ]}
+  baseline={0}
+/>
+
+The fix: CUDA Graphs capture the entire decode step as a single graph, eliminating per-kernel CPU launch overhead. `torch.compile` fuses elementwise kernels, reducing the kernel count.
+
+**Pattern 2: Memory Fragmentation (OOM with Free Memory)**
+
+The profiler shows `cudaMalloc` calls returning errors or taking unusually long (milliseconds instead of microseconds), even though `nvidia-smi` reports available memory. This is fragmentation: the allocator has free memory, but not in contiguous blocks large enough for the requested allocation.
+
+```python
+def detect_memory_fragmentation(nsys_sqlite_path):
+    """Find suspiciously slow cudaMalloc calls that indicate fragmentation."""
+    import sqlite3
+
+    conn = sqlite3.connect(nsys_sqlite_path)
+
+    query = """
+        SELECT start, end, (end - start) as duration_ns
+        FROM CUPTI_ACTIVITY_KIND_RUNTIME
+        WHERE nameId IN (
+            SELECT id FROM StringIds WHERE value LIKE '%cudaMalloc%'
+        )
+        ORDER BY duration_ns DESC
+    """
+    allocs = conn.execute(query).fetchall()
+
+    slow_allocs = [(start, end, dur) for start, end, dur in allocs if dur > 1_000_000]  # > 1ms
+
+    conn.close()
+
+    return {
+        "total_allocs": len(allocs),
+        "slow_allocs_count": len(slow_allocs),
+        "worst_alloc_ms": slow_allocs[0][2] / 1e6 if slow_allocs else 0,
+        "avg_alloc_us": sum(d for _, _, d in allocs) / len(allocs) / 1e3 if allocs else 0,
+    }
+```
+
+The fix: pre-allocate KV cache and activation buffers at startup. Use PyTorch's caching allocator (`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`) to reduce fragmentation. For vLLM, set `--gpu-memory-utilization 0.9` to pre-allocate 90% of GPU memory upfront.
+
+**Pattern 3: NCCL Communication Stripes**
+
+In multi-GPU profiles, you see regular colored bands (NCCL kernels) interleaved with compute. The ratio of communication to compute determines the scaling efficiency.
+
+```python
+def analyze_nccl_overhead(nsys_sqlite_path):
+    """Compute NCCL communication overhead from nsys trace."""
+    import sqlite3
+
+    conn = sqlite3.connect(nsys_sqlite_path)
+
+    # NCCL kernels
+    nccl_query = """
+        SELECT SUM(end - start) as total_ns, COUNT(*) as count
+        FROM CUPTI_ACTIVITY_KIND_KERNEL
+        WHERE shortName LIKE '%nccl%'
+    """
+    nccl_total, nccl_count = conn.execute(nccl_query).fetchone()
+
+    # All GPU kernels
+    all_query = """
+        SELECT SUM(end - start) as total_ns
+        FROM CUPTI_ACTIVITY_KIND_KERNEL
+    """
+    all_total = conn.execute(all_query).fetchone()[0]
+
+    conn.close()
+
+    nccl_total = nccl_total or 0
+
+    return {
+        "nccl_time_ms": nccl_total / 1e6,
+        "nccl_count": nccl_count or 0,
+        "nccl_pct": (nccl_total / all_total * 100) if all_total else 0,
+        "compute_time_ms": (all_total - nccl_total) / 1e6,
+    }
+```
+
+<Benchmark
+  title="NCCL Overhead by Parallelism Strategy (Llama 70B, 4x H100 NVLink)"
+  columns={["Strategy", "NCCL Time %", "Comm Volume/Step", "Overlap Possible", "Effective Throughput vs 1 GPU"]}
+  rows={[
+    { values: ["Tensor Parallel (TP=4)", "8-12%", "2x allreduce per layer", "Partial (with compute)", "3.5-3.7x"], highlight: true },
+    { values: ["Pipeline Parallel (PP=4)", "3-5%", "1x p2p per microbatch boundary", "Yes (pipeline bubbles)", "3.2-3.6x"], highlight: false },
+    { values: ["Sequence Parallel (SP=4)", "5-8%", "1x allgather + 1x reduce-scatter/layer", "Yes (with attention)", "3.4-3.8x"], highlight: true },
+    { values: ["TP=2, PP=2", "6-9%", "Reduced vs TP=4", "Partial", "3.5-3.7x"], highlight: false },
+  ]}
+  notes="Measured on 4x H100 SXM with NVLink 4.0 (900 GB/s). Effective throughput measured as tokens/s relative to single-GPU baseline."
+/>
+
+**Pattern 4: Memory Bandwidth Saturation (Decode Phase)**
+
+During decode, each generated token requires reading all model weights once (memory-bound). The profile shows short kernels that achieve high memory bandwidth but low compute utilization:
+
+```bash
+# Use Nsight Compute for a single decode-phase GEMM
+ncu --target-processes all \
+    --set full \
+    --kernel-name "ampere_fp16_s1688gemm" \
+    --launch-count 5 \
+    --output decode_gemm \
+    python single_decode.py
+```
+
+The Nsight Compute output shows:
+
+```
+Metric                          Value       Peak        %
+------------------------------------------------------------
+SM Active Cycles                42,156      -           -
+DRAM Throughput                 2,847 GB/s  3,352 GB/s  84.9%
+SM Throughput                   89.2 TFLOPS 989 TFLOPS  9.0%
+L2 Hit Rate                    32.4%       -           -
+Warp Stall (Memory Dependency)  68.3%       -           -
+```
+
+This kernel is 84.9% memory-bandwidth-bound and only 9.0% compute-bound -- the textbook decode-phase pattern. Optimizing this kernel means reducing memory traffic (quantized weights, grouped-query attention) rather than adding compute (FP8 tensor cores will not help a memory-bound kernel).
+
+---
+
+## 3. torch.profiler: Python-Level Tracing
+
+`torch.profiler` integrates with PyTorch to capture operator-level traces with Python stack information, CUDA kernel associations, and memory timelines.
+
+### Basic Usage
+
+```python
+import torch
+from torch.profiler import profile, ProfilerActivity, schedule, tensorboard_trace_handler
+
+def profile_inference(model, input_ids, num_steps=10, warmup=3):
+    """Profile inference with torch.profiler.
+
+    Captures:
+    - CPU operators (PyTorch dispatcher overhead)
+    - CUDA kernels (actual GPU work)
+    - Memory allocations and frees
+    - Stack traces for each operator
+    """
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=schedule(
+            wait=1,          # Skip first iteration (cold start)
+            warmup=warmup,   # Warmup iterations (discard)
+            active=num_steps, # Capture these iterations
+            repeat=1,
+        ),
+        on_trace_ready=tensorboard_trace_handler("./tb_logs/inference"),
+        record_shapes=True,      # Record tensor shapes per operator
+        profile_memory=True,     # Track memory allocations
+        with_stack=True,         # Capture Python stack traces
+        with_flops=True,         # Estimate FLOPS per operator
+        with_modules=True,       # Associate ops with nn.Module hierarchy
+    ) as prof:
+        for step in range(1 + warmup + num_steps):
+            with torch.no_grad():
+                output = model.generate(
+                    input_ids,
+                    max_new_tokens=1,
+                    do_sample=False,
+                )
+            prof.step()  # Signal end of iteration
+
+    return prof
+
+
+def analyze_profile(prof):
+    """Extract key metrics from a torch.profiler profile."""
+
+    # Top operators by GPU time
+    print("=== Top 20 Operators by CUDA Time ===")
+    print(prof.key_averages().table(
+        sort_by="cuda_time_total",
+        row_limit=20,
+    ))
+
+    # Top operators by CPU time (scheduling overhead)
+    print("\n=== Top 20 Operators by CPU Time ===")
+    print(prof.key_averages().table(
+        sort_by="cpu_time_total",
+        row_limit=20,
+    ))
+
+    # Memory usage summary
+    print("\n=== Memory Summary ===")
+    print(prof.key_averages().table(
+        sort_by="self_cuda_memory_usage",
+        row_limit=10,
+    ))
+
+    # Group by module (which nn.Module is most expensive)
+    print("\n=== Time by Module ===")
+    print(prof.key_averages(group_by_input_shape=False).table(
+        sort_by="cuda_time_total",
+        row_limit=20,
+    ))
+```
+
+### The Memory Timeline
+
+One of `torch.profiler`'s most useful features is the memory timeline, which shows GPU memory allocation and deallocation over time. This reveals:
+
+- **Memory peaks**: When activation memory spikes during prefill
+- **Fragmentation**: Repeated alloc/free cycles that leave gaps
+- **Leaks**: Memory that is allocated but never freed
+
+```python
+def capture_memory_timeline(model, input_ids, output_path="memory_timeline.html"):
+    """Capture a detailed memory timeline.
+
+    The memory timeline shows:
+    - Each allocation as a horizontal bar (wider = more memory)
+    - Color-coded by category (parameters, activations, gradients, etc.)
+    - Hoverable for allocation stack trace
+    """
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        profile_memory=True,
+        record_shapes=True,
+        with_stack=True,
+    ) as prof:
+        with torch.no_grad():
+            # Prefill
+            output = model(input_ids, use_cache=True)
+
+            # Multiple decode steps
+            past_kv = output.past_key_values
+            next_token = output.logits[:, -1:, :].argmax(dim=-1)
+
+            for _ in range(20):
+                output = model(next_token, past_key_values=past_kv, use_cache=True)
+                past_kv = output.past_key_values
+                next_token = output.logits[:, -1:, :].argmax(dim=-1)
+
+    # Export memory timeline
+    prof.export_memory_timeline(output_path, device="cuda:0")
+
+    # Also export Chrome trace for manual analysis
+    prof.export_chrome_trace("inference_trace.json")
+
+    return prof
+```
+
+### Operator-Level Breakdown
+
+```python
+def detailed_operator_analysis(prof):
+    """Deep dive into operator-level performance.
+
+    Key metrics per operator:
+    - self_cuda_time: Time in CUDA kernels launched by this operator
+    - cpu_time: Time in Python/C++ dispatch
+    - cuda_memory_usage: Net memory change
+    - flops: Estimated floating point operations
+    """
+
+    key_avgs = prof.key_averages()
+
+    # Compute FLOPS efficiency
+    total_flops = sum(
+        evt.flops for evt in key_avgs
+        if evt.flops is not None and evt.flops > 0
+    )
+    total_cuda_time = sum(
+        evt.cuda_time_total for evt in key_avgs
+    )
+
+    # Achieved TFLOPS
+    if total_cuda_time > 0:
+        achieved_tflops = total_flops / (total_cuda_time * 1e-6) / 1e12
+    else:
+        achieved_tflops = 0
+
+    # CPU vs GPU time ratio (scheduling overhead indicator)
+    total_cpu_time = sum(evt.cpu_time_total for evt in key_avgs)
+
+    # Find the biggest CPU-side bottlenecks (pure Python overhead)
+    cpu_only_ops = [
+        evt for evt in key_avgs
+        if evt.cpu_time_total > 0 and evt.cuda_time_total == 0
+    ]
+    cpu_only_ops.sort(key=lambda e: e.cpu_time_total, reverse=True)
+
+    analysis = {
+        "achieved_tflops": achieved_tflops,
+        "cpu_to_gpu_ratio": total_cpu_time / total_cuda_time if total_cuda_time > 0 else float('inf'),
+        "total_cuda_ms": total_cuda_time / 1e3,
+        "total_cpu_ms": total_cpu_time / 1e3,
+        "top_cpu_only_ops": [
+            (evt.key, evt.cpu_time_total / 1e3)  # name, ms
+            for evt in cpu_only_ops[:10]
+        ],
+    }
+
+    return analysis
+```
+
+<Callout type="tip" title="TensorBoard Integration">
+Export the trace to TensorBoard for interactive exploration: `tensorboard --logdir=./tb_logs`. The Trace View shows the full timeline. The Operator View shows cumulative stats per operator type. The Memory View shows the allocation timeline. The Module View (when `with_modules=True`) shows time broken down by `nn.Module` hierarchy, letting you identify which transformer layer is slowest.
+</Callout>
+
+---
+
+## 4. Common Bottleneck Patterns and Their Fixes
+
+### Bottleneck 1: Python Dispatch Overhead
+
+**Profile signature**: High CPU time relative to CUDA time. `cpu_to_gpu_ratio` above 2.0. Many small gaps between GPU kernels on the Nsight Systems timeline.
+
+```python
+def diagnose_dispatch_overhead(prof):
+    """Identify Python dispatch overhead from torch.profiler trace."""
+
+    key_avgs = prof.key_averages()
+
+    # Look for operators where CPU time >> CUDA time
+    dispatch_heavy = []
+    for evt in key_avgs:
+        if evt.count > 0 and evt.cuda_time_total > 0:
+            ratio = evt.cpu_time_total / evt.cuda_time_total
+            if ratio > 5.0:  # CPU takes 5x longer than GPU
+                dispatch_heavy.append({
+                    "name": evt.key,
+                    "count": evt.count,
+                    "cpu_ms": evt.cpu_time_total / 1e3,
+                    "cuda_ms": evt.cuda_time_total / 1e3,
+                    "ratio": ratio,
+                })
+
+    dispatch_heavy.sort(key=lambda x: x["cpu_ms"], reverse=True)
+
+    print("Operators with high dispatch overhead (CPU/CUDA ratio > 5):")
+    for op in dispatch_heavy[:15]:
+        print(f"  {op['name']}: CPU={op['cpu_ms']:.1f}ms, "
+              f"CUDA={op['cuda_ms']:.1f}ms, ratio={op['ratio']:.1f}x, "
+              f"count={op['count']}")
+
+    return dispatch_heavy
+```
+
+**Fix**: Use `torch.compile` to fuse operators and reduce dispatch count, or CUDA Graphs to capture the entire decode step:
+
+```python
+import torch
+
+def apply_cuda_graph_optimization(model, example_input_ids, example_position_ids, example_kv):
+    """Capture a CUDA graph for the decode step.
+
+    CUDA Graphs record a sequence of GPU operations and replay them
+    without CPU involvement. This eliminates all Python dispatch
+    overhead for the captured region.
+
+    Constraints:
+    - Input shapes must be fixed (pad to max batch size)
+    - No Python control flow inside the graph
+    - No CPU-GPU synchronization inside the graph
+    """
+
+    # Warmup (populate CUDA caches, JIT compile kernels)
+    for _ in range(3):
+        with torch.no_grad():
+            model(example_input_ids, position_ids=example_position_ids,
+                  past_key_values=example_kv, use_cache=True)
+
+    # Capture the graph
+    graph = torch.cuda.CUDAGraph()
+
+    # Static inputs (will be overwritten before each replay)
+    static_input_ids = example_input_ids.clone()
+    static_position_ids = example_position_ids.clone()
+
+    with torch.cuda.graph(graph):
+        static_output = model(
+            static_input_ids,
+            position_ids=static_position_ids,
+            past_key_values=example_kv,
+            use_cache=True,
+        )
+
+    def run_decode_step(input_ids, position_ids):
+        """Replay the CUDA graph with new inputs."""
+        static_input_ids.copy_(input_ids)
+        static_position_ids.copy_(position_ids)
+        graph.replay()
+        return static_output
+
+    return run_decode_step
+```
+
+### Bottleneck 2: KV Cache Memory Allocation
+
+**Profile signature**: Large `cudaMalloc` and `cudaFree` calls visible on the timeline. Memory allocation spikes during request arrival.
+
+```python
+def diagnose_memory_allocation(prof):
+    """Find excessive CUDA memory operations."""
+
+    key_avgs = prof.key_averages()
+
+    # Find memory-related operators
+    mem_ops = [
+        evt for evt in key_avgs
+        if any(keyword in evt.key.lower()
+               for keyword in ["alloc", "malloc", "free", "empty", "resize"])
+    ]
+
+    total_mem_cpu_time = sum(evt.cpu_time_total for evt in mem_ops)
+    total_cpu_time = sum(evt.cpu_time_total for evt in key_avgs)
+
+    print(f"Memory operations: {total_mem_cpu_time / 1e3:.1f}ms "
+          f"({total_mem_cpu_time / total_cpu_time * 100:.1f}% of CPU time)")
+
+    for evt in sorted(mem_ops, key=lambda e: e.cpu_time_total, reverse=True)[:10]:
+        print(f"  {evt.key}: {evt.cpu_time_total / 1e3:.1f}ms "
+              f"(count={evt.count}, "
+              f"mem_change={evt.cuda_memory_usage / 1e6:.1f}MB)")
+
+    return mem_ops
+```
+
+**Fix**: Pre-allocate KV cache pools at startup:
+
+```python
+class PreallocatedKVPool:
+    """Pre-allocate all KV cache memory at startup to avoid runtime allocations.
+
+    This is what vLLM's PagedAttention does internally.
+    """
+
+    def __init__(self, num_blocks, num_layers, num_kv_heads, head_dim,
+                 block_size, dtype, device):
+        # Allocate the entire KV pool as two large tensors
+        # K pool: [num_blocks, num_layers, num_kv_heads, block_size, head_dim]
+        # V pool: same shape
+        self.k_pool = torch.zeros(
+            num_blocks, num_layers, num_kv_heads, block_size, head_dim,
+            dtype=dtype, device=device
+        )
+        self.v_pool = torch.zeros(
+            num_blocks, num_layers, num_kv_heads, block_size, head_dim,
+            dtype=dtype, device=device
+        )
+
+        self.free_blocks = list(range(num_blocks))
+        self.block_size = block_size
+
+        total_bytes = self.k_pool.nelement() * self.k_pool.element_size() * 2
+        print(f"KV pool pre-allocated: {total_bytes / 1e9:.2f} GB "
+              f"({num_blocks} blocks of {block_size} tokens)")
+
+    def allocate(self):
+        """Get a free block index. O(1), no CUDA allocation."""
+        if not self.free_blocks:
+            raise RuntimeError("KV pool exhausted")
+        return self.free_blocks.pop()
+
+    def free(self, block_idx):
+        """Return a block to the pool. O(1), no CUDA free."""
+        self.free_blocks.append(block_idx)
+
+    def get_k(self, block_idx, layer_idx):
+        """Get K tensor for a specific block and layer."""
+        return self.k_pool[block_idx, layer_idx]
+
+    def get_v(self, block_idx, layer_idx):
+        """Get V tensor for a specific block and layer."""
+        return self.v_pool[block_idx, layer_idx]
+```
+
+### Bottleneck 3: NCCL Synchronization Stalls
+
+**Profile signature**: In multi-GPU profiles, NCCL kernels on one GPU finish much earlier than on another. The fast GPU stalls waiting for the slow GPU's allreduce contribution.
+
+```python
+def diagnose_nccl_imbalance(nsys_paths_per_gpu):
+    """Compare NCCL timing across GPUs to detect load imbalance.
+
+    nsys_paths_per_gpu: dict mapping GPU index to nsys-rep path
+    """
+    import sqlite3
+
+    per_gpu_nccl = {}
+
+    for gpu_idx, path in nsys_paths_per_gpu.items():
+        conn = sqlite3.connect(path)
+
+        query = """
+            SELECT
+                shortName,
+                start,
+                end,
+                (end - start) as duration_ns
+            FROM CUPTI_ACTIVITY_KIND_KERNEL
+            WHERE shortName LIKE '%nccl%'
+            ORDER BY start
+        """
+        nccl_events = conn.execute(query).fetchall()
+        conn.close()
+
+        per_gpu_nccl[gpu_idx] = {
+            "count": len(nccl_events),
+            "total_ms": sum(d for _, _, _, d in nccl_events) / 1e6,
+            "avg_us": sum(d for _, _, _, d in nccl_events) / len(nccl_events) / 1e3 if nccl_events else 0,
+            "max_us": max(d for _, _, _, d in nccl_events) / 1e3 if nccl_events else 0,
+        }
+
+    # Detect imbalance
+    times = [info["total_ms"] for info in per_gpu_nccl.values()]
+    imbalance = (max(times) - min(times)) / max(times) * 100 if max(times) > 0 else 0
+
+    return {
+        "per_gpu": per_gpu_nccl,
+        "imbalance_pct": imbalance,
+        "recommendation": "Check load balancing" if imbalance > 15 else "Balanced",
+    }
+```
+
+---
+
+## 5. Building a Profiling Wrapper for vLLM
+
+The following wrapper adds profiling to a vLLM serving engine without modifying vLLM's source code:
+
+```python
+import time
+import json
+import torch
+from torch.profiler import profile, ProfilerActivity, schedule
+from contextlib import contextmanager
+from dataclasses import dataclass, asdict
+
+@dataclass
+class InferenceTrace:
+    """A single inference trace with timing and resource metrics."""
+    request_id: str
+    prompt_tokens: int
+    generated_tokens: int
+    prefill_ms: float
+    decode_ms: float
+    total_ms: float
+    prefill_tokens_per_sec: float
+    decode_tokens_per_sec: float
+    peak_memory_gb: float
+    gpu_active_pct: float
+    batch_size: int
+    timestamp: float
+
+
+class VLLMProfiler:
+    """Non-invasive profiling wrapper for vLLM inference.
+
+    Wraps the vLLM engine to capture per-request timing,
+    GPU utilization, and memory usage without modifying
+    the engine code.
+
+    Usage:
+        from vllm import LLM, SamplingParams
+
+        llm = LLM(model="meta-llama/Llama-3-70B-Instruct", tensor_parallel_size=4)
+        profiler = VLLMProfiler(llm)
+
+        # Profile a batch of requests
+        results = profiler.profile_batch(prompts, sampling_params)
+        profiler.export_report("profile_report.json")
+    """
+
+    def __init__(self, llm_engine, enable_torch_profiler=False):
+        self.engine = llm_engine
+        self.traces = []
+        self.enable_torch = enable_torch_profiler
+        self._cuda_events = {}
+
+    def profile_batch(self, prompts, sampling_params, batch_label="default"):
+        """Profile a batch of inference requests.
+
+        Captures:
+        - Per-request latency breakdown (prefill vs decode)
+        - Peak GPU memory
+        - Tokens/second for prefill and decode phases
+        """
+
+        # Record GPU memory before
+        torch.cuda.reset_peak_memory_stats()
+        mem_before = torch.cuda.memory_allocated() / 1e9
+
+        # Create CUDA events for precise GPU timing
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+
+        torch.cuda.synchronize()
+        start_event.record()
+        wall_start = time.perf_counter()
+
+        # Run inference
+        if self.enable_torch:
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+            ) as prof:
+                outputs = self.engine.generate(prompts, sampling_params)
+            self._last_torch_prof = prof
+        else:
+            outputs = self.engine.generate(prompts, sampling_params)
+
+        end_event.record()
+        torch.cuda.synchronize()
+        wall_end = time.perf_counter()
+
+        gpu_time_ms = start_event.elapsed_time(end_event)
+        wall_time_ms = (wall_end - wall_start) * 1000
+
+        peak_mem = torch.cuda.max_memory_allocated() / 1e9
+
+        # Compute per-request metrics
+        total_prompt_tokens = sum(len(p.split()) for p in prompts)  # Approximate
+        total_generated = sum(len(o.outputs[0].token_ids) for o in outputs)
+
+        trace = InferenceTrace(
+            request_id=batch_label,
+            prompt_tokens=total_prompt_tokens,
+            generated_tokens=total_generated,
+            prefill_ms=0,  # Cannot separate without internal hooks
+            decode_ms=0,
+            total_ms=gpu_time_ms,
+            prefill_tokens_per_sec=0,
+            decode_tokens_per_sec=total_generated / (gpu_time_ms / 1000) if gpu_time_ms > 0 else 0,
+            peak_memory_gb=peak_mem,
+            gpu_active_pct=(gpu_time_ms / wall_time_ms * 100) if wall_time_ms > 0 else 0,
+            batch_size=len(prompts),
+            timestamp=time.time(),
+        )
+        self.traces.append(trace)
+
+        return outputs, trace
+
+    @contextmanager
+    def nsys_region(self, name, color="blue"):
+        """Mark a region for Nsight Systems with NVTX.
+
+        Usage:
+            with profiler.nsys_region("prefill_batch_8"):
+                outputs = engine.generate(...)
+        """
+        try:
+            import nvtx
+            rng = nvtx.start_range(message=name, color=color)
+            yield
+            nvtx.end_range(rng)
+        except ImportError:
+            yield
+
+    def profile_with_nsys_markers(self, prompts, sampling_params):
+        """Profile with NVTX markers for Nsight Systems.
+
+        Run the script under nsys:
+            nsys profile --trace=cuda,nvtx python script.py
+        """
+        with self.nsys_region("full_inference", "green"):
+            with self.nsys_region("generate", "blue"):
+                outputs = self.engine.generate(prompts, sampling_params)
+        return outputs
+
+    def profile_latency_distribution(self, prompts, sampling_params,
+                                      num_iterations=50, warmup=5):
+        """Run multiple iterations to build a latency distribution.
+
+        Returns percentile statistics (P50, P90, P95, P99).
+        """
+        latencies = []
+
+        # Warmup
+        for _ in range(warmup):
+            self.engine.generate(prompts[:1], sampling_params)
+
+        # Measurement iterations
+        for i in range(num_iterations):
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+
+            self.engine.generate(prompts, sampling_params)
+
+            torch.cuda.synchronize()
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            latencies.append(elapsed_ms)
+
+        latencies.sort()
+        n = len(latencies)
+
+        return {
+            "p50_ms": latencies[int(n * 0.50)],
+            "p90_ms": latencies[int(n * 0.90)],
+            "p95_ms": latencies[int(n * 0.95)],
+            "p99_ms": latencies[int(n * 0.99)],
+            "mean_ms": sum(latencies) / n,
+            "min_ms": latencies[0],
+            "max_ms": latencies[-1],
+            "std_ms": (sum((x - sum(latencies) / n) ** 2 for x in latencies) / n) ** 0.5,
+            "num_iterations": n,
+        }
+
+    def export_report(self, output_path):
+        """Export all traces to a JSON report."""
+        report = {
+            "traces": [asdict(t) for t in self.traces],
+            "summary": self._compute_summary(),
+        }
+        with open(output_path, "w") as f:
+            json.dump(report, f, indent=2)
+        return report
+
+    def _compute_summary(self):
+        if not self.traces:
+            return {}
+        return {
+            "total_requests": sum(t.batch_size for t in self.traces),
+            "avg_latency_ms": sum(t.total_ms for t in self.traces) / len(self.traces),
+            "avg_throughput_tps": sum(t.decode_tokens_per_sec for t in self.traces) / len(self.traces),
+            "peak_memory_gb": max(t.peak_memory_gb for t in self.traces),
+            "avg_gpu_active_pct": sum(t.gpu_active_pct for t in self.traces) / len(self.traces),
+        }
+
+    def print_torch_profile_summary(self):
+        """Print the torch.profiler summary if available."""
+        if hasattr(self, '_last_torch_prof'):
+            analyze_profile(self._last_torch_prof)
+        else:
+            print("No torch profiler data. Set enable_torch_profiler=True.")
+```
+
+### Complete Profiling Session Script
+
+```python
+"""
+Complete profiling session for vLLM inference.
+
+Run under Nsight Systems:
+    nsys profile --trace=cuda,nvtx --delay=10 --duration=30 \
+        --output=vllm_profile python profile_session.py
+
+Or standalone for torch.profiler + custom metrics:
+    python profile_session.py
+"""
+from vllm import LLM, SamplingParams
+
+# Model setup
+MODEL = "meta-llama/Llama-3-70B-Instruct"
+TP_SIZE = 4
+
+# Initialize engine
+llm = LLM(
+    model=MODEL,
+    tensor_parallel_size=TP_SIZE,
+    gpu_memory_utilization=0.9,
+    max_model_len=32768,
+)
+
+# Profiler
+profiler = VLLMProfiler(llm, enable_torch_profiler=True)
+
+# Test prompts at various lengths
+short_prompts = ["Explain TCP three-way handshake."] * 8
+medium_prompts = ["Write a detailed analysis of: " + "x " * 500] * 8
+long_prompts = ["Summarize: " + "word " * 4000] * 4
+
+params = SamplingParams(max_tokens=256, temperature=0.0)
+
+# Profile each configuration
+for label, prompts in [
+    ("short_batch8", short_prompts),
+    ("medium_batch8", medium_prompts),
+    ("long_batch4", long_prompts),
+]:
+    with profiler.nsys_region(label):
+        outputs, trace = profiler.profile_batch(prompts, params, batch_label=label)
+        print(f"{label}: {trace.total_ms:.1f}ms, "
+              f"{trace.decode_tokens_per_sec:.0f} tok/s, "
+              f"peak mem: {trace.peak_memory_gb:.1f} GB")
+
+# Latency distribution
+print("\n=== Latency Distribution (short prompts, batch 8) ===")
+dist = profiler.profile_latency_distribution(short_prompts, params, num_iterations=30)
+for k, v in dist.items():
+    if isinstance(v, float):
+        print(f"  {k}: {v:.1f}")
+
+# Export
+profiler.export_report("inference_profile_report.json")
+profiler.print_torch_profile_summary()
+```
+
+<PerfChart
+  title="Where Time Goes: Llama 70B Decode Step (Batch 8, TP=4)"
+  unit="%"
+  data={[
+    { label: "GEMM (QKV + O proj)", value: 38.2, color: "blue", annotation: "640 kernel launches/step" },
+    { label: "FlashAttention", value: 20.5, color: "purple", annotation: "Memory-bound during decode" },
+    { label: "FFN GEMM (gate+up+down)", value: 13.7, color: "cyan", annotation: "2x hidden_dim expansion" },
+    { label: "Elementwise (SiLU, add)", value: 9.1, color: "green", annotation: "Fusible with torch.compile" },
+    { label: "LayerNorm / RMSNorm", value: 5.6, color: "orange", annotation: "Kernel-launch-bound" },
+    { label: "NCCL AllReduce", value: 8.3, color: "red", annotation: "TP=4 communication" },
+    { label: "Other + overhead", value: 4.6, color: "gray", annotation: "Scheduling, memory ops" }
+  ]}
+  baseline={0}
+/>
+
+---
+
+## 6. Optimization Priorities from Profile Data
+
+Given a typical profile, here is the priority order for optimization:
+
+<Benchmark
+  title="Optimization Priority Matrix"
+  columns={["Bottleneck", "Profile Signal", "Fix", "Expected Speedup", "Implementation Effort"]}
+  rows={[
+    { values: ["CPU dispatch gaps", "GPU active below 60%", "CUDA Graphs for decode", "1.5-2.3x decode", "Medium (shape constraints)"], highlight: true },
+    { values: ["GEMM throughput", "GEMM at 38%+ of GPU time", "FP8 quantization", "1.3-1.8x prefill", "Low (library swap)"], highlight: true },
+    { values: ["Attention memory-bound", "FlashAttn at 20%+ of time", "GQA, FP8 KV cache", "1.2-1.5x decode", "Architecture-dependent"], highlight: false },
+    { values: ["NCCL overhead above 10%", "Striped comm bands", "Overlap comm+compute, reduce TP", "1.1-1.3x", "High (scheduling changes)"], highlight: false },
+    { values: ["Memory alloc stalls", "cudaMalloc above 1ms", "Pre-allocate pools", "1.05-1.2x", "Low (configuration)"], highlight: false },
+    { values: ["Kernel fusion opportunities", "Many small elementwise kernels", "torch.compile", "1.1-1.3x", "Low (one line)"], highlight: false },
+  ]}
+  notes="Speedups are cumulative but not multiplicative. Applying all optimizations typically yields 2-4x total improvement over a naive eager-mode baseline."
+/>
+
+<Callout type="perf" title="The 80/20 Rule of Inference Profiling">
+CUDA Graphs (eliminating CPU dispatch overhead) and weight quantization (FP8 or INT4) together typically account for 60-70% of the achievable speedup. The remaining optimizations -- kernel fusion, communication overlap, memory management -- are important for the last 30-40% but have diminishing returns. Always profile, always fix the biggest bottleneck first.
+</Callout>
+
+---
+
+## 7. Automated Regression Detection
+
+In production, profiling is not a one-time activity. Every model update, framework upgrade, or configuration change can regress performance. The following system captures baseline profiles and flags regressions automatically:
+
+```python
+import json
+import os
+from datetime import datetime
+
+class PerformanceRegressionDetector:
+    """Detect performance regressions by comparing against baseline profiles.
+
+    Stores baseline metrics and flags any measurement that degrades
+    beyond a configurable threshold.
+    """
+
+    def __init__(self, baseline_path="perf_baselines.json", threshold_pct=10):
+        self.baseline_path = baseline_path
+        self.threshold = threshold_pct / 100  # 10% = 0.10
+        self.baselines = self._load_baselines()
+
+    def _load_baselines(self):
+        if os.path.exists(self.baseline_path):
+            with open(self.baseline_path) as f:
+                return json.load(f)
+        return {}
+
+    def _save_baselines(self):
+        with open(self.baseline_path, "w") as f:
+            json.dump(self.baselines, f, indent=2)
+
+    def record_baseline(self, config_name, metrics):
+        """Record a baseline measurement for a configuration."""
+        self.baselines[config_name] = {
+            "metrics": metrics,
+            "timestamp": datetime.now().isoformat(),
+        }
+        self._save_baselines()
+
+    def check_regression(self, config_name, current_metrics):
+        """Compare current metrics against baseline. Return regressions."""
+        if config_name not in self.baselines:
+            return {"status": "no_baseline", "regressions": []}
+
+        baseline = self.baselines[config_name]["metrics"]
+        regressions = []
+
+        # Metrics where higher is better
+        higher_better = {"decode_tokens_per_sec", "gpu_active_pct",
+                         "prefill_tokens_per_sec"}
+        # Metrics where lower is better
+        lower_better = {"p50_ms", "p90_ms", "p95_ms", "p99_ms",
+                        "total_ms", "peak_memory_gb"}
+
+        for key in baseline:
+            if key not in current_metrics:
+                continue
+
+            base_val = baseline[key]
+            curr_val = current_metrics[key]
+
+            if base_val == 0:
+                continue
+
+            if key in higher_better:
+                change = (base_val - curr_val) / base_val
+                if change > self.threshold:
+                    regressions.append({
+                        "metric": key,
+                        "baseline": base_val,
+                        "current": curr_val,
+                        "degradation_pct": change * 100,
+                    })
+            elif key in lower_better:
+                change = (curr_val - base_val) / base_val
+                if change > self.threshold:
+                    regressions.append({
+                        "metric": key,
+                        "baseline": base_val,
+                        "current": curr_val,
+                        "degradation_pct": change * 100,
+                    })
+
+        status = "regression" if regressions else "ok"
+        return {"status": status, "regressions": regressions}
+
+    def run_check(self, config_name, profiler_wrapper):
+        """End-to-end regression check: profile and compare."""
+        # Run profiling
+        dist = profiler_wrapper.profile_latency_distribution(
+            prompts=["Test prompt " * 50] * 8,
+            sampling_params=None,  # Use defaults
+        )
+
+        # Check against baseline
+        result = self.check_regression(config_name, dist)
+
+        if result["status"] == "regression":
+            print(f"REGRESSION DETECTED for {config_name}:")
+            for r in result["regressions"]:
+                print(f"  {r['metric']}: {r['baseline']:.1f} -> {r['current']:.1f} "
+                      f"({r['degradation_pct']:.1f}% worse)")
+        elif result["status"] == "no_baseline":
+            print(f"No baseline for {config_name}. Recording current as baseline.")
+            self.record_baseline(config_name, dist)
+        else:
+            print(f"{config_name}: OK (no regressions)")
+
+        return result
+```
+
+<Callout type="warning" title="Profile Reproducibility">
+GPU profiling results have variance. Single-run comparisons are unreliable. Always collect at least 20-50 iterations (after warmup) and compare percentile distributions, not single-point measurements. A P99 regression of 15% is meaningful; a P50 regression of 3% is noise. The `profile_latency_distribution` method above handles this correctly.
+</Callout>
+
+---
+
+## Reviewer Agent Validation
+
+**Challenge**: Write a function that takes the output of `torch.profiler.key_averages()` and returns a dictionary classifying the workload as "compute-bound," "memory-bound," or "overhead-bound" based on the ratio of GEMM time to total GPU time, the CPU-to-CUDA time ratio, and the fraction of time in NCCL kernels.
+
+Expected:
+
+```python
+def classify_bottleneck(key_averages):
+    gemm_time = sum(
+        evt.cuda_time_total for evt in key_averages
+        if "gemm" in evt.key.lower() or "mm" in evt.key.lower()
+    )
+    nccl_time = sum(
+        evt.cuda_time_total for evt in key_averages
+        if "nccl" in evt.key.lower()
+    )
+    total_cuda = sum(evt.cuda_time_total for evt in key_averages)
+    total_cpu = sum(evt.cpu_time_total for evt in key_averages)
+
+    gemm_frac = gemm_time / total_cuda if total_cuda > 0 else 0
+    nccl_frac = nccl_time / total_cuda if total_cuda > 0 else 0
+    cpu_ratio = total_cpu / total_cuda if total_cuda > 0 else float('inf')
+
+    if cpu_ratio > 3.0:
+        classification = "overhead-bound"
+    elif nccl_frac > 0.2:
+        classification = "communication-bound"
+    elif gemm_frac > 0.5:
+        classification = "compute-bound"
+    else:
+        classification = "memory-bound"
+
+    return {
+        "classification": classification,
+        "gemm_fraction": gemm_frac,
+        "nccl_fraction": nccl_frac,
+        "cpu_to_cuda_ratio": cpu_ratio,
+    }
+```
