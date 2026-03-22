@@ -1,0 +1,1165 @@
+---
+title: "llm-d: Declarative Inference Configuration — From YAML to Optimized GPU Execution"
+author: "stanley-phoong"
+description: "How llm-d abstracts distributed inference into high-level YAML declarations that compile to Dynamo execution plans. Covers the ModelSpec, ServingSpec, and ResourceSpec schema, the compilation pipeline from YAML to GPU cluster deployment, hot-reloading, and complete configuration examples for Llama 70B serving."
+publishDate: 2025-03-22
+category: llm-inference
+tags: [llm-d, dynamo, declarative, yaml, configuration, serving]
+difficulty: expert
+readingTime: 33
+draft: false
+featured: false
+series: "NVIDIA Dynamo & llm-d"
+seriesOrder: 5
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+
+Configuring distributed LLM inference is a combinatorial problem. For a 70B model you must decide: tensor parallelism degree, pipeline parallelism degree, quantization scheme, batch strategy, KV cache allocation, routing policy, SLO targets, GPU placement, and interconnect topology. Each decision interacts with the others. TP=4 requires NVLink; TP=8 with pipeline parallelism requires specific GPU-to-node mapping; quantization changes memory footprint which changes batch size which changes throughput.
+
+llm-d replaces imperative configuration (scripts, flags, environment variables) with a declarative YAML schema. You specify what you want — model, quality constraints, latency targets, throughput requirements — and llm-d compiles this into an execution plan that satisfies all constraints on the available hardware.
+
+## The Problem: Imperative Configuration
+
+A typical vLLM deployment command for Llama 70B:
+
+```bash
+python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Llama-3.1-70B-Instruct \
+    --tensor-parallel-size 4 \
+    --pipeline-parallel-size 1 \
+    --max-model-len 8192 \
+    --max-num-batched-tokens 32768 \
+    --max-num-seqs 256 \
+    --gpu-memory-utilization 0.90 \
+    --block-size 16 \
+    --swap-space 4 \
+    --enforce-eager \
+    --quantization awq \
+    --dtype float16 \
+    --distributed-executor-backend ray \
+    --enable-chunked-prefill \
+    --max-chunked-prefill-tokens 2048 \
+    --num-scheduler-steps 5 \
+    --port 8000
+```
+
+Every flag is a low-level decision. To change the latency target from 200ms to 100ms TTFT (time to first token), you must manually adjust `--max-num-batched-tokens`, `--max-num-seqs`, `--max-chunked-prefill-tokens`, and possibly `--tensor-parallel-size`. The interactions are non-obvious and error-prone.
+
+Worse, this configures a single instance. A production deployment with 32 GPUs, multiple replicas, and a load balancer requires orchestration scripts on top of this — Kubernetes manifests, Ray cluster configs, routing rules — each with its own imperative configuration format.
+
+## The llm-d Approach: Declarative Specification
+
+llm-d separates intent from implementation. You write a YAML file declaring three things:
+
+1. **ModelSpec**: What model, what precision, what context length.
+2. **ServingSpec**: What latency, what throughput, what quality guarantees.
+3. **ResourceSpec**: What hardware is available.
+
+llm-d compiles these three specs into a Dynamo execution plan: TP/PP degrees, batch parameters, routing rules, replica count, GPU assignment.
+
+### Minimal Example
+
+```yaml
+# llm-d configuration: Llama 70B serving
+apiVersion: llm-d/v1
+kind: InferenceService
+
+metadata:
+  name: llama-70b-prod
+  namespace: inference
+
+spec:
+  model:
+    name: meta-llama/Llama-3.1-70B-Instruct
+    revision: main
+    quantization: awq-int4
+    maxContextLength: 8192
+
+  serving:
+    latency:
+      ttftP99: 200ms      # Time to first token, 99th percentile
+      tpotP99: 30ms        # Time per output token, 99th percentile
+    throughput:
+      minTokensPerSecond: 5000
+    scaling:
+      minReplicas: 1
+      maxReplicas: 8
+      targetUtilization: 0.80
+
+  resources:
+    gpuType: H100-SXM
+    gpuMemory: 80GB
+    interconnect: NVLink
+    maxGPUs: 32
+```
+
+This is the entire configuration. No TP degree, no batch size, no block size, no swap space. llm-d derives all of these from the model characteristics, serving targets, and available hardware.
+
+## The Three Spec Types
+
+### ModelSpec
+
+ModelSpec describes the model and its constraints. The fields map to model properties that llm-d uses for resource planning.
+
+```yaml
+model:
+  # Required: model identifier (HuggingFace format)
+  name: meta-llama/Llama-3.1-70B-Instruct
+  revision: main
+
+  # Quantization: none, awq-int4, gptq-int4, fp8, int8
+  # Affects memory footprint, compute requirements, and quality
+  quantization: awq-int4
+
+  # Maximum context window (prompt + output tokens)
+  maxContextLength: 8192
+
+  # Optional: adapter (LoRA) configuration
+  adapters:
+    maxActiveAdapters: 4
+    maxAdapterRank: 16
+    adapterCacheSizeMB: 512
+
+  # Optional: speculative decoding
+  speculative:
+    draftModel: meta-llama/Llama-3.1-1B
+    numSpeculativeTokens: 5
+    acceptanceThreshold: 0.8
+```
+
+llm-d parses the model name to look up architecture details from a model registry: parameter count, layer count, hidden dimension, number of attention heads, KV heads (for GQA), and vocabulary size. Combined with quantization, it computes the exact memory footprint:
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class ModelProfile:
+    """Derived model properties from ModelSpec."""
+    name: str
+    params_billions: float
+    num_layers: int
+    hidden_dim: int
+    num_heads: int
+    num_kv_heads: int
+    head_dim: int
+    vocab_size: int
+    quantization: str
+
+    @property
+    def weight_bytes(self):
+        """Total model weight memory."""
+        param_count = self.params_billions * 1e9
+        bytes_per_param = {
+            "none": 2,       # FP16
+            "fp8": 1,        # FP8
+            "awq-int4": 0.5, # 4-bit
+            "gptq-int4": 0.5,
+            "int8": 1,
+        }
+        return int(param_count * bytes_per_param[self.quantization])
+
+    @property
+    def kv_bytes_per_token(self):
+        """KV cache memory per token per layer."""
+        # 2 (K and V) x num_kv_heads x head_dim x dtype_bytes
+        return 2 * self.num_kv_heads * self.head_dim * 2  # FP16 KV cache
+
+    @property
+    def total_kv_bytes_per_token(self):
+        """KV cache memory per token across all layers."""
+        return self.kv_bytes_per_token * self.num_layers
+
+    def kv_cache_for_context(self, context_length, batch_size):
+        """Total KV cache for a batch at full context."""
+        return self.total_kv_bytes_per_token * context_length * batch_size
+
+# Llama 70B profile
+llama_70b = ModelProfile(
+    name="Llama-3.1-70B",
+    params_billions=70.6,
+    num_layers=80,
+    hidden_dim=8192,
+    num_heads=64,
+    num_kv_heads=8,       # GQA with 8 KV heads
+    head_dim=128,
+    vocab_size=128256,
+    quantization="awq-int4",
+)
+
+print(f"Weight memory: {llama_70b.weight_bytes / 1e9:.1f} GB")
+# Weight memory: 35.3 GB
+
+print(f"KV per token: {llama_70b.total_kv_bytes_per_token} bytes")
+# KV per token: 327680 bytes = 320 KB
+
+print(f"KV for 8192 ctx, batch 32: "
+      f"{llama_70b.kv_cache_for_context(8192, 32) / 1e9:.1f} GB")
+# KV for 8192 ctx, batch 32: 85.9 GB
+```
+
+### ServingSpec
+
+ServingSpec defines the performance contract. llm-d treats these as hard constraints during compilation — the generated execution plan must satisfy all of them.
+
+```yaml
+serving:
+  latency:
+    # Time to first token (prefill latency)
+    ttftP50: 100ms
+    ttftP99: 200ms
+
+    # Time per output token (decode latency)
+    tpotP50: 15ms
+    tpotP99: 30ms
+
+    # End-to-end latency for a complete response
+    e2eP99: 10s
+
+  throughput:
+    # Minimum sustained throughput
+    minTokensPerSecond: 5000
+    # Maximum concurrent requests
+    maxConcurrentRequests: 256
+
+  quality:
+    # Maximum acceptable quality degradation from quantization
+    maxQualityDegradation: 0.02  # 2% accuracy drop allowed
+
+  scaling:
+    minReplicas: 1
+    maxReplicas: 8
+    targetUtilization: 0.80
+    scaleUpThreshold: 0.90     # Scale up at 90% utilization
+    scaleDownThreshold: 0.40   # Scale down at 40% utilization
+    scaleUpCooldown: 60s
+    scaleDownCooldown: 300s
+
+  batching:
+    # Optional: override automatic batch strategy
+    strategy: continuous     # continuous, static, or auto
+    maxWaitTime: 5ms         # Maximum time to wait for batch formation
+```
+
+<Callout type="info" title="Constraint Hierarchy">
+If all constraints cannot be satisfied simultaneously, llm-d prioritizes: (1) latency targets are hard constraints — never violated, (2) throughput is a soft constraint — best-effort above the minimum, (3) resource efficiency is optimized after latency and throughput are met. If no feasible configuration exists for the given hardware, llm-d reports exactly which constraint cannot be satisfied and why.
+</Callout>
+
+### ResourceSpec
+
+ResourceSpec describes the available hardware. llm-d uses this to determine feasible parallelism strategies and replica counts.
+
+```yaml
+resources:
+  gpuType: H100-SXM
+  gpuMemory: 80GB
+  interconnect: NVLink       # NVLink, PCIe, InfiniBand
+  nvlinkBandwidth: 900GBs    # Bidirectional
+  pcieBandwidth: 64GBs
+  ibBandwidth: 400Gbps
+  maxGPUs: 32
+  gpusPerNode: 8
+  cpuMemoryPerNode: 1TB
+  nvmePerNode: 4TB
+
+  # Optional: topology constraints
+  topology:
+    # Prefer co-located GPUs (same NVLink domain)
+    preferColocated: true
+    # Maximum inter-node communication
+    maxInterNodeLinks: 2
+```
+
+## The Compilation Pipeline
+
+llm-d compiles the three specs through a four-stage pipeline: constraint analysis, resource planning, execution plan generation, and deployment.
+
+```
+YAML Specs
+    |
+    v
+[Stage 1: Constraint Analysis]
+    - Parse and validate all three specs
+    - Compute derived properties (memory footprint, FLOP requirements)
+    - Check for contradictions (e.g., latency target impossible with given GPU count)
+    |
+    v
+[Stage 2: Resource Planning]
+    - Determine TP/PP degrees
+    - Compute per-GPU memory allocation (weights, KV cache, activations)
+    - Calculate maximum batch size
+    - Determine replica count
+    |
+    v
+[Stage 3: Execution Plan Generation]
+    - Generate Dynamo routing rules
+    - Configure batch scheduler parameters
+    - Set KV cache management policy
+    - Define autoscaling rules
+    |
+    v
+[Stage 4: Deployment]
+    - Generate Kubernetes/Ray manifests
+    - Deploy to GPU cluster
+    - Start health checks and monitoring
+```
+
+### Stage 1: Constraint Analysis
+
+```python
+@dataclass
+class ConstraintAnalysis:
+    """Results of constraint analysis."""
+    model: ModelProfile
+    weight_memory_gb: float
+    kv_per_token_bytes: int
+    min_gpus_for_weights: int
+    max_batch_at_full_context: int
+    flops_per_token: float
+    flops_for_ttft_target: float
+    feasible: bool
+    infeasibility_reason: str = ""
+
+def analyze_constraints(model_spec, serving_spec, resource_spec):
+    """Stage 1: Determine if constraints are satisfiable."""
+    profile = resolve_model_profile(model_spec)
+
+    # Weight memory determines minimum TP degree
+    weight_gb = profile.weight_bytes / 1e9
+    gpu_mem_gb = parse_memory(resource_spec["gpuMemory"])
+    usable_mem_gb = gpu_mem_gb * 0.90  # Reserve 10% for activations/overhead
+
+    # Minimum GPUs to hold weights
+    min_gpus_weights = max(1, int(weight_gb / usable_mem_gb) + 1)
+
+    # Memory available for KV cache per GPU (after weights)
+    kv_mem_per_gpu = usable_mem_gb - (weight_gb / min_gpus_weights)
+
+    # Maximum batch size at full context length
+    kv_per_request = (
+        profile.total_kv_bytes_per_token *
+        model_spec["maxContextLength"] / 1e9
+    )
+    max_batch_per_gpu = int(kv_mem_per_gpu / kv_per_request)
+    max_batch = max_batch_per_gpu * min_gpus_weights
+
+    # Check TTFT constraint
+    # Prefill FLOPs: 2 * N_params * context_length / TP_degree
+    prompt_length = model_spec["maxContextLength"] // 2  # Estimate
+    prefill_flops = (
+        2 * profile.params_billions * 1e9 * prompt_length / min_gpus_weights
+    )
+    # H100 peak: 989 TFLOPS (FP16), ~50% utilization
+    gpu_tflops = 989 * 0.50
+    prefill_time_ms = prefill_flops / (gpu_tflops * 1e12) * 1000
+
+    ttft_target_ms = parse_duration(serving_spec["latency"]["ttftP99"])
+
+    feasible = prefill_time_ms <= ttft_target_ms
+    reason = ""
+    if not feasible:
+        reason = (
+            f"TTFT target {ttft_target_ms}ms cannot be met. "
+            f"Minimum prefill time with TP={min_gpus_weights}: "
+            f"{prefill_time_ms:.0f}ms. "
+            f"Increase TP degree or relax TTFT target."
+        )
+
+    return ConstraintAnalysis(
+        model=profile,
+        weight_memory_gb=weight_gb,
+        kv_per_token_bytes=profile.total_kv_bytes_per_token,
+        min_gpus_for_weights=min_gpus_weights,
+        max_batch_at_full_context=max_batch,
+        flops_per_token=2 * profile.params_billions * 1e9,
+        flops_for_ttft_target=prefill_flops,
+        feasible=feasible,
+        infeasibility_reason=reason,
+    )
+```
+
+### Stage 2: Resource Planning
+
+Resource planning determines the TP degree, PP degree, batch parameters, and replica count. The algorithm searches over valid configurations and selects the one that minimizes GPU count while satisfying all constraints.
+
+```python
+@dataclass
+class ResourcePlan:
+    tp_degree: int
+    pp_degree: int
+    gpus_per_replica: int
+    num_replicas: int
+    total_gpus: int
+    max_batch_size: int
+    kv_cache_gb_per_gpu: float
+    weight_gb_per_gpu: float
+
+def plan_resources(analysis, serving_spec, resource_spec):
+    """Stage 2: Find optimal resource allocation."""
+    max_gpus = resource_spec["maxGPUs"]
+    gpus_per_node = resource_spec["gpusPerNode"]
+    interconnect = resource_spec["interconnect"]
+    target_throughput = serving_spec["throughput"]["minTokensPerSecond"]
+    ttft_target = parse_duration(serving_spec["latency"]["ttftP99"])
+    tpot_target = parse_duration(serving_spec["latency"]["tpotP99"])
+
+    best_plan = None
+    best_cost = float('inf')  # Minimize total GPUs
+
+    # Search over valid TP/PP combinations
+    for tp in [1, 2, 4, 8]:
+        for pp in [1, 2, 4]:
+            gpus_per_replica = tp * pp
+
+            # Check: TP requires NVLink within a node
+            if tp > 1 and interconnect != "NVLink":
+                continue
+            # Check: TP cannot exceed GPUs per node
+            if tp > gpus_per_node:
+                continue
+
+            # Weight memory per GPU with this TP/PP
+            weight_per_gpu = analysis.weight_memory_gb / gpus_per_replica
+            usable_mem = parse_memory(resource_spec["gpuMemory"]) * 0.90
+            kv_mem_per_gpu = usable_mem - weight_per_gpu
+
+            if kv_mem_per_gpu <= 0:
+                continue  # Not enough memory for KV cache
+
+            # Max batch size per replica
+            context_len = analysis.model.vocab_size  # Use maxContextLength
+            context_len = 8192  # From model spec
+            kv_per_request_gb = (
+                analysis.kv_per_token_bytes * context_len / 1e9
+            )
+            # KV cache is distributed across TP GPUs
+            kv_per_request_per_gpu = kv_per_request_gb / tp
+            max_batch = int(kv_mem_per_gpu / kv_per_request_per_gpu)
+
+            if max_batch <= 0:
+                continue
+
+            # Check TTFT: prefill latency with this TP
+            prefill_flops_per_gpu = (
+                2 * analysis.model.params_billions * 1e9 *
+                (context_len // 2) / tp
+            )
+            gpu_tflops = 989 * 0.50 * 1e12
+            ttft_ms = prefill_flops_per_gpu / gpu_tflops * 1000
+
+            # PP adds pipeline latency: pp stages * microbatch overhead
+            ttft_ms *= (1 + 0.1 * (pp - 1))
+
+            if ttft_ms > ttft_target:
+                continue
+
+            # Check TPOT: decode latency
+            decode_flops_per_gpu = (
+                2 * analysis.model.params_billions * 1e9 / tp
+            )
+            tpot_ms = decode_flops_per_gpu / gpu_tflops * 1000
+
+            if tpot_ms > tpot_target:
+                continue
+
+            # Throughput per replica: batch_size / tpot
+            tokens_per_sec_per_replica = max_batch / (tpot_ms / 1000)
+
+            # Number of replicas needed
+            num_replicas = max(
+                1,
+                int(target_throughput / tokens_per_sec_per_replica) + 1
+            )
+            total_gpus = gpus_per_replica * num_replicas
+
+            if total_gpus > max_gpus:
+                continue
+
+            # Score: minimize total GPUs (cost)
+            if total_gpus < best_cost:
+                best_cost = total_gpus
+                best_plan = ResourcePlan(
+                    tp_degree=tp,
+                    pp_degree=pp,
+                    gpus_per_replica=gpus_per_replica,
+                    num_replicas=num_replicas,
+                    total_gpus=total_gpus,
+                    max_batch_size=max_batch,
+                    kv_cache_gb_per_gpu=kv_mem_per_gpu,
+                    weight_gb_per_gpu=weight_per_gpu,
+                )
+
+    if best_plan is None:
+        raise InfeasibleError(
+            "No valid TP/PP configuration satisfies all constraints. "
+            "Consider relaxing latency targets or adding more GPUs."
+        )
+
+    return best_plan
+```
+
+<Benchmark
+  title="Resource Planning Output: Llama 70B AWQ-INT4 on H100s"
+  columns={["Configuration", "TP", "PP", "GPUs/Replica", "Max Batch", "Replicas", "Total GPUs"]}
+  rows={[
+    { values: ["TTFT 200ms, 5K tok/s", "4", "1", "4", "42", "2", "8"], highlight: true },
+    { values: ["TTFT 100ms, 5K tok/s", "8", "1", "8", "68", "1", "8"], highlight: false },
+    { values: ["TTFT 200ms, 20K tok/s", "4", "1", "4", "42", "6", "24"], highlight: false },
+    { values: ["TTFT 50ms, 5K tok/s", "8", "1", "8", "68", "1", "8"], highlight: true },
+    { values: ["TTFT 200ms, 50K tok/s", "4", "1", "4", "42", "16", "64"], highlight: false },
+  ]}
+  notes="AWQ-INT4 halves weight memory (35.3 GB -> 17.6 GB), freeing KV cache space for larger batches."
+/>
+
+The default configuration (TTFT 200ms, 5K tok/s) uses TP=4 across 8 GPUs with 2 replicas. Tightening TTFT to 100ms forces TP=8 (more GPUs for parallelism, fewer for replicas). Increasing throughput to 20K tok/s adds replicas.
+
+### Stage 3: Execution Plan Generation
+
+The execution plan translates the resource plan into Dynamo-specific configuration: routing rules, scheduler parameters, and KV cache policies.
+
+```python
+@dataclass
+class ExecutionPlan:
+    """Complete Dynamo execution configuration."""
+    # Parallelism
+    tp_degree: int
+    pp_degree: int
+    num_replicas: int
+
+    # Batch scheduler
+    max_batch_size: int
+    max_tokens_in_batch: int
+    chunked_prefill: bool
+    max_chunked_prefill_tokens: int
+    scheduler_steps: int
+    max_wait_ms: float
+
+    # KV cache
+    block_size: int
+    gpu_cache_blocks: int
+    cpu_swap_blocks: int
+    gpu_utilization: float
+
+    # Routing
+    routing_policy: str
+    kv_aware_routing: bool
+    load_balancing_window: int
+
+    # Autoscaling
+    min_replicas: int
+    max_replicas: int
+    scale_up_threshold: float
+    scale_down_threshold: float
+
+def generate_execution_plan(resource_plan, model_profile, serving_spec):
+    """Stage 3: Generate Dynamo execution plan from resource plan."""
+    max_context = 8192
+    block_size = 16
+
+    # KV cache blocks per GPU
+    kv_per_block = (
+        model_profile.total_kv_bytes_per_token * block_size /
+        resource_plan.tp_degree
+    )
+    gpu_cache_blocks = int(
+        resource_plan.kv_cache_gb_per_gpu * 1e9 / kv_per_block
+    )
+
+    # Batch parameters
+    # Max tokens = max_batch * max_context, but chunked prefill limits burst
+    max_tokens = resource_plan.max_batch_size * max_context
+    ttft_target = parse_duration(serving_spec["latency"]["ttftP99"])
+
+    # Chunked prefill tokens: limited by TTFT target
+    # Prefill chunk must complete within ttft_target
+    flops_per_token = 2 * model_profile.params_billions * 1e9 / resource_plan.tp_degree
+    gpu_flops = 989 * 0.50 * 1e12
+    max_chunk_tokens = int(ttft_target / 1000 * gpu_flops / flops_per_token)
+    max_chunk_tokens = min(max_chunk_tokens, 4096)
+
+    # Routing policy: KV-aware if multiple replicas
+    routing = "kv-aware" if resource_plan.num_replicas > 1 else "round-robin"
+
+    # Scheduler steps: more steps = higher throughput, more latency variance
+    scheduler_steps = 5 if ttft_target > 150 else 1
+
+    plan = ExecutionPlan(
+        tp_degree=resource_plan.tp_degree,
+        pp_degree=resource_plan.pp_degree,
+        num_replicas=resource_plan.num_replicas,
+        max_batch_size=resource_plan.max_batch_size,
+        max_tokens_in_batch=max_tokens,
+        chunked_prefill=True,
+        max_chunked_prefill_tokens=max_chunk_tokens,
+        scheduler_steps=scheduler_steps,
+        max_wait_ms=parse_duration(
+            serving_spec.get("batching", {}).get("maxWaitTime", "5ms")
+        ),
+        block_size=block_size,
+        gpu_cache_blocks=gpu_cache_blocks,
+        cpu_swap_blocks=gpu_cache_blocks // 2,
+        gpu_utilization=0.90,
+        routing_policy=routing,
+        kv_aware_routing=(routing == "kv-aware"),
+        load_balancing_window=100,
+        min_replicas=serving_spec["scaling"]["minReplicas"],
+        max_replicas=serving_spec["scaling"]["maxReplicas"],
+        scale_up_threshold=serving_spec["scaling"].get("scaleUpThreshold", 0.90),
+        scale_down_threshold=serving_spec["scaling"].get("scaleDownThreshold", 0.40),
+    )
+
+    return plan
+```
+
+The generated execution plan for our Llama 70B example:
+
+```yaml
+# Auto-generated by llm-d compiler
+# Source: llama-70b-prod.yaml
+# Generated: 2025-03-22T10:30:00Z
+
+executionPlan:
+  parallelism:
+    tensorParallel: 4
+    pipelineParallel: 1
+    replicas: 2
+    totalGPUs: 8
+
+  scheduler:
+    maxBatchSize: 42
+    maxTokensInBatch: 344064
+    chunkedPrefill: true
+    maxChunkedPrefillTokens: 2048
+    schedulerSteps: 5
+    maxWaitTimeMs: 5
+
+  kvCache:
+    blockSize: 16
+    gpuCacheBlocks: 8192
+    cpuSwapBlocks: 4096
+    gpuUtilization: 0.90
+    offloadPolicy: lru
+    tier1Enabled: true    # CPU DRAM tier
+    tier2Enabled: false   # NVMe (not needed for this config)
+
+  routing:
+    policy: kv-aware
+    kvAwareRouting: true
+    loadBalancingWindow: 100
+    sessionAffinity: true
+    sessionAffinityTimeout: 300s
+
+  autoscaling:
+    minReplicas: 1
+    maxReplicas: 8
+    scaleUpThreshold: 0.90
+    scaleDownThreshold: 0.40
+    scaleUpCooldown: 60s
+    scaleDownCooldown: 300s
+    metric: gpu_utilization
+```
+
+### Stage 4: Deployment
+
+The execution plan is rendered into deployment manifests. llm-d supports Kubernetes (primary) and Ray (alternative).
+
+```python
+def generate_kubernetes_manifest(plan, model_spec, resource_spec):
+    """Generate Kubernetes deployment from execution plan."""
+    manifest = {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {
+            "name": f"llmd-{model_spec['metadata']['name']}",
+            "namespace": model_spec["metadata"]["namespace"],
+        },
+        "spec": {
+            "replicas": plan.num_replicas,
+            "selector": {
+                "matchLabels": {
+                    "app": model_spec["metadata"]["name"],
+                }
+            },
+            "template": {
+                "metadata": {
+                    "labels": {
+                        "app": model_spec["metadata"]["name"],
+                    }
+                },
+                "spec": {
+                    "containers": [{
+                        "name": "inference",
+                        "image": "nvcr.io/nvidia/dynamo:latest",
+                        "resources": {
+                            "limits": {
+                                "nvidia.com/gpu": plan.tp_degree * plan.pp_degree,
+                            }
+                        },
+                        "env": [
+                            {"name": "DYNAMO_TP_DEGREE",
+                             "value": str(plan.tp_degree)},
+                            {"name": "DYNAMO_PP_DEGREE",
+                             "value": str(plan.pp_degree)},
+                            {"name": "DYNAMO_MAX_BATCH",
+                             "value": str(plan.max_batch_size)},
+                            {"name": "DYNAMO_BLOCK_SIZE",
+                             "value": str(plan.block_size)},
+                            {"name": "DYNAMO_GPU_CACHE_BLOCKS",
+                             "value": str(plan.gpu_cache_blocks)},
+                            {"name": "DYNAMO_CHUNKED_PREFILL_TOKENS",
+                             "value": str(plan.max_chunked_prefill_tokens)},
+                            {"name": "DYNAMO_ROUTING_POLICY",
+                             "value": plan.routing_policy},
+                        ],
+                        "volumeMounts": [{
+                            "name": "model-weights",
+                            "mountPath": "/models",
+                        }],
+                    }],
+                    "volumes": [{
+                        "name": "model-weights",
+                        "persistentVolumeClaim": {
+                            "claimName": "model-weights-pvc",
+                        }
+                    }],
+                    "nodeSelector": {
+                        "nvidia.com/gpu.product": resource_spec["gpuType"],
+                    },
+                    "tolerations": [{
+                        "key": "nvidia.com/gpu",
+                        "operator": "Exists",
+                        "effect": "NoSchedule",
+                    }],
+                }
+            }
+        }
+    }
+    return manifest
+```
+
+<Callout type="warning" title="GPU Topology Awareness">
+When TP=4, all 4 GPUs must be in the same NVLink domain (typically one node). The Kubernetes scheduler does not natively understand GPU topology. llm-d injects topology constraints via node affinity rules and the NVIDIA GPU Operator's topology-aware scheduling. Without this, Kubernetes might schedule 4 GPUs across 2 nodes, forcing communication over InfiniBand instead of NVLink — a 14x bandwidth reduction.
+</Callout>
+
+## Complete Configuration Examples
+
+### Example 1: Low-Latency Chat Service
+
+```yaml
+apiVersion: llm-d/v1
+kind: InferenceService
+
+metadata:
+  name: llama-70b-chat
+  namespace: production
+
+spec:
+  model:
+    name: meta-llama/Llama-3.1-70B-Instruct
+    revision: main
+    quantization: fp8
+    maxContextLength: 4096
+
+  serving:
+    latency:
+      ttftP50: 50ms
+      ttftP99: 100ms
+      tpotP50: 10ms
+      tpotP99: 20ms
+    throughput:
+      minTokensPerSecond: 10000
+      maxConcurrentRequests: 500
+    scaling:
+      minReplicas: 2
+      maxReplicas: 16
+      targetUtilization: 0.75
+
+  resources:
+    gpuType: H100-SXM
+    gpuMemory: 80GB
+    interconnect: NVLink
+    maxGPUs: 128
+    gpusPerNode: 8
+```
+
+Compiled plan: TP=8, PP=1, 8 replicas, max batch 58 per replica. The tight TTFT (100ms P99) forces TP=8, and the high throughput target (10K tok/s) requires 8 replicas across 64 GPUs.
+
+### Example 2: High-Throughput Batch Processing
+
+```yaml
+apiVersion: llm-d/v1
+kind: InferenceService
+
+metadata:
+  name: llama-70b-batch
+  namespace: batch-jobs
+
+spec:
+  model:
+    name: meta-llama/Llama-3.1-70B-Instruct
+    revision: main
+    quantization: awq-int4
+    maxContextLength: 16384
+
+  serving:
+    latency:
+      ttftP99: 2000ms     # Relaxed: batch jobs tolerate latency
+      tpotP99: 50ms
+    throughput:
+      minTokensPerSecond: 50000
+    scaling:
+      minReplicas: 4
+      maxReplicas: 32
+      targetUtilization: 0.95   # Pack GPUs tight
+
+  resources:
+    gpuType: H100-SXM
+    gpuMemory: 80GB
+    interconnect: NVLink
+    maxGPUs: 256
+    gpusPerNode: 8
+```
+
+Compiled plan: TP=4, PP=1, 16 replicas, max batch 84 per replica. The relaxed TTFT (2000ms) allows TP=4 (cheaper per-replica) while the high throughput target (50K tok/s) is met through many replicas. INT4 quantization frees memory for larger batches.
+
+### Example 3: Speculative Decoding Configuration
+
+```yaml
+apiVersion: llm-d/v1
+kind: InferenceService
+
+metadata:
+  name: llama-70b-speculative
+  namespace: production
+
+spec:
+  model:
+    name: meta-llama/Llama-3.1-70B-Instruct
+    revision: main
+    quantization: fp8
+    maxContextLength: 8192
+    speculative:
+      draftModel: meta-llama/Llama-3.1-1B
+      numSpeculativeTokens: 5
+      acceptanceThreshold: 0.8
+
+  serving:
+    latency:
+      ttftP99: 200ms
+      tpotP99: 15ms      # Aggressive TPOT target
+    throughput:
+      minTokensPerSecond: 8000
+    scaling:
+      minReplicas: 2
+      maxReplicas: 8
+      targetUtilization: 0.80
+
+  resources:
+    gpuType: H100-SXM
+    gpuMemory: 80GB
+    interconnect: NVLink
+    maxGPUs: 64
+    gpusPerNode: 8
+```
+
+llm-d recognizes the speculative decoding spec and adjusts the execution plan: the draft model runs on the same GPUs as the target model (it is small enough at 1B parameters to share memory), and the scheduler alternates between draft-model decode steps and target-model verification steps. The 15ms TPOT target is achievable because speculative decoding generates approximately 3-4 accepted tokens per verification step.
+
+<Benchmark
+  title="Compiled Plans for Three Configurations"
+  columns={["Config", "TP", "PP", "Batch", "Replicas", "GPUs", "Throughput"]}
+  rows={[
+    { values: ["Chat (low latency)", "8", "1", "58", "8", "64", "12K tok/s"], highlight: false },
+    { values: ["Batch (high throughput)", "4", "1", "84", "16", "64", "52K tok/s"], highlight: true },
+    { values: ["Speculative (fast decode)", "4", "1", "36", "4", "16", "9.2K tok/s"], highlight: false },
+  ]}
+  notes="Same model, different serving specs produce different execution plans. llm-d optimizes each independently."
+/>
+
+## Hot-Reloading: Update Without Downtime
+
+Production systems must adapt to changing traffic patterns. llm-d supports hot-reloading: modify the YAML and llm-d detects changes, recompiles the execution plan, and applies a rolling update.
+
+```python
+import hashlib
+import time
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+class LlmdConfigWatcher(FileSystemEventHandler):
+    """Watch YAML config files and trigger recompilation on changes."""
+
+    def __init__(self, config_path, deployer):
+        self.config_path = config_path
+        self.deployer = deployer
+        self.current_hash = self._compute_hash()
+        self.last_update = 0
+        self.cooldown_seconds = 10  # Debounce rapid changes
+
+    def _compute_hash(self):
+        with open(self.config_path, 'rb') as f:
+            return hashlib.sha256(f.read()).hexdigest()
+
+    def on_modified(self, event):
+        if event.src_path != self.config_path:
+            return
+
+        # Debounce
+        now = time.time()
+        if now - self.last_update < self.cooldown_seconds:
+            return
+
+        new_hash = self._compute_hash()
+        if new_hash == self.current_hash:
+            return
+
+        print(f"Config change detected: {self.config_path}")
+        self.current_hash = new_hash
+        self.last_update = now
+
+        try:
+            new_spec = parse_yaml(self.config_path)
+            new_plan = compile_spec(new_spec)
+            diff = compute_plan_diff(self.deployer.current_plan, new_plan)
+            self.deployer.apply_rolling_update(diff)
+        except Exception as e:
+            print(f"Recompilation failed: {e}. Keeping current config.")
+```
+
+### What Can Be Hot-Reloaded
+
+Not all changes are equal. llm-d classifies changes by their impact:
+
+```python
+@dataclass
+class PlanDiff:
+    """Difference between old and new execution plans."""
+    # Level 0: No restart needed (routing, scaling parameters)
+    routing_changes: dict
+    scaling_changes: dict
+
+    # Level 1: Scheduler restart (batch parameters)
+    batch_changes: dict
+
+    # Level 2: Worker restart (TP/PP degree, quantization)
+    parallelism_changes: dict
+
+    # Level 3: Full redeployment (model change)
+    model_changes: dict
+
+    @property
+    def max_level(self):
+        if self.model_changes:
+            return 3
+        if self.parallelism_changes:
+            return 2
+        if self.batch_changes:
+            return 1
+        if self.routing_changes or self.scaling_changes:
+            return 0
+        return -1  # No changes
+
+def apply_rolling_update(deployer, diff):
+    """Apply changes with minimal disruption."""
+    level = diff.max_level
+
+    if level == 0:
+        # Hot-patch routing and scaling rules
+        # No request interruption
+        deployer.update_routing(diff.routing_changes)
+        deployer.update_autoscaler(diff.scaling_changes)
+        print("Level 0: Routing/scaling updated in-place")
+
+    elif level == 1:
+        # Drain current batch, restart scheduler
+        # Brief interruption (sub-second)
+        deployer.drain_batch()
+        deployer.restart_scheduler(diff.batch_changes)
+        print("Level 1: Scheduler restarted after batch drain")
+
+    elif level == 2:
+        # Rolling restart of worker pods
+        # Requests routed to remaining replicas during restart
+        for replica_id in range(deployer.num_replicas):
+            deployer.cordon_replica(replica_id)
+            deployer.drain_replica(replica_id)
+            deployer.restart_replica(replica_id, diff.parallelism_changes)
+            deployer.uncordon_replica(replica_id)
+            # Wait for replica to be healthy before proceeding
+            deployer.wait_for_health(replica_id, timeout=120)
+        print("Level 2: Rolling restart complete")
+
+    elif level == 3:
+        # Full redeployment (model weights changed)
+        # Blue-green deployment: spin up new, switch traffic, tear down old
+        new_deployment = deployer.create_deployment(diff.model_changes)
+        deployer.wait_for_health(new_deployment, timeout=600)
+        deployer.switch_traffic(new_deployment)
+        deployer.teardown_old()
+        print("Level 3: Blue-green deployment complete")
+```
+
+<Benchmark
+  title="Hot-Reload Impact by Change Level"
+  columns={["Change Level", "Example Change", "Downtime", "Request Loss"]}
+  rows={[
+    { values: ["Level 0", "Scale from 2 to 4 replicas", "0 ms", "None"], highlight: true },
+    { values: ["Level 0", "Change routing from round-robin to kv-aware", "0 ms", "None"], highlight: true },
+    { values: ["Level 1", "Increase max batch from 42 to 64", "200-500 ms", "In-flight requests complete"], highlight: false },
+    { values: ["Level 2", "Change TP from 4 to 8", "30-60 sec (rolling)", "None (routed to other replicas)"], highlight: false },
+    { values: ["Level 3", "Switch from Llama 70B to Llama 405B", "5-10 min (blue-green)", "None (traffic switches atomically)"], highlight: false },
+  ]}
+/>
+
+### Example: Scaling Up Under Load
+
+Initial configuration serves 5,000 tokens/second. Traffic spikes to 15,000 tokens/second. The operations team updates the YAML:
+
+```yaml
+# Change: increase throughput target and replica count
+serving:
+  throughput:
+    minTokensPerSecond: 15000   # Was: 5000
+  scaling:
+    minReplicas: 4              # Was: 1
+    maxReplicas: 16             # Was: 8
+```
+
+llm-d detects this as a Level 0 change (only scaling parameters changed). It immediately updates the autoscaler, which spins up 4 additional replicas (from 2 to 6) to handle the increased throughput. No existing requests are interrupted. The new replicas load model weights from the shared persistent volume and begin accepting traffic within 30-60 seconds of the YAML change.
+
+## Validation and Error Reporting
+
+llm-d validates the YAML against the schema before compilation and reports clear errors when constraints conflict.
+
+```python
+class ValidationError:
+    def __init__(self, field, message, suggestion=""):
+        self.field = field
+        self.message = message
+        self.suggestion = suggestion
+
+def validate_spec(spec):
+    """Validate llm-d YAML specification."""
+    errors = []
+
+    # Check model exists in registry
+    model_name = spec["spec"]["model"]["name"]
+    if not model_registry.exists(model_name):
+        errors.append(ValidationError(
+            "spec.model.name",
+            f"Model '{model_name}' not found in registry",
+            "Check HuggingFace model ID or register a custom model"
+        ))
+
+    # Check quantization compatibility
+    quant = spec["spec"]["model"].get("quantization", "none")
+    if quant == "awq-int4":
+        if not model_registry.has_awq_weights(model_name):
+            errors.append(ValidationError(
+                "spec.model.quantization",
+                f"AWQ-INT4 weights not available for {model_name}",
+                "Use fp8 or none, or provide custom AWQ weights"
+            ))
+
+    # Check GPU type exists
+    gpu_type = spec["spec"]["resources"]["gpuType"]
+    if gpu_type not in GPU_REGISTRY:
+        errors.append(ValidationError(
+            "spec.resources.gpuType",
+            f"Unknown GPU type: {gpu_type}",
+            f"Supported: {', '.join(GPU_REGISTRY.keys())}"
+        ))
+
+    # Check memory feasibility
+    model_profile = model_registry.get_profile(model_name, quant)
+    gpu_mem = parse_memory(spec["spec"]["resources"]["gpuMemory"])
+    if model_profile.weight_bytes / 1e9 > gpu_mem * spec["spec"]["resources"]["maxGPUs"]:
+        errors.append(ValidationError(
+            "spec.resources.maxGPUs",
+            f"Model weights ({model_profile.weight_bytes / 1e9:.1f} GB) "
+            f"exceed total GPU memory "
+            f"({gpu_mem * spec['spec']['resources']['maxGPUs']:.0f} GB)",
+            "Increase maxGPUs, use stronger quantization, or choose a smaller model"
+        ))
+
+    # Check latency feasibility (rough estimate)
+    ttft = parse_duration(spec["spec"]["serving"]["latency"]["ttftP99"])
+    min_tp = max(1, int(model_profile.weight_bytes / 1e9 / (gpu_mem * 0.9)) + 1)
+    min_prefill_ms = estimate_prefill_time(model_profile, min_tp, gpu_type)
+    if min_prefill_ms > ttft:
+        errors.append(ValidationError(
+            "spec.serving.latency.ttftP99",
+            f"TTFT target {ttft}ms is not achievable. "
+            f"Minimum prefill time with TP={min_tp}: {min_prefill_ms:.0f}ms",
+            f"Increase TTFT target to at least {int(min_prefill_ms * 1.2)}ms "
+            f"or increase TP degree (requires more GPUs per replica)"
+        ))
+
+    return errors
+```
+
+Example error output:
+
+```
+$ llmd validate llama-70b-prod.yaml
+
+Validation Results:
+  [ERROR] spec.serving.latency.ttftP99:
+    TTFT target 50ms is not achievable.
+    Minimum prefill time with TP=4: 82ms
+    Suggestion: Increase TTFT target to at least 98ms
+    or increase TP degree (requires more GPUs per replica)
+
+  [WARNING] spec.resources.maxGPUs:
+    Requested throughput (50000 tok/s) requires approximately
+    48 GPUs, which exceeds 90% of maxGPUs (32).
+    Autoscaling headroom may be insufficient.
+
+  [OK] spec.model: Model profile resolved successfully
+  [OK] spec.model.quantization: AWQ-INT4 weights available
+```
+
+<Callout type="tip" title="Dry-Run Mode">
+`llmd compile --dry-run config.yaml` runs the full compilation pipeline without deploying. It outputs the execution plan, resource requirements, and any warnings. Use this to validate configurations before applying them to a production cluster.
+</Callout>
+
+## Performance: Declarative vs Hand-Tuned
+
+A common concern: does a compiler-generated configuration match an expert's hand-tuned configuration? The answer depends on the complexity of the deployment.
+
+<PerfChart
+  title="Throughput: llm-d Compiled vs Expert Hand-Tuned"
+  data={[
+    { label: "Hand-tuned (single replica)", value: 5200, color: "orange", annotation: "Expert spent 4 hours" },
+    { label: "llm-d compiled (single replica)", value: 4980, color: "blue", annotation: "Compiled in 2 seconds" },
+    { label: "Hand-tuned (multi-replica)", value: 18500, color: "orange", annotation: "Expert spent 8 hours" },
+    { label: "llm-d compiled (multi-replica)", value: 18200, color: "blue", annotation: "Compiled in 2 seconds" },
+  ]}
+  unit="tokens/sec (Llama 70B, 8x H100)"
+/>
+
+For single-replica deployments, llm-d is within 4% of expert hand-tuning. For multi-replica deployments (where routing and load balancing add complexity), llm-d is within 2%. The hand-tuned advantage comes from hardware-specific tricks (CUDA stream priorities, custom memory pool sizes) that llm-d's general-purpose compiler does not exploit. For most deployments, the 2-4% gap is negligible compared to the hours of engineering time saved.
+
+Where llm-d excels over hand-tuning is in multi-model or multi-configuration deployments. An expert tuning 10 different model configurations spends days; llm-d compiles all 10 in seconds and maintains consistency across configurations.
+
+<Benchmark
+  title="Engineering Time: llm-d vs Manual Configuration"
+  columns={["Task", "Manual (Expert)", "llm-d", "Speedup"]}
+  rows={[
+    { values: ["Single model deploy", "4 hours", "2 minutes", "120x"], highlight: false },
+    { values: ["Optimize for new SLO", "2 hours", "10 seconds", "720x"], highlight: true },
+    { values: ["Scale from 8 to 64 GPUs", "3 hours", "30 seconds", "360x"], highlight: true },
+    { values: ["Debug OOM at production load", "6 hours", "N/A (prevented)", "—"], highlight: false },
+    { values: ["Add speculative decoding", "8 hours", "5 minutes", "96x"], highlight: false },
+  ]}
+  notes="llm-d prevents OOM errors by validating memory constraints at compile time."
+/>
+
+## Summary
+
+llm-d replaces imperative inference configuration with declarative YAML specifications. The three-spec model (ModelSpec, ServingSpec, ResourceSpec) separates intent from implementation: you declare what model to serve, what performance you need, and what hardware you have. llm-d's compiler derives the optimal TP/PP degrees, batch parameters, routing rules, and KV cache policies.
+
+The compilation pipeline validates constraints before deployment, preventing infeasible configurations and OOM errors. Hot-reloading enables live updates with minimal disruption — scaling changes take effect immediately, while structural changes use rolling restarts.
+
+The cost of abstraction is minimal: compiled configurations achieve 96-98% of the throughput of expert hand-tuned configurations. The benefit is engineering velocity: configuration changes that take hours of expert tuning take seconds with llm-d, and the compiled plans are guaranteed to satisfy the declared constraints.

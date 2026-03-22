@@ -271,9 +271,23 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"dataset-frontier-agent-simulation-synthetic.mdx": {
+	id: "dataset-frontier-agent-simulation-synthetic.mdx";
+  slug: "dataset-frontier-agent-simulation-synthetic";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "dataset-frontier-curation-dclm-fineweb.mdx": {
 	id: "dataset-frontier-curation-dclm-fineweb.mdx";
   slug: "dataset-frontier-curation-dclm-fineweb";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"dataset-frontier-preference-data-dpo-rlhf.mdx": {
+	id: "dataset-frontier-preference-data-dpo-rlhf.mdx";
+  slug: "dataset-frontier-preference-data-dpo-rlhf";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -425,6 +439,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"frontier-research-long-context-10m-architectures.mdx": {
+	id: "frontier-research-long-context-10m-architectures.mdx";
+  slug: "frontier-research-long-context-10m-architectures";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "frontier-research-policy-of-thoughts-test-time.mdx": {
 	id: "frontier-research-policy-of-thoughts-test-time.mdx";
   slug: "frontier-research-policy-of-thoughts-test-time";
@@ -442,6 +463,13 @@ declare module 'astro:content' {
 "frontier-research-reward-model-engineering.mdx": {
 	id: "frontier-research-reward-model-engineering.mdx";
   slug: "frontier-research-reward-model-engineering";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"frontier-research-test-time-compute-small-beats-large.mdx": {
+	id: "frontier-research-test-time-compute-small-beats-large.mdx";
+  slug: "frontier-research-test-time-compute-small-beats-large";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -509,9 +537,30 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"inference-timeline-batched-gemm-throughput.mdx": {
+	id: "inference-timeline-batched-gemm-throughput.mdx";
+  slug: "inference-timeline-batched-gemm-throughput";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "inference-timeline-speculative-decoding-v2.mdx": {
 	id: "inference-timeline-speculative-decoding-v2.mdx";
   slug: "inference-timeline-speculative-decoding-v2";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"inference-timeline-token-generation-pipeline.mdx": {
+	id: "inference-timeline-token-generation-pipeline.mdx";
+  slug: "inference-timeline-token-generation-pipeline";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"inference-timeline-vlm-serving-vit-paging.mdx": {
+	id: "inference-timeline-vlm-serving-vit-paging.mdx";
+  slug: "inference-timeline-vlm-serving-vit-paging";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -897,6 +946,13 @@ declare module 'astro:content' {
 "vllm-v1-disaggregated-multimodal-serving.mdx": {
 	id: "vllm-v1-disaggregated-multimodal-serving.mdx";
   slug: "vllm-v1-disaggregated-multimodal-serving";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"vllm-v1-omniconnector-multimodal-lifecycle.mdx": {
+	id: "vllm-v1-omniconnector-multimodal-lifecycle.mdx";
+  slug: "vllm-v1-omniconnector-multimodal-lifecycle";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
