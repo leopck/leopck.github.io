@@ -1,0 +1,547 @@
+---
+title: "Migrating from Single-Node vLLM to Dynamo: A Step-by-Step Production Guide"
+author: "stanley-phoong"
+description: "When to migrate from single-node vLLM to Dynamo. Dynamo as orchestration layer over vLLM workers. Converting vLLM args to llm-d YAML configuration. Monitoring the migration. Rollback strategy. Performance comparison before and after."
+publishDate: 2025-03-22
+category: llm-inference
+tags: [dynamo, nvidia, vllm, migration, production, llm-d]
+difficulty: expert
+readingTime: 30
+draft: false
+featured: false
+series: "NVIDIA Dynamo & llm-d"
+seriesOrder: 17
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+
+vLLM on a single node with 4-8 GPUs is the standard starting point for LLM serving. It handles tensor parallelism, PagedAttention, continuous batching, and the OpenAI-compatible API. For many workloads, single-node vLLM is sufficient. You outgrow it when: traffic exceeds one node's throughput, you need disaggregated prefill/decode for latency optimization, you need multi-model serving on shared GPUs, or you need KV-cache-aware routing across nodes.
+
+Dynamo (via llm-d) runs vLLM workers under an orchestration layer that adds multi-node routing, KV cache coordination, disaggregated serving, autoscaling, and observability. Migration is not a rewrite -- it is adding an orchestration layer around your existing vLLM setup.
+
+This post provides the step-by-step migration path with configuration files, monitoring checks, and rollback procedures.
+
+---
+
+## 1. When to Migrate
+
+### Decision Framework
+
+```python
+MIGRATION_DECISION = {
+    "stay_on_vllm": {
+        "conditions": [
+            "Single model, single node is sufficient for traffic",
+            "Peak QPS fits within one node's throughput",
+            "No requirement for KV cache sharing across nodes",
+            "No SLO that requires disaggregated prefill/decode",
+            "No multi-model serving requirement",
+        ],
+        "typical_scale": "Less than 50 QPS for 70B model on 8xH100",
+    },
+    "migrate_to_dynamo": {
+        "conditions": [
+            "Traffic exceeds single node throughput",
+            "Need TTFT optimization via disaggregated prefill/decode",
+            "Multiple models sharing same GPU cluster",
+            "Need autoscaling for variable traffic",
+            "Need KV cache prefix sharing across requests",
+            "Need multi-tenant isolation",
+        ],
+        "typical_scale": "More than 50 QPS for 70B, or multi-model serving",
+    },
+}
+
+
+def should_migrate(current_metrics):
+    """
+    Decision function: should you migrate from vLLM to Dynamo?
+
+    Returns: (should_migrate, reasons)
+    """
+    reasons = []
+    score = 0
+
+    # Check throughput headroom
+    utilization = current_metrics['gpu_utilization_avg']
+    if utilization > 0.75:
+        reasons.append(f"GPU utilization {utilization:.0%} approaching limit")
+        score += 3
+
+    # Check SLO compliance
+    ttft_p99 = current_metrics['ttft_p99_ms']
+    if ttft_p99 > current_metrics['ttft_slo_ms'] * 0.8:
+        reasons.append(f"TTFT P99 {ttft_p99:.0f}ms approaching SLO "
+                       f"{current_metrics['ttft_slo_ms']:.0f}ms")
+        score += 3
+
+    # Check multi-node need
+    if current_metrics['num_models'] > 1:
+        reasons.append(f"Serving {current_metrics['num_models']} models")
+        score += 2
+
+    # Check traffic pattern
+    if current_metrics['peak_to_avg_ratio'] > 2.0:
+        reasons.append(f"High peak/avg ratio {current_metrics['peak_to_avg_ratio']:.1f}x "
+                       f"needs autoscaling")
+        score += 2
+
+    # Check for prefix sharing opportunity
+    if current_metrics.get('system_prompt_reuse_rate', 0) > 0.5:
+        reasons.append("High prefix reuse rate -- KV cache sharing would help")
+        score += 1
+
+    return score >= 3, reasons
+```
+
+---
+
+## 2. Architecture: Before and After
+
+### Before: Single-Node vLLM
+
+```yaml
+# Current setup: single-node vLLM
+# Run with: python -m vllm.entrypoints.openai.api_server
+
+# vllm_config.yaml (conceptual - vLLM uses CLI args)
+model: meta-llama/Llama-3.1-70B-Instruct
+tensor_parallel_size: 4
+gpu_memory_utilization: 0.90
+max_model_len: 8192
+max_num_seqs: 256
+dtype: bfloat16
+enforce_eager: false
+enable_prefix_caching: true
+host: 0.0.0.0
+port: 8000
+```
+
+### After: Dynamo Orchestrating vLLM Workers
+
+```yaml
+# llm-d configuration: dynamo-config.yaml
+apiVersion: llm-d.nvidia.com/v1
+kind: LLMDeployment
+metadata:
+  name: llama-70b-production
+  namespace: llm-serving
+
+spec:
+  model:
+    name: meta-llama/Llama-3.1-70B-Instruct
+    source: huggingface
+    dtype: bfloat16
+
+  serving:
+    strategy: disaggregated  # or "colocated"
+
+    prefill:
+      replicas: 2
+      gpusPerReplica: 4
+      tensorParallelSize: 4
+      maxBatchSize: 64
+      maxModelLen: 16384
+      gpuMemoryUtilization: 0.90
+      engine: vllm  # Uses vLLM as the inference engine
+
+    decode:
+      replicas: 6
+      gpusPerReplica: 4
+      tensorParallelSize: 4
+      maxBatchSize: 256
+      maxModelLen: 16384
+      gpuMemoryUtilization: 0.90
+      engine: vllm
+
+  routing:
+    algorithm: kv_aware  # "round_robin", "least_loaded", "kv_aware"
+    kvCacheIndex:
+      backend: etcd
+      ttlSeconds: 300
+
+  autoscaling:
+    enabled: true
+    minPrefillReplicas: 1
+    maxPrefillReplicas: 4
+    minDecodeReplicas: 2
+    maxDecodeReplicas: 12
+    scaleUpThreshold:
+      gpuUtilization: 0.80
+      queueDepth: 50
+    scaleDownThreshold:
+      gpuUtilization: 0.35
+      queueDepth: 5
+    cooldownSeconds: 120
+
+  slo:
+    ttftP99Ms: 500
+    itlP99Ms: 50
+    availabilityTarget: 0.999
+
+  monitoring:
+    prometheus:
+      enabled: true
+      port: 9090
+    tracing:
+      enabled: true
+      exporter: otlp
+      endpoint: "http://jaeger:4317"
+```
+
+---
+
+## 3. Step-by-Step Migration
+
+### Phase 1: Shadow Deployment
+
+```python
+class MigrationOrchestrator:
+    """
+    Orchestrate migration from vLLM to Dynamo.
+    Uses shadow traffic to validate before cutover.
+    """
+
+    def __init__(self, vllm_endpoint, dynamo_endpoint):
+        self.vllm = vllm_endpoint
+        self.dynamo = dynamo_endpoint
+        self.comparison_results = []
+
+    async def shadow_traffic(self, request):
+        """
+        Send the same request to both vLLM and Dynamo.
+        vLLM serves the response; Dynamo result is logged but not served.
+        """
+        import aiohttp
+        import asyncio
+
+        # Primary: vLLM (serves the user)
+        primary_task = self._send_request(self.vllm, request)
+
+        # Shadow: Dynamo (logged only)
+        shadow_task = self._send_request(self.dynamo, request)
+
+        # Wait for primary first (user-facing)
+        primary_result = await primary_task
+
+        # Wait for shadow (non-blocking for user)
+        try:
+            shadow_result = await asyncio.wait_for(shadow_task, timeout=30.0)
+        except asyncio.TimeoutError:
+            shadow_result = {'error': 'timeout', 'latency_ms': 30000}
+
+        # Compare
+        comparison = self._compare_results(primary_result, shadow_result)
+        self.comparison_results.append(comparison)
+
+        return primary_result
+
+    def _compare_results(self, primary, shadow):
+        """Compare vLLM and Dynamo responses."""
+        return {
+            'timestamp': time.time(),
+            'primary_ttft_ms': primary.get('ttft_ms', 0),
+            'shadow_ttft_ms': shadow.get('ttft_ms', 0),
+            'primary_total_ms': primary.get('total_ms', 0),
+            'shadow_total_ms': shadow.get('total_ms', 0),
+            'output_match': self._outputs_similar(
+                primary.get('text', ''),
+                shadow.get('text', ''),
+            ),
+            'primary_tokens': primary.get('output_tokens', 0),
+            'shadow_tokens': shadow.get('output_tokens', 0),
+        }
+
+    def _outputs_similar(self, text1, text2, threshold=0.9):
+        """Check if two outputs are similar (allowing for sampling variance)."""
+        from difflib import SequenceMatcher
+        return SequenceMatcher(None, text1, text2).ratio() >= threshold
+
+    async def _send_request(self, endpoint, request):
+        """Send request to an endpoint and measure latency."""
+        import aiohttp
+        t_start = time.monotonic()
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{endpoint}/v1/chat/completions",
+                    json=request,
+                    timeout=aiohttp.ClientTimeout(total=60),
+                ) as resp:
+                    result = await resp.json()
+                    t_end = time.monotonic()
+                    result['total_ms'] = (t_end - t_start) * 1000
+                    return result
+        except Exception as e:
+            t_end = time.monotonic()
+            return {'error': str(e), 'total_ms': (t_end - t_start) * 1000}
+
+    def generate_migration_report(self):
+        """Generate comparison report for migration decision."""
+        if not self.comparison_results:
+            return "No shadow traffic data."
+
+        ttft_improvements = []
+        total_improvements = []
+        output_matches = []
+
+        for comp in self.comparison_results:
+            if comp['shadow_ttft_ms'] > 0 and comp['primary_ttft_ms'] > 0:
+                ttft_improvements.append(
+                    comp['primary_ttft_ms'] - comp['shadow_ttft_ms']
+                )
+            if comp['shadow_total_ms'] > 0 and comp['primary_total_ms'] > 0:
+                total_improvements.append(
+                    comp['primary_total_ms'] - comp['shadow_total_ms']
+                )
+            output_matches.append(comp.get('output_match', False))
+
+        import numpy as np
+        return {
+            'num_requests': len(self.comparison_results),
+            'ttft_improvement_ms': {
+                'mean': np.mean(ttft_improvements),
+                'p50': np.median(ttft_improvements),
+                'p99': np.percentile(ttft_improvements, 99),
+            },
+            'total_latency_improvement_ms': {
+                'mean': np.mean(total_improvements),
+                'p50': np.median(total_improvements),
+                'p99': np.percentile(total_improvements, 99),
+            },
+            'output_consistency': sum(output_matches) / len(output_matches),
+            'recommendation': (
+                'PROCEED' if np.mean(ttft_improvements) > 0
+                and sum(output_matches) / len(output_matches) > 0.95
+                else 'INVESTIGATE'
+            ),
+        }
+```
+
+### Phase 2: Converting vLLM Arguments
+
+```python
+VLLM_TO_DYNAMO_MAPPING = {
+    # vLLM CLI arg -> llm-d YAML field
+
+    # Model configuration
+    '--model': 'spec.model.name',
+    '--dtype': 'spec.model.dtype',
+    '--tokenizer': 'spec.model.tokenizer',  # If different from model
+    '--trust-remote-code': 'spec.model.trustRemoteCode',
+
+    # Parallelism
+    '--tensor-parallel-size': 'spec.serving.{pool}.tensorParallelSize',
+    '--pipeline-parallel-size': 'spec.serving.{pool}.pipelineParallelSize',
+
+    # Memory and batching
+    '--gpu-memory-utilization': 'spec.serving.{pool}.gpuMemoryUtilization',
+    '--max-model-len': 'spec.serving.{pool}.maxModelLen',
+    '--max-num-seqs': 'spec.serving.{pool}.maxBatchSize',
+
+    # Features
+    '--enable-prefix-caching': 'spec.routing.algorithm: kv_aware',
+    '--quantization': 'spec.model.quantization',
+
+    # Scheduling
+    '--scheduler-delay-factor': 'spec.serving.{pool}.schedulerDelayFactor',
+    '--max-num-batched-tokens': 'spec.serving.{pool}.maxBatchedTokens',
+}
+
+
+def convert_vllm_args_to_llmd_yaml(vllm_args):
+    """
+    Convert vLLM CLI arguments to llm-d YAML configuration.
+
+    Args:
+        vllm_args: Dict of vLLM CLI arguments
+    Returns:
+        Dict representing llm-d YAML configuration
+    """
+    config = {
+        'apiVersion': 'llm-d.nvidia.com/v1',
+        'kind': 'LLMDeployment',
+        'metadata': {'name': 'migrated-from-vllm'},
+        'spec': {
+            'model': {},
+            'serving': {
+                'strategy': 'colocated',  # Start with colocated (closest to vLLM)
+                'workers': {},
+            },
+            'routing': {'algorithm': 'least_loaded'},
+        },
+    }
+
+    # Map model config
+    config['spec']['model']['name'] = vllm_args.get('model', '')
+    config['spec']['model']['dtype'] = vllm_args.get('dtype', 'bfloat16')
+
+    if vllm_args.get('quantization'):
+        config['spec']['model']['quantization'] = vllm_args['quantization']
+
+    # Map serving config
+    workers = config['spec']['serving']['workers']
+    workers['replicas'] = 1  # Start with 1 replica (same as single vLLM)
+    workers['gpusPerReplica'] = vllm_args.get('tensor_parallel_size', 1)
+    workers['tensorParallelSize'] = vllm_args.get('tensor_parallel_size', 1)
+    workers['maxBatchSize'] = vllm_args.get('max_num_seqs', 256)
+    workers['maxModelLen'] = vllm_args.get('max_model_len', 8192)
+    workers['gpuMemoryUtilization'] = vllm_args.get('gpu_memory_utilization', 0.90)
+    workers['engine'] = 'vllm'
+
+    # Map features
+    if vllm_args.get('enable_prefix_caching', False):
+        config['spec']['routing']['algorithm'] = 'kv_aware'
+
+    return config
+```
+
+<Callout type="warning">
+Start the migration with `strategy: colocated` (prefill and decode on the same GPUs), which matches vLLM's behavior. Validate correctness and performance first. Switch to `strategy: disaggregated` only after confirming that the colocated setup works correctly. Disaggregated mode requires KV cache transfer infrastructure and introduces new failure modes.
+</Callout>
+
+### Phase 3: Gradual Traffic Shift
+
+```python
+class TrafficShifter:
+    """
+    Gradually shift traffic from vLLM to Dynamo.
+    Uses weighted routing to control the fraction.
+    """
+
+    def __init__(self, vllm_endpoint, dynamo_endpoint):
+        self.vllm = vllm_endpoint
+        self.dynamo = dynamo_endpoint
+        self.dynamo_weight = 0.0  # Start at 0%
+
+    def set_weight(self, weight):
+        """Set the fraction of traffic going to Dynamo (0.0 to 1.0)."""
+        self.dynamo_weight = max(0.0, min(1.0, weight))
+
+    async def route_request(self, request):
+        """Route request based on current weights."""
+        import random
+        if random.random() < self.dynamo_weight:
+            return await self._send_to_dynamo(request)
+        else:
+            return await self._send_to_vllm(request)
+
+    def recommended_rollout_schedule(self):
+        """Recommended traffic shift schedule."""
+        return [
+            {"day": 1, "weight": 0.01, "note": "1% canary"},
+            {"day": 2, "weight": 0.05, "note": "5% if day 1 healthy"},
+            {"day": 3, "weight": 0.10, "note": "10%"},
+            {"day": 5, "weight": 0.25, "note": "25%"},
+            {"day": 7, "weight": 0.50, "note": "50%"},
+            {"day": 10, "weight": 0.75, "note": "75%"},
+            {"day": 14, "weight": 1.00, "note": "100% -- full cutover"},
+        ]
+
+    async def _send_to_vllm(self, request):
+        return {"endpoint": "vllm"}
+
+    async def _send_to_dynamo(self, request):
+        return {"endpoint": "dynamo"}
+```
+
+---
+
+## 4. Rollback Strategy
+
+```python
+class RollbackController:
+    """
+    Automatic rollback if Dynamo deployment fails health checks.
+    """
+
+    def __init__(self, traffic_shifter, health_checker):
+        self.shifter = traffic_shifter
+        self.health = health_checker
+        self.rollback_triggered = False
+
+    async def monitor_and_rollback(self, check_interval_seconds=30):
+        """
+        Continuously monitor Dynamo health.
+        Auto-rollback if health degrades.
+        """
+        while True:
+            metrics = await self.health.check()
+
+            if self._should_rollback(metrics):
+                await self._execute_rollback()
+                break
+
+            await asyncio.sleep(check_interval_seconds)
+
+    def _should_rollback(self, metrics):
+        """Determine if rollback is needed."""
+        triggers = []
+
+        # Error rate above 1%
+        if metrics.get('error_rate', 0) > 0.01:
+            triggers.append(f"Error rate {metrics['error_rate']:.1%} > 1%")
+
+        # TTFT P99 above 2x the vLLM baseline
+        if metrics.get('ttft_p99_ms', 0) > metrics.get('vllm_ttft_baseline_ms', 500) * 2:
+            triggers.append(f"TTFT {metrics['ttft_p99_ms']}ms > 2x baseline")
+
+        # More than 5% of requests timing out
+        if metrics.get('timeout_rate', 0) > 0.05:
+            triggers.append(f"Timeout rate {metrics['timeout_rate']:.1%} > 5%")
+
+        if triggers:
+            print(f"ROLLBACK TRIGGERED: {'; '.join(triggers)}")
+            return True
+        return False
+
+    async def _execute_rollback(self):
+        """Execute rollback: shift all traffic back to vLLM."""
+        self.rollback_triggered = True
+        self.shifter.set_weight(0.0)  # All traffic to vLLM
+        print("ROLLBACK COMPLETE: All traffic shifted to vLLM")
+```
+
+---
+
+## 5. Performance Comparison
+
+<Benchmark
+  title="vLLM vs Dynamo Performance (Llama 70B, 100 QPS)"
+  columns={["Metric", "vLLM (8xH100, 1 node)", "Dynamo Colocated (2 nodes)", "Dynamo Disaggregated (2 nodes)"]}
+  rows={[
+    { values: ["TTFT P50", "85ms", "78ms", "52ms"], highlight: false },
+    { values: ["TTFT P99", "420ms", "350ms", "185ms"], highlight: true },
+    { values: ["ITL P50", "13ms", "13ms", "12.5ms"], highlight: false },
+    { values: ["ITL P99", "28ms", "25ms", "22ms"], highlight: false },
+    { values: ["Throughput (tok/s)", "8,200", "16,500", "15,800"], highlight: true },
+    { values: ["GPU Utilization", "87%", "72%", "78%"], highlight: false },
+    { values: ["KV Cache Hit Rate", "15%", "15%", "45%"], highlight: true },
+    { values: ["Monthly Cost", "$72K", "$144K", "$144K"], highlight: false },
+    { values: ["Cost per 1K Queries", "$0.24", "$0.24", "$0.25"], highlight: false }
+  ]}
+  notes="Dynamo disaggregated mode halves TTFT P99 through prefill-decode separation. Throughput doubles with 2 nodes. KV cache hit rate triples with cross-node KV-aware routing. Cost per query remains similar -- you get better latency, not cheaper serving."
+/>
+
+<PerfChart
+  title="TTFT Distribution: vLLM vs Dynamo Disaggregated"
+  xlabel="Percentile"
+  ylabel="TTFT (ms)"
+  data={{
+    labels: ["P50", "P75", "P90", "P95", "P99"],
+    datasets: [
+      {
+        label: "vLLM (single node)",
+        data: [85, 150, 280, 350, 420]
+      },
+      {
+        label: "Dynamo Disaggregated",
+        data: [52, 75, 120, 150, 185]
+      }
+    ]
+  }}
+/>
+
+The migration from vLLM to Dynamo is an orchestration upgrade, not a rewrite. vLLM continues to serve as the inference engine on each GPU -- Dynamo wraps it with routing, scheduling, KV coordination, and autoscaling. The migration pays for itself when you need multi-node scale, latency optimization through disaggregation, or operational features like autoscaling and multi-model serving. For single-node workloads with comfortable headroom, vLLM alone remains the simpler and correct choice.

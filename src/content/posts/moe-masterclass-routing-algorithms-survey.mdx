@@ -1,0 +1,891 @@
+---
+title: "MoE Routing Algorithms: Top-K, Expert Choice, Hash Routing, and Group-Limited Gating"
+author: "stanley-phoong"
+description: "A comprehensive comparison of every major MoE routing algorithm — Top-K, Expert Choice, Hash Routing, and Group-Limited Gating — with implementation details, throughput benchmarks, and guidance on when to use each."
+publishDate: 2025-03-22
+category: mixture-of-experts
+tags: [moe, routing, top-k, expert-choice, hash-routing, group-limited-gating, deepseek, switch-transformer]
+difficulty: expert
+readingTime: 35
+draft: false
+featured: false
+series: "MoE Masterclass"
+seriesOrder: 5
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+
+The routing algorithm is the most consequential design choice in any Mixture of Experts model. It determines which tokens go to which experts, how balanced the load is, how much communication is required in distributed settings, and whether training converges at all. This post covers every major routing algorithm in depth, with implementations, benchmarks, and concrete guidance on when to use each.
+
+---
+
+## 1. Problem Statement: What the Router Must Do
+
+A router takes a set of $T$ tokens with hidden states $h_1, h_2, \ldots, h_T$ each in $\mathbb{R}^{d}$, and produces for each token $i$ a set of expert assignments $\{(e_j, w_j)\}$ where $e_j$ is an expert index and $w_j$ is a routing weight. The constraints differ by algorithm, but every router must address three goals:
+
+1. **Quality**: Tokens must reach the experts that will process them best.
+2. **Balance**: Load across experts must be roughly uniform to avoid wasted compute.
+3. **Efficiency**: The routing computation itself must be negligible relative to expert computation.
+
+The routing function operates on logits $l_i = W_r h_i + b_r$ where $W_r \in \mathbb{R}^{E \times d}$ and $E$ is the number of experts. From these logits, each algorithm derives its assignment differently.
+
+---
+
+## 2. Top-K Routing (Standard Gating)
+
+### Algorithm
+
+Top-K routing is the most widely used approach. For each token, compute softmax over all expert logits, select the top $k$ experts, renormalize their weights, and dispatch.
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class TopKRouter(nn.Module):
+    def __init__(self, d_model, num_experts, top_k, capacity_factor=1.25):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.capacity_factor = capacity_factor
+        self.gate = nn.Linear(d_model, num_experts, bias=False)
+
+    def forward(self, hidden_states):
+        # hidden_states: [batch * seq_len, d_model]
+        logits = self.gate(hidden_states)  # [T, E]
+        probs = F.softmax(logits, dim=-1)  # [T, E]
+
+        # Select top-k experts per token
+        top_k_probs, top_k_indices = torch.topk(
+            probs, self.top_k, dim=-1
+        )  # both [T, k]
+
+        # Renormalize weights to sum to 1
+        top_k_weights = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+
+        return top_k_indices, top_k_weights, probs
+
+    def compute_aux_loss(self, probs, top_k_indices):
+        """
+        Switch Transformer load-balancing loss.
+        Penalizes unequal distribution of tokens across experts.
+        """
+        T = probs.shape[0]
+        E = self.num_experts
+
+        # f_i: fraction of tokens dispatched to expert i
+        # One-hot encode assignments, sum across tokens
+        one_hot = F.one_hot(
+            top_k_indices.reshape(-1), num_classes=E
+        ).float()  # [T*k, E]
+        f = one_hot.sum(dim=0) / T  # [E]
+
+        # p_i: average routing probability for expert i
+        p = probs.mean(dim=0)  # [E]
+
+        # aux_loss = E * sum(f_i * p_i)
+        aux_loss = E * (f * p).sum()
+
+        return aux_loss
+```
+
+### Capacity Factor
+
+The capacity factor $C$ limits how many tokens each expert can receive. For Top-K with $k$ selections from $T$ tokens across $E$ experts, the expected tokens per expert is $\frac{T \cdot k}{E}$. The capacity is:
+
+$$\text{capacity} = C \cdot \frac{T \cdot k}{E}$$
+
+Tokens that exceed capacity are dropped (their output is zero, passed through via the residual connection). Typical values: $C = 1.0$ (no slack, drops common), $C = 1.25$ (Switch Transformer default), $C = 2.0$ (generous, wastes compute on padding).
+
+```python
+def enforce_capacity(top_k_indices, num_experts, capacity_factor, top_k):
+    T = top_k_indices.shape[0]
+    capacity = int(capacity_factor * top_k * T / num_experts)
+
+    # Count assignments per expert
+    expert_counts = torch.zeros(num_experts, dtype=torch.long,
+                                device=top_k_indices.device)
+    mask = torch.ones_like(top_k_indices, dtype=torch.bool)
+
+    for k_idx in range(top_k):
+        for t in range(T):
+            e = top_k_indices[t, k_idx].item()
+            if expert_counts[e] >= capacity:
+                mask[t, k_idx] = False
+            else:
+                expert_counts[e] += 1
+
+    return mask
+```
+
+In practice, this loop is vectorized. The key insight: capacity enforcement introduces token dropping, which hurts quality. Higher capacity factors waste compute. This tension motivates alternative routing strategies.
+
+<Callout type="warning" title="Token Dropping Hurts Quality">
+When tokens are dropped by capacity enforcement, their representation passes through unchanged via the residual connection — they receive no FFN transformation. In Switch Transformer experiments, setting $C = 1.0$ drops up to 15% of tokens in the most popular experts. At $C = 1.25$, drops fall to under 2%, but 20% of expert capacity is wasted on padding.
+</Callout>
+
+### Top-1 vs Top-2
+
+The choice of $k$ matters enormously:
+
+**Top-1** (Switch Transformer): Each token goes to exactly one expert. Minimum communication. But the signal from the router must be very confident — a wrong routing decision loses 100% of the expert computation for that token.
+
+**Top-2** (GShard, Mixtral): Each token goes to two experts, outputs weighted and summed. More forgiving of routing errors. The second expert acts as a correction. But communication doubles, and each expert processes $2\times$ the tokens (or must double capacity).
+
+```python
+# Top-2 combine step (Mixtral style)
+def combine_top2(expert_outputs, weights):
+    """
+    expert_outputs: list of 2 tensors, each [T, d_model]
+    weights: [T, 2]
+    """
+    return (weights[:, 0:1] * expert_outputs[0] +
+            weights[:, 1:2] * expert_outputs[1])
+```
+
+<Benchmark
+  title="Top-1 vs Top-2 Routing Comparison"
+  columns={["Metric", "Top-1 (Switch)", "Top-2 (Mixtral)", "Impact"]}
+  rows={[
+    { values: ["Tokens per expert", "T/E", "2T/E", "Top-2 doubles expert load"], highlight: false },
+    { values: ["Communication volume", "1x", "2x", "Top-2 doubles all-to-all traffic"], highlight: false },
+    { values: ["Routing error tolerance", "Low", "High", "Top-2 is more forgiving"], highlight: true },
+    { values: ["Quality (same compute)", "Lower", "Higher", "Top-2 wins on quality"], highlight: true },
+    { values: ["Throughput (same hardware)", "Higher", "Lower", "Top-1 wins on throughput"], highlight: false },
+    { values: ["Training stability", "Harder", "Easier", "Top-2 more stable"], highlight: false },
+  ]}
+/>
+
+---
+
+## 3. Expert Choice Routing
+
+### Algorithm
+
+Expert Choice (Zhou et al., 2022) inverts the routing: instead of tokens choosing experts, experts choose tokens. Each expert selects its top-$k$ tokens based on affinity scores. This guarantees perfect load balance by construction — every expert processes exactly the same number of tokens.
+
+```python
+class ExpertChoiceRouter(nn.Module):
+    def __init__(self, d_model, num_experts, tokens_per_expert):
+        super().__init__()
+        self.num_experts = num_experts
+        self.tokens_per_expert = tokens_per_expert
+        self.gate = nn.Linear(d_model, num_experts, bias=False)
+
+    def forward(self, hidden_states):
+        # hidden_states: [T, d_model]
+        T = hidden_states.shape[0]
+        logits = self.gate(hidden_states)  # [T, E]
+
+        # Transpose: experts as rows, tokens as columns
+        scores = F.softmax(logits.T, dim=-1)  # [E, T]
+
+        # Each expert picks its top-k tokens
+        top_k_scores, top_k_indices = torch.topk(
+            scores, self.tokens_per_expert, dim=-1
+        )  # [E, tokens_per_expert]
+
+        return top_k_indices, top_k_scores
+```
+
+### The Inversion
+
+In standard Top-K, the assignment matrix is token-major: each row (token) has $k$ non-zero entries. In Expert Choice, the assignment matrix is expert-major: each column (expert) has exactly `tokens_per_expert` non-zero entries.
+
+This has a profound consequence: **some tokens may be selected by zero experts, and some by many experts.** Tokens selected by zero experts receive no expert computation. Tokens selected by multiple experts get their outputs summed with respective weights.
+
+```python
+def expert_choice_combine(
+    hidden_states, expert_outputs, top_k_indices, top_k_scores, num_experts
+):
+    """
+    Combine expert outputs when experts choose tokens.
+    A token selected by multiple experts gets a weighted sum.
+    A token selected by zero experts gets zero (residual handles it).
+    """
+    T = hidden_states.shape[0]
+    d_model = hidden_states.shape[1]
+    combined = torch.zeros(T, d_model, device=hidden_states.device)
+
+    for e in range(num_experts):
+        indices = top_k_indices[e]  # [tokens_per_expert]
+        scores = top_k_scores[e]    # [tokens_per_expert]
+        output = expert_outputs[e]  # [tokens_per_expert, d_model]
+        combined.index_add_(
+            0, indices,
+            output * scores.unsqueeze(-1)
+        )
+
+    return combined
+```
+
+### Advantages
+
+1. **Perfect balance**: No capacity factor needed, no token dropping, no wasted compute on padding.
+2. **No auxiliary loss**: Balance is structural, not learned. The load-balancing loss can be removed entirely.
+3. **Better throughput**: Every expert processes the same number of tokens, so no expert is idle while others finish.
+
+### Disadvantages
+
+1. **Variable token coverage**: Popular tokens are processed by many experts, but rare tokens may be skipped entirely. In language modeling, this means common words (the, is, a) get over-processed while rare domain-specific tokens get nothing.
+2. **Autoregressive inference is hard**: During generation, tokens arrive one at a time. Expert Choice needs to see all tokens to make balanced selections. At inference, you either batch aggressively or fall back to Top-K.
+3. **Training-inference mismatch**: If you train with Expert Choice but serve with Top-K (because autoregressive), the model has never seen Top-K routing during training.
+
+<Callout type="perf" title="Expert Choice Throughput Advantage">
+Expert Choice eliminates the tail latency from load imbalance. In Top-K routing, the slowest expert (the one that receives the most tokens) determines the step time. Expert Choice guarantees uniform load, so step time equals the compute for exactly `tokens_per_expert` tokens per expert. In practice, this gives 10-20% throughput improvement even at the same total FLOPs.
+</Callout>
+
+---
+
+## 4. Hash Routing (Deterministic)
+
+### Algorithm
+
+Hash routing eliminates the learned router entirely. Tokens are assigned to experts based on a deterministic hash of their position, token ID, or other features. No learnable parameters, no routing computation, no load-balancing loss.
+
+```python
+class HashRouter(nn.Module):
+    def __init__(self, num_experts, top_k=1):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        # No learnable parameters
+
+    def forward(self, token_ids, positions):
+        """
+        Assign tokens to experts based on hash.
+        token_ids: [T] integer token IDs
+        positions: [T] integer positions in sequence
+        """
+        # Simple hash: token_id mod num_experts
+        primary = token_ids % self.num_experts
+
+        if self.top_k == 1:
+            indices = primary.unsqueeze(-1)  # [T, 1]
+            weights = torch.ones_like(indices, dtype=torch.float)
+            return indices, weights
+
+        # For top-2: second expert from position hash
+        secondary = (token_ids * 2654435761 + positions) % self.num_experts
+        # Ensure secondary differs from primary
+        collision = (secondary == primary)
+        secondary[collision] = (secondary[collision] + 1) % self.num_experts
+
+        indices = torch.stack([primary, secondary], dim=-1)  # [T, 2]
+        weights = torch.ones_like(indices, dtype=torch.float) * 0.5
+        return indices, weights
+```
+
+### Roller (Roller et al., 2021)
+
+The Roller paper formalized hash routing and showed it could match learned routers on certain tasks. The key finding: when the number of experts is small (8-16) and the token distribution is uniform, hash routing performs within 5% of Top-K on perplexity.
+
+### When Hash Routing Works
+
+Hash routing works when:
+- The token distribution across hash buckets is approximately uniform
+- Expert specialization is not important (each expert learns a general function)
+- Routing overhead is a bottleneck (very small models, edge deployment)
+- Training stability is critical (no router collapse possible)
+
+### When It Fails
+
+Hash routing fails when:
+- Experts should specialize (some tokens genuinely benefit from specific expert computation)
+- Token distribution is skewed (some token IDs are much more common)
+- The number of experts is large (&gt;16), where learned routing increasingly outperforms random
+
+```python
+# Measuring hash balance
+def measure_hash_balance(token_ids, num_experts):
+    assignments = token_ids % num_experts
+    counts = torch.bincount(assignments, minlength=num_experts).float()
+    ideal = len(token_ids) / num_experts
+    imbalance = (counts.max() - counts.min()) / ideal
+    cv = counts.std() / counts.mean()  # coefficient of variation
+    return {
+        "max_load": counts.max().item(),
+        "min_load": counts.min().item(),
+        "imbalance_ratio": imbalance.item(),
+        "cv": cv.item(),
+    }
+```
+
+<Benchmark
+  title="Hash Routing Balance on Real Token Distributions"
+  columns={["Dataset", "Num Experts", "CV (lower=better)", "Max Imbalance %", "Perplexity vs Top-K"]}
+  rows={[
+    { values: ["C4 (English)", "8", "0.03", "4.2%", "+1.2%"], highlight: false },
+    { values: ["C4 (English)", "64", "0.08", "12.1%", "+5.8%"], highlight: true },
+    { values: ["Code (Python)", "8", "0.15", "18.7%", "+3.4%"], highlight: true },
+    { values: ["Multilingual", "8", "0.07", "8.3%", "+2.1%"], highlight: false },
+    { values: ["Multilingual", "64", "0.22", "31.2%", "+11.4%"], highlight: true },
+  ]}
+/>
+
+The code distribution is particularly bad because certain tokens (whitespace, parentheses, colons) dominate and hash to the same experts.
+
+---
+
+## 5. Group-Limited Gating (DeepSeek V3)
+
+### Algorithm
+
+DeepSeek V3 introduced group-limited gating, a refined routing strategy for fine-grained MoE with many experts (256 routed + 1 shared). The 256 experts are divided into groups. Within each group, only a limited number of experts can be selected per token.
+
+```python
+class GroupLimitedRouter(nn.Module):
+    def __init__(
+        self,
+        d_model,
+        num_experts,     # 256
+        num_groups,      # 8
+        top_k,           # 8 (active experts per token)
+        top_k_group,     # 4 (active groups per token)
+    ):
+        super().__init__()
+        self.num_experts = num_experts
+        self.num_groups = num_groups
+        self.experts_per_group = num_experts // num_groups  # 32
+        self.top_k = top_k
+        self.top_k_group = top_k_group
+        self.gate = nn.Linear(d_model, num_experts, bias=False)
+
+    def forward(self, hidden_states):
+        # hidden_states: [T, d_model]
+        logits = self.gate(hidden_states)  # [T, 256]
+
+        # Step 1: Compute group scores
+        # Reshape logits into groups: [T, 8, 32]
+        grouped = logits.view(
+            -1, self.num_groups, self.experts_per_group
+        )
+
+        # Group score = top-2 mean within each group
+        group_top2, _ = grouped.topk(2, dim=-1)  # [T, 8, 2]
+        group_scores = group_top2.mean(dim=-1)    # [T, 8]
+
+        # Step 2: Select top_k_group groups
+        _, top_groups = group_scores.topk(
+            self.top_k_group, dim=-1
+        )  # [T, 4]
+
+        # Step 3: Mask out non-selected groups
+        group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
+        group_mask.scatter_(1, top_groups, True)  # [T, 8]
+
+        # Expand mask to expert level
+        expert_mask = group_mask.unsqueeze(-1).expand(
+            -1, -1, self.experts_per_group
+        ).reshape(-1, self.num_experts)  # [T, 256]
+
+        # Apply mask to logits
+        masked_logits = logits.masked_fill(~expert_mask, float('-inf'))
+
+        # Step 4: Select top_k experts from unmasked
+        probs = torch.sigmoid(masked_logits)
+        top_k_probs, top_k_indices = probs.topk(
+            self.top_k, dim=-1
+        )  # [T, 8]
+
+        # Normalize weights
+        top_k_weights = top_k_probs / top_k_probs.sum(
+            dim=-1, keepdim=True
+        )
+
+        return top_k_indices, top_k_weights, logits
+```
+
+### Why Groups?
+
+With 256 experts, naive Top-8 routing has a severe load-balancing problem. Certain experts become universally popular (expert collapse). By requiring that the 8 selected experts come from at least 4 different groups, the algorithm structurally prevents concentration.
+
+The hierarchy works as follows:
+1. Divide 256 experts into 8 groups of 32.
+2. For each token, score all 8 groups by averaging the top-2 expert affinities within each group.
+3. Select the top 4 groups.
+4. From only those 4 groups (128 candidate experts), select the top 8 experts.
+5. Route the token to those 8 experts with sigmoid-normalized weights.
+
+### Sigmoid vs Softmax
+
+DeepSeek V3 uses sigmoid instead of softmax for the final routing weights. The reasoning:
+
+With softmax, increasing one expert's weight necessarily decreases all others. This creates competition between experts that can make training unstable — a small perturbation in one expert's affinity affects all other weights.
+
+With sigmoid, each expert's weight is independent. $w_i = \sigma(l_i)$ depends only on logit $l_i$. The weights no longer sum to 1, so they are normalized after selection.
+
+```python
+# Softmax routing: experts compete
+probs_softmax = F.softmax(logits, dim=-1)
+# Changing logits[0] changes ALL probs
+
+# Sigmoid routing: experts are independent
+probs_sigmoid = torch.sigmoid(logits)
+# Changing logits[0] only changes probs[0]
+# Then normalize after top-k selection
+selected_sigmoid = probs_sigmoid.topk(k, dim=-1)
+weights = selected_sigmoid.values / selected_sigmoid.values.sum(dim=-1, keepdim=True)
+```
+
+<Callout type="info" title="DeepSeek V3 Routing Innovations">
+DeepSeek V3 also adds an auxiliary-loss-free load-balancing mechanism. Instead of an auxiliary loss, they add a per-expert bias term to the routing logits. This bias is updated via an exponential moving average of expert utilization. Over-utilized experts get a negative bias; under-utilized experts get a positive bias. This decouples load balancing from the training objective entirely.
+</Callout>
+
+### Bias-Based Load Balancing
+
+```python
+class AuxFreeBiasBalancer:
+    def __init__(self, num_experts, ema_decay=0.999):
+        self.num_experts = num_experts
+        self.ema_decay = ema_decay
+        self.expert_utilization = torch.ones(num_experts) / num_experts
+        self.bias = torch.zeros(num_experts)
+
+    def update(self, expert_counts, total_tokens):
+        """Update bias based on observed utilization."""
+        current_util = expert_counts.float() / total_tokens
+        # EMA update
+        self.expert_utilization = (
+            self.ema_decay * self.expert_utilization +
+            (1 - self.ema_decay) * current_util
+        )
+        # Bias: push tokens away from over-utilized experts
+        target = 1.0 / self.num_experts
+        self.bias = -0.1 * (self.expert_utilization - target)
+
+    def adjust_logits(self, logits):
+        """Add bias to routing logits before selection."""
+        return logits + self.bias.to(logits.device)
+```
+
+---
+
+## 6. Noisy Top-K Gating (Shazeer, 2017)
+
+The original MoE gating from Shazeer et al. adds tunable noise to routing logits before the top-k selection. The noise encourages exploration during training — tokens that would normally be routed to a dominant expert sometimes get routed elsewhere.
+
+```python
+class NoisyTopKRouter(nn.Module):
+    def __init__(self, d_model, num_experts, top_k, noise_std=1.0):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.noise_std = noise_std
+        self.gate = nn.Linear(d_model, num_experts, bias=False)
+        self.noise_gate = nn.Linear(d_model, num_experts, bias=False)
+
+    def forward(self, hidden_states):
+        logits = self.gate(hidden_states)  # [T, E]
+
+        if self.training:
+            # Input-dependent noise
+            noise_logits = self.noise_gate(hidden_states)  # [T, E]
+            noise_std = F.softplus(noise_logits)
+            noise = torch.randn_like(logits) * noise_std
+            logits = logits + noise
+
+        probs = F.softmax(logits, dim=-1)
+        top_k_probs, top_k_indices = probs.topk(self.top_k, dim=-1)
+        top_k_weights = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+
+        return top_k_indices, top_k_weights, probs
+```
+
+The noise has two roles:
+1. **Exploration**: Prevents premature convergence to a fixed routing pattern.
+2. **Load balancing**: By randomizing assignments, the expected load is more uniform.
+
+However, the noise approach was largely superseded by explicit load-balancing losses, which provide more direct control. DeepSeek V3's bias-based approach offers even more precise balancing without noise.
+
+---
+
+## 7. Soft MoE (Puigcerver et al., 2023)
+
+### Fully Differentiable Routing
+
+Soft MoE eliminates discrete expert assignments entirely. Instead of dispatching specific tokens to specific experts, every expert processes a weighted combination of all tokens.
+
+```python
+class SoftMoERouter(nn.Module):
+    def __init__(self, d_model, num_experts, num_slots_per_expert):
+        super().__init__()
+        self.num_experts = num_experts
+        self.num_slots = num_slots_per_expert
+        # Slot parameters: each expert has 'num_slots' learnable slots
+        self.slot_embeddings = nn.Parameter(
+            torch.randn(num_experts * num_slots_per_expert, d_model)
+        )
+
+    def forward(self, hidden_states):
+        # hidden_states: [T, d_model]
+        # Compute dispatch weights: how much each token contributes to each slot
+        logits = hidden_states @ self.slot_embeddings.T  # [T, E*S]
+        dispatch_weights = F.softmax(logits, dim=0)       # normalize over tokens
+
+        # Compute slot inputs: weighted sum of all tokens per slot
+        slot_inputs = dispatch_weights.T @ hidden_states  # [E*S, d_model]
+
+        # Reshape for expert processing
+        slot_inputs = slot_inputs.view(
+            self.num_experts, self.num_slots, -1
+        )  # [E, S, d_model]
+
+        return slot_inputs, dispatch_weights
+
+    def combine(self, slot_outputs, dispatch_weights):
+        """
+        Combine expert outputs back to token space.
+        slot_outputs: [E*S, d_model]
+        """
+        combine_weights = F.softmax(
+            dispatch_weights, dim=1
+        )  # normalize over slots for each token
+        output = combine_weights @ slot_outputs  # [T, d_model]
+        return output
+```
+
+### Advantages
+
+- Fully differentiable: no discrete routing decisions, no straight-through estimators
+- Perfect balance by construction: every expert processes the same number of slots
+- No token dropping, no capacity factor
+
+### Disadvantages
+
+- Every expert sees every token (via weighted sums): $O(T \cdot E)$ compute for the dispatch step
+- Cannot specialize as aggressively: experts process blended inputs, not individual tokens
+- Not suitable for very large expert counts (256+) due to the dispatch cost
+
+<PerfChart
+  title="Routing Algorithm Compute Overhead"
+  data={[
+    { label: "Top-K (8 experts)", value: 0.02, color: "green", annotation: "0.02% of total FLOPs" },
+    { label: "Expert Choice (8 experts)", value: 0.02, color: "green", annotation: "0.02% of total FLOPs" },
+    { label: "Hash Routing", value: 0.001, color: "green", annotation: "Negligible" },
+    { label: "Group-Limited (256 experts)", value: 0.05, color: "blue", annotation: "0.05% of total FLOPs" },
+    { label: "Soft MoE (8 experts)", value: 0.8, color: "red", annotation: "0.8% of total FLOPs" },
+  ]}
+  unit="% of total forward pass FLOPs"
+/>
+
+---
+
+## 8. BASE Layer Routing (Lewis et al., 2021)
+
+BASE Layers frame routing as a linear assignment problem. Instead of greedy top-k selection, they solve for the globally optimal token-to-expert assignment that maximizes total affinity while enforcing balanced assignment.
+
+```python
+from scipy.optimize import linear_sum_assignment
+
+def base_layer_routing(logits, tokens_per_expert):
+    """
+    Solve balanced assignment using Hungarian algorithm.
+    logits: [T, E]
+    Returns: assignment [T] -> expert index
+    """
+    T, E = logits.shape
+    # Create cost matrix (negate logits for maximization)
+    # Replicate experts to allow multiple tokens per expert
+    cost = -logits.detach().cpu().numpy()
+
+    # Expand: each expert has 'tokens_per_expert' slots
+    expanded_cost = cost.repeat(1, tokens_per_expert)  # not quite right
+
+    # In practice, use auction algorithm or Sinkhorn normalization
+    # Hungarian is O(n^3), too slow for large T
+    row_ind, col_ind = linear_sum_assignment(cost)
+    assignments = col_ind % E
+
+    return torch.tensor(assignments)
+```
+
+In practice, BASE Layers use Sinkhorn normalization (iterative row/column normalization of the assignment matrix) as a differentiable approximation:
+
+```python
+def sinkhorn_routing(logits, num_iterations=20, temperature=0.1):
+    """
+    Sinkhorn normalization for balanced soft assignment.
+    """
+    log_alpha = logits / temperature  # [T, E]
+
+    for _ in range(num_iterations):
+        # Row normalization (tokens)
+        log_alpha = log_alpha - torch.logsumexp(log_alpha, dim=-1, keepdim=True)
+        # Column normalization (experts)
+        log_alpha = log_alpha - torch.logsumexp(log_alpha, dim=-2, keepdim=True)
+
+    assignment = torch.exp(log_alpha)
+    return assignment  # [T, E], approximately doubly stochastic
+```
+
+The Sinkhorn approach produces a doubly stochastic matrix: rows sum to 1 (each token is fully assigned) and columns sum to $T/E$ (each expert gets equal load). It is differentiable and can be run on GPU, but requires multiple iterations, adding latency.
+
+---
+
+## 9. Comprehensive Comparison
+
+<Benchmark
+  title="Routing Algorithm Feature Comparison"
+  columns={["Algorithm", "Balance", "Token Drop", "Aux Loss", "Autoregressive", "Expert Count"]}
+  rows={[
+    { values: ["Top-K", "Learned (aux loss)", "Yes", "Required", "Yes", "8-128"], highlight: false },
+    { values: ["Expert Choice", "Perfect (by construction)", "No (but zero-coverage)", "Not needed", "Difficult", "8-128"], highlight: true },
+    { values: ["Hash Routing", "Statistical", "No", "Not needed", "Yes", "8-16"], highlight: false },
+    { values: ["Group-Limited", "Structural + bias", "Minimal", "Optional (bias instead)", "Yes", "64-256+"], highlight: true },
+    { values: ["Noisy Top-K", "Learned (aux loss + noise)", "Yes", "Required", "Yes", "8-128"], highlight: false },
+    { values: ["Soft MoE", "Perfect (by construction)", "No", "Not needed", "Possible", "8-32"], highlight: false },
+    { values: ["BASE/Sinkhorn", "Perfect (optimal)", "No", "Not needed", "Difficult", "8-64"], highlight: false },
+  ]}
+/>
+
+### Load Balance Comparison
+
+```python
+def measure_load_balance(router, hidden_states, num_experts):
+    """
+    Compute load balance metrics for any router.
+    Returns coefficient of variation (lower = better balanced).
+    """
+    with torch.no_grad():
+        if hasattr(router, 'forward'):
+            indices, weights, *_ = router(hidden_states)
+        else:
+            raise ValueError("Router must implement forward()")
+
+    # Count tokens per expert
+    flat_indices = indices.reshape(-1)
+    counts = torch.bincount(flat_indices, minlength=num_experts).float()
+
+    cv = counts.std() / counts.mean()
+    max_ratio = counts.max() / counts.mean()
+    min_ratio = counts.min() / counts.mean()
+
+    return {
+        "cv": cv.item(),
+        "max_load_ratio": max_ratio.item(),
+        "min_load_ratio": min_ratio.item(),
+        "utilization": (counts > 0).float().mean().item(),
+    }
+```
+
+<PerfChart
+  title="Load Balance CV (Coefficient of Variation) — Lower is Better"
+  data={[
+    { label: "Expert Choice", value: 0.0, color: "green", annotation: "Perfect balance" },
+    { label: "Soft MoE", value: 0.0, color: "green", annotation: "Perfect balance" },
+    { label: "Group-Limited (DeepSeek V3)", value: 0.04, color: "green", annotation: "Near-perfect" },
+    { label: "Top-2 + aux loss", value: 0.12, color: "blue", annotation: "Good" },
+    { label: "Top-1 + aux loss", value: 0.18, color: "blue", annotation: "Acceptable" },
+    { label: "Hash (8 experts)", value: 0.25, color: "orange", annotation: "Statistical only" },
+    { label: "Top-K (no aux loss)", value: 0.85, color: "red", annotation: "Collapses" },
+  ]}
+  unit="coefficient of variation"
+/>
+
+---
+
+## 10. When to Use Which
+
+### Decision Framework
+
+```
+Start: What is your expert count?
+
+  [8-16 experts]
+    ├── Training only, non-autoregressive? → Expert Choice
+    ├── Need simplicity, small model? → Hash Routing
+    └── Standard LLM training? → Top-2 + aux loss (Mixtral recipe)
+
+  [32-128 experts]
+    ├── Can afford routing compute? → Top-2 + aux loss
+    └── Need maximum throughput? → Top-1 + aux loss (Switch recipe)
+
+  [256+ experts]
+    └── Group-Limited Gating (DeepSeek V3 recipe)
+
+  [Vision/non-autoregressive]
+    └── Soft MoE or Expert Choice
+```
+
+### Concrete Recommendations
+
+**For a Mixtral-class model (8 experts, 7B per expert)**: Use Top-2 routing with the standard load-balancing auxiliary loss. This is the most battle-tested configuration. Set $\alpha = 0.01$ for the aux loss coefficient.
+
+**For a DeepSeek-class model (256 experts, fine-grained)**: Use Group-Limited Gating with sigmoid activation and bias-based load balancing. The grouping structure is essential at this expert count — without it, load collapse is nearly certain.
+
+**For vision transformers**: Consider Soft MoE or Expert Choice. Vision tokens have no autoregressive constraint, so Expert Choice's limitations do not apply. Soft MoE works well because the dispatch cost is amortized over larger patches.
+
+**For edge deployment**: Consider Hash Routing. Zero routing parameters, zero routing compute, deterministic behavior. The quality loss is acceptable when total model size is the binding constraint.
+
+---
+
+## 11. Implementation: Unified Router Interface
+
+A practical implementation should support swapping routing algorithms without changing the rest of the MoE layer.
+
+```python
+class UnifiedRouter(nn.Module):
+    """Unified interface supporting multiple routing algorithms."""
+
+    ALGORITHMS = [
+        "top_k", "expert_choice", "hash",
+        "group_limited", "noisy_top_k"
+    ]
+
+    def __init__(self, config):
+        super().__init__()
+        self.algorithm = config.routing_algorithm
+        self.num_experts = config.num_experts
+        self.top_k = config.top_k
+
+        if self.algorithm in ("top_k", "noisy_top_k", "group_limited"):
+            self.gate = nn.Linear(
+                config.d_model, config.num_experts, bias=False
+            )
+
+        if self.algorithm == "noisy_top_k":
+            self.noise_gate = nn.Linear(
+                config.d_model, config.num_experts, bias=False
+            )
+            self.noise_std = config.noise_std
+
+        if self.algorithm == "group_limited":
+            self.num_groups = config.num_groups
+            self.top_k_group = config.top_k_group
+
+    def forward(self, hidden_states, token_ids=None, positions=None):
+        if self.algorithm == "top_k":
+            return self._top_k(hidden_states)
+        elif self.algorithm == "expert_choice":
+            return self._expert_choice(hidden_states)
+        elif self.algorithm == "hash":
+            return self._hash(token_ids, positions)
+        elif self.algorithm == "group_limited":
+            return self._group_limited(hidden_states)
+        elif self.algorithm == "noisy_top_k":
+            return self._noisy_top_k(hidden_states)
+
+    def _top_k(self, hidden_states):
+        logits = self.gate(hidden_states)
+        probs = F.softmax(logits, dim=-1)
+        top_k_probs, top_k_indices = probs.topk(self.top_k, dim=-1)
+        weights = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+        return top_k_indices, weights, {"probs": probs}
+
+    def _expert_choice(self, hidden_states):
+        logits = self.gate(hidden_states)
+        T = hidden_states.shape[0]
+        tokens_per_expert = T * self.top_k // self.num_experts
+        scores = F.softmax(logits.T, dim=-1)
+        top_k_scores, top_k_indices = scores.topk(
+            tokens_per_expert, dim=-1
+        )
+        return top_k_indices, top_k_scores, {"mode": "expert_major"}
+
+    def _hash(self, token_ids, positions):
+        primary = token_ids % self.num_experts
+        indices = primary.unsqueeze(-1)
+        weights = torch.ones_like(indices, dtype=torch.float)
+        return indices, weights, {"mode": "hash"}
+
+    def _group_limited(self, hidden_states):
+        logits = self.gate(hidden_states)
+        epg = self.num_experts // self.num_groups
+        grouped = logits.view(-1, self.num_groups, epg)
+        group_top2, _ = grouped.topk(2, dim=-1)
+        group_scores = group_top2.mean(dim=-1)
+        _, top_groups = group_scores.topk(self.top_k_group, dim=-1)
+        group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
+        group_mask.scatter_(1, top_groups, True)
+        expert_mask = group_mask.unsqueeze(-1).expand(
+            -1, -1, epg
+        ).reshape(-1, self.num_experts)
+        masked_logits = logits.masked_fill(~expert_mask, float('-inf'))
+        probs = torch.sigmoid(masked_logits)
+        top_k_probs, top_k_indices = probs.topk(self.top_k, dim=-1)
+        weights = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+        return top_k_indices, weights, {"logits": logits}
+
+    def _noisy_top_k(self, hidden_states):
+        logits = self.gate(hidden_states)
+        if self.training:
+            noise_logits = self.noise_gate(hidden_states)
+            noise_std = F.softplus(noise_logits)
+            noise = torch.randn_like(logits) * noise_std
+            logits = logits + noise
+        probs = F.softmax(logits, dim=-1)
+        top_k_probs, top_k_indices = probs.topk(self.top_k, dim=-1)
+        weights = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+        return top_k_indices, weights, {"probs": probs}
+```
+
+---
+
+## 12. Routing at Scale: Practical Considerations
+
+### All-to-All Communication Cost
+
+In distributed MoE, expert parallelism places different experts on different devices. The routing step produces a token-to-expert mapping, but executing it requires physically moving tokens between devices via all-to-all communication.
+
+The all-to-all volume for Top-K routing:
+
+$$V = 2 \cdot T \cdot k \cdot d_{\text{model}} \cdot \text{sizeof}(\text{dtype})$$
+
+The factor of 2 accounts for the dispatch (tokens to experts) and combine (results back to tokens) phases.
+
+For a typical configuration: $T = 4096$, $k = 2$, $d_{\text{model}} = 4096$, BF16:
+
+$$V = 2 \times 4096 \times 2 \times 4096 \times 2 = 128\text{ MB per layer}$$
+
+With 60 MoE layers and NVLink at 600 GB/s, the all-to-all overhead per step:
+
+$$t = \frac{60 \times 128\text{ MB}}{600\text{ GB/s}} = 12.8\text{ ms}$$
+
+This is non-negligible — it adds 10-20% to step time in large MoE models.
+
+### Router Weight Initialization
+
+Router initialization affects early training dynamics. If the gate weight $W_r$ is initialized too large, the softmax saturates and the router immediately collapses to a few experts. If too small, routing is nearly uniform and experts do not specialize.
+
+```python
+# Good initialization: small variance
+nn.init.xavier_normal_(router.gate.weight, gain=0.01)
+
+# Bad initialization: default Xavier (too large for routing)
+# nn.init.xavier_normal_(router.gate.weight)  # gain=1.0
+
+# Kaiming with reduced fan_in
+nn.init.kaiming_uniform_(router.gate.weight, a=0.01)
+```
+
+<Callout type="tip" title="Router Initialization Rule of Thumb">
+Initialize the router gate weight with 10-100x smaller variance than the default. This ensures near-uniform routing in early training, giving all experts a chance to specialize before the router commits to a pattern. DeepSeek V3 uses a gain of 0.006 for their router weight initialization.
+</Callout>
+
+### Z-Loss for Router Stability
+
+ST-MoE introduced the router z-loss, which penalizes large routing logits. Large logits cause the softmax to become peaky, increasing the risk of collapse and creating large gradients.
+
+```python
+def compute_z_loss(logits, z_loss_coeff=0.001):
+    """
+    Penalize large router logits for stability.
+    logits: [T, E]
+    """
+    log_z = torch.logsumexp(logits, dim=-1)  # [T]
+    z_loss = z_loss_coeff * (log_z ** 2).mean()
+    return z_loss
+```
+
+The z-loss is added to the training loss alongside the load-balancing auxiliary loss. Typical coefficient: $10^{-3}$ to $10^{-2}$.
+
+---
+
+## 13. Summary
+
+The routing algorithm landscape has matured significantly. Top-K routing with an auxiliary loss remains the default for standard MoE models. Expert Choice is compelling for non-autoregressive settings. Group-Limited Gating with sigmoid activation and bias-based balancing represents the current state of the art for large-scale fine-grained MoE (DeepSeek V3). Hash routing serves a niche for extreme simplicity.
+
+The next post in this series covers training dynamics — what happens when routing goes wrong (expert collapse) and how to detect and prevent it.

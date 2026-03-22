@@ -1,0 +1,1013 @@
+---
+title: "MoE Training Dynamics: Load Collapse, Expert Specialization, and Training Stability"
+author: "stanley-phoong"
+description: "How MoE training goes wrong — router collapse, expert death, training instability — and the concrete techniques to detect and prevent each failure mode. Includes monitoring code, jitter analysis, and temperature scaling strategies."
+publishDate: 2025-03-22
+category: mixture-of-experts
+tags: [moe, training-stability, router-collapse, expert-specialization, load-balancing, jitter, temperature-scaling]
+difficulty: expert
+readingTime: 35
+draft: false
+featured: false
+series: "MoE Masterclass"
+seriesOrder: 6
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+
+MoE models are harder to train than dense models. The router introduces a discrete assignment problem into an otherwise continuous optimization. This post covers every major failure mode — router collapse, expert death, oscillation, and training instability at scale — with concrete monitoring code and prevention strategies.
+
+---
+
+## 1. Router Collapse: The Dominant Failure Mode
+
+### What Collapse Looks Like
+
+Router collapse occurs when the gating network converges to routing most or all tokens to a small subset of experts. In the extreme case, 2 out of 64 experts receive 95% of all tokens. The remaining 62 experts are effectively dead — they receive negligible gradients and never specialize.
+
+```python
+import torch
+import torch.nn.functional as F
+
+def detect_collapse(router_logits, num_experts, threshold=0.3):
+    """
+    Detect router collapse by measuring expert utilization.
+
+    Args:
+        router_logits: [T, E] raw routing logits
+        num_experts: number of experts
+        threshold: fraction of experts that must receive
+                   at least 50% of expected load
+
+    Returns:
+        collapsed: bool
+        metrics: dict of diagnostic values
+    """
+    probs = F.softmax(router_logits, dim=-1)  # [T, E]
+    T = probs.shape[0]
+
+    # Hard assignments: which expert each token would go to (top-1)
+    assignments = probs.argmax(dim=-1)  # [T]
+    counts = torch.bincount(assignments, minlength=num_experts).float()
+
+    expected = T / num_experts
+    active_experts = (counts > expected * 0.5).sum().item()
+    active_fraction = active_experts / num_experts
+
+    # Entropy of assignment distribution
+    assignment_dist = counts / counts.sum()
+    entropy = -(assignment_dist * (assignment_dist + 1e-10).log()).sum().item()
+    max_entropy = torch.tensor(num_experts).float().log().item()
+    normalized_entropy = entropy / max_entropy
+
+    # Gini coefficient of expert loads
+    sorted_counts = counts.sort().values
+    n = len(sorted_counts)
+    cumsum = sorted_counts.cumsum(0)
+    gini = (2 * torch.arange(1, n + 1, device=counts.device).float() @ sorted_counts
+            - (n + 1) * sorted_counts.sum()) / (n * sorted_counts.sum())
+
+    collapsed = active_fraction < threshold
+
+    return collapsed, {
+        "active_experts": active_experts,
+        "active_fraction": active_fraction,
+        "normalized_entropy": normalized_entropy,
+        "gini_coefficient": gini.item(),
+        "max_expert_load": counts.max().item() / expected,
+        "min_expert_load": counts.min().item() / expected,
+    }
+```
+
+### Why Collapse Happens
+
+Collapse is a positive feedback loop:
+
+1. Early in training, by random initialization, some experts are slightly better for common token patterns.
+2. These experts receive more tokens via Top-K routing.
+3. More tokens means more gradient updates, so these experts improve faster.
+4. Improved experts attract even more tokens.
+5. Neglected experts stagnate. Their weights drift randomly, making them even less attractive.
+6. Eventually, 2-4 experts handle everything.
+
+The mathematical driver is the softmax function. If expert $i$ has logit $l_i$ slightly higher than expert $j$, the routing probability is:
+
+$$\frac{e^{l_i}}{e^{l_i} + e^{l_j}} = \sigma(l_i - l_j)$$
+
+As $l_i - l_j$ grows during training, the sigmoid saturates, and the gradient with respect to $l_j$ vanishes. Expert $j$ receives exponentially less signal.
+
+<Callout type="danger" title="Collapse is Silent">
+Router collapse does not cause the training loss to spike. The collapsed model continues to train — it just trains a dense model using 2 experts instead of 64. Loss curves look normal. You must actively monitor expert utilization to detect collapse. By the time it is visible in downstream evaluation metrics, it is too late to recover.
+</Callout>
+
+---
+
+## 2. Monitoring Expert Utilization
+
+### Essential Metrics
+
+Every MoE training run should log these metrics per MoE layer, per logging step:
+
+```python
+class MoEMonitor:
+    def __init__(self, num_experts, num_layers, log_interval=100):
+        self.num_experts = num_experts
+        self.num_layers = num_layers
+        self.log_interval = log_interval
+        self.step = 0
+        self.history = {
+            layer: {
+                "entropy": [],
+                "gini": [],
+                "max_load": [],
+                "min_load": [],
+                "dead_experts": [],
+            }
+            for layer in range(num_layers)
+        }
+
+    def log_routing(self, layer_idx, expert_counts, total_tokens):
+        """
+        Call this every forward pass for each MoE layer.
+        expert_counts: [E] int tensor, tokens routed to each expert
+        """
+        self.step += 1
+        if self.step % self.log_interval != 0:
+            return
+
+        counts = expert_counts.float()
+        expected = total_tokens / self.num_experts
+
+        # Expert utilization distribution
+        dist = counts / counts.sum()
+        entropy = -(dist * (dist + 1e-10).log()).sum().item()
+        max_entropy = torch.tensor(self.num_experts).float().log().item()
+
+        # Gini coefficient
+        sorted_c = counts.sort().values
+        n = len(sorted_c)
+        gini = (2 * torch.arange(1, n + 1).float() @ sorted_c
+                - (n + 1) * sorted_c.sum()) / (n * sorted_c.sum())
+
+        # Dead expert count (less than 1% of expected load)
+        dead = (counts < expected * 0.01).sum().item()
+
+        h = self.history[layer_idx]
+        h["entropy"].append(entropy / max_entropy)
+        h["gini"].append(gini.item())
+        h["max_load"].append((counts.max() / expected).item())
+        h["min_load"].append((counts.min() / expected).item())
+        h["dead_experts"].append(dead)
+
+    def check_alerts(self, layer_idx):
+        """Return list of alert strings for this layer."""
+        h = self.history[layer_idx]
+        alerts = []
+        if len(h["entropy"]) < 2:
+            return alerts
+
+        # Entropy dropping rapidly
+        if h["entropy"][-1] < 0.5:
+            alerts.append(
+                f"Layer {layer_idx}: LOW ENTROPY ({h['entropy'][-1]:.3f})"
+                " - probable collapse"
+            )
+
+        # Max load too high
+        if h["max_load"][-1] > 5.0:
+            alerts.append(
+                f"Layer {layer_idx}: Expert overload "
+                f"({h['max_load'][-1]:.1f}x expected)"
+            )
+
+        # Dead experts
+        if h["dead_experts"][-1] > self.num_experts * 0.5:
+            alerts.append(
+                f"Layer {layer_idx}: {h['dead_experts'][-1]} dead experts "
+                f"out of {self.num_experts}"
+            )
+
+        return alerts
+```
+
+### Visualization Pattern
+
+For each MoE layer, plot these time series during training:
+
+1. **Expert utilization heatmap**: x-axis = training step, y-axis = expert index, color = token count. In a healthy run, all rows have similar colors. In collapse, a few rows turn bright while most go dark.
+
+2. **Normalized entropy**: Should stay above 0.8 for 8 experts, above 0.7 for 64 experts. A sustained drop below 0.5 indicates collapse.
+
+3. **Max/min load ratio**: The ratio of the most loaded expert to the least loaded. Below 3x is healthy. Above 10x means severe imbalance.
+
+```python
+def log_to_wandb(monitor, layer_idx, step):
+    """Example wandb logging for MoE monitoring."""
+    h = monitor.history[layer_idx]
+    if not h["entropy"]:
+        return
+
+    import wandb
+    wandb.log({
+        f"moe/layer_{layer_idx}/entropy": h["entropy"][-1],
+        f"moe/layer_{layer_idx}/gini": h["gini"][-1],
+        f"moe/layer_{layer_idx}/max_load_ratio": h["max_load"][-1],
+        f"moe/layer_{layer_idx}/min_load_ratio": h["min_load"][-1],
+        f"moe/layer_{layer_idx}/dead_experts": h["dead_experts"][-1],
+    }, step=step)
+```
+
+---
+
+## 3. Prevention: Auxiliary Loss
+
+### Standard Load-Balancing Loss
+
+The most common prevention mechanism is the auxiliary loss from Switch Transformer. It penalizes unequal token distribution across experts.
+
+For $E$ experts and $T$ tokens:
+
+$$\mathcal{L}_{\text{aux}} = \alpha \cdot E \cdot \sum_{i=1}^{E} f_i \cdot p_i$$
+
+Where:
+- $f_i = \frac{1}{T} \sum_{t=1}^{T} \mathbb{1}[\text{token } t \text{ dispatched to expert } i]$ (fraction of tokens sent to expert $i$)
+- $p_i = \frac{1}{T} \sum_{t=1}^{T} \text{softmax}(\text{logits}_t)_i$ (average routing probability for expert $i$)
+- $\alpha$ is the coefficient (typically 0.01)
+
+```python
+def switch_load_balancing_loss(router_probs, expert_indices, num_experts, alpha=0.01):
+    """
+    Switch Transformer auxiliary loss.
+    router_probs: [T, E] softmax routing probabilities
+    expert_indices: [T, k] top-k expert assignments
+    """
+    T, E = router_probs.shape
+
+    # f_i: fraction of tokens dispatched to each expert
+    one_hot = F.one_hot(expert_indices.reshape(-1), E).float()  # [T*k, E]
+    f = one_hot.mean(dim=0)  # [E]
+
+    # p_i: mean routing probability per expert
+    p = router_probs.mean(dim=0)  # [E]
+
+    # Loss: E * sum(f_i * p_i)
+    loss = alpha * E * (f * p).sum()
+
+    return loss
+```
+
+### Tuning the Auxiliary Loss Coefficient
+
+The coefficient $\alpha$ controls the tradeoff between load balance and routing quality.
+
+<Benchmark
+  title="Auxiliary Loss Coefficient Impact"
+  columns={["Alpha", "Load Balance CV", "Dead Experts", "Perplexity Impact", "Assessment"]}
+  rows={[
+    { values: ["0.0 (no aux loss)", "0.85+", "50-90%", "Baseline (collapsed)", "Unusable"], highlight: true },
+    { values: ["0.001", "0.30-0.50", "10-30%", "+0.5-1.0%", "Insufficient"], highlight: false },
+    { values: ["0.01", "0.10-0.20", "0-5%", "0.0%", "Recommended"], highlight: true },
+    { values: ["0.1", "0.03-0.08", "0%", "+0.3-0.8%", "Over-constrained"], highlight: false },
+    { values: ["1.0", "0.01-0.02", "0%", "+2-5%", "Degrades quality significantly"], highlight: true },
+  ]}
+/>
+
+At $\alpha = 0.01$, the auxiliary loss provides enough signal to maintain balance without significantly interfering with the primary language modeling loss. Higher values force near-perfect balance but prevent expert specialization — if every expert must process exactly the same tokens, they cannot learn different functions.
+
+---
+
+## 4. Prevention: Jitter and Noise Injection
+
+### Multiplicative Jitter (ST-MoE)
+
+ST-MoE (Zoph et al., 2022) found that adding multiplicative jitter to router inputs is critical for training stability.
+
+```python
+class JitteredRouter(nn.Module):
+    def __init__(self, d_model, num_experts, jitter_range=0.01):
+        super().__init__()
+        self.gate = nn.Linear(d_model, num_experts, bias=False)
+        self.jitter_range = jitter_range
+
+    def forward(self, hidden_states):
+        if self.training and self.jitter_range > 0:
+            # Multiplicative jitter: multiply by uniform(1 - eps, 1 + eps)
+            jitter = torch.empty_like(hidden_states).uniform_(
+                1.0 - self.jitter_range,
+                1.0 + self.jitter_range,
+            )
+            hidden_states = hidden_states * jitter
+
+        logits = self.gate(hidden_states)
+        return logits
+```
+
+The jitter serves two purposes:
+1. **Exploration**: Prevents the router from committing too early to a fixed pattern.
+2. **Gradient noise**: Adds implicit regularization similar to dropout.
+
+### Additive Noise (Shazeer, 2017)
+
+The original Shazeer approach adds learned, input-dependent Gaussian noise:
+
+```python
+def noisy_gating(hidden_states, gate, noise_gate, noise_std_scale=1.0):
+    logits = gate(hidden_states)  # [T, E]
+
+    if gate.training:
+        noise_logits = noise_gate(hidden_states)
+        noise_std = F.softplus(noise_logits) * noise_std_scale
+        noise = torch.randn_like(logits) * noise_std
+        logits = logits + noise
+
+    return logits
+```
+
+### Comparison of Noise Strategies
+
+```python
+def compare_noise_strategies(hidden_states, gate, num_trials=100):
+    """Measure how each noise strategy affects routing diversity."""
+    E = gate.out_features
+    T = hidden_states.shape[0]
+
+    strategies = {}
+
+    # No noise
+    with torch.no_grad():
+        logits = gate(hidden_states)
+        base_assignments = logits.argmax(dim=-1)
+
+    # Multiplicative jitter
+    jitter_diverse = 0
+    for _ in range(num_trials):
+        jitter = torch.empty_like(hidden_states).uniform_(0.99, 1.01)
+        logits = gate(hidden_states * jitter)
+        assignments = logits.argmax(dim=-1)
+        jitter_diverse += (assignments != base_assignments).float().mean()
+    strategies["jitter_0.01"] = (jitter_diverse / num_trials).item()
+
+    # Additive noise
+    additive_diverse = 0
+    for _ in range(num_trials):
+        logits = gate(hidden_states) + torch.randn(T, E) * 0.1
+        assignments = logits.argmax(dim=-1)
+        additive_diverse += (assignments != base_assignments).float().mean()
+    strategies["additive_0.1"] = (additive_diverse / num_trials).item()
+
+    return strategies  # fraction of tokens that switch expert
+```
+
+<Callout type="info" title="ST-MoE Recommendation">
+ST-MoE tested multiplicative jitter ranges from 0.001 to 0.1 and found 0.01 optimal. Below 0.001, the jitter has no effect. Above 0.05, it degrades routing quality because tokens are frequently routed to wrong experts during training. The sweet spot is enough randomness to prevent collapse without corrupting the routing signal.
+</Callout>
+
+---
+
+## 5. Prevention: Z-Loss for Router Logits
+
+### The Problem with Large Logits
+
+When router logits grow large, softmax becomes extremely peaky. A logit vector like $[20.0, -5.0, -3.0, \ldots]$ produces a probability distribution where expert 0 gets $\sim 1.0$ and all others get $\sim 0.0$. This causes:
+
+1. **Vanishing gradients** for non-selected experts.
+2. **Numerical instability** in the softmax computation.
+3. **Brittle routing** where tiny perturbations flip the argmax.
+
+### Z-Loss Implementation
+
+```python
+def router_z_loss(logits, z_coeff=0.001):
+    """
+    Penalize large routing logits.
+    Encourages logit values to stay near zero,
+    keeping softmax in its sensitive range.
+
+    logits: [T, E]
+    """
+    # log(sum(exp(logits))) should be small
+    log_z = torch.logsumexp(logits, dim=-1)  # [T]
+    z_loss = z_coeff * (log_z ** 2).mean()
+    return z_loss
+```
+
+The z-loss penalizes $(\log Z)^2$ where $Z = \sum_i e^{l_i}$. When all logits are near zero, $\log Z \approx \log E$ (a small constant). When logits are large, $\log Z$ grows, and the squared penalty kicks in.
+
+### Combined Loss
+
+```python
+def total_moe_loss(
+    lm_loss,
+    router_probs,
+    expert_indices,
+    router_logits,
+    num_experts,
+    alpha_aux=0.01,
+    alpha_z=0.001,
+):
+    """Total training loss with both auxiliary losses."""
+    aux = switch_load_balancing_loss(
+        router_probs, expert_indices, num_experts, alpha_aux
+    )
+    z = router_z_loss(router_logits, alpha_z)
+    total = lm_loss + aux + z
+    return total, {"lm_loss": lm_loss.item(), "aux_loss": aux.item(), "z_loss": z.item()}
+```
+
+<PerfChart
+  title="Impact of Z-Loss on Router Logit Magnitude (Training Step 50K)"
+  data={[
+    { label: "No Z-loss", value: 45.2, color: "red", annotation: "Logit range [-45, +45]" },
+    { label: "Z-loss 0.01", value: 8.3, color: "blue", annotation: "Logit range [-8, +8]" },
+    { label: "Z-loss 0.001", value: 15.7, color: "green", annotation: "Logit range [-16, +16]" },
+    { label: "Z-loss 0.0001", value: 28.4, color: "orange", annotation: "Logit range [-28, +28]" },
+  ]}
+  unit="max |logit| value"
+/>
+
+---
+
+## 6. Temperature Scaling for Routing
+
+### Static Temperature
+
+Temperature scaling modifies the softmax sharpness without directly constraining logit magnitude:
+
+$$p_i = \frac{e^{l_i / \tau}}{\sum_j e^{l_j / \tau}}$$
+
+At $\tau = 1.0$ (default), softmax behaves normally. At $\tau > 1.0$, the distribution is smoother (more uniform routing). At $\tau < 1.0$, the distribution is sharper (more concentrated routing).
+
+```python
+class TemperatureRouter(nn.Module):
+    def __init__(self, d_model, num_experts, top_k, temperature=1.0):
+        super().__init__()
+        self.gate = nn.Linear(d_model, num_experts, bias=False)
+        self.top_k = top_k
+        self.temperature = temperature
+
+    def forward(self, hidden_states):
+        logits = self.gate(hidden_states)
+        scaled_logits = logits / self.temperature
+        probs = F.softmax(scaled_logits, dim=-1)
+        top_k_probs, top_k_indices = probs.topk(self.top_k, dim=-1)
+        weights = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+        return top_k_indices, weights, probs
+```
+
+### Annealed Temperature
+
+A more sophisticated approach anneals the temperature during training. Start warm (uniform routing) and gradually cool (allow specialization):
+
+```python
+class AnnealedTemperatureRouter(nn.Module):
+    def __init__(
+        self,
+        d_model,
+        num_experts,
+        top_k,
+        initial_temp=2.0,
+        final_temp=0.5,
+        warmup_steps=10000,
+        total_steps=100000,
+    ):
+        super().__init__()
+        self.gate = nn.Linear(d_model, num_experts, bias=False)
+        self.top_k = top_k
+        self.initial_temp = initial_temp
+        self.final_temp = final_temp
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        self.step = 0
+
+    def get_temperature(self):
+        self.step += 1
+        if self.step < self.warmup_steps:
+            # Linear warmup: stay at initial_temp
+            return self.initial_temp
+        # Cosine anneal from initial_temp to final_temp
+        progress = (self.step - self.warmup_steps) / (
+            self.total_steps - self.warmup_steps
+        )
+        progress = min(progress, 1.0)
+        temp = self.final_temp + 0.5 * (self.initial_temp - self.final_temp) * (
+            1 + torch.cos(torch.tensor(progress * 3.14159))
+        )
+        return temp.item()
+
+    def forward(self, hidden_states):
+        logits = self.gate(hidden_states)
+        temp = self.get_temperature()
+        scaled_logits = logits / temp
+        probs = F.softmax(scaled_logits, dim=-1)
+        top_k_probs, top_k_indices = probs.topk(self.top_k, dim=-1)
+        weights = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+        return top_k_indices, weights, probs
+```
+
+### Learned Temperature
+
+DeepSeek V2 experimented with a learned per-layer temperature:
+
+```python
+class LearnedTemperatureRouter(nn.Module):
+    def __init__(self, d_model, num_experts, top_k):
+        super().__init__()
+        self.gate = nn.Linear(d_model, num_experts, bias=False)
+        self.top_k = top_k
+        # Learned log-temperature, initialized to log(1.0) = 0
+        self.log_temperature = nn.Parameter(torch.zeros(1))
+
+    def forward(self, hidden_states):
+        logits = self.gate(hidden_states)
+        # Clamp temperature to [0.1, 10.0]
+        temp = self.log_temperature.exp().clamp(0.1, 10.0)
+        scaled_logits = logits / temp
+        probs = F.softmax(scaled_logits, dim=-1)
+        top_k_probs, top_k_indices = probs.topk(self.top_k, dim=-1)
+        weights = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+        return top_k_indices, weights, probs
+```
+
+---
+
+## 7. Expert Specialization Patterns
+
+### What Experts Learn
+
+In a well-trained MoE model, different experts learn to handle different aspects of the input distribution. Research on Mixtral 8x7B has revealed clear specialization patterns:
+
+```python
+def analyze_expert_specialization(
+    model, tokenizer, dataset, num_experts, top_k=2
+):
+    """
+    Analyze what types of tokens each expert prefers.
+    Returns a mapping: expert_idx -> token distribution.
+    """
+    expert_token_counts = {
+        e: {} for e in range(num_experts)
+    }
+    expert_position_dist = {
+        e: [] for e in range(num_experts)
+    }
+
+    for text in dataset:
+        tokens = tokenizer.encode(text)
+        input_ids = torch.tensor([tokens])
+
+        with torch.no_grad():
+            outputs = model(input_ids, output_router_logits=True)
+
+        for layer_idx, router_logits in enumerate(outputs.router_logits):
+            probs = F.softmax(router_logits.squeeze(0), dim=-1)
+            top_k_indices = probs.topk(top_k, dim=-1).indices
+
+            for pos in range(len(tokens)):
+                token_str = tokenizer.decode([tokens[pos]])
+                for k in range(top_k):
+                    expert = top_k_indices[pos, k].item()
+                    expert_token_counts[expert][token_str] = (
+                        expert_token_counts[expert].get(token_str, 0) + 1
+                    )
+                    expert_position_dist[expert].append(pos / len(tokens))
+
+    return expert_token_counts, expert_position_dist
+```
+
+### Observed Specialization Patterns
+
+Studies on Mixtral and Switch Transformer reveal these patterns:
+
+<Benchmark
+  title="Expert Specialization Patterns in Mixtral 8x7B"
+  columns={["Expert", "Primary Domain", "Token Examples", "Position Preference"]}
+  rows={[
+    { values: ["Expert 0", "Punctuation/structure", "., ;, :, (, )", "Uniform"], highlight: false },
+    { values: ["Expert 1", "Code/technical", "def, class, import, return", "Uniform"], highlight: true },
+    { values: ["Expert 2", "Named entities", "Proper nouns, locations, dates", "Mid-sequence"], highlight: false },
+    { values: ["Expert 3", "Common function words", "the, is, are, was, been", "Early positions"], highlight: false },
+    { values: ["Expert 4", "Rare vocabulary", "Technical terms, neologisms", "Uniform"], highlight: true },
+    { values: ["Expert 5", "Numeric/math", "Digits, operators, formulas", "Uniform"], highlight: false },
+    { values: ["Expert 6", "Multilingual", "Non-English tokens", "Uniform"], highlight: false },
+    { values: ["Expert 7", "Continuation/completion", "Sentence-ending tokens", "Late positions"], highlight: false },
+  ]}
+/>
+
+### Layer-Wise Specialization
+
+Specialization differs by layer depth:
+
+- **Early layers (1-8)**: Experts specialize by surface-level token properties (character patterns, position, frequency).
+- **Middle layers (9-24)**: Experts specialize by semantic category (topic, language, domain).
+- **Late layers (25-32)**: Experts specialize by output function (generation of specific token types, formatting).
+
+```python
+def per_layer_specialization_entropy(model, dataset, tokenizer, num_layers, num_experts):
+    """
+    Measure how specialized experts are at each layer.
+    High entropy = generalist experts. Low entropy = specialists.
+    """
+    layer_entropies = []
+
+    for layer_idx in range(num_layers):
+        expert_dists = []  # distribution over token types per expert
+
+        # Collect routing decisions for this layer
+        # (simplified — real code would process batches)
+        expert_counts = torch.zeros(num_experts)
+
+        for text in dataset:
+            tokens = tokenizer.encode(text)
+            input_ids = torch.tensor([tokens])
+
+            with torch.no_grad():
+                outputs = model(input_ids, output_router_logits=True)
+
+            logits = outputs.router_logits[layer_idx].squeeze(0)
+            assignments = logits.argmax(dim=-1)
+            counts = torch.bincount(assignments, minlength=num_experts)
+            expert_counts += counts.float()
+
+        # Normalize
+        dist = expert_counts / expert_counts.sum()
+        entropy = -(dist * (dist + 1e-10).log()).sum().item()
+        max_entropy = torch.tensor(num_experts).float().log().item()
+        layer_entropies.append(entropy / max_entropy)
+
+    return layer_entropies
+```
+
+---
+
+## 8. Training Instability at Scale
+
+### Loss Spikes
+
+MoE models are more prone to loss spikes than dense models. The router introduces a discontinuity: a small change in router weights can cause a large change in which expert processes which tokens, leading to sudden shifts in the loss landscape.
+
+```python
+class LossSpikeDetector:
+    def __init__(self, window_size=100, spike_threshold=3.0):
+        self.window_size = window_size
+        self.spike_threshold = spike_threshold
+        self.losses = []
+        self.spike_count = 0
+
+    def check(self, loss_value):
+        self.losses.append(loss_value)
+        if len(self.losses) < self.window_size:
+            return False
+
+        window = self.losses[-self.window_size:]
+        mean = sum(window) / len(window)
+        std = (sum((x - mean) ** 2 for x in window) / len(window)) ** 0.5
+
+        is_spike = loss_value > mean + self.spike_threshold * std
+        if is_spike:
+            self.spike_count += 1
+        return is_spike
+
+    def spike_rate(self):
+        if len(self.losses) < self.window_size:
+            return 0.0
+        return self.spike_count / (len(self.losses) - self.window_size)
+```
+
+### Strategies for Stability at Scale
+
+**1. Gradient clipping on router weights only.**
+
+```python
+def clip_router_gradients(model, max_norm=1.0):
+    """Clip gradients only for router parameters."""
+    router_params = [
+        p for name, p in model.named_parameters()
+        if 'gate' in name or 'router' in name
+    ]
+    if router_params:
+        torch.nn.utils.clip_grad_norm_(router_params, max_norm)
+```
+
+**2. Lower learning rate for router.**
+
+```python
+def get_moe_param_groups(model, base_lr=3e-4, router_lr_scale=0.1):
+    """Separate parameter groups: lower LR for router."""
+    router_params = []
+    other_params = []
+
+    for name, param in model.named_parameters():
+        if 'gate' in name or 'router' in name:
+            router_params.append(param)
+        else:
+            other_params.append(param)
+
+    return [
+        {"params": other_params, "lr": base_lr},
+        {"params": router_params, "lr": base_lr * router_lr_scale},
+    ]
+```
+
+**3. Expert dropout during training.**
+
+```python
+class ExpertDropout(nn.Module):
+    def __init__(self, num_experts, drop_rate=0.1):
+        super().__init__()
+        self.num_experts = num_experts
+        self.drop_rate = drop_rate
+
+    def forward(self, expert_outputs, expert_mask):
+        """
+        Randomly zero out entire expert outputs during training.
+        Prevents over-reliance on any single expert.
+        """
+        if self.training and self.drop_rate > 0:
+            drop_mask = torch.bernoulli(
+                torch.ones(self.num_experts) * (1 - self.drop_rate)
+            ).to(expert_outputs.device)
+            # Scale up surviving experts
+            scale = 1.0 / (1.0 - self.drop_rate)
+            expert_outputs = expert_outputs * drop_mask.view(
+                self.num_experts, 1, 1
+            ) * scale
+        return expert_outputs
+```
+
+**4. Warmup the number of experts.**
+
+Start training with fewer active experts and gradually increase. This gives the router time to learn meaningful distinctions before it must differentiate among many experts.
+
+```python
+class GradualExpertWarmup:
+    def __init__(self, total_experts, warmup_steps=5000, step_size=2):
+        self.total_experts = total_experts
+        self.warmup_steps = warmup_steps
+        self.step_size = step_size
+        self.step = 0
+
+    def get_active_experts(self):
+        self.step += 1
+        if self.step >= self.warmup_steps:
+            return self.total_experts
+        # Exponential warmup: 2, 4, 8, 16, ... up to total
+        active = min(
+            self.step_size ** (1 + self.step * 6 // self.warmup_steps),
+            self.total_experts,
+        )
+        return int(active)
+```
+
+<Callout type="perf" title="ST-MoE Stability Recipe">
+The ST-MoE paper found that combining three techniques — router z-loss ($\alpha_z = 0.001$), multiplicative jitter ($\epsilon = 0.01$), and a lower router learning rate (10x lower than base) — eliminated 95% of training instabilities in their 269B parameter MoE model. No single technique was sufficient; all three were needed.
+</Callout>
+
+---
+
+## 9. Recovering from Collapse
+
+### Detection During Training
+
+```python
+def should_intervene(monitor, layer_idx, patience=5):
+    """
+    Check if intervention is needed.
+    Trigger if entropy has been dropping for 'patience' consecutive checks.
+    """
+    h = monitor.history[layer_idx]["entropy"]
+    if len(h) < patience + 1:
+        return False
+
+    recent = h[-patience:]
+    # Check monotonic decrease
+    decreasing = all(recent[i] > recent[i + 1] for i in range(len(recent) - 1))
+    # Check absolute level
+    low = recent[-1] < 0.5
+
+    return decreasing and low
+```
+
+### Intervention Strategies
+
+**1. Reset router weights.**
+
+```python
+def reset_router(model, layer_idx, d_model, num_experts):
+    """Reset router weights for a specific layer."""
+    gate = model.layers[layer_idx].moe.gate
+    nn.init.xavier_normal_(gate.weight, gain=0.01)
+    if gate.bias is not None:
+        nn.init.zeros_(gate.bias)
+```
+
+**2. Increase auxiliary loss temporarily.**
+
+```python
+class AdaptiveAuxLoss:
+    def __init__(self, base_alpha=0.01, max_alpha=0.1, recovery_steps=1000):
+        self.base_alpha = base_alpha
+        self.max_alpha = max_alpha
+        self.recovery_steps = recovery_steps
+        self.intervention_step = None
+
+    def get_alpha(self, current_step, is_collapsing):
+        if is_collapsing and self.intervention_step is None:
+            self.intervention_step = current_step
+
+        if self.intervention_step is not None:
+            elapsed = current_step - self.intervention_step
+            if elapsed < self.recovery_steps:
+                # Linearly decay from max_alpha back to base_alpha
+                progress = elapsed / self.recovery_steps
+                return self.max_alpha * (1 - progress) + self.base_alpha * progress
+            else:
+                self.intervention_step = None
+
+        return self.base_alpha
+```
+
+**3. Temporary uniform routing.**
+
+Force uniform routing for a fixed number of steps to allow dead experts to receive gradients and recover:
+
+```python
+class EmergencyUniformRouting:
+    def __init__(self, uniform_steps=500):
+        self.uniform_steps = uniform_steps
+        self.remaining = 0
+
+    def trigger(self):
+        self.remaining = self.uniform_steps
+
+    def should_force_uniform(self):
+        if self.remaining > 0:
+            self.remaining -= 1
+            return True
+        return False
+
+    def uniform_route(self, hidden_states, num_experts, top_k):
+        T = hidden_states.shape[0]
+        # Random assignment
+        indices = torch.randint(0, num_experts, (T, top_k))
+        weights = torch.ones(T, top_k) / top_k
+        return indices, weights
+```
+
+---
+
+## 10. Expert Parallelism and Training Dynamics Interaction
+
+### Expert Parallelism Gradient Effects
+
+When experts are distributed across devices via expert parallelism (EP), each device computes gradients only for the experts it hosts. The router gradient, however, depends on all experts because the softmax operates over all expert logits.
+
+This creates a subtlety: the router gradient is computed locally but the loss depends on global expert quality. If one device's experts are systematically weaker (e.g., due to stale parameters after a communication failure), the router will route away from them, making recovery harder.
+
+```python
+def check_expert_gradient_health(model, num_experts, ep_size):
+    """
+    Check that experts across all EP ranks are receiving
+    comparable gradient magnitudes.
+    """
+    experts_per_rank = num_experts // ep_size
+    gradient_norms = []
+
+    for e in range(num_experts):
+        rank = e // experts_per_rank
+        expert_params = get_expert_params(model, e)
+        grad_norm = sum(
+            p.grad.norm().item() ** 2 for p in expert_params if p.grad is not None
+        ) ** 0.5
+        gradient_norms.append((rank, e, grad_norm))
+
+    # Check variance across ranks
+    rank_norms = {}
+    for rank, e, norm in gradient_norms:
+        rank_norms.setdefault(rank, []).append(norm)
+
+    rank_means = {r: sum(norms) / len(norms) for r, norms in rank_norms.items()}
+    cv = torch.tensor(list(rank_means.values())).std() / torch.tensor(
+        list(rank_means.values())
+    ).mean()
+
+    return {
+        "per_expert_grad_norms": gradient_norms,
+        "per_rank_mean_grad_norm": rank_means,
+        "cross_rank_cv": cv.item(),
+    }
+```
+
+<PerfChart
+  title="Training Failure Rate by MoE Configuration"
+  data={[
+    { label: "Dense (baseline)", value: 2, color: "green", annotation: "2% of runs have instability" },
+    { label: "MoE + aux loss only", value: 15, color: "orange", annotation: "15% of runs" },
+    { label: "MoE + aux + z-loss", value: 8, color: "blue", annotation: "8% of runs" },
+    { label: "MoE + aux + z-loss + jitter", value: 3, color: "green", annotation: "3% of runs" },
+    { label: "MoE + all + lower router LR", value: 1, color: "green", annotation: "1% of runs" },
+  ]}
+  unit="% of training runs with instability events"
+/>
+
+---
+
+## 11. Complete Training Stability Recipe
+
+Putting it all together, here is the complete recipe for stable MoE training:
+
+```python
+class StableMoEConfig:
+    # Router
+    router_init_gain: float = 0.01          # Small init
+    router_lr_scale: float = 0.1            # 10x lower LR
+    router_grad_clip: float = 1.0           # Router-specific clipping
+
+    # Noise / Jitter
+    jitter_range: float = 0.01             # Multiplicative jitter
+
+    # Auxiliary losses
+    aux_loss_alpha: float = 0.01           # Load balance loss
+    z_loss_alpha: float = 0.001            # Logit magnitude penalty
+
+    # Temperature
+    initial_temperature: float = 2.0       # Warm start
+    final_temperature: float = 1.0         # Cool to standard
+    temp_warmup_steps: int = 5000          # Temperature anneal period
+
+    # Capacity
+    capacity_factor: float = 1.25          # 25% slack
+
+    # Monitoring
+    log_interval: int = 100                # Log every N steps
+    entropy_alert_threshold: float = 0.5   # Alert below this
+    dead_expert_threshold: float = 0.01    # 1% of expected load
+
+
+class StableMoETrainer:
+    def __init__(self, model, config):
+        self.model = model
+        self.config = config
+        self.monitor = MoEMonitor(
+            config.num_experts,
+            config.num_moe_layers,
+            config.log_interval,
+        )
+        self.spike_detector = LossSpikeDetector()
+        self.adaptive_aux = AdaptiveAuxLoss(
+            base_alpha=config.aux_loss_alpha
+        )
+
+    def training_step(self, batch, step):
+        outputs = self.model(batch)
+        lm_loss = outputs.loss
+
+        # Compute MoE auxiliary losses
+        total_aux = 0
+        total_z = 0
+        for layer_idx, (probs, indices, logits) in enumerate(
+            outputs.moe_outputs
+        ):
+            # Check for collapse
+            is_collapsing = should_intervene(self.monitor, layer_idx)
+            alpha = self.adaptive_aux.get_alpha(step, is_collapsing)
+
+            aux = switch_load_balancing_loss(
+                probs, indices, self.config.num_experts, alpha
+            )
+            z = router_z_loss(logits, self.config.z_loss_alpha)
+            total_aux += aux
+            total_z += z
+
+            # Monitoring
+            counts = torch.bincount(
+                indices.reshape(-1),
+                minlength=self.config.num_experts,
+            )
+            self.monitor.log_routing(
+                layer_idx, counts, indices.shape[0]
+            )
+
+        total_loss = lm_loss + total_aux + total_z
+
+        # Check for loss spike
+        if self.spike_detector.check(total_loss.item()):
+            clip_router_gradients(self.model, max_norm=0.5)
+
+        return total_loss
+```
+
+---
+
+## 12. Summary
+
+MoE training stability requires active engineering:
+
+1. **Monitor continuously**: Track expert utilization entropy, Gini coefficient, and dead expert count per layer per logging step.
+2. **Prevent collapse**: Use auxiliary loss ($\alpha = 0.01$), z-loss ($\alpha_z = 0.001$), multiplicative jitter ($\epsilon = 0.01$), and a reduced router learning rate.
+3. **Detect and recover**: Implement automated detection that triggers increased auxiliary loss or router resets when entropy drops.
+4. **Control logit magnitude**: Z-loss keeps router logits in a regime where softmax gradients are informative.
+5. **Understand specialization**: Different layers specialize at different granularities. Early layers differentiate by surface form; late layers differentiate by output function.
+
+The next post in the series covers the historical evolution of MoE architectures — from Shazeer 2017 through Switch, GShard, ST-MoE, Mixtral, and DeepSeek.

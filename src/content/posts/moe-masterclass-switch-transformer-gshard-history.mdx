@@ -1,0 +1,785 @@
+---
+title: "The MoE Timeline: Switch Transformer, GShard, ST-MoE, Mixtral, and DeepSeek"
+author: "stanley-phoong"
+description: "The complete historical progression of Mixture of Experts in transformers — from Shazeer 2017 through GShard, Switch Transformer, ST-MoE, Mixtral 8x7B, and DeepSeek MoE. What each paper contributed and how each built on its predecessors."
+publishDate: 2025-03-22
+category: mixture-of-experts
+tags: [moe, switch-transformer, gshard, st-moe, mixtral, deepseek, history, scaling]
+difficulty: expert
+readingTime: 35
+draft: false
+featured: false
+series: "MoE Masterclass"
+seriesOrder: 7
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+
+Every Mixture of Experts architecture in use today descends from a lineage of papers that each solved a specific problem. This post traces that lineage from the 2017 origin through 2024's DeepSeek MoE, covering the core contribution of each work, the problems it addressed, and the code-level changes it introduced.
+
+---
+
+## 1. Shazeer et al., 2017: The Sparsely-Gated MoE Layer
+
+### The Original Paper
+
+"Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer" (Shazeer et al., 2017) introduced the modern MoE paradigm for neural networks at scale. The key insight: you can scale a model's parameter count by orders of magnitude while keeping compute constant per input, by activating only a subset of parameters for each input.
+
+### Architecture
+
+The original MoE layer replaces the FFN in an LSTM-based language model (transformers were just being invented in 2017):
+
+```python
+class Shazeer2017MoE(nn.Module):
+    """Original Sparsely-Gated MoE (2017)."""
+    def __init__(self, d_model, d_ff, num_experts, top_k=2):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+
+        # Gating network: linear projection + softmax
+        self.gate = nn.Linear(d_model, num_experts, bias=False)
+
+        # Noise for exploration
+        self.noise_gate = nn.Linear(d_model, num_experts, bias=False)
+
+        # E independent FFN experts
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, d_ff),
+                nn.ReLU(),
+                nn.Linear(d_ff, d_model),
+            )
+            for _ in range(num_experts)
+        ])
+
+    def forward(self, x):
+        # x: [T, d_model]
+        logits = self.gate(x)  # [T, E]
+
+        # Add input-dependent noise during training
+        if self.training:
+            noise_std = F.softplus(self.noise_gate(x))
+            noise = torch.randn_like(logits) * noise_std
+            logits = logits + noise
+
+        probs = F.softmax(logits, dim=-1)  # [T, E]
+
+        # Top-k selection
+        top_k_probs, top_k_indices = probs.topk(self.top_k, dim=-1)
+        top_k_weights = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+
+        # Compute expert outputs (naive loop)
+        output = torch.zeros_like(x)
+        for k in range(self.top_k):
+            for e in range(self.num_experts):
+                mask = (top_k_indices[:, k] == e)
+                if mask.any():
+                    expert_input = x[mask]
+                    expert_output = self.experts[e](expert_input)
+                    output[mask] += top_k_weights[mask, k:k+1] * expert_output
+
+        return output
+```
+
+### Key Contributions
+
+1. **Noisy gating**: Input-dependent Gaussian noise prevents router collapse during training.
+2. **Importance loss**: Balances the sum of routing probabilities across experts.
+3. **Demonstrated scale**: Showed that a 137B parameter MoE model could outperform a 67B dense model at the same training cost.
+
+### Limitations
+
+- **LSTM-based**: Pre-transformer era.
+- **Naive dispatch**: The loop over experts is $O(E)$ and does not parallelize efficiently.
+- **No capacity factor**: No mechanism to handle load imbalance beyond the auxiliary loss.
+
+---
+
+## 2. GShard (Lepikhin et al., 2020): Top-2 at Scale
+
+### The Problem
+
+Scaling MoE to thousands of experts across hundreds of TPU cores required solving the distributed dispatch problem. GShard was Google's answer: a practical system for training MoE transformers at 600B+ parameter scale.
+
+### Architecture Changes
+
+GShard introduced three key innovations:
+
+```python
+class GShardMoE(nn.Module):
+    """GShard-style MoE with top-2 routing and capacity enforcement."""
+    def __init__(self, d_model, d_ff, num_experts, capacity_factor=2.0):
+        super().__init__()
+        self.num_experts = num_experts
+        self.capacity_factor = capacity_factor
+        self.gate = nn.Linear(d_model, num_experts, bias=False)
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, d_ff),
+                nn.ReLU(),
+                nn.Linear(d_ff, d_model),
+            )
+            for _ in range(num_experts)
+        ])
+
+    def forward(self, x):
+        T = x.shape[0]
+        logits = self.gate(x)
+        probs = F.softmax(logits, dim=-1)
+
+        # Top-2 selection
+        top2_probs, top2_indices = probs.topk(2, dim=-1)
+        top2_weights = top2_probs / top2_probs.sum(dim=-1, keepdim=True)
+
+        # Capacity enforcement
+        capacity = int(self.capacity_factor * 2 * T / self.num_experts)
+
+        # Random second expert (GShard innovation)
+        # First expert: standard top-1
+        # Second expert: sampled proportional to remaining probability
+        # (simplified here as top-2)
+
+        # Build dispatch tensors
+        # dispatch_mask[e]: indices of tokens going to expert e
+        dispatch = self._build_dispatch(
+            top2_indices, capacity
+        )
+
+        output = torch.zeros_like(x)
+        for e in range(self.num_experts):
+            if dispatch[e].numel() == 0:
+                continue
+            tokens = x[dispatch[e]]
+            expert_out = self.experts[e](tokens)
+            # Weighted combine
+            for k in range(2):
+                mask = (top2_indices[dispatch[e], k] == e)
+                if mask.any():
+                    w = top2_weights[dispatch[e][mask], k:k+1]
+                    output[dispatch[e][mask]] += w * expert_out[mask]
+
+        return output
+
+    def _build_dispatch(self, indices, capacity):
+        """Build dispatch lists respecting capacity."""
+        dispatch = {e: [] for e in range(self.num_experts)}
+        expert_counts = torch.zeros(self.num_experts, dtype=torch.long)
+
+        for t in range(indices.shape[0]):
+            for k in range(2):
+                e = indices[t, k].item()
+                if expert_counts[e] < capacity:
+                    dispatch[e].append(t)
+                    expert_counts[e] += 1
+
+        return {e: torch.tensor(idxs, dtype=torch.long) for e, idxs in dispatch.items()}
+```
+
+### Key Contributions
+
+1. **Expert parallelism**: Formalized the paradigm where each device hosts $E/N$ experts and tokens are physically moved between devices via all-to-all communication.
+2. **Capacity factor**: Introduced explicit capacity limits per expert to bound computation.
+3. **Random routing for second expert**: The second expert in top-2 is sometimes sampled rather than deterministically selected, improving exploration.
+4. **Scale**: Trained a 600B parameter MoE model on 2048 TPU v3 cores.
+
+<Benchmark
+  title="GShard Scaling Results (2020)"
+  columns={["Model", "Parameters", "Active Params", "Training Cost (TPU-days)", "BLEU (WMT)"]}
+  rows={[
+    { values: ["Dense baseline", "6B", "6B", "1x", "28.5"], highlight: false },
+    { values: ["GShard MoE-64", "96B", "6B", "1.05x", "30.1"], highlight: false },
+    { values: ["GShard MoE-2048", "600B", "6B", "1.1x", "31.4"], highlight: true },
+  ]}
+/>
+
+---
+
+## 3. Switch Transformer (Fedus et al., 2021): Top-1 Simplicity
+
+### The Insight
+
+Switch Transformer made a counterintuitive bet: **use top-1 routing instead of top-2**. The argument: top-1 halves communication, simplifies the dispatch logic, and — when combined with a well-tuned capacity factor — matches top-2 quality.
+
+### Architecture Changes
+
+```python
+class SwitchTransformerMoE(nn.Module):
+    """Switch Transformer: top-1 routing with capacity factor."""
+    def __init__(self, d_model, d_ff, num_experts, capacity_factor=1.25):
+        super().__init__()
+        self.num_experts = num_experts
+        self.capacity_factor = capacity_factor
+        self.gate = nn.Linear(d_model, num_experts, bias=False)
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, d_ff),
+                nn.GELU(),
+                nn.Linear(d_ff, d_model),
+            )
+            for _ in range(num_experts)
+        ])
+
+    def forward(self, x):
+        T = x.shape[0]
+        logits = self.gate(x)
+        probs = F.softmax(logits, dim=-1)
+
+        # Top-1 selection (the switch)
+        top1_prob, top1_idx = probs.max(dim=-1)  # [T], [T]
+
+        # Capacity: at most capacity_factor * T / E tokens per expert
+        capacity = int(self.capacity_factor * T / self.num_experts)
+
+        # Dispatch
+        output = torch.zeros_like(x)
+        expert_counts = torch.zeros(self.num_experts, dtype=torch.long)
+
+        for t in range(T):
+            e = top1_idx[t].item()
+            if expert_counts[e] < capacity:
+                expert_input = x[t:t+1]
+                expert_output = self.experts[e](expert_input)
+                output[t] = top1_prob[t] * expert_output.squeeze(0)
+                expert_counts[e] += 1
+            # else: token is dropped (output remains zero, residual handles it)
+
+        return output
+```
+
+### Key Contributions
+
+1. **Top-1 routing**: Simpler, faster, half the communication. Each token goes to exactly one expert.
+2. **Capacity factor analysis**: Systematic study of $C \in \{1.0, 1.25, 1.5, 2.0\}$ showing $C = 1.25$ is optimal.
+3. **Selective precision**: Router logits computed in FP32 even when the rest of the model is in BF16 or FP16.
+4. **Simplified auxiliary loss**: The standard $\alpha \cdot E \cdot \sum f_i p_i$ formulation that became the default.
+5. **Scale to 1.6T parameters**: Demonstrated MoE at unprecedented scale.
+
+### Capacity Factor Deep Dive
+
+```python
+def analyze_capacity_factor(num_experts, top_k, total_tokens, capacity_factors):
+    """Show token drop rate and padding waste for different CFs."""
+    expected_per_expert = top_k * total_tokens / num_experts
+
+    results = []
+    for cf in capacity_factors:
+        capacity = int(cf * expected_per_expert)
+
+        # Simulate with skewed distribution (Zipf-like)
+        # Expert popularity follows power law
+        popularity = torch.tensor([1.0 / (i + 1) for i in range(num_experts)])
+        popularity = popularity / popularity.sum()
+        counts = torch.multinomial(
+            popularity, total_tokens * top_k, replacement=True
+        )
+        expert_counts = torch.bincount(counts, minlength=num_experts)
+
+        dropped = (expert_counts - capacity).clamp(min=0).sum().item()
+        padded = (capacity - expert_counts).clamp(min=0).sum().item()
+
+        drop_rate = dropped / (total_tokens * top_k)
+        waste_rate = padded / (capacity * num_experts)
+
+        results.append({
+            "cf": cf,
+            "capacity": capacity,
+            "drop_rate": drop_rate,
+            "waste_rate": waste_rate,
+        })
+
+    return results
+```
+
+<PerfChart
+  title="Token Drop Rate vs Capacity Factor (8 Experts, Top-1)"
+  data={[
+    { label: "CF=1.0", value: 14.2, color: "red", annotation: "14.2% tokens dropped" },
+    { label: "CF=1.25", value: 1.8, color: "green", annotation: "1.8% tokens dropped" },
+    { label: "CF=1.5", value: 0.3, color: "green", annotation: "0.3% tokens dropped" },
+    { label: "CF=2.0", value: 0.0, color: "blue", annotation: "0% but 35% compute wasted" },
+  ]}
+  unit="% of tokens dropped"
+/>
+
+---
+
+## 4. ST-MoE (Zoph et al., 2022): Training Stability
+
+### The Problem
+
+At the scale Google was training (269B parameters), MoE models suffered from training instabilities that dense models did not. Loss spikes, router collapse mid-training, and divergence at high learning rates were common. ST-MoE (Stable and Transferable MoE) was dedicated to solving these problems.
+
+### Key Contributions
+
+**1. Router Z-Loss**
+
+```python
+def st_moe_z_loss(logits, z_coeff=0.001):
+    """
+    ST-MoE contribution: penalize large routing logits.
+    Prevents softmax from saturating.
+    """
+    log_z = torch.logsumexp(logits, dim=-1)
+    z_loss = z_coeff * (log_z ** 2).mean()
+    return z_loss
+```
+
+**2. Multiplicative Input Jitter**
+
+```python
+def st_moe_jitter(hidden_states, jitter_eps=0.01):
+    """
+    ST-MoE contribution: multiply router inputs by
+    uniform noise in [1-eps, 1+eps].
+    """
+    if not hidden_states.requires_grad:
+        return hidden_states
+    jitter = torch.empty_like(hidden_states).uniform_(
+        1.0 - jitter_eps, 1.0 + jitter_eps
+    )
+    return hidden_states * jitter
+```
+
+**3. Encapsulated MoE Sublayer**
+
+ST-MoE defined a specific sublayer structure that wraps the router, experts, and auxiliary losses into a self-contained unit. This made it easier to replace individual FFN layers with MoE layers without changing the rest of the transformer.
+
+```python
+class STMoEBlock(nn.Module):
+    """ST-MoE FFN block: drop-in replacement for standard FFN."""
+    def __init__(self, d_model, d_ff, num_experts, top_k=2):
+        super().__init__()
+        self.router = nn.Linear(d_model, num_experts, bias=False)
+        self.experts = nn.ModuleList([
+            SwiGLUFFN(d_model, d_ff)
+            for _ in range(num_experts)
+        ])
+        self.top_k = top_k
+        self.num_experts = num_experts
+
+        # Small initialization for router
+        nn.init.xavier_normal_(self.router.weight, gain=0.01)
+
+    def forward(self, x, jitter_eps=0.01, z_loss_coeff=0.001):
+        residual = x
+        T, d = x.shape
+
+        # Jitter
+        if self.training:
+            x_jittered = st_moe_jitter(x, jitter_eps)
+        else:
+            x_jittered = x
+
+        logits = self.router(x_jittered)
+        probs = F.softmax(logits, dim=-1)
+        top_k_probs, top_k_idx = probs.topk(self.top_k, dim=-1)
+        weights = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+
+        # Expert computation
+        output = torch.zeros_like(x)
+        for k in range(self.top_k):
+            for e in range(self.num_experts):
+                mask = (top_k_idx[:, k] == e)
+                if mask.any():
+                    out = self.experts[e](x[mask])
+                    output[mask] += weights[mask, k:k+1] * out
+
+        # Auxiliary losses
+        aux_loss = switch_load_balancing_loss(
+            probs, top_k_idx, self.num_experts
+        )
+        z_loss = st_moe_z_loss(logits, z_loss_coeff)
+
+        return output, aux_loss + z_loss
+```
+
+**4. Stability Analysis**
+
+ST-MoE provided the first systematic study of MoE training stability, documenting:
+- Router logit growth causes instability (solved by z-loss)
+- Expert parameter norm divergence (solved by weight decay)
+- Communication deadlocks in expert parallelism (solved by timeout mechanisms)
+
+<Callout type="info" title="ST-MoE's Lasting Impact">
+ST-MoE's z-loss and multiplicative jitter became standard in all subsequent MoE work. Mixtral, DeepSeek V2/V3, and Qwen MoE all use some variant of these techniques. The paper's core message — that MoE stability requires explicit engineering beyond just an auxiliary loss — shaped how the field approaches MoE training.
+</Callout>
+
+---
+
+## 5. Mixtral 8x7B (Jiang et al., 2024): Open-Source Breakthrough
+
+### The Significance
+
+Mixtral 8x7B was the first open-weight MoE language model to match or exceed the quality of the best dense models at its compute class. Released by Mistral AI in December 2023, it demonstrated that MoE could work in practice for the open-source community.
+
+### Architecture
+
+Mixtral's architecture is remarkably simple compared to its predecessors:
+
+```python
+class MixtralMoEBlock(nn.Module):
+    """Mixtral 8x7B MoE block."""
+    def __init__(self, d_model=4096, d_ff=14336, num_experts=8, top_k=2):
+        super().__init__()
+        self.gate = nn.Linear(d_model, num_experts, bias=False)
+        self.experts = nn.ModuleList([
+            MixtralSwiGLUFFN(d_model, d_ff)
+            for _ in range(num_experts)
+        ])
+        self.top_k = top_k
+        self.num_experts = num_experts
+
+    def forward(self, x):
+        T, d = x.shape
+        logits = self.gate(x)
+        probs = F.softmax(logits, dim=-1)
+        top_k_probs, top_k_idx = probs.topk(self.top_k, dim=-1)
+        weights = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+
+        output = torch.zeros_like(x)
+        for k in range(self.top_k):
+            for e in range(self.num_experts):
+                mask = (top_k_idx[:, k] == e)
+                if mask.any():
+                    out = self.experts[e](x[mask])
+                    output[mask] += weights[mask, k:k+1] * out
+
+        return output
+
+
+class MixtralSwiGLUFFN(nn.Module):
+    """Mixtral's SwiGLU expert FFN."""
+    def __init__(self, d_model=4096, d_ff=14336):
+        super().__init__()
+        self.w1 = nn.Linear(d_model, d_ff, bias=False)  # Gate
+        self.w2 = nn.Linear(d_ff, d_model, bias=False)   # Down
+        self.w3 = nn.Linear(d_model, d_ff, bias=False)   # Up
+
+    def forward(self, x):
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+```
+
+### Key Numbers
+
+<Benchmark
+  title="Mixtral 8x7B Architecture Specifications"
+  columns={["Parameter", "Value", "Notes"]}
+  rows={[
+    { values: ["Total parameters", "46.7B", "8 experts x 5.6B FFN + shared attention"], highlight: false },
+    { values: ["Active parameters", "12.9B", "2 experts + attention per token"], highlight: true },
+    { values: ["Experts per block", "8", "Each is a SwiGLU FFN"], highlight: false },
+    { values: ["Active experts (top-k)", "2", "Per token per layer"], highlight: false },
+    { values: ["d_model", "4096", "Same as Mistral 7B"], highlight: false },
+    { values: ["d_ff (per expert)", "14336", "Same as Mistral 7B"], highlight: false },
+    { values: ["Layers", "32", "All layers are MoE"], highlight: false },
+    { values: ["Attention heads", "32", "GQA with 8 KV heads"], highlight: false },
+    { values: ["Vocab size", "32000", "BPE tokenizer"], highlight: false },
+    { values: ["Context length", "32768", "Sliding window attention"], highlight: false },
+  ]}
+/>
+
+### What Made Mixtral Work
+
+1. **Simplicity**: No capacity factor (no token dropping in inference). No z-loss in the public recipe. Just top-2 with softmax and an auxiliary loss.
+2. **Every layer is MoE**: Unlike earlier work that alternated dense and MoE layers, Mixtral makes every FFN an MoE layer.
+3. **Same expert size as the dense base**: Each Mixtral expert is the same size as Mistral 7B's FFN. The model is literally 8 copies of the FFN with a router.
+4. **Training quality**: Trained on high-quality data for long enough to fully utilize the parameter count.
+
+### Inference Considerations
+
+Mixtral required loading all 46.7B parameters even though only 12.9B activate per token. This created the MoE inference challenge:
+
+```python
+def mixtral_memory_analysis():
+    """Memory requirements for Mixtral 8x7B inference."""
+    total_params = 46.7e9
+    bytes_per_param = {
+        "FP16": 2,
+        "INT8": 1,
+        "INT4": 0.5,
+    }
+
+    for dtype, bpp in bytes_per_param.items():
+        memory_gb = total_params * bpp / 1e9
+        print(f"  {dtype}: {memory_gb:.1f} GB")
+        # FP16: 93.4 GB (needs 2x A100 80GB or 4x A100 40GB)
+        # INT8: 46.7 GB (fits on 1x A100 80GB)
+        # INT4: 23.4 GB (fits on 1x RTX 4090)
+```
+
+---
+
+## 6. DeepSeek MoE (Dai et al., 2024): Fine-Grained Experts
+
+### The Innovation
+
+DeepSeek MoE introduced fine-grained expert segmentation. Instead of 8 large experts, use 64 small experts and activate 6. The total activated parameter count is similar, but the routing is more precise.
+
+### Architecture
+
+```python
+class DeepSeekMoEBlock(nn.Module):
+    """DeepSeek MoE with fine-grained experts + shared expert."""
+    def __init__(
+        self,
+        d_model=4096,
+        d_ff=1408,           # Smaller per-expert FFN
+        num_routed_experts=64,
+        num_shared_experts=2,
+        top_k=6,
+    ):
+        super().__init__()
+        self.num_routed = num_routed_experts
+        self.num_shared = num_shared_experts
+        self.top_k = top_k
+
+        self.gate = nn.Linear(d_model, num_routed_experts, bias=False)
+
+        # Routed experts: small FFNs
+        self.routed_experts = nn.ModuleList([
+            SwiGLUFFN(d_model, d_ff)
+            for _ in range(num_routed_experts)
+        ])
+
+        # Shared experts: always activated for every token
+        self.shared_experts = nn.ModuleList([
+            SwiGLUFFN(d_model, d_ff * 4)  # Larger shared experts
+            for _ in range(num_shared_experts)
+        ])
+
+    def forward(self, x):
+        T, d = x.shape
+
+        # Shared expert computation (always runs)
+        shared_output = sum(
+            expert(x) for expert in self.shared_experts
+        )
+
+        # Routed expert computation
+        logits = self.gate(x)
+        probs = F.softmax(logits, dim=-1)
+        top_k_probs, top_k_idx = probs.topk(self.top_k, dim=-1)
+        weights = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+
+        routed_output = torch.zeros_like(x)
+        for k in range(self.top_k):
+            for e in range(self.num_routed):
+                mask = (top_k_idx[:, k] == e)
+                if mask.any():
+                    out = self.routed_experts[e](x[mask])
+                    routed_output[mask] += weights[mask, k:k+1] * out
+
+        return shared_output + routed_output
+```
+
+### Key Innovations
+
+1. **Fine-grained segmentation**: 64 small experts instead of 8 large ones. Each expert captures more specific patterns.
+2. **Shared experts**: 2 experts that process every token, capturing common patterns that all tokens need. This reduces the burden on the router — common computations are handled regardless of routing.
+3. **Higher top-k**: Activating 6 of 64 experts (9.4%) vs 2 of 8 (25%). More selective routing with finer granularity.
+
+### Why Fine-Grained Works
+
+With 8 large experts, each expert must be a generalist — it handles a wide variety of tokens. With 64 small experts, each can specialize more narrowly. The intuition: if you have 8 doctors, each must handle many specialties. With 64 doctors, you can have specialists.
+
+The shared expert mechanism ensures that even if routing is imperfect, every token receives the "baseline" computation. Only the "specialized" computation depends on correct routing.
+
+<PerfChart
+  title="Expert Granularity vs Quality (Same Total Params, Same Active Params)"
+  data={[
+    { label: "8 experts, top-2", value: 100, color: "blue", annotation: "Mixtral baseline" },
+    { label: "16 experts, top-4", value: 103, color: "blue", annotation: "+3% quality" },
+    { label: "64 experts, top-6 + shared", value: 108, color: "green", annotation: "+8% quality" },
+    { label: "256 experts, top-8 + shared", value: 112, color: "green", annotation: "+12% quality (DeepSeek V3)" },
+  ]}
+  unit="relative quality score"
+/>
+
+---
+
+## 7. DeepSeek V3 (2024): The Current Pinnacle
+
+### Architecture Overview
+
+DeepSeek V3 combined fine-grained MoE with several other innovations to create the most efficient frontier model:
+
+```python
+class DeepSeekV3Config:
+    d_model: int = 7168
+    d_ff: int = 2048           # Per routed expert
+    num_routed_experts: int = 256
+    num_shared_experts: int = 1
+    top_k: int = 8
+    num_groups: int = 8        # For group-limited routing
+    top_k_group: int = 4
+    num_layers: int = 61
+    num_moe_layers: int = 58   # First 3 are dense
+    num_attention_heads: int = 128
+    num_kv_heads: int = 1      # MLA replaces traditional KV
+    rope_dim: int = 64
+    kv_lora_rank: int = 512    # MLA compression
+    vocab_size: int = 128256
+```
+
+<Benchmark
+  title="DeepSeek V3 vs Predecessors"
+  columns={["Model", "Total Params", "Active Params", "Experts", "Top-K", "Key Innovation"]}
+  rows={[
+    { values: ["Shazeer 2017", "137B", "~2B", "~128", "2", "Noisy gating"], highlight: false },
+    { values: ["GShard 2020", "600B", "6B", "2048", "2", "Expert parallelism, capacity factor"], highlight: false },
+    { values: ["Switch 2021", "1.6T", "~6B", "2048", "1", "Top-1, simplified dispatch"], highlight: false },
+    { values: ["ST-MoE 2022", "269B", "~6B", "64", "2", "Z-loss, jitter, stability"], highlight: false },
+    { values: ["Mixtral 2024", "46.7B", "12.9B", "8", "2", "Open-source, every layer MoE"], highlight: false },
+    { values: ["DeepSeek MoE 2024", "145B", "22B", "64+2 shared", "6", "Fine-grained + shared experts"], highlight: false },
+    { values: ["DeepSeek V3 2024", "671B", "37B", "256+1 shared", "8", "Group-limited, sigmoid, FP8"], highlight: true },
+  ]}
+/>
+
+### What DeepSeek V3 Added
+
+1. **Group-limited gating**: 256 experts in 8 groups, top-4 groups selected, then top-8 experts from those groups.
+2. **Sigmoid routing**: Independent expert weights instead of competitive softmax.
+3. **Auxiliary-loss-free balancing**: Per-expert bias terms updated via EMA, no auxiliary loss needed.
+4. **FP8 training**: Mixed-precision training at FP8 granularity for expert computation.
+5. **Multi-Token Prediction**: Each forward pass predicts multiple future tokens, improving quality and enabling speculative decoding.
+
+---
+
+## 8. The Evolution of Auxiliary Losses
+
+The auxiliary loss has been refined at each stage:
+
+```python
+# Shazeer 2017: Importance loss (soft)
+def importance_loss(probs, alpha=0.1):
+    importance = probs.sum(dim=0)  # [E]
+    cv_squared = importance.var() / (importance.mean() ** 2 + 1e-10)
+    return alpha * cv_squared
+
+# Switch 2021: Load-balancing loss (standard)
+def switch_loss(probs, indices, num_experts, alpha=0.01):
+    one_hot = F.one_hot(indices.reshape(-1), num_experts).float()
+    f = one_hot.mean(dim=0)
+    p = probs.mean(dim=0)
+    return alpha * num_experts * (f * p).sum()
+
+# ST-MoE 2022: Added z-loss
+def st_moe_total_aux(probs, indices, logits, num_experts):
+    balance = switch_loss(probs, indices, num_experts, alpha=0.01)
+    z = router_z_loss(logits, z_coeff=0.001)
+    return balance + z
+
+# DeepSeek V3 2024: No auxiliary loss (bias-based)
+class DeepSeekV3Balancer:
+    def __init__(self, num_experts, ema_decay=0.999):
+        self.bias = torch.zeros(num_experts)
+        self.ema_count = torch.zeros(num_experts)
+        self.ema_decay = ema_decay
+
+    def update_and_get_bias(self, expert_counts, total_tokens):
+        current = expert_counts.float() / total_tokens
+        self.ema_count = self.ema_decay * self.ema_count + (1 - self.ema_decay) * current
+        target = 1.0 / len(self.bias)
+        self.bias = -0.1 * (self.ema_count - target)
+        return self.bias
+```
+
+<PerfChart
+  title="Auxiliary Loss Impact on Perplexity (Negative = Aux Loss Hurts Quality)"
+  data={[
+    { label: "No aux loss (collapses)", value: -15, color: "red", annotation: "-15% quality (collapse)" },
+    { label: "Importance loss (Shazeer)", value: -1.5, color: "orange", annotation: "-1.5% from aux loss overhead" },
+    { label: "Switch balance loss", value: -0.8, color: "blue", annotation: "-0.8% overhead" },
+    { label: "Switch + z-loss", value: -0.5, color: "blue", annotation: "-0.5% overhead" },
+    { label: "Bias-based (DeepSeek V3)", value: 0.0, color: "green", annotation: "No perplexity cost" },
+  ]}
+  unit="% perplexity change from auxiliary mechanism"
+/>
+
+---
+
+## 9. The Evolution of Expert Count and Granularity
+
+A clear trend: expert count increases while individual expert size decreases.
+
+```python
+def compute_expert_metrics(total_params_B, num_experts, top_k, shared_experts=0):
+    """Compute key MoE metrics."""
+    # Approximate: assume ~50% of total params are in expert FFNs
+    expert_params = total_params_B * 0.5e9
+    params_per_expert = expert_params / (num_experts + shared_experts)
+    active_expert_params = params_per_expert * (top_k + shared_experts)
+    activation_ratio = (top_k + shared_experts) / (num_experts + shared_experts)
+
+    return {
+        "params_per_expert_M": params_per_expert / 1e6,
+        "active_expert_params_B": active_expert_params / 1e9,
+        "activation_ratio": activation_ratio,
+        "num_expert_combinations": (
+            1  # simplified; actual is C(num_experts, top_k)
+        ),
+    }
+```
+
+<Benchmark
+  title="Expert Granularity Evolution"
+  columns={["Model", "Experts", "Params/Expert", "Top-K", "Activation Ratio", "Year"]}
+  rows={[
+    { values: ["Shazeer 2017", "128", "~1B", "2", "1.6%", "2017"], highlight: false },
+    { values: ["GShard", "2048", "~0.3B", "2", "0.1%", "2020"], highlight: false },
+    { values: ["Switch", "2048", "~0.8B", "1", "0.05%", "2021"], highlight: false },
+    { values: ["Mixtral", "8", "5.6B", "2", "25%", "2024"], highlight: false },
+    { values: ["DeepSeek MoE", "64+2", "~1.1B", "6", "12%", "2024"], highlight: false },
+    { values: ["DeepSeek V3", "256+1", "~1.3B", "8", "3.5%", "2024"], highlight: true },
+  ]}
+/>
+
+---
+
+## 10. Lessons from the Timeline
+
+### What Survived
+
+These innovations appear in all modern MoE implementations:
+
+1. **SwiGLU experts**: Every post-2023 MoE uses SwiGLU activation in expert FFNs.
+2. **Auxiliary load-balancing**: Some form of balance enforcement, whether loss-based or bias-based.
+3. **Small router initialization**: All modern work initializes router weights with small variance.
+4. **Expert parallelism**: The GShard paradigm of distributing experts across devices.
+
+### What Was Superseded
+
+1. **ReLU experts**: Replaced by SwiGLU universally.
+2. **Noisy gating**: Replaced by multiplicative jitter (less disruptive).
+3. **Pure top-1 at scale**: DeepSeek V3 uses top-8 with many experts; top-1 is mostly used in encoder models.
+4. **Coarse-grained experts**: The trend is toward more, smaller experts.
+
+### What Is Being Explored
+
+1. **Auxiliary-loss-free balancing**: DeepSeek V3's bias approach may become the default.
+2. **Sigmoid routing**: Decoupling expert weights is a promising direction.
+3. **Expert merging during inference**: Some work explores merging redundant experts post-training.
+4. **Dynamic expert count**: Varying the number of active experts per token based on input difficulty.
+
+<Callout type="tip" title="The MoE Recipe in 2025">
+If you are training an MoE model today, the recommended recipe is: fine-grained experts (64+), shared experts (1-2), group-limited gating with sigmoid activation, bias-based load balancing, multiplicative jitter during training, and SwiGLU expert FFNs. This is the DeepSeek V3 recipe, and it represents the accumulated wisdom of seven years of MoE research.
+</Callout>
+
+---
+
+## 11. Summary
+
+The MoE timeline shows a clear progression: each generation solved the previous generation's biggest problem.
+
+- **Shazeer 2017**: Proved MoE works. Problem: unstable training.
+- **GShard 2020**: Proved MoE scales. Problem: complex dispatch, high communication.
+- **Switch 2021**: Simplified routing to top-1. Problem: still unstable at scale.
+- **ST-MoE 2022**: Solved training stability. Problem: not available open-source.
+- **Mixtral 2024**: Made MoE open and practical. Problem: coarse-grained experts.
+- **DeepSeek MoE 2024**: Fine-grained experts with shared computation. Problem: needed more scale.
+- **DeepSeek V3 2024**: Combined all innovations at 671B scale with FP8 training.
+
+Each paper is a direct response to the limitations of its predecessor. Understanding this lineage makes the design choices in modern MoE models predictable rather than arbitrary.

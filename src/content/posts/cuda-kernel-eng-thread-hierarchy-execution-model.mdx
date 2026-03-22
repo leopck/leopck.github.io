@@ -1,0 +1,803 @@
+---
+title: "CUDA Thread Hierarchy: Grids, Blocks, Warps, and the Execution Model That Determines Performance"
+author: "stanley-phoong"
+description: "A complete technical reference for the CUDA thread hierarchy — grids, blocks, warps, and individual threads. Covers SIMT execution, warp scheduling, block dimension selection, occupancy analysis, and thread indexing patterns with benchmarked implementations."
+publishDate: 2025-03-22
+category: gpu-programming
+tags: [cuda, thread-hierarchy, warps, occupancy, simt, gpu, kernel-engineering]
+difficulty: expert
+readingTime: 30
+draft: false
+featured: false
+series: "CUDA Kernel Engineering"
+seriesOrder: 1
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+
+CUDA exposes a three-level thread hierarchy: grids contain blocks, blocks contain threads, and hardware groups threads into warps of 32. Every performance characteristic of a CUDA kernel — occupancy, memory access efficiency, divergence cost, synchronization overhead — traces directly back to how work maps onto this hierarchy. This post covers the hierarchy from hardware up: what a warp actually is at the silicon level, how the block scheduler assigns blocks to SMs, how grid and block dimensions interact with occupancy, and how to select optimal launch configurations for real workloads.
+
+All measurements target NVIDIA Ampere (A100-80GB SXM, SM 8.0) unless stated otherwise. The principles generalize across architectures.
+
+---
+
+## 1. The Hardware Foundation: SMs, Warp Schedulers, and Execution Units
+
+An A100 GPU contains 108 Streaming Multiprocessors (SMs). Each SM is an independent processor with its own:
+
+- **Register file**: 65,536 32-bit registers (256 KB)
+- **Shared memory / L1 cache**: configurable, up to 164 KB shared + 28 KB L1
+- **Warp schedulers**: 4 per SM
+- **Execution units**: 64 FP32 CUDA cores, 32 FP64 cores, 4 tensor cores (third-gen)
+- **Load/store units**: 32 per SM
+- **Special function units (SFUs)**: 16 per SM
+
+Each warp scheduler manages a pool of warps and issues one instruction per cycle from one ready warp. With 4 schedulers, an SM can issue 4 independent instructions per cycle — one from each scheduler's selected warp.
+
+### The Warp: 32 Threads in Lockstep
+
+A **warp** is the fundamental unit of execution. It consists of 32 threads that execute the same instruction simultaneously. This is NVIDIA's **Single Instruction, Multiple Threads (SIMT)** execution model.
+
+Key properties of a warp:
+
+1. **All 32 threads execute the same PC (program counter)** at any given cycle
+2. **Divergence** (branches where threads take different paths) causes serialization: the warp executes each path sequentially, masking inactive threads
+3. **Memory transactions** are issued per-warp: 32 threads generate addresses, and the hardware coalesces them into cache line requests
+4. **Warp-level primitives** (`__shfl_sync`, `__ballot_sync`, etc.) communicate directly between the 32 registers within a warp
+
+```cpp
+// Every thread in a warp executes this simultaneously
+// Thread 0-31 all compute their own 'val', but in lockstep
+__global__ void example_kernel(float* data, int n) {
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    if (tid < n) {
+        float val = data[tid];     // 32 threads issue loads together
+        val = val * 2.0f + 1.0f;   // 32 threads compute together
+        data[tid] = val;            // 32 threads issue stores together
+    }
+}
+```
+
+### Warp Scheduling: Latency Hiding Through Occupancy
+
+When a warp issues a memory load, it stalls until the data arrives (hundreds of cycles for global memory). The warp scheduler simply switches to another ready warp. This is the GPU's primary latency-hiding mechanism: keep enough warps resident so there is always one ready to execute.
+
+The number of resident warps per SM is called **occupancy**:
+
+$$\text{Occupancy} = \frac{\text{Active warps per SM}}{\text{Maximum warps per SM}}$$
+
+On Ampere, maximum warps per SM = 64 (2048 threads / 32 threads per warp). 100% occupancy means 64 warps are resident simultaneously, giving the scheduler maximum freedom to hide latency.
+
+<Callout type="perf" title="Occupancy Is Necessary but Not Sufficient">
+  High occupancy does not guarantee high performance. A kernel at 50% occupancy can outperform one at 100% occupancy if the lower-occupancy kernel has better memory access patterns or higher instruction-level parallelism. Occupancy provides the *opportunity* to hide latency; whether that opportunity matters depends on whether your kernel is latency-bound in the first place.
+</Callout>
+
+---
+
+## 2. The Three-Level Hierarchy: Grid, Block, Thread
+
+When you launch a CUDA kernel, you specify a **grid** of **blocks**, where each block contains a fixed number of **threads**:
+
+```cpp
+// Launch configuration
+dim3 gridDim(num_blocks_x, num_blocks_y, num_blocks_z);
+dim3 blockDim(threads_per_block_x, threads_per_block_y, threads_per_block_z);
+kernel<<<gridDim, blockDim>>>(args...);
+```
+
+### Grid: The Top Level
+
+A grid is the entire collection of thread blocks launched by a single kernel invocation. Grid dimensions can be 1D, 2D, or 3D:
+
+- **1D grid**: `gridDim = (N, 1, 1)` — common for vector operations
+- **2D grid**: `gridDim = (Nx, Ny, 1)` — common for 2D data (images, matrices)
+- **3D grid**: `gridDim = (Nx, Ny, Nz)` — common for volumetric data
+
+Maximum grid dimensions on Compute Capability 8.0:
+- `gridDim.x`: up to $2^{31} - 1$ (2,147,483,647)
+- `gridDim.y`: up to 65,535
+- `gridDim.z`: up to 65,535
+
+### Block: The Cooperative Unit
+
+A thread block is a group of threads that can:
+
+1. **Synchronize** via `__syncthreads()`
+2. **Share data** through shared memory (fast, on-chip SRAM)
+3. **Execute on the same SM** — all threads in a block are guaranteed to be co-resident
+
+Block dimensions are also 1D, 2D, or 3D. Maximum limits on CC 8.0:
+- `blockDim.x`: up to 1024
+- `blockDim.y`: up to 1024
+- `blockDim.z`: up to 64
+- **Total threads per block**: up to 1024
+
+A block is divided into warps. A block of 256 threads contains 8 warps. The mapping is straightforward: thread IDs 0-31 form warp 0, threads 32-63 form warp 1, and so on.
+
+```cpp
+// For a 2D block of (16, 16) = 256 threads:
+// Linear thread ID within block:
+int linear_tid = threadIdx.x + threadIdx.y * blockDim.x;
+// Warp ID within block:
+int warp_id = linear_tid / 32;  // 0..7
+// Lane ID within warp:
+int lane_id = linear_tid % 32;  // 0..31
+```
+
+### Thread: The Individual Unit
+
+Each thread has:
+- A unique ID within its block: `threadIdx.x`, `threadIdx.y`, `threadIdx.z`
+- Access to the block's shared memory
+- Its own registers (allocated from the SM's register file)
+- A unique global ID computed from `threadIdx`, `blockIdx`, and `blockDim`
+
+---
+
+## 3. Thread Indexing: Computing Global IDs
+
+The most fundamental pattern in CUDA programming is computing a global thread index from the built-in variables.
+
+### 1D Indexing
+
+```cpp
+// N elements, one thread per element
+__global__ void vector_add_1d(float* a, float* b, float* c, int n) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < n) {
+        c[idx] = a[idx] + b[idx];
+    }
+}
+
+// Launch: enough blocks to cover N elements
+int block_size = 256;
+int grid_size = (n + block_size - 1) / block_size;
+vector_add_1d<<<grid_size, block_size>>>(a, b, c, n);
+```
+
+### 2D Indexing
+
+```cpp
+// M x N matrix, one thread per element
+__global__ void matrix_scale_2d(float* mat, float scalar, int M, int N) {
+    int col = threadIdx.x + blockIdx.x * blockDim.x;
+    int row = threadIdx.y + blockIdx.y * blockDim.y;
+    if (row < M && col < N) {
+        mat[row * N + col] = mat[row * N + col] * scalar;
+    }
+}
+
+// Launch: 2D grid of 2D blocks
+dim3 block(16, 16);   // 256 threads per block
+dim3 grid((N + 15) / 16, (M + 15) / 16);
+matrix_scale_2d<<<grid, block>>>(mat, scalar, M, N);
+```
+
+### 3D Indexing
+
+```cpp
+// Volume processing: W x H x D
+__global__ void volume_process(float* vol, int W, int H, int D) {
+    int x = threadIdx.x + blockIdx.x * blockDim.x;
+    int y = threadIdx.y + blockIdx.y * blockDim.y;
+    int z = threadIdx.z + blockIdx.z * blockDim.z;
+    if (x < W && y < H && z < D) {
+        int idx = x + y * W + z * W * H;
+        vol[idx] = process(vol[idx]);
+    }
+}
+
+dim3 block(8, 8, 4);  // 256 threads
+dim3 grid((W+7)/8, (H+7)/8, (D+3)/4);
+volume_process<<<grid, block>>>(vol, W, H, D);
+```
+
+### Grid-Stride Loops: When One Thread Handles Multiple Elements
+
+When the total number of elements exceeds the number of launched threads (or you want a fixed grid size for persistent kernel patterns), use a grid-stride loop:
+
+```cpp
+__global__ void vector_add_stride(float* a, float* b, float* c, int n) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int i = idx; i < n; i += stride) {
+        c[i] = a[i] + b[i];
+    }
+}
+
+// Launch with limited grid size
+int block_size = 256;
+int grid_size = min((n + block_size - 1) / block_size, 1024);
+vector_add_stride<<<grid_size, block_size>>>(a, b, c, n);
+```
+
+Grid-stride loops have three advantages: they amortize launch overhead, they allow a fixed grid size (useful for persistent kernels), and they ensure coalesced access across iterations because the stride is a multiple of the block size.
+
+---
+
+## 4. Block Scheduling: How Blocks Map to SMs
+
+The GPU block scheduler assigns blocks to SMs at runtime. This is the critical link between your launch configuration and hardware utilization.
+
+### The Block Scheduler Algorithm
+
+1. The scheduler maintains a queue of unexecuted blocks
+2. For each SM, it checks if the SM has enough resources for the next block: registers, shared memory, warp slots, block slots
+3. If resources are available, the block is assigned to that SM
+4. When a block completes (all threads exit), its resources are freed and a new block can be scheduled
+
+Key implications:
+
+- **Blocks are independent**: the scheduler can assign them to any SM in any order
+- **Blocks do not migrate**: once assigned to an SM, a block runs there until completion
+- **Multiple blocks can share an SM**: if resources permit, 2, 4, 8, or more blocks can be resident simultaneously
+- **Minimum parallelism**: you need at least as many blocks as SMs (108 on A100) to keep the GPU busy
+
+<Benchmark
+  title="Block Count vs GPU Utilization (A100, 108 SMs)"
+  columns={["Grid Size (blocks)", "SMs Active", "GPU Utilization", "Notes"]}
+  rows={[
+    { values: ["1", "1 / 108", "0.9%", "Extremely underutilized"], highlight: false },
+    { values: ["54", "54 / 108", "50%", "Half the GPU idle"], highlight: false },
+    { values: ["108", "108 / 108", "100% (1 block/SM)", "Minimum full utilization"], highlight: true },
+    { values: ["216", "108 / 108", "100% (2 blocks/SM)", "Better latency hiding"], highlight: false },
+    { values: ["864", "108 / 108", "100% (8 blocks/SM)", "Near-maximum occupancy"], highlight: true },
+    { values: ["10000+", "108 / 108", "100%", "Ample parallelism"], highlight: false }
+  ]}
+  notes="More blocks than SMs allows overlapping execution and better latency hiding. Target at least 4x the SM count."
+/>
+
+### Resource Limits per SM (Ampere A100, CC 8.0)
+
+Each SM has hard resource limits that constrain how many blocks can be resident:
+
+- **Maximum blocks per SM**: 32
+- **Maximum warps per SM**: 64
+- **Maximum threads per SM**: 2048
+- **Register file**: 65,536 registers
+- **Shared memory**: up to 164 KB (configurable)
+
+The actual number of resident blocks is the minimum across all resource constraints:
+
+$$\text{Blocks per SM} = \min\left(\left\lfloor\frac{2048}{\text{threads/block}}\right\rfloor, \left\lfloor\frac{65536}{\text{regs/thread} \times \text{threads/block}}\right\rfloor, \left\lfloor\frac{\text{smem capacity}}{\text{smem/block}}\right\rfloor, 32\right)$$
+
+---
+
+## 5. Occupancy Analysis: Choosing Block Size
+
+Block size is the single most impactful launch configuration parameter. Here is a systematic analysis.
+
+### Register Pressure
+
+Each thread uses registers for local variables. The compiler allocates registers, and the count is visible via `--ptxas-options=-v` at compile time. If a kernel uses 32 registers per thread and the block size is 256 threads:
+
+$$\text{Registers per block} = 32 \times 256 = 8192$$
+
+$$\text{Blocks per SM (register-limited)} = \left\lfloor\frac{65536}{8192}\right\rfloor = 8$$
+
+$$\text{Occupancy} = \frac{8 \times 256}{2048} = 100\%$$
+
+But if the kernel uses 64 registers per thread:
+
+$$\text{Registers per block} = 64 \times 256 = 16384$$
+
+$$\text{Blocks per SM} = \left\lfloor\frac{65536}{16384}\right\rfloor = 4$$
+
+$$\text{Occupancy} = \frac{4 \times 256}{2048} = 50\%$$
+
+### Shared Memory Pressure
+
+If a kernel uses 32 KB of shared memory per block:
+
+$$\text{Blocks per SM (smem-limited)} = \left\lfloor\frac{164 \text{ KB}}{32 \text{ KB}}\right\rfloor = 5$$
+
+$$\text{Occupancy} = \frac{5 \times 256}{2048} = 62.5\%$$
+
+### Block Size Occupancy Table
+
+<Benchmark
+  title="Occupancy vs Block Size (A100, 32 regs/thread, 0 smem)"
+  columns={["Block Size", "Warps/Block", "Blocks/SM (thread-limited)", "Blocks/SM (reg-limited)", "Blocks/SM (actual)", "Occupancy"]}
+  rows={[
+    { values: ["32", "1", "32 (capped)", "32 (capped)", "32", "50%"], highlight: false },
+    { values: ["64", "2", "32", "32", "32", "100%"], highlight: false },
+    { values: ["128", "4", "16", "16", "16", "100%"], highlight: false },
+    { values: ["256", "8", "8", "8", "8", "100%"], highlight: true },
+    { values: ["512", "16", "4", "4", "4", "100%"], highlight: false },
+    { values: ["1024", "32", "2", "2", "2", "100%"], highlight: false }
+  ]}
+  notes="With low register pressure, all block sizes from 64-1024 achieve 100% occupancy. Higher register counts shift the advantage toward smaller blocks."
+/>
+
+### The Occupancy API
+
+CUDA provides a runtime API to query optimal launch configurations:
+
+```cpp
+#include <cuda_runtime.h>
+
+// Query maximum active blocks per SM for a given kernel and block size
+int num_blocks;
+cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+    &num_blocks,
+    my_kernel,       // kernel function pointer
+    256,             // block size
+    0                // dynamic shared memory per block
+);
+
+// Auto-select block size that maximizes occupancy
+int min_grid_size, block_size;
+cudaOccupancyMaxPotentialBlockSize(
+    &min_grid_size,
+    &block_size,
+    my_kernel,
+    0,               // dynamic smem
+    0                // block size limit (0 = no limit)
+);
+printf("Optimal block size: %d, min grid size: %d\n", block_size, min_grid_size);
+```
+
+<Callout type="tip" title="When to Use cudaOccupancyMaxPotentialBlockSize">
+  Use this API as a starting point, not a final answer. It maximizes occupancy, which is the right heuristic for memory-bound kernels. For compute-bound kernels, you may get better performance at lower occupancy if the extra registers enable more instruction-level parallelism. Always benchmark.
+</Callout>
+
+---
+
+## 6. Warp Divergence: The Cost of Branching
+
+When threads within a warp take different branches, the warp must execute both paths sequentially. This is called **warp divergence**.
+
+```cpp
+// BAD: Divergent branching within a warp
+__global__ void divergent_kernel(float* data, int n) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < n) {
+        if (threadIdx.x % 2 == 0) {
+            // Even threads take this path
+            data[idx] = expensive_function_a(data[idx]);
+        } else {
+            // Odd threads take this path
+            // Warp executes both paths sequentially
+            data[idx] = expensive_function_b(data[idx]);
+        }
+    }
+}
+```
+
+In the above kernel, every warp has 16 threads taking path A and 16 threads taking path B. The warp executes path A (16 threads active, 16 masked), then path B (16 active, 16 masked). Effective throughput: 50%.
+
+```cpp
+// BETTER: Divergence at warp boundaries
+__global__ void aligned_kernel(float* data, int n) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    int warp_id = threadIdx.x / 32;
+    if (idx < n) {
+        if (warp_id % 2 == 0) {
+            // Entire warp 0, 2, 4... takes this path
+            data[idx] = expensive_function_a(data[idx]);
+        } else {
+            // Entire warp 1, 3, 5... takes this path
+            // No divergence within any warp
+            data[idx] = expensive_function_b(data[idx]);
+        }
+    }
+}
+```
+
+The cost model for divergence:
+
+$$T_{\text{divergent}} = T_{\text{path A}} + T_{\text{path B}}$$
+
+$$T_{\text{non-divergent}} = \max(T_{\text{path A}}, T_{\text{path B}})$$
+
+For branches that affect entire warps uniformly, there is no divergence cost at all. The hardware simply executes the taken path. This is why organizing data so that adjacent threads (within a warp) take the same branch is a fundamental optimization.
+
+### Measuring Divergence with Nsight Compute
+
+Nsight Compute reports the `smsp__thread_inst_executed_per_inst_executed` metric, which tells you the average number of active threads per instruction. For a non-divergent kernel, this is 32. For a 50% divergent kernel, it is 16.
+
+```bash
+ncu --metrics smsp__thread_inst_executed_per_inst_executed.avg \
+    ./my_program
+```
+
+---
+
+## 7. Implementation: Vector Add with Optimal Block Size Selection
+
+This complete implementation demonstrates every concept covered above: thread indexing, block size selection, occupancy analysis, and grid-stride loops.
+
+```cpp
+#include <cuda_runtime.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+// Error checking macro
+#define CUDA_CHECK(call) do { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA error at %s:%d: %s\n", \
+                __FILE__, __LINE__, cudaGetErrorString(err)); \
+        exit(EXIT_FAILURE); \
+    } \
+} while(0)
+
+// Kernel: grid-stride vector add
+__global__ void vector_add(const float* __restrict__ a,
+                           const float* __restrict__ b,
+                           float* __restrict__ c,
+                           int n) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    int stride = blockDim.x * gridDim.x;
+
+    // Grid-stride loop: each thread processes multiple elements
+    for (int i = idx; i < n; i += stride) {
+        c[i] = a[i] + b[i];
+    }
+}
+
+// Kernel: vectorized (float4) grid-stride vector add
+__global__ void vector_add_vec4(const float4* __restrict__ a,
+                                const float4* __restrict__ b,
+                                float4* __restrict__ c,
+                                int n4) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    int stride = blockDim.x * gridDim.x;
+
+    for (int i = idx; i < n4; i += stride) {
+        float4 va = a[i];
+        float4 vb = b[i];
+        c[i] = make_float4(va.x + vb.x, va.y + vb.y,
+                            va.z + vb.z, va.w + vb.w);
+    }
+}
+
+struct LaunchConfig {
+    int block_size;
+    int grid_size;
+    int occupancy_blocks_per_sm;
+    float occupancy_pct;
+};
+
+// Analyze and select optimal launch configuration
+LaunchConfig select_launch_config(void* kernel, int n,
+                                   int dynamic_smem = 0) {
+    LaunchConfig config;
+
+    // Let CUDA runtime select optimal block size
+    int min_grid_size;
+    CUDA_CHECK(cudaOccupancyMaxPotentialBlockSize(
+        &min_grid_size,
+        &config.block_size,
+        kernel,
+        dynamic_smem,
+        0  // no block size limit
+    ));
+
+    // Query actual occupancy at this block size
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &config.occupancy_blocks_per_sm,
+        kernel,
+        config.block_size,
+        dynamic_smem
+    ));
+
+    // Compute occupancy percentage
+    config.occupancy_pct = (float)(config.occupancy_blocks_per_sm *
+                           config.block_size) / 2048.0f * 100.0f;
+
+    // Grid size: enough blocks to fill the GPU, then rely on grid-stride
+    int device;
+    cudaDeviceProp props;
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaGetDeviceProperties(&props, device));
+
+    // Target: occupancy_blocks_per_sm * num_SMs blocks
+    config.grid_size = config.occupancy_blocks_per_sm *
+                       props.multiProcessorCount;
+
+    // But don't exceed what's needed for the data
+    int needed = (n + config.block_size - 1) / config.block_size;
+    if (needed < config.grid_size) {
+        config.grid_size = needed;
+    }
+
+    return config;
+}
+
+void benchmark_block_sizes(int n) {
+    float *d_a, *d_b, *d_c;
+    size_t bytes = n * sizeof(float);
+
+    CUDA_CHECK(cudaMalloc(&d_a, bytes));
+    CUDA_CHECK(cudaMalloc(&d_b, bytes));
+    CUDA_CHECK(cudaMalloc(&d_c, bytes));
+
+    // Initialize
+    float* h_a = (float*)malloc(bytes);
+    for (int i = 0; i < n; i++) h_a[i] = 1.0f;
+    CUDA_CHECK(cudaMemcpy(d_a, h_a, bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_a, bytes, cudaMemcpyHostToDevice));
+    free(h_a);
+
+    printf("Vector size: %d elements (%.1f MB)\n", n, bytes / 1e6);
+    printf("%-12s %-12s %-12s %-15s %-12s\n",
+           "BlockSize", "GridSize", "Occupancy%", "Bandwidth(GB/s)", "Time(ms)");
+    printf("%-12s %-12s %-12s %-15s %-12s\n",
+           "--------", "--------", "---------", "--------------", "-------");
+
+    int block_sizes[] = {32, 64, 128, 256, 512, 1024};
+
+    for (int bs : block_sizes) {
+        int occ_blocks;
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ_blocks, (void*)vector_add, bs, 0));
+
+        float occ_pct = (float)(occ_blocks * bs) / 2048.0f * 100.0f;
+        int grid = min((n + bs - 1) / bs, occ_blocks * 108);
+
+        // Warmup
+        vector_add<<<grid, bs>>>(d_a, d_b, d_c, n);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // Benchmark
+        cudaEvent_t start, stop;
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+
+        int iterations = 100;
+        CUDA_CHECK(cudaEventRecord(start));
+        for (int i = 0; i < iterations; i++) {
+            vector_add<<<grid, bs>>>(d_a, d_b, d_c, n);
+        }
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+
+        float ms;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        ms /= iterations;
+
+        // Bandwidth: 3 arrays * n elements * 4 bytes each
+        double bw = 3.0 * n * sizeof(float) / (ms / 1000.0) / 1e9;
+
+        printf("%-12d %-12d %-12.0f %-15.1f %-12.3f\n",
+               bs, grid, occ_pct, bw, ms);
+
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+    }
+
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_c));
+}
+
+int main() {
+    int n = 1 << 24;  // 16M elements
+
+    // Auto-select optimal configuration
+    LaunchConfig config = select_launch_config(
+        (void*)vector_add, n);
+
+    printf("Auto-selected: block=%d, grid=%d, occupancy=%.0f%%\n",
+           config.block_size, config.grid_size, config.occupancy_pct);
+
+    // Benchmark all block sizes
+    benchmark_block_sizes(n);
+
+    return 0;
+}
+```
+
+### Expected Results
+
+<Benchmark
+  title="Vector Add Bandwidth vs Block Size (A100, N=16M, FP32)"
+  columns={["Block Size", "Occupancy", "Bandwidth (GB/s)", "% of Peak (2039 GB/s)"]}
+  rows={[
+    { values: ["32", "50%", "1580", "77.5%"], highlight: false },
+    { values: ["64", "100%", "1810", "88.8%"], highlight: false },
+    { values: ["128", "100%", "1890", "92.7%"], highlight: false },
+    { values: ["256", "100%", "1910", "93.7%"], highlight: true },
+    { values: ["512", "100%", "1900", "93.2%"], highlight: false },
+    { values: ["1024", "100%", "1880", "92.2%"], highlight: false }
+  ]}
+  notes="Block size 256 achieves peak bandwidth for this kernel. The 32-thread block case is limited by 50% occupancy. All 100% occupancy configurations perform similarly."
+/>
+
+<PerfChart
+  title="Effective Bandwidth by Block Size"
+  unit="GB/s"
+  data={[
+    { label: "BS=32", value: 1580, color: "gray", annotation: "50% occ" },
+    { label: "BS=64", value: 1810, color: "blue" },
+    { label: "BS=128", value: 1890, color: "blue" },
+    { label: "BS=256", value: 1910, color: "green", annotation: "Peak" },
+    { label: "BS=512", value: 1900, color: "blue" },
+    { label: "BS=1024", value: 1880, color: "blue" }
+  ]}
+/>
+
+### Vectorized Access: float4
+
+Using `float4` loads (128-bit per thread) improves bandwidth by reducing the number of memory transactions:
+
+```cpp
+// Launch for vectorized kernel
+int n4 = n / 4;
+LaunchConfig config4 = select_launch_config(
+    (void*)vector_add_vec4, n4);
+vector_add_vec4<<<config4.grid_size, config4.block_size>>>(
+    (float4*)d_a, (float4*)d_b, (float4*)d_c, n4);
+```
+
+<Benchmark
+  title="Scalar vs Vectorized Vector Add (A100, N=16M)"
+  columns={["Variant", "Block Size", "Bandwidth (GB/s)", "% of Peak"]}
+  rows={[
+    { values: ["Scalar (float)", "256", "1910", "93.7%"], highlight: false },
+    { values: ["Vectorized (float4)", "256", "1970", "96.6%"], highlight: true }
+  ]}
+  notes="Vectorized access achieves ~3% higher bandwidth by issuing fewer, wider memory transactions."
+/>
+
+---
+
+## 8. Advanced: Cooperative Groups
+
+CUDA Cooperative Groups (introduced in CUDA 9) generalize the synchronization model beyond block-level `__syncthreads()`:
+
+```cpp
+#include <cooperative_groups.h>
+namespace cg = cooperative_groups;
+
+__global__ void cooperative_example(float* data, int n) {
+    // Thread block group (equivalent to __syncthreads scope)
+    cg::thread_block block = cg::this_thread_block();
+
+    // Warp-level group (no need for shared memory)
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+
+    // Warp-level reduction using cooperative groups
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    float val = (idx < n) ? data[idx] : 0.0f;
+
+    // Reduce within warp (no shared memory needed)
+    for (int offset = warp.size() / 2; offset > 0; offset /= 2) {
+        val += warp.shfl_down(val, offset);
+    }
+
+    // Thread 0 of each warp has the warp sum
+    if (warp.thread_rank() == 0) {
+        // Write partial sum to shared memory for block-level reduction
+        extern __shared__ float warp_sums[];
+        warp_sums[warp.meta_group_rank()] = val;
+    }
+
+    block.sync();  // Equivalent to __syncthreads()
+
+    // First warp reduces warp sums
+    if (warp.meta_group_rank() == 0) {
+        int num_warps = block.size() / 32;
+        val = (warp.thread_rank() < num_warps) ?
+              warp_sums[warp.thread_rank()] : 0.0f;
+        for (int offset = warp.size() / 2; offset > 0; offset /= 2) {
+            val += warp.shfl_down(val, offset);
+        }
+    }
+}
+```
+
+### Grid-Level Synchronization
+
+Cooperative launch enables synchronization across the entire grid. All blocks must be resident simultaneously, which limits the grid size:
+
+```cpp
+// Grid-level cooperative kernel
+__global__ void grid_cooperative_kernel(float* data) {
+    cg::grid_group grid = cg::this_grid();
+
+    // Phase 1: local computation
+    int idx = grid.thread_rank();
+    data[idx] = compute(data[idx]);
+
+    // Barrier: ALL threads across ALL blocks synchronize
+    grid.sync();
+
+    // Phase 2: read neighbors (guaranteed to see phase 1 results)
+    data[idx] = data[idx] + data[(idx + 1) % grid.size()];
+}
+
+// Must use cooperative launch
+void* args[] = { &d_data };
+cudaLaunchCooperativeKernel(
+    (void*)grid_cooperative_kernel,
+    grid_size,      // limited by SM count * blocks_per_sm
+    block_size,
+    args
+);
+```
+
+<Callout type="warning" title="Grid Sync Limits Parallelism">
+  Grid synchronization requires all blocks to be resident simultaneously. On A100, if your kernel supports 4 blocks per SM, the maximum grid size is $4 \times 108 = 432$ blocks. This significantly limits the problem sizes you can handle with grid sync. Use it only when the algorithm genuinely requires global synchronization.
+</Callout>
+
+---
+
+## 9. Common Mistakes and How to Fix Them
+
+### Mistake 1: Block Size Too Small
+
+```cpp
+// BAD: 32 threads per block = 1 warp per block
+// Wastes block slots (max 32 blocks/SM), limits occupancy to 50%
+kernel<<<grid, 32>>>(data, n);
+
+// GOOD: 256 threads per block
+kernel<<<grid, 256>>>(data, n);
+```
+
+### Mistake 2: Ignoring Tail Effects
+
+```cpp
+// BAD: No bounds check, out-of-bounds access
+__global__ void bad_kernel(float* data, int n) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    data[idx] = data[idx] * 2.0f;  // UB when idx >= n
+}
+
+// GOOD: Bounds check
+__global__ void good_kernel(float* data, int n) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < n) {
+        data[idx] = data[idx] * 2.0f;
+    }
+}
+```
+
+### Mistake 3: Hardcoding Grid Size for Specific GPU
+
+```cpp
+// BAD: Assumes 108 SMs (A100-specific)
+kernel<<<108 * 8, 256>>>(data, n);
+
+// GOOD: Query device properties
+int device;
+cudaGetDevice(&device);
+cudaDeviceProp props;
+cudaGetDeviceProperties(&props, device);
+int grid = props.multiProcessorCount * blocks_per_sm;
+kernel<<<grid, 256>>>(data, n);
+```
+
+### Mistake 4: Excessive Register Usage Killing Occupancy
+
+```cpp
+// Check register usage at compile time
+// nvcc --ptxas-options=-v kernel.cu
+// ptxas info: Used 64 registers, 0 bytes smem
+
+// Limit registers to increase occupancy
+__global__ __launch_bounds__(256, 4) // max 256 threads, min 4 blocks/SM
+void limited_kernel(float* data, int n) {
+    // Compiler will spill to local memory if needed to stay within
+    // 65536 / (4 * 256) = 64 registers per thread
+}
+```
+
+---
+
+## 10. Summary: Decision Framework for Launch Configuration
+
+1. **Start with `cudaOccupancyMaxPotentialBlockSize`** to get a baseline block size
+2. **Use 128 or 256 threads per block** as defaults — these work well across most kernels
+3. **Check register usage** with `--ptxas-options=-v` and ensure you have at least 50% occupancy
+4. **Use grid-stride loops** for large data to keep grid sizes manageable and portable
+5. **Benchmark** at least three block sizes (128, 256, 512) with real data to find the actual optimum
+6. **Profile with Nsight Compute** to identify whether your kernel is limited by occupancy, memory bandwidth, or compute
+
+<Callout type="info" title="Series Navigation">
+  This is Part 1 of the CUDA Kernel Engineering series. Part 2 covers memory coalescing — the access pattern rules that determine whether your kernel achieves 90% or 9% of peak memory bandwidth.
+</Callout>

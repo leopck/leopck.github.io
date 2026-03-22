@@ -236,6 +236,48 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"cuda-kernel-eng-memory-coalescing-access-patterns.mdx": {
+	id: "cuda-kernel-eng-memory-coalescing-access-patterns.mdx";
+  slug: "cuda-kernel-eng-memory-coalescing-access-patterns";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"cuda-kernel-eng-shared-memory-bank-conflicts.mdx": {
+	id: "cuda-kernel-eng-shared-memory-bank-conflicts.mdx";
+  slug: "cuda-kernel-eng-shared-memory-bank-conflicts";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"cuda-kernel-eng-tensor-cores-wmma-mma-wgmma.mdx": {
+	id: "cuda-kernel-eng-tensor-cores-wmma-mma-wgmma.mdx";
+  slug: "cuda-kernel-eng-tensor-cores-wmma-mma-wgmma";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"cuda-kernel-eng-thread-hierarchy-execution-model.mdx": {
+	id: "cuda-kernel-eng-thread-hierarchy-execution-model.mdx";
+  slug: "cuda-kernel-eng-thread-hierarchy-execution-model";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"cuda-kernel-eng-triton-kernel-development.mdx": {
+	id: "cuda-kernel-eng-triton-kernel-development.mdx";
+  slug: "cuda-kernel-eng-triton-kernel-development";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"cuda-kernel-eng-warp-primitives-shuffles.mdx": {
+	id: "cuda-kernel-eng-warp-primitives-shuffles.mdx";
+  slug: "cuda-kernel-eng-warp-primitives-shuffles";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "cuda-kernel-fusion-memory-traffic-2020.mdx": {
 	id: "cuda-kernel-fusion-memory-traffic-2020.mdx";
   slug: "cuda-kernel-fusion-memory-traffic-2020";
@@ -327,6 +369,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"dataset-frontier-decontamination-pipeline.mdx": {
+	id: "dataset-frontier-decontamination-pipeline.mdx";
+  slug: "dataset-frontier-decontamination-pipeline";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "dataset-frontier-evaluation-benchmarks.mdx": {
 	id: "dataset-frontier-evaluation-benchmarks.mdx";
   slug: "dataset-frontier-evaluation-benchmarks";
@@ -362,6 +411,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"dataset-frontier-multimodal-data-image-video.mdx": {
+	id: "dataset-frontier-multimodal-data-image-video.mdx";
+  slug: "dataset-frontier-multimodal-data-image-video";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "dataset-frontier-preference-data-dpo-rlhf.mdx": {
 	id: "dataset-frontier-preference-data-dpo-rlhf.mdx";
   slug: "dataset-frontier-preference-data-dpo-rlhf";
@@ -369,9 +425,23 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"dataset-frontier-rlhf-data-at-scale.mdx": {
+	id: "dataset-frontier-rlhf-data-at-scale.mdx";
+  slug: "dataset-frontier-rlhf-data-at-scale";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "dataset-frontier-synthetic-data-pipelines.mdx": {
 	id: "dataset-frontier-synthetic-data-pipelines.mdx";
   slug: "dataset-frontier-synthetic-data-pipelines";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"dataset-frontier-tokenizer-training.mdx": {
+	id: "dataset-frontier-tokenizer-training.mdx";
+  slug: "dataset-frontier-tokenizer-training";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -495,6 +565,34 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"frontier-arch-claude-constitutional-ai.mdx": {
+	id: "frontier-arch-claude-constitutional-ai.mdx";
+  slug: "frontier-arch-claude-constitutional-ai";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"frontier-arch-gemini-multimodal-native.mdx": {
+	id: "frontier-arch-gemini-multimodal-native.mdx";
+  slug: "frontier-arch-gemini-multimodal-native";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"frontier-arch-llama-3-architecture-decisions.mdx": {
+	id: "frontier-arch-llama-3-architecture-decisions.mdx";
+  slug: "frontier-arch-llama-3-architecture-decisions";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"frontier-arch-qwen-25-innovations.mdx": {
+	id: "frontier-arch-qwen-25-innovations.mdx";
+  slug: "frontier-arch-qwen-25-innovations";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "frontier-models-2025-architectural-convergence.mdx": {
 	id: "frontier-models-2025-architectural-convergence.mdx";
   slug: "frontier-models-2025-architectural-convergence";
@@ -502,9 +600,30 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"frontier-research-agent-architectures.mdx": {
+	id: "frontier-research-agent-architectures.mdx";
+  slug: "frontier-research-agent-architectures";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"frontier-research-alignment-scaling.mdx": {
+	id: "frontier-research-alignment-scaling.mdx";
+  slug: "frontier-research-alignment-scaling";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "frontier-research-constitutional-ai-dpo-alternatives.mdx": {
 	id: "frontier-research-constitutional-ai-dpo-alternatives.mdx";
   slug: "frontier-research-constitutional-ai-dpo-alternatives";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"frontier-research-continual-learning-forgetting.mdx": {
+	id: "frontier-research-continual-learning-forgetting.mdx";
+  slug: "frontier-research-continual-learning-forgetting";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -600,6 +719,13 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"frontier-research-synthetic-reasoning-data.mdx": {
+	id: "frontier-research-synthetic-reasoning-data.mdx";
+  slug: "frontier-research-synthetic-reasoning-data";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "frontier-research-test-time-compute-small-beats-large.mdx": {
 	id: "frontier-research-test-time-compute-small-beats-large.mdx";
   slug: "frontier-research-test-time-compute-small-beats-large";
@@ -617,6 +743,41 @@ declare module 'astro:content' {
 "gpipe-pipedream-pipeline-parallelism-performance-analysis-2019.mdx": {
 	id: "gpipe-pipedream-pipeline-parallelism-performance-analysis-2019.mdx";
   slug: "gpipe-pipedream-pipeline-parallelism-performance-analysis-2019";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"gpu-hw-amd-mi300x-rocm-comparison.mdx": {
+	id: "gpu-hw-amd-mi300x-rocm-comparison.mdx";
+  slug: "gpu-hw-amd-mi300x-rocm-comparison";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"gpu-hw-hbm-memory-generations.mdx": {
+	id: "gpu-hw-hbm-memory-generations.mdx";
+  slug: "gpu-hw-hbm-memory-generations";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"gpu-hw-nvidia-architecture-evolution.mdx": {
+	id: "gpu-hw-nvidia-architecture-evolution.mdx";
+  slug: "gpu-hw-nvidia-architecture-evolution";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"gpu-hw-nvlink-nvswitch-interconnect.mdx": {
+	id: "gpu-hw-nvlink-nvswitch-interconnect.mdx";
+  slug: "gpu-hw-nvlink-nvswitch-interconnect";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"gpu-hw-streaming-multiprocessor-deep-dive.mdx": {
+	id: "gpu-hw-streaming-multiprocessor-deep-dive.mdx";
+  slug: "gpu-hw-streaming-multiprocessor-deep-dive";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -964,6 +1125,20 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"moe-masterclass-deepseek-v3-complete-recipe.mdx": {
+	id: "moe-masterclass-deepseek-v3-complete-recipe.mdx";
+  slug: "moe-masterclass-deepseek-v3-complete-recipe";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"moe-masterclass-expert-offloading-consumer-gpu.mdx": {
+	id: "moe-masterclass-expert-offloading-consumer-gpu.mdx";
+  slug: "moe-masterclass-expert-offloading-consumer-gpu";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "moe-masterclass-expert-parallelism-communication.mdx": {
 	id: "moe-masterclass-expert-parallelism-communication.mdx";
   slug: "moe-masterclass-expert-parallelism-communication";
@@ -974,6 +1149,34 @@ declare module 'astro:content' {
 "moe-masterclass-gated-layer-implementation.mdx": {
 	id: "moe-masterclass-gated-layer-implementation.mdx";
   slug: "moe-masterclass-gated-layer-implementation";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"moe-masterclass-inference-challenges-serving.mdx": {
+	id: "moe-masterclass-inference-challenges-serving.mdx";
+  slug: "moe-masterclass-inference-challenges-serving";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"moe-masterclass-routing-algorithms-survey.mdx": {
+	id: "moe-masterclass-routing-algorithms-survey.mdx";
+  slug: "moe-masterclass-routing-algorithms-survey";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"moe-masterclass-switch-transformer-gshard-history.mdx": {
+	id: "moe-masterclass-switch-transformer-gshard-history.mdx";
+  slug: "moe-masterclass-switch-transformer-gshard-history";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"moe-masterclass-training-dynamics-stability.mdx": {
+	id: "moe-masterclass-training-dynamics-stability.mdx";
+  slug: "moe-masterclass-training-dynamics-stability";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -1002,6 +1205,13 @@ declare module 'astro:content' {
 "nvidia-dynamo-blackwell-gb200-integration.mdx": {
 	id: "nvidia-dynamo-blackwell-gb200-integration.mdx";
   slug: "nvidia-dynamo-blackwell-gb200-integration";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"nvidia-dynamo-capacity-planning.mdx": {
+	id: "nvidia-dynamo-capacity-planning.mdx";
+  slug: "nvidia-dynamo-capacity-planning";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -1037,6 +1247,13 @@ declare module 'astro:content' {
 "nvidia-dynamo-llmd-declarative-framework.mdx": {
 	id: "nvidia-dynamo-llmd-declarative-framework.mdx";
   slug: "nvidia-dynamo-llmd-declarative-framework";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"nvidia-dynamo-migration-from-vllm.mdx": {
+	id: "nvidia-dynamo-migration-from-vllm.mdx";
+  slug: "nvidia-dynamo-migration-from-vllm";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">
@@ -1090,6 +1307,20 @@ declare module 'astro:content' {
   collection: "posts";
   data: InferEntrySchema<"posts">
 } & { render(): Render[".mdx"] };
+"nvidia-dynamo-request-lifecycle-trace.mdx": {
+	id: "nvidia-dynamo-request-lifecycle-trace.mdx";
+  slug: "nvidia-dynamo-request-lifecycle-trace";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"nvidia-dynamo-security-isolation.mdx": {
+	id: "nvidia-dynamo-security-isolation.mdx";
+  slug: "nvidia-dynamo-security-isolation";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
 "nvidia-dynamo-vs-sglang-router.mdx": {
 	id: "nvidia-dynamo-vs-sglang-router.mdx";
   slug: "nvidia-dynamo-vs-sglang-router";
@@ -1135,6 +1366,48 @@ declare module 'astro:content' {
 "quantization-llm-performance-2019.mdx": {
 	id: "quantization-llm-performance-2019.mdx";
   slug: "quantization-llm-performance-2019";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"quantization-masterclass-activation-quantization-smoothquant.mdx": {
+	id: "quantization-masterclass-activation-quantization-smoothquant.mdx";
+  slug: "quantization-masterclass-activation-quantization-smoothquant";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"quantization-masterclass-fp4-nvfp4-mxfp4-blackwell.mdx": {
+	id: "quantization-masterclass-fp4-nvfp4-mxfp4-blackwell.mdx";
+  slug: "quantization-masterclass-fp4-nvfp4-mxfp4-blackwell";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"quantization-masterclass-fp8-training-inference.mdx": {
+	id: "quantization-masterclass-fp8-training-inference.mdx";
+  slug: "quantization-masterclass-fp8-training-inference";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"quantization-masterclass-kv-cache-quantization-depth.mdx": {
+	id: "quantization-masterclass-kv-cache-quantization-depth.mdx";
+  slug: "quantization-masterclass-kv-cache-quantization-depth";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"quantization-masterclass-number-formats.mdx": {
+	id: "quantization-masterclass-number-formats.mdx";
+  slug: "quantization-masterclass-number-formats";
+  body: string;
+  collection: "posts";
+  data: InferEntrySchema<"posts">
+} & { render(): Render[".mdx"] };
+"quantization-masterclass-weight-quantization-gptq-awq.mdx": {
+	id: "quantization-masterclass-weight-quantization-gptq-awq.mdx";
+  slug: "quantization-masterclass-weight-quantization-gptq-awq";
   body: string;
   collection: "posts";
   data: InferEntrySchema<"posts">

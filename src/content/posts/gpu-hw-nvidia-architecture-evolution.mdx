@@ -1,0 +1,475 @@
+---
+title: "NVIDIA GPU Architecture Evolution: Volta, Ampere, Hopper, Blackwell — What Changed and Why"
+author: "stanley-phoong"
+description: "A generation-by-generation analysis of NVIDIA's data center GPU architectures — the specific bottleneck each generation targeted, the hardware mechanisms introduced, and how performance scaled for LLM inference from V100 through B200."
+publishDate: 2025-03-22
+category: gpu-programming
+tags: [nvidia, gpu-architecture, volta, ampere, hopper, blackwell, tensor-cores, llm-inference]
+difficulty: expert
+readingTime: 40
+draft: false
+featured: false
+series: "GPU Hardware & AI Accelerators"
+seriesOrder: 1
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+
+Every NVIDIA data center GPU generation since Volta has been a response to a specific bottleneck exposed by the previous generation's workloads. Volta introduced tensor cores because FP32 CUDA cores could not keep up with matrix-heavy deep learning. Ampere added sparsity support and TF32 because FP16 training was cumbersome and half the weights were zero. Hopper introduced the Transformer Engine and asynchronous execution because attention-based models had unique memory access patterns that synchronous pipelines could not hide. Blackwell doubled die area and introduced FP4 because trillion-parameter models demanded both more compute and more memory bandwidth than a single die could provide.
+
+This post traces the concrete hardware changes across four generations — Volta (V100), Ampere (A100), Hopper (H100/H200), and Blackwell (B100/B200) — with emphasis on what each change means for LLM inference throughput.
+
+## The Generational Summary
+
+<Benchmark
+  title="NVIDIA Data Center GPU Architecture Comparison"
+  columns={["Spec", "V100 (Volta)", "A100 (Ampere)", "H100 (Hopper)", "B200 (Blackwell)"]}
+  rows={[
+    { values: ["Process", "12nm (TSMC)", "7nm (TSMC)", "4nm (TSMC)", "4nm (TSMC)"], highlight: false },
+    { values: ["Transistors", "21.1B", "54.2B", "80B", "208B"], highlight: false },
+    { values: ["SMs", "80", "108", "132", "192 (2 dies)"], highlight: false },
+    { values: ["FP16 Tensor TFLOPS", "125", "312", "990", "2,250"], highlight: true },
+    { values: ["FP8 Tensor TFLOPS", "N/A", "N/A", "1,979", "4,500"], highlight: true },
+    { values: ["FP4 Tensor TFLOPS", "N/A", "N/A", "N/A", "9,000"], highlight: true },
+    { values: ["HBM Type", "HBM2", "HBM2e", "HBM3", "HBM3e"], highlight: false },
+    { values: ["HBM Capacity", "32 GB", "80 GB", "80 GB", "192 GB"], highlight: false },
+    { values: ["HBM Bandwidth", "900 GB/s", "2,039 GB/s", "3,350 GB/s", "8,000 GB/s"], highlight: true },
+    { values: ["TDP", "300W", "400W", "700W", "1,000W"], highlight: false },
+    { values: ["NVLink BW (bidirectional)", "300 GB/s", "600 GB/s", "900 GB/s", "1,800 GB/s"], highlight: false },
+  ]}
+  notes="B200 uses a dual-die design connected by a high-bandwidth on-package interconnect. FP4 TFLOPS are sparse equivalent."
+/>
+
+Each generation roughly doubles the metric that mattered most for the dominant workload of its era. The progression tells a story: compute-bound training drove early generations, while memory-bound inference drives the latest.
+
+## Volta (2017): The First Tensor Cores
+
+### The Bottleneck Volta Targeted
+
+Before Volta, deep learning training ran on Pascal (P100) GPUs using standard FP32 CUDA cores. A single CUDA core performs one FMA (fused multiply-add) per cycle — two FLOPs. The P100 had 3,584 CUDA cores at 1.48 GHz, yielding approximately 10.6 TFLOPS FP32. Training a ResNet-50 to convergence took roughly 29 hours on 8x P100 GPUs. The bottleneck was raw matrix-multiply throughput.
+
+### What Volta Introduced
+
+**Tensor Cores.** Each Volta tensor core computes a 4x4x4 FMA in a single cycle:
+
+$$D_{4 \times 4} = A_{4 \times 4} \times B_{4 \times 4} + C_{4 \times 4}$$
+
+That is $4 \times 4 \times 4 \times 2 = 128$ FLOPs per tensor core per cycle. With 8 tensor cores per SM and 80 SMs, Volta delivers:
+
+$$80 \times 8 \times 128 \times 1.53\text{ GHz} = 125 \text{ TFLOPS (FP16)}$$
+
+This is a 12x improvement over Pascal's FP32 throughput for matrix operations.
+
+**Mixed-precision training.** Volta tensor cores consume FP16 inputs and accumulate into FP32. The WMMA (Warp-level Matrix Multiply Accumulate) API exposed this:
+
+```cpp
+// Volta WMMA: 16x16x16 matrix multiply
+#include <mma.h>
+using namespace nvcuda;
+
+__global__ void volta_tensor_core_gemm(half *A, half *B, float *C, int M, int N, int K) {
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    int warpM = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
+    int warpN = (blockIdx.y * blockDim.y + threadIdx.y);
+
+    for (int k = 0; k < K; k += 16) {
+        wmma::load_matrix_sync(a_frag, A + warpM * 16 * K + k, K);
+        wmma::load_matrix_sync(b_frag, B + k * N + warpN * 16, N);
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
+    wmma::store_matrix_sync(C + warpM * 16 * N + warpN * 16, c_frag, N, wmma::mem_row_major);
+}
+```
+
+**Independent thread scheduling.** Prior to Volta, all 32 threads in a warp shared a single program counter. Volta gave each thread its own program counter and call stack, enabling fine-grained synchronization patterns. This changed the warp execution model fundamentally — `__syncwarp()` became necessary where implicit warp synchrony was previously assumed.
+
+**L1/Shared memory unification.** Volta unified the L1 data cache and shared memory into a single 128 KB pool per SM, configurable between shared memory and L1. This replaced Pascal's separate 48 KB shared memory and 24 KB L1 cache with a much larger, flexible pool.
+
+<Callout type="perf" title="Volta's Impact on Training">
+ResNet-50 training time dropped from 29 hours (8x P100) to approximately 6 hours (8x V100) — a 4.8x reduction. Mixed-precision training with loss scaling became the standard workflow, and nearly every training framework adopted FP16 tensor core paths within a year of Volta's launch.
+</Callout>
+
+### HBM2: 900 GB/s
+
+Volta used HBM2 with a 4096-bit memory bus. Peak bandwidth was 900 GB/s. With 125 TFLOPS FP16 tensor throughput, the compute-to-bandwidth ratio was:
+
+$$\frac{125 \times 10^{12}}{900 \times 10^9} \approx 139 \text{ FLOP/byte}$$
+
+This was a reasonable ratio for training workloads dominated by large GEMMs, but it already meant that anything smaller than a few hundred by a few hundred matrix multiply was memory-bound.
+
+## Ampere (2020): Sparsity, TF32, and the A100
+
+### The Bottleneck Ampere Targeted
+
+By 2020, mixed-precision FP16 training was ubiquitous, but two problems emerged. First, converting models to FP16 required careful loss scaling and sometimes hyperparameter changes — many practitioners wanted FP32-like convenience with tensor core speed. Second, research showed that 50-80% of trained weights could be pruned to zero without accuracy loss, but Volta had no way to exploit this sparsity in hardware.
+
+### What Ampere Introduced
+
+**TF32 (TensorFloat-32).** A 19-bit format with FP32's 8-bit exponent (same range) and FP16's 10-bit mantissa (same precision as FP16). Tensor cores on Ampere natively support TF32 inputs, meaning existing FP32 code gets tensor core acceleration transparently. No code changes, no loss scaling, no format conversion:
+
+```cpp
+// On Ampere, this automatically uses TF32 tensor cores
+// cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH) is sufficient
+// The GPU rounds FP32 inputs to TF32 before the tensor core operation
+cublasGemmEx(handle,
+    CUBLAS_OP_N, CUBLAS_OP_T,
+    M, N, K,
+    &alpha,
+    A, CUDA_R_32F, M,    // FP32 input, silently rounded to TF32
+    B, CUDA_R_32F, K,    // FP32 input, silently rounded to TF32
+    &beta,
+    C, CUDA_R_32F, M,    // FP32 output (accumulated in FP32)
+    CUBLAS_COMPUTE_32F_FAST_TF32,
+    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+```
+
+TF32 tensor TFLOPS on A100: 156 TFLOPS (compared to 19.5 TFLOPS for FP32 CUDA cores). That is an 8x speedup for any FP32 GEMM with zero code changes.
+
+**Structured sparsity (2:4).** The A100 tensor cores support a 2:4 sparsity pattern: out of every 4 consecutive elements, at most 2 can be non-zero. When weights are pruned to this pattern, tensor cores skip the zero multiplications:
+
+```
+Dense:    [0.5, 0.0, 0.3, 0.0, 0.0, 0.7, 0.0, 0.2]
+2:4 mask: [ 1,   0,   1,   0,   0,   1,   0,   1 ]
+Compressed: [0.5, 0.3, 0.7, 0.2] + index metadata
+```
+
+This doubles effective tensor TFLOPS for qualifying matrices: 312 TFLOPS FP16 dense becomes 624 TFLOPS FP16 sparse.
+
+**Third-generation tensor cores.** The A100 tensor core handles larger matrix tiles: 8x4x16 for FP16/BF16. With 4 tensor cores per SM partition and 108 SMs:
+
+$$108 \times 4 \times 4 \times 256 \times 1.41\text{ GHz} = 312 \text{ TFLOPS (FP16 dense)}$$
+
+**BF16 support.** While Volta supported only FP16 (with its limited dynamic range), Ampere tensor cores natively support BF16 — the same 8-bit exponent as FP32 with a truncated 7-bit mantissa. This format is more training-friendly because it rarely causes overflow/underflow, eliminating the need for loss scaling in most cases.
+
+**Larger L2 cache.** The A100 has a 40 MB L2 cache (vs. Volta's 6 MB). For inference workloads where the KV cache or small model layers fit in L2, this is significant.
+
+### HBM2e: 2,039 GB/s
+
+Ampere moved to HBM2e with a 5120-bit bus. The 2.26x bandwidth increase (900 to 2,039 GB/s) tracked roughly with the compute increase (125 to 312 TFLOPS FP16), maintaining a similar compute-to-bandwidth ratio:
+
+$$\frac{312 \times 10^{12}}{2039 \times 10^9} \approx 153 \text{ FLOP/byte}$$
+
+<PerfChart
+  title="FP16 Tensor TFLOPS Progression"
+  data={[
+    { label: "V100 (Volta)", value: 125, color: "#6366f1", annotation: "First tensor cores" },
+    { label: "A100 (Ampere)", value: 312, color: "#3b82f6", annotation: "+TF32, sparsity, BF16" },
+    { label: "H100 (Hopper)", value: 990, color: "#10b981", annotation: "+FP8, TMA, WGMMA" },
+    { label: "B200 (Blackwell)", value: 2250, color: "#ef4444", annotation: "+FP4, dual-die" }
+  ]}
+  unit="TFLOPS"
+  baseline={0}
+/>
+
+### Multi-Instance GPU (MIG)
+
+Ampere introduced MIG, allowing a single A100 to be partitioned into up to 7 isolated GPU instances. Each instance has its own SMs, memory controllers, and L2 cache slice. This is significant for inference serving: multiple models or multiple users can share a single GPU with hardware-level isolation, not just software time-slicing.
+
+## Hopper (2022): The Transformer Engine
+
+### The Bottleneck Hopper Targeted
+
+By 2022, transformer-based LLMs dominated GPU workloads. These models have distinctive characteristics: attention mechanisms with irregular memory access patterns, very long sequential dependencies requiring the KV cache, and a mix of compute-bound (GEMM) and memory-bound (attention, normalization) operations within a single forward pass. Ampere treated all of these uniformly. Hopper redesigned the execution model around the transformer's specific needs.
+
+### What Hopper Introduced
+
+**FP8 tensor cores and the Transformer Engine.** Hopper tensor cores support two FP8 formats: E4M3 (4-bit exponent, 3-bit mantissa — more precision) and E5M2 (5-bit exponent, 2-bit mantissa — more range). The Transformer Engine dynamically selects per-tensor scaling factors to maximize the use of each format's representable range:
+
+```cpp
+// FP8 GEMM via cuBLAS on Hopper
+// The Transformer Engine manages scaling automatically
+cublasLtMatmul(ltHandle,
+    operationDesc,      // Specifies FP8 compute
+    &alpha,
+    A_fp8, Adesc,       // E4M3 encoded weights
+    B_fp8, Bdesc,       // E4M3 encoded activations
+    &beta,
+    C_bf16, Cdesc,      // BF16 output (higher precision for accumulation)
+    D_bf16, Ddesc,
+    &heuristicResult.algo,
+    workspace, workspaceSize,
+    stream);
+```
+
+FP8 doubles compute throughput vs FP16: 1,979 TFLOPS (FP8) vs 990 TFLOPS (FP16). For inference, this is enormous — the decode phase is memory-bound anyway, so doubling compute headroom means you can increase batch size before becoming compute-bound.
+
+**Tensor Memory Accelerator (TMA).** The TMA is a dedicated hardware unit that handles bulk data movement between global memory and shared memory. Before Hopper, moving data from HBM to shared memory required every thread in a threadblock to participate in cooperative loads. The TMA offloads this entirely:
+
+```cpp
+// Pre-Hopper: all 256 threads load cooperatively
+__shared__ half tile[64][64];
+int idx = threadIdx.x;
+for (int i = idx; i < 64*64; i += blockDim.x) {
+    tile[i / 64][i % 64] = global_ptr[base + i];
+}
+__syncthreads();
+
+// Hopper TMA: single thread issues the entire transfer
+// Remaining threads are free to compute
+if (threadIdx.x == 0) {
+    __nv_tma_load_2d(&tile, tma_desc, coord_x, coord_y, barrier);
+}
+// Other threads continue executing while TMA moves data
+__nv_arrive_wait(barrier);  // Wait only when data is needed
+```
+
+The TMA handles addressing, bounds checking, and format conversion in hardware. This frees the warp schedulers from spending cycles on address calculation and load instructions.
+
+**Warp Group Matrix Multiply-Accumulate (WGMMA).** WGMMA replaces the WMMA interface with a 128-thread (4-warp) cooperative matrix multiply. While WMMA operated on 16x16 tiles with a single warp, WGMMA operates on much larger tiles:
+
+$$\text{WGMMA tile: } 64 \times 256 \times 16 \text{ (M } \times \text{ N } \times \text{ K)}$$
+
+This is $64 \times 256 \times 16 \times 2 = 524{,}288$ FLOPs per instruction — a 128x increase over WMMA's 4,096 FLOPs per instruction. The larger tile size improves data reuse and reduces instruction overhead.
+
+**Asynchronous execution.** Hopper introduces hardware-level asynchrony throughout the pipeline. The TMA, WGMMA, and memory barriers all operate asynchronously, enabling a genuine 3-stage software pipeline:
+
+1. **Stage N**: TMA loads tile N+2 from HBM to shared memory
+2. **Stage N**: Tensor cores compute on tile N (already in shared memory)
+3. **Stage N**: Previous results from tile N-1 are written back
+
+All three stages execute simultaneously. This is not just software pipelining — the hardware has separate execution units for memory movement (TMA), compute (tensor cores), and synchronization (async barriers).
+
+<Callout type="info" title="Thread Block Clusters">
+Hopper introduces thread block clusters — a new level of the hierarchy between a thread block and the grid. A cluster is a group of up to 16 thread blocks guaranteed to run on adjacent SMs. Threads within a cluster can access each other's shared memory directly via distributed shared memory (DSMEM), bypassing the L2 cache. This is critical for operations like all-reduce within a cluster during tensor parallelism.
+</Callout>
+
+**Fourth-generation NVLink.** Hopper NVLink provides 900 GB/s bidirectional bandwidth per GPU (18 links at 50 GB/s each), a 50% increase over Ampere's 600 GB/s. The NVSwitch 3.0 connects all 8 GPUs in a DGX H100 node with full bisection bandwidth.
+
+### HBM3: 3,350 GB/s
+
+The H100 uses HBM3 on a 5120-bit bus, delivering 3,350 GB/s — a 64% increase over the A100's 2,039 GB/s. But the compute-to-bandwidth ratio shifted significantly:
+
+$$\frac{990 \times 10^{12}}{3350 \times 10^9} \approx 296 \text{ FLOP/byte (FP16)}$$
+
+$$\frac{1979 \times 10^{12}}{3350 \times 10^9} \approx 591 \text{ FLOP/byte (FP8)}$$
+
+This means the roofline ridge point has moved further right — more operations are memory-bound on Hopper than on Ampere. For LLM inference, where the decode phase is dominated by memory-bound GEMV operations, the extra compute is less important than the bandwidth increase.
+
+<Benchmark
+  title="Compute-to-Bandwidth Ratio (Ridge Point) Evolution"
+  columns={["GPU", "FP16 TFLOPS", "BW (GB/s)", "FP16 FLOP/byte", "FP8 FLOP/byte"]}
+  rows={[
+    { values: ["V100", "125", "900", "139", "N/A"], highlight: false },
+    { values: ["A100", "312", "2,039", "153", "N/A"], highlight: false },
+    { values: ["H100", "990", "3,350", "296", "591"], highlight: true },
+    { values: ["B200", "2,250", "8,000", "281", "563"], highlight: true },
+  ]}
+  notes="Higher FLOP/byte means more operations fall below the ridge point and are memory-bound. Blackwell's massive bandwidth increase actually improves this ratio vs Hopper."
+/>
+
+### The H200: Same Compute, More Memory
+
+The H200 is the same Hopper die with HBM3e instead of HBM3: 141 GB capacity (vs 80 GB) and 4,800 GB/s bandwidth (vs 3,350 GB/s). No additional SMs or tensor cores. This is significant because it reveals NVIDIA's understanding that LLM inference is memory-capacity-and-bandwidth-bound, not compute-bound. The H200 can serve a 70B parameter model (140 GB in FP16) on a single GPU — impossible on the 80 GB H100.
+
+## Blackwell (2024): Dual-Die and FP4
+
+### The Bottleneck Blackwell Targeted
+
+Trillion-parameter models (GPT-4 class) require massive parallelism across many GPUs. The communication overhead of tensor and pipeline parallelism across 8, 16, or 32 GPUs limits scaling efficiency. Simultaneously, inference demand exploded — the cost of serving models at scale made every percentage of efficiency count. Blackwell attacks both problems: more compute per socket (reducing parallelism requirements) and lower-precision formats (reducing memory and bandwidth requirements).
+
+### What Blackwell Introduced
+
+**Dual-die design.** The B200 consists of two GPU dies connected by a 10 TB/s chip-to-chip interconnect on the same package. Each die has 96 SMs (192 total), giving the B200 more than double the SM count of the H100. The two dies appear as a single GPU to software — no explicit multi-GPU programming required.
+
+**Fifth-generation tensor cores with FP4.** Blackwell tensor cores support FP4 (E2M1 format): a 4-bit floating point with 2-bit exponent and 1-bit mantissa. The representable values are limited to {0, 0.5, 1, 1.5, 2, 3, 4, 6} and their negatives, but post-training quantization to FP4 retains surprising accuracy for inference:
+
+$$\text{FP4 TFLOPS (dense)} = 4{,}500 \quad \text{FP4 TFLOPS (sparse)} = 9{,}000$$
+
+At FP4, a 70B parameter model occupies approximately 35 GB — fitting comfortably on a single B200 with 192 GB of HBM3e. A 405B model (Llama 3) fits in approximately 200 GB, requiring just two B200 GPUs instead of eight H100s.
+
+**Second-generation Transformer Engine.** The Blackwell Transformer Engine extends dynamic scaling to FP4, with per-block micro-scaling. Instead of a single scaling factor per tensor, Blackwell uses fine-grained scaling with one factor per 16 or 32 elements:
+
+$$x_{\text{FP4}} = \text{round\_to\_FP4}\left(\frac{x}{\text{scale}}\right), \quad \text{scale} = \frac{\max(|x_{\text{block}}|)}{\text{FP4\_MAX}}$$
+
+This micro-scaling reduces quantization error significantly compared to per-tensor scaling.
+
+**HBM3e: 8 TB/s.** The B200 provides 192 GB of HBM3e at 8 TB/s aggregate bandwidth. This is a 2.4x bandwidth increase over the H100 (3.35 TB/s). For the decode phase of LLM inference, where throughput is:
+
+$$\text{Tokens/s} = \frac{\text{Memory Bandwidth}}{2 \times \text{Params (bytes per param)}}$$
+
+The B200 at FP8 (1 byte per param) for a 70B model delivers:
+
+$$\frac{8000 \times 10^9}{2 \times 70 \times 10^9} \approx 57 \text{ tokens/s (single user)}$$
+
+Compare to H100 at FP8: $3350 / 140 \approx 24$ tokens/s. That is a 2.4x improvement from bandwidth alone.
+
+**Fifth-generation NVLink and NVLink-C2C.** NVLink 5.0 provides 1,800 GB/s bidirectional bandwidth per GPU (3.6x the A100). The NVL72 configuration connects 72 B200 GPUs via NVSwitch into a single coherent fabric with 130 TB/s bisection bandwidth. The NVLink-C2C (chip-to-chip) interconnect connects the two dies within a B200 at 10 TB/s — fast enough that inter-die communication is essentially the same cost as on-die shared memory.
+
+<PerfChart
+  title="HBM Bandwidth Progression (GB/s)"
+  data={[
+    { label: "V100 (HBM2)", value: 900, color: "#6366f1", annotation: "4096-bit bus" },
+    { label: "A100 (HBM2e)", value: 2039, color: "#3b82f6", annotation: "5120-bit bus" },
+    { label: "H100 (HBM3)", value: 3350, color: "#10b981", annotation: "5120-bit bus, higher clock" },
+    { label: "H200 (HBM3e)", value: 4800, color: "#22d3ee", annotation: "Same die, better memory" },
+    { label: "B200 (HBM3e)", value: 8000, color: "#ef4444", annotation: "Dual-die, 12-hi stacks" }
+  ]}
+  unit="GB/s"
+  baseline={0}
+/>
+
+### Blackwell Secure AI
+
+Blackwell includes a hardware confidential computing engine that encrypts GPU memory with AES-256 and provides attestation for model weights and inputs. This is not a performance feature, but it matters for deployment — enterprise customers deploying proprietary models on shared infrastructure require hardware-level isolation.
+
+## What Each Generation Actually Targeted
+
+The pattern is clear when you map each generation to its primary bottleneck:
+
+<Benchmark
+  title="Primary Bottleneck Addressed per Generation"
+  columns={["Generation", "Primary Bottleneck", "Key Innovation", "Result"]}
+  rows={[
+    { values: ["Volta (2017)", "Matrix multiply throughput", "Tensor cores (FP16 in, FP32 acc)", "12x over Pascal FP32"], highlight: false },
+    { values: ["Ampere (2020)", "Precision flexibility, weight redundancy", "TF32, BF16, 2:4 sparsity", "Transparent FP32 speedup, 2x sparse"], highlight: false },
+    { values: ["Hopper (2022)", "Transformer memory access patterns", "FP8, TMA, WGMMA, async execution", "2x over Ampere per FLOP"], highlight: true },
+    { values: ["Blackwell (2024)", "Model size vs single-GPU capacity", "Dual-die, FP4, 8 TB/s HBM3e", "2-4x inference throughput"], highlight: true },
+  ]}
+/>
+
+## Performance Progression for LLM Inference
+
+LLM inference has two distinct phases with different bottlenecks:
+
+**Prefill (prompt processing):** Compute-bound. The entire input sequence is processed in parallel as a large matrix multiply. Tensor FLOPS matter here.
+
+**Decode (token generation):** Memory-bandwidth-bound. Each token requires reading all model weights for a single GEMV. Memory bandwidth matters here.
+
+For a 70B parameter model (FP16, 140 GB weights):
+
+<Benchmark
+  title="70B Model Decode Throughput (Single GPU, Batch=1)"
+  columns={["GPU", "Precision", "Weight Size", "BW (GB/s)", "Theoretical tok/s", "Measured tok/s"]}
+  rows={[
+    { values: ["V100 32GB", "FP16", "140 GB (needs 5 GPUs)", "900", "N/A (multi-GPU)", "~3"], highlight: false },
+    { values: ["A100 80GB", "FP16", "140 GB (needs 2 GPUs)", "2,039", "N/A (multi-GPU)", "~8"], highlight: false },
+    { values: ["H100 80GB", "FP8", "70 GB", "3,350", "~24", "~18"], highlight: true },
+    { values: ["H200 141GB", "FP8", "70 GB", "4,800", "~34", "~26"], highlight: true },
+    { values: ["B200 192GB", "FP4", "35 GB", "8,000", "~114", "~70"], highlight: true },
+  ]}
+  notes="Measured values account for KV cache overhead, kernel launch overhead, and less-than-100% bandwidth utilization. Multi-GPU setups incur NVLink communication overhead."
+/>
+
+The theoretical tokens/s for decode is:
+
+$$\text{tok/s} \approx \frac{\text{BW}}{2P \times b}$$
+
+where $P$ is parameter count, $b$ is bytes per parameter, and the factor of 2 accounts for the multiply-accumulate (read weight, read activation, write output — simplified to 2x weight read as the dominant term). Real throughput is typically 60-75% of theoretical due to:
+
+- KV cache reads (additional bandwidth consumption)
+- Non-GEMM operations (layernorm, rotary embeddings, softmax)
+- Memory controller inefficiency at non-sequential access patterns
+- Kernel launch overhead between layers
+
+### Batched Inference: Where Compute Matters Again
+
+At batch size 1, decode is purely memory-bound. But as batch size increases, the same weight read serves multiple tokens, and compute becomes the bottleneck:
+
+$$\text{Batch size at compute-memory boundary} \approx \frac{\text{FLOP/byte ratio}}{2}$$
+
+For H100 at FP8: $591 / 2 \approx 296$. At batch sizes above roughly 296, the H100 becomes compute-bound during decode. This is where FP8 and FP4 throughput improvements matter — they raise the ceiling for batched inference.
+
+<PerfChart
+  title="Approximate Maximum Decode Throughput (70B, FP8, High Batch)"
+  data={[
+    { label: "A100 (FP16 only)", value: 1100, color: "#3b82f6", annotation: "BW-limited sooner" },
+    { label: "H100 (FP8)", value: 4200, color: "#10b981", annotation: "1,979 TFLOPS FP8" },
+    { label: "B200 (FP8)", value: 9500, color: "#ef4444", annotation: "4,500 TFLOPS FP8" }
+  ]}
+  unit="tokens/s (large batch)"
+  baseline={0}
+/>
+
+## Implementation: Querying Architecture Capabilities
+
+You can query the specific capabilities of any NVIDIA GPU programmatically:
+
+```cpp
+#include <cuda_runtime.h>
+#include <cstdio>
+
+void print_arch_details(int device) {
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, device);
+
+    printf("Device: %s\n", prop.name);
+    printf("Compute Capability: %d.%d\n", prop.major, prop.minor);
+    printf("SMs: %d\n", prop.multiProcessorCount);
+    printf("Max threads per SM: %d\n", prop.maxThreadsPerMultiProcessor);
+    printf("Max threads per block: %d\n", prop.maxThreadsPerBlock);
+    printf("Registers per SM: %d\n", prop.regsPerMultiprocessor);
+    printf("Shared memory per SM: %zu bytes\n", prop.sharedMemPerMultiprocessor);
+    printf("Shared memory per block: %zu bytes\n", prop.sharedMemPerBlock);
+    printf("L2 cache size: %d bytes\n", prop.l2CacheSize);
+    printf("Global memory: %zu MB\n", prop.totalGlobalMem / (1024 * 1024));
+    printf("Memory bus width: %d bits\n", prop.memoryBusWidth);
+    printf("Memory clock: %d MHz\n", prop.memoryClockRate / 1000);
+    printf("Peak memory BW: %.1f GB/s\n",
+        2.0 * prop.memoryClockRate * (prop.memoryBusWidth / 8) / 1.0e6);
+    printf("Clock rate: %d MHz\n", prop.clockRate / 1000);
+
+    // Architecture-specific features
+    if (prop.major >= 7) printf("Tensor cores: Yes (Volta+)\n");
+    if (prop.major >= 8) printf("TF32 support: Yes (Ampere+)\n");
+    if (prop.major >= 8) printf("BF16 support: Yes (Ampere+)\n");
+    if (prop.major >= 9) printf("FP8 support: Yes (Hopper+)\n");
+    if (prop.major >= 9) printf("TMA support: Yes (Hopper+)\n");
+    if (prop.major >= 10) printf("FP4 support: Yes (Blackwell+)\n");
+}
+
+int main() {
+    int deviceCount;
+    cudaGetDeviceCount(&deviceCount);
+    for (int i = 0; i < deviceCount; i++) {
+        print_arch_details(i);
+        printf("\n");
+    }
+    return 0;
+}
+```
+
+Compile with: `nvcc -o arch_query arch_query.cu`
+
+<Callout type="warning" title="Compute Capability Mapping">
+Volta = SM 7.0 (V100). Ampere = SM 8.0 (A100). Hopper = SM 9.0 (H100). Blackwell = SM 10.0 (B200). The compute capability determines which PTX instructions are available. Code compiled for SM 7.0 runs on all subsequent architectures, but cannot use newer instructions (FP8, TMA, WGMMA).
+</Callout>
+
+## Measuring Actual vs Theoretical Performance
+
+The `nvidia-smi` tool provides real-time monitoring, but for detailed architecture-level profiling, use `ncu` (Nsight Compute):
+
+```bash
+# Profile a kernel and show SM utilization, memory throughput, tensor core utilization
+ncu --set full --target-processes all ./my_inference_binary
+
+# Key metrics to check:
+# sm__throughput.avg.pct_of_peak_sustained_elapsed  -> SM utilization
+# dram__throughput.avg.pct_of_peak_sustained_elapsed -> HBM bandwidth utilization
+# sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed -> Tensor core usage
+# l1tex__throughput.avg.pct_of_peak_sustained_elapsed -> L1/shared memory throughput
+```
+
+For inference specifically, the key question is: are you memory-bound or compute-bound? If `dram__throughput` is near 80%+ of peak and `sm__pipe_tensor_cycles_active` is low, you are memory-bound and the solution is higher bandwidth (better GPU or quantization). If tensor utilization is high, you are compute-bound and need either a faster GPU or smaller batch size.
+
+## The Takeaway: Architecture Determines Strategy
+
+Each GPU architecture implies a different optimal inference strategy:
+
+- **V100:** FP16 tensor cores, limited memory capacity. Multi-GPU is mandatory for anything above 13B parameters. Quantization to INT8 helps but hardware support is limited.
+
+- **A100:** TF32 for training convenience, FP16/BF16 for inference. 80 GB allows up to 40B FP16 models on one GPU. Structured sparsity is available but rarely used in practice due to the 2:4 constraint.
+
+- **H100:** FP8 is the default for inference. The Transformer Engine handles quantization automatically. TMA and WGMMA require CUDA 12+ and explicit kernel redesign (or use of libraries like CUTLASS 3.x / cuDNN 9). The 80 GB capacity is the main limitation.
+
+- **H200:** Same as H100 but 141 GB and 4.8 TB/s. The go-to for serving 70B models on a single GPU. No new programming model.
+
+- **B200:** FP4 for inference, 192 GB capacity, 8 TB/s bandwidth. A single B200 can serve a 70B model at FP4 with headroom for large KV caches. The NVL72 configuration puts 13.8 TB of aggregate HBM in a single rack — enough for a trillion-parameter model with full KV cache.
+
+The hardware determines what is possible. The next posts in this series cover each subsystem in detail: HBM generations, NVLink interconnect, the streaming multiprocessor, AMD's alternative, and the thermal and power realities that constrain all of it.

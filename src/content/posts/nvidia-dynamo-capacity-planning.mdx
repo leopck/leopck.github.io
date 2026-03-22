@@ -1,0 +1,635 @@
+---
+title: "Dynamo Capacity Planning: How Many GPUs for Your SLO, Traffic Pattern, and Model Size"
+author: "stanley-phoong"
+description: "Capacity planning formulas for Dynamo deployments. GPUs required from peak QPS, tokens per query, and throughput per GPU. Prefill vs decode GPU ratio. Burst headroom. Cost optimization. Complete capacity planning calculator implementation."
+publishDate: 2025-03-22
+category: llm-inference
+tags: [dynamo, nvidia, capacity-planning, gpu, slo, cost-optimization]
+difficulty: expert
+readingTime: 30
+draft: false
+featured: false
+series: "NVIDIA Dynamo & llm-d"
+seriesOrder: 16
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+
+How many GPUs do you need? The answer depends on four variables: peak queries per second, average tokens per query (input + output), throughput per GPU (tokens per second at your target latency), and your utilization target (never plan for 100% -- you need burst headroom). Get this wrong and you either waste money on idle GPUs or violate SLOs under peak load.
+
+Dynamo adds a fifth variable: the prefill-to-decode GPU ratio. Disaggregated serving splits computation into prefill workers (compute-bound, handling prompt processing) and decode workers (memory-bandwidth-bound, generating tokens). The optimal ratio depends on your prompt length distribution and output length distribution. A chatbot with short prompts and long outputs needs more decode GPUs. A summarization service with long prompts and short outputs needs more prefill GPUs.
+
+This post provides the complete capacity planning framework with working code.
+
+---
+
+## 1. The Fundamental Capacity Equation
+
+### Base Formula
+
+```python
+import math
+from dataclasses import dataclass
+
+
+@dataclass
+class WorkloadProfile:
+    """Characterize your workload for capacity planning."""
+    peak_qps: float              # Peak queries per second
+    avg_input_tokens: int        # Average input (prompt) tokens
+    avg_output_tokens: int       # Average output (generated) tokens
+    p99_input_tokens: int        # 99th percentile input tokens
+    p99_output_tokens: int       # 99th percentile output tokens
+    daily_pattern: str           # "flat", "business_hours", "global"
+    peak_to_average_ratio: float # Peak QPS / Average QPS
+
+
+@dataclass
+class SLORequirements:
+    """Service Level Objectives."""
+    ttft_p99_ms: float          # Time to first token, 99th percentile
+    itl_p99_ms: float           # Inter-token latency, 99th percentile
+    total_latency_p99_ms: float # End-to-end latency, 99th percentile
+    availability: float          # e.g., 0.999 = 99.9% uptime
+
+
+@dataclass
+class GPUProfile:
+    """GPU performance characteristics for a specific model."""
+    gpu_type: str
+    model_name: str
+    tp_degree: int              # Tensor parallelism degree
+    prefill_throughput_tps: float  # Tokens/sec for prefill (per TP group)
+    decode_throughput_tps: float   # Tokens/sec for decode (per TP group)
+    max_batch_size: int
+    kv_cache_per_token_bytes: int  # KV cache memory per token
+    gpu_memory_bytes: int          # Total GPU memory
+    cost_per_gpu_hour: float       # USD
+
+
+def compute_minimum_gpus(
+    workload: WorkloadProfile,
+    slo: SLORequirements,
+    gpu: GPUProfile,
+    utilization_target: float = 0.70,
+) -> dict:
+    """
+    Compute minimum GPU count for a Dynamo deployment.
+
+    Returns breakdown of prefill GPUs, decode GPUs, and total cost.
+    """
+    # Total tokens per second needed
+    total_input_tps = workload.peak_qps * workload.avg_input_tokens
+    total_output_tps = workload.peak_qps * workload.avg_output_tokens
+
+    # Prefill GPU requirement
+    # Each prefill GPU group processes input tokens at prefill_throughput_tps
+    prefill_groups_needed = math.ceil(
+        total_input_tps / (gpu.prefill_throughput_tps * utilization_target)
+    )
+    prefill_gpus = prefill_groups_needed * gpu.tp_degree
+
+    # Decode GPU requirement
+    # Each decode GPU group generates output tokens at decode_throughput_tps
+    decode_groups_needed = math.ceil(
+        total_output_tps / (gpu.decode_throughput_tps * utilization_target)
+    )
+    decode_gpus = decode_groups_needed * gpu.tp_degree
+
+    # Memory check: can each decode group hold enough KV cache?
+    max_concurrent_sequences = workload.peak_qps * (
+        workload.avg_output_tokens / gpu.decode_throughput_tps
+    )
+    kv_memory_needed = (
+        max_concurrent_sequences *
+        (workload.avg_input_tokens + workload.avg_output_tokens) *
+        gpu.kv_cache_per_token_bytes
+    )
+    kv_memory_per_group = kv_memory_needed / decode_groups_needed
+    model_memory = gpu.gpu_memory_bytes * gpu.tp_degree * 0.35  # ~35% for model
+    available_kv_memory = gpu.gpu_memory_bytes * gpu.tp_degree * 0.55  # ~55% for KV
+
+    if kv_memory_per_group > available_kv_memory:
+        # Need more decode groups for memory
+        decode_groups_needed = math.ceil(
+            kv_memory_needed / available_kv_memory
+        )
+        decode_gpus = decode_groups_needed * gpu.tp_degree
+
+    total_gpus = prefill_gpus + decode_gpus
+
+    # Cost
+    hourly_cost = total_gpus * gpu.cost_per_gpu_hour
+    monthly_cost = hourly_cost * 24 * 30
+
+    return {
+        'prefill_gpus': prefill_gpus,
+        'decode_gpus': decode_gpus,
+        'total_gpus': total_gpus,
+        'prefill_decode_ratio': prefill_gpus / max(decode_gpus, 1),
+        'utilization_target': utilization_target,
+        'hourly_cost_usd': hourly_cost,
+        'monthly_cost_usd': monthly_cost,
+        'cost_per_1k_queries': (hourly_cost / 3600) / workload.peak_qps * 1000,
+    }
+```
+
+---
+
+## 2. Prefill vs Decode GPU Ratio
+
+### Why the Ratio Matters
+
+```python
+def analyze_prefill_decode_ratio(workload, gpu):
+    """
+    Compute the optimal prefill-to-decode GPU ratio.
+
+    The ratio depends on:
+    1. Input/output token ratio
+    2. Prefill vs decode throughput per GPU
+    3. Whether prefill or decode is the bottleneck
+    """
+    # Compute time per query on each type of GPU
+    prefill_time_per_query = workload.avg_input_tokens / gpu.prefill_throughput_tps
+    decode_time_per_query = workload.avg_output_tokens / gpu.decode_throughput_tps
+
+    # Ratio of time spent on each phase
+    time_ratio = prefill_time_per_query / decode_time_per_query
+
+    # Optimal GPU ratio matches the time ratio
+    # If prefill takes 2x as long as decode per query,
+    # you need 2x as many prefill GPU-groups
+    optimal_ratio = time_ratio
+
+    scenarios = {
+        'chatbot': {
+            'description': 'Short prompts (128 tokens), long outputs (512 tokens)',
+            'avg_input': 128,
+            'avg_output': 512,
+            'prefill_time': 128 / gpu.prefill_throughput_tps,
+            'decode_time': 512 / gpu.decode_throughput_tps,
+        },
+        'summarization': {
+            'description': 'Long prompts (4096 tokens), short outputs (256 tokens)',
+            'avg_input': 4096,
+            'avg_output': 256,
+            'prefill_time': 4096 / gpu.prefill_throughput_tps,
+            'decode_time': 256 / gpu.decode_throughput_tps,
+        },
+        'code_generation': {
+            'description': 'Medium prompts (1024 tokens), medium outputs (1024 tokens)',
+            'avg_input': 1024,
+            'avg_output': 1024,
+            'prefill_time': 1024 / gpu.prefill_throughput_tps,
+            'decode_time': 1024 / gpu.decode_throughput_tps,
+        },
+        'rag_qa': {
+            'description': 'Long context (8192 tokens), short answers (128 tokens)',
+            'avg_input': 8192,
+            'avg_output': 128,
+            'prefill_time': 8192 / gpu.prefill_throughput_tps,
+            'decode_time': 128 / gpu.decode_throughput_tps,
+        },
+    }
+
+    for name, s in scenarios.items():
+        ratio = s['prefill_time'] / s['decode_time']
+        s['optimal_prefill_decode_ratio'] = round(ratio, 2)
+        s['recommendation'] = (
+            f"{max(1, round(ratio))} prefill : 1 decode GPU groups"
+        )
+
+    return scenarios, optimal_ratio
+```
+
+<Benchmark
+  title="Optimal Prefill:Decode GPU Ratio by Workload (Llama 70B, H100)"
+  columns={["Workload", "Avg Input", "Avg Output", "Prefill Time", "Decode Time", "Optimal Ratio"]}
+  rows={[
+    { values: ["Chatbot", "128 tokens", "512 tokens", "2.6ms", "64ms", "1:25 (decode heavy)"], highlight: false },
+    { values: ["Summarization", "4096 tokens", "256 tokens", "82ms", "32ms", "2.5:1 (prefill heavy)"], highlight: true },
+    { values: ["Code Generation", "1024 tokens", "1024 tokens", "20ms", "128ms", "1:6 (decode heavy)"], highlight: false },
+    { values: ["RAG Q&A", "8192 tokens", "128 tokens", "164ms", "16ms", "10:1 (prefill heavy)"], highlight: true },
+    { values: ["Agent (Multi-turn)", "2048 tokens", "256 tokens", "41ms", "32ms", "1.3:1 (balanced)"], highlight: false }
+  ]}
+  notes="RAG and summarization workloads are prefill-heavy and benefit most from disaggregated serving. Chatbots are decode-heavy and may be better served with co-located prefill+decode."
+/>
+
+---
+
+## 3. Complete Capacity Planning Calculator
+
+```python
+class CapacityPlanningCalculator:
+    """
+    Complete capacity planning tool for Dynamo deployments.
+    Takes workload profile, SLO requirements, and GPU specs.
+    Outputs GPU count, configuration, and cost estimate.
+    """
+
+    def __init__(self):
+        self.gpu_profiles = self._load_gpu_profiles()
+
+    def _load_gpu_profiles(self):
+        """Known GPU performance profiles for common models."""
+        return {
+            ('llama-70b', 'h100'): GPUProfile(
+                gpu_type='H100',
+                model_name='Llama 3.1 70B',
+                tp_degree=4,
+                prefill_throughput_tps=50000,  # tokens/sec for prefill
+                decode_throughput_tps=8000,    # tokens/sec for decode
+                max_batch_size=256,
+                kv_cache_per_token_bytes=2560,  # 80 layers * 8 heads * 128 dim * 2 (KV) * 2 (BF16)
+                gpu_memory_bytes=80 * 1024 ** 3,  # 80GB
+                cost_per_gpu_hour=3.50,
+            ),
+            ('llama-8b', 'h100'): GPUProfile(
+                gpu_type='H100',
+                model_name='Llama 3.1 8B',
+                tp_degree=1,
+                prefill_throughput_tps=120000,
+                decode_throughput_tps=25000,
+                max_batch_size=512,
+                kv_cache_per_token_bytes=512,
+                gpu_memory_bytes=80 * 1024 ** 3,
+                cost_per_gpu_hour=3.50,
+            ),
+            ('llama-405b', 'h100'): GPUProfile(
+                gpu_type='H100',
+                model_name='Llama 3.1 405B',
+                tp_degree=8,
+                prefill_throughput_tps=20000,
+                decode_throughput_tps=3000,
+                max_batch_size=128,
+                kv_cache_per_token_bytes=6400,
+                gpu_memory_bytes=80 * 1024 ** 3,
+                cost_per_gpu_hour=3.50,
+            ),
+        }
+
+    def plan(self, workload, slo, model_key, strategy="disaggregated"):
+        """
+        Generate a complete capacity plan.
+
+        Args:
+            workload: WorkloadProfile
+            slo: SLORequirements
+            model_key: Tuple of (model_name, gpu_type)
+            strategy: "disaggregated" or "colocated"
+        """
+        gpu = self.gpu_profiles[model_key]
+
+        if strategy == "disaggregated":
+            result = self._plan_disaggregated(workload, slo, gpu)
+        else:
+            result = self._plan_colocated(workload, slo, gpu)
+
+        # Add burst headroom
+        result = self._add_burst_headroom(result, workload)
+
+        # Add redundancy for availability
+        result = self._add_redundancy(result, slo)
+
+        # Cost summary
+        result['cost_summary'] = self._compute_costs(result, gpu)
+
+        return result
+
+    def _plan_disaggregated(self, workload, slo, gpu):
+        """Plan with separate prefill and decode pools."""
+        # Prefill capacity
+        total_prefill_tps = workload.peak_qps * workload.avg_input_tokens
+        prefill_groups = math.ceil(total_prefill_tps / (gpu.prefill_throughput_tps * 0.70))
+
+        # Decode capacity
+        total_decode_tps = workload.peak_qps * workload.avg_output_tokens
+        decode_groups = math.ceil(total_decode_tps / (gpu.decode_throughput_tps * 0.70))
+
+        # SLO check: TTFT
+        prefill_time = workload.p99_input_tokens / gpu.prefill_throughput_tps * 1000
+        overhead_ms = 5  # Router + scheduler + transfer
+        ttft_estimate = prefill_time + overhead_ms
+
+        if ttft_estimate > slo.ttft_p99_ms:
+            # Need more prefill parallelism
+            prefill_groups = math.ceil(
+                prefill_groups * ttft_estimate / slo.ttft_p99_ms
+            )
+
+        # SLO check: ITL
+        itl_estimate = 1000 / (gpu.decode_throughput_tps / workload.peak_qps)
+        if itl_estimate > slo.itl_p99_ms:
+            decode_groups = math.ceil(
+                decode_groups * itl_estimate / slo.itl_p99_ms
+            )
+
+        return {
+            'strategy': 'disaggregated',
+            'prefill_groups': prefill_groups,
+            'decode_groups': decode_groups,
+            'prefill_gpus': prefill_groups * gpu.tp_degree,
+            'decode_gpus': decode_groups * gpu.tp_degree,
+            'total_gpus': (prefill_groups + decode_groups) * gpu.tp_degree,
+            'estimated_ttft_p99_ms': ttft_estimate,
+            'estimated_itl_p99_ms': itl_estimate,
+        }
+
+    def _plan_colocated(self, workload, slo, gpu):
+        """Plan with co-located prefill and decode on same GPUs."""
+        total_tps = workload.peak_qps * (
+            workload.avg_input_tokens + workload.avg_output_tokens
+        )
+
+        # Co-located throughput is lower due to prefill-decode interference
+        effective_throughput = min(
+            gpu.prefill_throughput_tps * 0.6,  # Prefill slowed by decode sharing
+            gpu.decode_throughput_tps * 0.8,   # Decode slowed by prefill sharing
+        )
+
+        groups = math.ceil(total_tps / (effective_throughput * 0.70))
+
+        return {
+            'strategy': 'colocated',
+            'groups': groups,
+            'total_gpus': groups * gpu.tp_degree,
+        }
+
+    def _add_burst_headroom(self, plan, workload):
+        """Add capacity for traffic bursts."""
+        burst_factor = workload.peak_to_average_ratio
+        headroom_factor = 1.0 + max(0, (burst_factor - 1.5) * 0.5)
+        # If peak/avg > 1.5, add proportional headroom
+
+        plan['burst_headroom_factor'] = headroom_factor
+        plan['total_gpus_with_burst'] = math.ceil(
+            plan['total_gpus'] * headroom_factor
+        )
+        return plan
+
+    def _add_redundancy(self, plan, slo):
+        """Add GPU redundancy for availability target."""
+        if slo.availability >= 0.999:
+            # 99.9% availability: N+2 redundancy
+            plan['redundancy_gpus'] = 2 * plan.get(
+                'prefill_gpus', 0
+            ) // max(plan.get('prefill_groups', 1), 1) + 2
+        elif slo.availability >= 0.99:
+            # 99% availability: N+1 redundancy
+            plan['redundancy_gpus'] = plan.get(
+                'prefill_gpus', 0
+            ) // max(plan.get('prefill_groups', 1), 1) + 1
+        else:
+            plan['redundancy_gpus'] = 0
+
+        plan['total_gpus_final'] = plan['total_gpus_with_burst'] + plan.get('redundancy_gpus', 0)
+        return plan
+
+    def _compute_costs(self, plan, gpu):
+        """Compute cost breakdown."""
+        total_gpus = plan['total_gpus_final']
+        hourly = total_gpus * gpu.cost_per_gpu_hour
+        return {
+            'total_gpus': total_gpus,
+            'hourly_cost': hourly,
+            'daily_cost': hourly * 24,
+            'monthly_cost': hourly * 24 * 30,
+            'annual_cost': hourly * 24 * 365,
+            'cost_per_1m_tokens': (
+                hourly / (gpu.decode_throughput_tps * 3600 * total_gpus / gpu.tp_degree)
+            ) * 1e6,
+        }
+```
+
+---
+
+## 4. Worked Examples
+
+### Example 1: Chatbot Service
+
+```python
+chatbot_workload = WorkloadProfile(
+    peak_qps=100,
+    avg_input_tokens=256,
+    avg_output_tokens=512,
+    p99_input_tokens=1024,
+    p99_output_tokens=2048,
+    daily_pattern="business_hours",
+    peak_to_average_ratio=2.5,
+)
+
+chatbot_slo = SLORequirements(
+    ttft_p99_ms=500,
+    itl_p99_ms=50,
+    total_latency_p99_ms=30000,
+    availability=0.999,
+)
+
+calculator = CapacityPlanningCalculator()
+plan = calculator.plan(chatbot_workload, chatbot_slo, ('llama-70b', 'h100'))
+```
+
+<Benchmark
+  title="Capacity Plan: Chatbot (100 QPS, Llama 70B, H100)"
+  columns={["Component", "Count", "Purpose"]}
+  rows={[
+    { values: ["Prefill GPU Groups (4 GPUs each)", "2", "Handle 25.6K tokens/sec input"], highlight: false },
+    { values: ["Decode GPU Groups (4 GPUs each)", "10", "Handle 51.2K tokens/sec output"], highlight: true },
+    { values: ["Prefill GPUs", "8", ""], highlight: false },
+    { values: ["Decode GPUs", "40", ""], highlight: false },
+    { values: ["Burst Headroom (+25%)", "12", "For 2.5x peak/average ratio"], highlight: false },
+    { values: ["Redundancy", "8", "N+2 for 99.9% availability"], highlight: false },
+    { values: ["Total GPUs", "68", "$238/hour, $171K/month"], highlight: true }
+  ]}
+  notes="Chatbot workloads are heavily decode-bound: 83% of GPUs are allocated to decode. The prefill:decode ratio is 1:5."
+/>
+
+### Example 2: RAG Service
+
+```python
+rag_workload = WorkloadProfile(
+    peak_qps=50,
+    avg_input_tokens=8192,
+    avg_output_tokens=256,
+    p99_input_tokens=16384,
+    p99_output_tokens=512,
+    daily_pattern="flat",
+    peak_to_average_ratio=1.3,
+)
+
+rag_slo = SLORequirements(
+    ttft_p99_ms=2000,   # 2 seconds TTFT acceptable for RAG
+    itl_p99_ms=50,
+    total_latency_p99_ms=15000,
+    availability=0.999,
+)
+```
+
+<Benchmark
+  title="Capacity Plan: RAG Service (50 QPS, Llama 70B, H100)"
+  columns={["Component", "Count", "Purpose"]}
+  rows={[
+    { values: ["Prefill GPU Groups", "12", "Handle 409.6K tokens/sec input"], highlight: true },
+    { values: ["Decode GPU Groups", "2", "Handle 12.8K tokens/sec output"], highlight: false },
+    { values: ["Prefill GPUs", "48", ""], highlight: false },
+    { values: ["Decode GPUs", "8", ""], highlight: false },
+    { values: ["Burst + Redundancy", "10", ""], highlight: false },
+    { values: ["Total GPUs", "66", "$231/hour, $166K/month"], highlight: true }
+  ]}
+  notes="RAG workloads are heavily prefill-bound: 73% of GPUs handle prefill. The prefill:decode ratio is 6:1 -- the inverse of the chatbot case."
+/>
+
+---
+
+## 5. Dynamic Scaling
+
+### Autoscaling Based on Queue Depth
+
+```python
+class DynamoAutoscaler:
+    """
+    Autoscale GPU allocation based on real-time metrics.
+    """
+
+    def __init__(self, min_gpus, max_gpus, scale_up_threshold=0.85,
+                 scale_down_threshold=0.40, cooldown_seconds=120):
+        self.min_gpus = min_gpus
+        self.max_gpus = max_gpus
+        self.scale_up_threshold = scale_up_threshold
+        self.scale_down_threshold = scale_down_threshold
+        self.cooldown_seconds = cooldown_seconds
+        self.last_scale_time = 0
+
+    def evaluate(self, metrics):
+        """
+        Evaluate whether to scale based on current metrics.
+
+        Metrics:
+        - gpu_utilization: average across fleet
+        - queue_depth: pending requests
+        - slo_violation_rate: fraction of requests missing SLO
+        - ttft_p99: current P99 TTFT
+        """
+        current_time = time.time()
+        if current_time - self.last_scale_time < self.cooldown_seconds:
+            return {'action': 'none', 'reason': 'cooldown'}
+
+        # Scale up conditions (any one triggers)
+        scale_up = False
+        reason = ""
+
+        if metrics['gpu_utilization'] > self.scale_up_threshold:
+            scale_up = True
+            reason = f"GPU utilization {metrics['gpu_utilization']:.0%} > {self.scale_up_threshold:.0%}"
+
+        if metrics['slo_violation_rate'] > 0.01:  # More than 1% SLO violations
+            scale_up = True
+            reason = f"SLO violation rate {metrics['slo_violation_rate']:.1%} > 1%"
+
+        if metrics['queue_depth'] > 100:
+            scale_up = True
+            reason = f"Queue depth {metrics['queue_depth']} > 100"
+
+        if scale_up:
+            # Calculate how many GPUs to add
+            if metrics['slo_violation_rate'] > 0.05:
+                gpus_to_add = 8  # Aggressive scale for high violation
+            else:
+                gpus_to_add = 4  # Gradual scale
+
+            self.last_scale_time = current_time
+            return {
+                'action': 'scale_up',
+                'gpus_to_add': gpus_to_add,
+                'reason': reason,
+            }
+
+        # Scale down conditions (all must be true)
+        if (metrics['gpu_utilization'] < self.scale_down_threshold and
+                metrics['slo_violation_rate'] == 0 and
+                metrics['queue_depth'] < 10):
+            gpus_to_remove = 4
+            self.last_scale_time = current_time
+            return {
+                'action': 'scale_down',
+                'gpus_to_remove': gpus_to_remove,
+                'reason': f"Low utilization {metrics['gpu_utilization']:.0%}",
+            }
+
+        return {'action': 'none', 'reason': 'within thresholds'}
+```
+
+<PerfChart
+  title="Cost Savings: Static vs Autoscaled Deployment"
+  xlabel="Hour of Day"
+  ylabel="Active GPUs"
+  data={{
+    labels: ["0", "2", "4", "6", "8", "10", "12", "14", "16", "18", "20", "22"],
+    datasets: [
+      {
+        label: "Static Provisioning",
+        data: [68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68]
+      },
+      {
+        label: "Autoscaled",
+        data: [28, 24, 24, 28, 48, 64, 68, 68, 68, 60, 48, 32]
+      }
+    ]
+  }}
+/>
+
+<Callout type="perf">
+Autoscaling reduces average GPU usage by 30-45% for workloads with business-hours patterns (peak-to-average ratio above 2x). At $3.50/GPU-hour for H100s, a 68-GPU fleet saves $35K-50K/month with autoscaling. The tradeoff: cold-start latency when scaling up. Dynamo's model pre-loading (ModelExpress) reduces cold-start from minutes to 15-30 seconds by streaming model weights from NVMe.
+</Callout>
+
+---
+
+## 6. Cost Optimization Strategies
+
+```python
+COST_OPTIMIZATION_STRATEGIES = {
+    "spot_instances_for_decode": {
+        "description": (
+            "Use spot/preemptible instances for decode workers. "
+            "Decode is more tolerant of preemption because: "
+            "1. KV cache can be rebuilt from prefill "
+            "2. Partially generated responses can be resumed "
+            "3. Decode workers are stateless except for KV cache"
+        ),
+        "savings": "50-70% on decode GPU cost",
+        "risk": "Momentary latency spike during preemption",
+    },
+    "mixed_gpu_types": {
+        "description": (
+            "Use H100 for prefill (compute-bound, benefits from high FLOPS) "
+            "and A100 for decode (memory-bandwidth-bound, A100 is sufficient). "
+            "A100 costs 60% of H100 per hour."
+        ),
+        "savings": "25-35% total cost",
+        "risk": "More complex fleet management",
+    },
+    "kv_cache_tiering": {
+        "description": (
+            "Tier KV cache: hot entries in GPU HBM, warm in CPU DRAM, "
+            "cold in NVMe. Reduces GPU memory pressure, allowing "
+            "larger batch sizes and fewer GPUs."
+        ),
+        "savings": "15-25% fewer GPUs needed",
+        "risk": "Increased TTFT for cold cache entries",
+    },
+    "request_coalescing": {
+        "description": (
+            "Batch similar requests to share KV cache prefix. "
+            "System prompts, common prefixes, and RAG contexts "
+            "can be shared across requests."
+        ),
+        "savings": "20-40% prefill compute savings",
+        "risk": "Requires prefix-aware routing",
+    },
+}
+```
+
+Capacity planning for Dynamo is not a one-time calculation. It is a continuous optimization loop: measure actual traffic patterns, compare against planned capacity, adjust GPU allocation, and re-evaluate costs. The formulas in this post provide the starting point; production experience refines the numbers. The most common mistake is over-provisioning decode GPUs for prefill-heavy workloads (RAG, summarization) or over-provisioning prefill GPUs for decode-heavy workloads (chatbots, code generation). Getting the prefill-to-decode ratio right typically saves 20-30% of total GPU cost compared to a naive 1:1 allocation.

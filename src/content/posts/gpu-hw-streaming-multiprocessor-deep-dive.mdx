@@ -1,0 +1,653 @@
+---
+title: "The Streaming Multiprocessor: Warp Schedulers, Register File, and the Execution Pipeline"
+author: "stanley-phoong"
+description: "A deep dive into the GPU streaming multiprocessor — warp scheduler mechanics, the 256 KB register file, shared memory and L1 cache partitioning, tensor core integration, instruction issue rules, occupancy analysis from first principles, and register pressure as the hidden bottleneck in kernel performance."
+publishDate: 2025-03-22
+category: gpu-programming
+tags: [gpu, sm, warp-scheduler, registers, shared-memory, tensor-cores, occupancy, cuda]
+difficulty: expert
+readingTime: 42
+draft: false
+featured: false
+series: "GPU Hardware & AI Accelerators"
+seriesOrder: 4
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+
+The streaming multiprocessor (SM) is the fundamental execution unit of every NVIDIA GPU. An H100 has 132 SMs. An A100 has 108. A V100 has 80. Every CUDA kernel you launch runs on one or more SMs, and the performance of that kernel is determined by how well it utilizes the resources within each SM: the warp schedulers, the register file, the shared memory, the L1 cache, and the tensor cores.
+
+Understanding the SM is not optional for high-performance GPU programming. The difference between a kernel that achieves 30% of theoretical throughput and one that achieves 85% almost always comes down to SM-level resource utilization — specifically, how many warps are resident (occupancy), how register pressure limits that occupancy, and whether the warp schedulers can find an instruction to issue every cycle.
+
+This post dissects the Hopper SM (SM 9.0) in detail, with comparisons to Ampere (SM 8.0) and Volta (SM 7.0) where the differences are significant.
+
+## SM Block Diagram
+
+Each Hopper SM contains:
+
+<Benchmark
+  title="Hopper SM (SM 9.0) Resource Summary"
+  columns={["Resource", "Per SM Partition", "Per SM (4 partitions)", "Per GPU (132 SMs)"]}
+  rows={[
+    { values: ["Warp schedulers", "1", "4", "528"], highlight: true },
+    { values: ["FP32 CUDA cores", "32", "128", "16,896"], highlight: false },
+    { values: ["FP64 CUDA cores", "16", "64", "8,448"], highlight: false },
+    { values: ["INT32 cores", "16", "64", "8,448"], highlight: false },
+    { values: ["Tensor cores (4th gen)", "1", "4", "528"], highlight: true },
+    { values: ["Load/Store units", "8", "32", "4,224"], highlight: false },
+    { values: ["Special function units (SFU)", "4", "16", "2,112"], highlight: false },
+    { values: ["Register file", "64 KB (16,384 x 32-bit)", "256 KB (65,536 x 32-bit)", "33 MB"], highlight: true },
+    { values: ["Shared memory / L1 (configurable)", "Up to 57 KB", "Up to 228 KB", "~29 MB"], highlight: true },
+    { values: ["L1 data cache", "Part of 256 KB pool", "Up to 256 KB pool", "~33 MB"], highlight: false },
+    { values: ["Max warps", "Up to 12", "48", "6,336"], highlight: false },
+    { values: ["Max threads", "Up to 384", "1,536 (on Ampere: 2,048)", "202,752"], highlight: false },
+  ]}
+  notes="Hopper reduced max threads per SM from 2,048 (Ampere) to 1,536 (48 warps). This is because warp group operations (WGMMA) use 128 threads (4 warps) as a unit, and 48/4 = 12 warp groups is the practical maximum."
+/>
+
+### The Four SM Partitions
+
+Each SM is divided into 4 processing blocks (also called SM sub-partitions or quadrants). Each partition has:
+
+- **1 warp scheduler** that selects one warp and issues one instruction per cycle
+- **32 FP32 CUDA cores** (or 16 FP32 + 16 INT32 on Ampere, depending on instruction mix)
+- **1 tensor core** (4th gen on Hopper)
+- **8 load/store units** for memory access
+- **4 SFUs** for transcendental functions (sin, cos, exp, rsqrt)
+
+The four partitions share:
+- The 256 KB register file (physically distributed, logically unified)
+- The shared memory / L1 cache pool
+- The L2 cache interface
+- The warp scheduling policy
+
+## Warp Scheduling: One Instruction Per Cycle Per Scheduler
+
+### The Warp Concept
+
+A warp is a group of 32 threads that execute in lockstep. When you launch a kernel with 256 threads per block, that block contains 8 warps. Each warp is assigned to one of the 4 SM partitions. Multiple warps can be assigned to the same partition.
+
+### Issue Rules
+
+Each warp scheduler can issue **one instruction per cycle** from one of its resident warps. The scheduler selects the highest-priority ready warp — a warp whose next instruction has all operands available and whose required execution unit is not occupied.
+
+The critical implication: if a warp issues a memory load (which takes 400-600 cycles for HBM), that warp stalls until the data arrives. The scheduler immediately switches to another resident warp that has a ready instruction. This is **latency hiding through warp-level parallelism** — the fundamental execution model of every NVIDIA GPU.
+
+```
+Cycle 1: Scheduler issues LOAD from Warp 0   (Warp 0 now stalls, waiting for data)
+Cycle 2: Scheduler issues FMA from Warp 3     (Warp 3 was ready)
+Cycle 3: Scheduler issues LOAD from Warp 1    (Warp 1 now stalls)
+Cycle 4: Scheduler issues FMA from Warp 5     (Warp 5 was ready)
+...
+Cycle 401: Warp 0's data arrives. Scheduler can issue Warp 0's next instruction.
+```
+
+If the scheduler has enough resident warps, it can keep the execution units busy every cycle even though individual warps stall for hundreds of cycles. If it runs out of ready warps, the execution unit sits idle — this is a **stall** and it directly reduces throughput.
+
+### Dual-Issue on Ampere
+
+The A100 (SM 8.0) can dual-issue under specific conditions: one FP32 instruction and one INT32 instruction from the same warp in the same cycle. This is because Ampere's SM partition has 16 FP32 cores and 16 INT32 cores that can operate in parallel. On Volta, the 32 CUDA cores per partition were all FP32 — no dual-issue.
+
+Hopper (SM 9.0) uses the same 128 FP32 cores per SM as Ampere but drops explicit dual-issue in favor of warp group operations for tensor cores. In practice, the INT32 throughput on Hopper is the same as FP32 because the cores are unified.
+
+<Callout type="info" title="Instruction Throughput vs Issue Rate">
+Issue rate (1 instruction per cycle per scheduler) is not the same as throughput. An FMA (fused multiply-add) instruction computes 32 FMA operations (one per thread in the warp) in a single issue slot. On the FP32 pipeline, this takes 1 cycle to issue but may take 4 cycles to complete (pipeline depth). The scheduler can issue a new instruction from a different warp on the very next cycle — the pipeline absorbs multiple in-flight instructions.
+</Callout>
+
+## The Register File: 256 KB of Fastest Storage
+
+### Register File Architecture
+
+Each SM has 65,536 32-bit registers, organized as a 256 KB register file. This is the fastest storage on the GPU — register access is 0-cycle latency (available in the same cycle as computation). There is no register renaming; each register address maps to a physical location.
+
+Registers are partitioned among resident warps. If a kernel uses 32 registers per thread and you have 48 warps (1,536 threads) resident:
+
+$$1{,}536 \times 32 = 49{,}152 \text{ registers}$$
+
+This is less than the 65,536 available, so all 48 warps can be resident. But if the kernel uses 64 registers per thread:
+
+$$\text{Max warps} = \lfloor 65{,}536 / (32 \times 64) \rfloor = \lfloor 32 \rfloor = 32 \text{ warps}$$
+
+Occupancy drops from 48/48 = 100% to 32/48 = 67%.
+
+### The Register-Occupancy Tradeoff
+
+This is the central tension in CUDA kernel design. More registers per thread means:
+- More values cached in the fastest possible memory
+- Fewer memory loads (registers replace shared memory or global memory loads)
+- Potentially higher per-thread throughput
+
+But fewer resident warps means:
+- Less latency hiding (fewer warps to switch between during stalls)
+- More idle cycles when all resident warps are waiting for memory
+- Potentially lower overall SM throughput
+
+<Benchmark
+  title="Register Usage vs Occupancy (Hopper SM, 256 threads/block = 8 warps/block)"
+  columns={["Regs/Thread", "Regs/Warp", "Max Warps", "Max Blocks", "Occupancy", "Status"]}
+  rows={[
+    { values: ["16", "512", "48", "6", "100%", "Likely memory-bound: too few registers"], highlight: false },
+    { values: ["32", "1,024", "48", "6", "100%", "Good balance for most kernels"], highlight: true },
+    { values: ["48", "1,536", "42", "5", "88%", "Moderate pressure"], highlight: false },
+    { values: ["64", "2,048", "32", "4", "67%", "High pressure, acceptable for compute-bound"], highlight: true },
+    { values: ["96", "3,072", "21", "2", "44%", "Severe pressure, may cause stalls"], highlight: false },
+    { values: ["128", "4,096", "16", "2", "33%", "Register spilling likely"], highlight: false },
+    { values: ["255", "8,160", "8", "1", "17%", "Maximum allowed, extreme case"], highlight: false },
+  ]}
+  notes="Max registers per thread is 255 on all NVIDIA architectures since Kepler. Occupancy assumes 256 threads/block. With 512 threads/block, the calculation changes."
+/>
+
+### Register Spilling
+
+When the compiler cannot fit all variables in the available registers, it **spills** excess values to local memory — which is actually global memory (HBM) with L1/L2 caching. Register spills appear as `.local` loads and stores in PTX/SASS:
+
+```
+// PTX showing register spill
+st.local.f32 [%rd1], %f42;    // Spill register f42 to local memory
+...
+ld.local.f32 %f42, [%rd1];    // Reload from local memory
+```
+
+Each spill costs approximately 20-30 cycles if the value is in L1, or 200-600 cycles if it must go to L2/HBM. In performance-critical kernels, spilling is catastrophic.
+
+You can check register usage and spills with the compiler:
+
+```bash
+# Show register usage per kernel
+nvcc -Xptxas -v my_kernel.cu -o my_kernel
+
+# Output:
+# ptxas info: Used 48 registers, 0 bytes smem, 368 bytes cmem[0]
+# ptxas info: Used 48 registers, 8 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+
+# Force max registers per thread
+nvcc --maxrregcount=32 my_kernel.cu -o my_kernel
+# This forces the compiler to use at most 32 registers, spilling the rest
+```
+
+<Callout type="warning" title="The maxrregcount Trap">
+Setting `--maxrregcount` too low forces spills, which often degrades performance more than the occupancy gain improves it. The compiler's default register allocation is usually near-optimal. Only use `--maxrregcount` after profiling shows that occupancy is the primary bottleneck AND that reducing registers improves wall-clock time.
+</Callout>
+
+### Launch Bounds
+
+The preferred way to control register usage is `__launch_bounds__`:
+
+```cpp
+// Tell the compiler: this kernel will be launched with at most 256 threads/block
+// and we want at least 4 blocks per SM
+__global__ void __launch_bounds__(256, 4) my_kernel(...) {
+    // With 4 blocks of 256 threads = 1024 threads = 32 warps
+    // 65,536 registers / 1024 threads = 64 registers per thread max
+    // Compiler will try to use <= 64 registers
+}
+```
+
+The second parameter (minimum blocks per SM) tells the compiler the desired occupancy level, allowing it to balance register usage against occupancy automatically.
+
+## Shared Memory and L1 Cache
+
+### The Configurable Pool
+
+Since Volta, shared memory and L1 data cache share a single physical SRAM pool. On Hopper, this pool is 256 KB per SM. The split is configurable at kernel launch:
+
+```cpp
+// Set shared memory preference
+cudaFuncSetAttribute(my_kernel,
+    cudaFuncAttributePreferredSharedMemoryCarveout,
+    cudaSharedmemCarveoutMaxShared);  // Maximize shared memory
+
+// Or set exact shared memory size
+cudaFuncSetAttribute(my_kernel,
+    cudaFuncAttributeMaxDynamicSharedMemorySize,
+    228 * 1024);  // Request 228 KB shared memory
+```
+
+<Benchmark
+  title="Shared Memory / L1 Configuration Options (Hopper)"
+  columns={["Configuration", "Shared Memory", "L1 Cache", "Best For"]}
+  rows={[
+    { values: ["MaxShared", "228 KB", "28 KB", "Tiled GEMM, FlashAttention, large cooperative kernels"], highlight: true },
+    { values: ["MaxL1", "28 KB", "228 KB", "Streaming kernels with irregular access patterns"], highlight: false },
+    { values: ["Default", "128 KB", "128 KB", "General-purpose kernels"], highlight: false },
+    { values: ["Equal", "164 KB", "92 KB", "Moderate tiling with cache benefit"], highlight: false },
+  ]}
+  notes="Exact split granularity depends on architecture. Not all intermediate values are supported."
+/>
+
+### Shared Memory Bank Conflicts
+
+Shared memory is organized into 32 banks, each 4 bytes wide. Threads in a warp can access 32 different banks simultaneously (one per thread) in a single cycle. If two or more threads access different addresses within the same bank, the accesses are serialized — a **bank conflict**.
+
+```cpp
+// No bank conflict: each thread accesses a different bank
+// Thread 0 -> bank 0, Thread 1 -> bank 1, ... Thread 31 -> bank 31
+__shared__ float data[1024];
+float val = data[threadIdx.x];  // Stride-1 access: perfect
+
+// 2-way bank conflict: even threads hit even banks, odd threads hit odd banks
+// But stride-2 means Thread 0 and Thread 16 both hit bank 0
+float val = data[threadIdx.x * 2];  // Stride-2: 2-way conflict
+
+// 32-way bank conflict (worst case): all threads hit bank 0
+float val = data[threadIdx.x * 32];  // Stride-32: serialized
+```
+
+Bank conflict cost: a $k$-way conflict takes $k$ cycles instead of 1. For a 32-way conflict, shared memory access degrades to 1/32 of peak bandwidth — effectively the same as a single-thread serial access.
+
+The solution is padding:
+
+```cpp
+// Padded shared memory to avoid bank conflicts
+// For a 32xN matrix, add 1 element of padding per row
+__shared__ float tile[32][33];  // 33 instead of 32
+
+// Now stride-32 access hits different banks:
+// Thread 0: tile[0][col] -> offset 0*33+col
+// Thread 1: tile[1][col] -> offset 1*33+col
+// Difference: 33 elements = 33 banks apart = bank (33 % 32) = bank 1 apart
+```
+
+## Tensor Cores: The Matrix Accelerator
+
+### Tensor Core Operation
+
+Each Hopper SM has 4 tensor cores (one per partition). Each tensor core performs a matrix multiply-accumulate on small tiles:
+
+$$D = A \times B + C$$
+
+The tile sizes depend on the data type:
+
+<Benchmark
+  title="Hopper Tensor Core Tile Sizes and Throughput"
+  columns={["Data Type", "Tile Size (MxNxK)", "FLOPs per Op", "Throughput per TC per Cycle"]}
+  rows={[
+    { values: ["FP16", "16x8x16", "4,096", "4,096 FLOP"], highlight: false },
+    { values: ["BF16", "16x8x16", "4,096", "4,096 FLOP"], highlight: false },
+    { values: ["TF32", "16x8x8", "2,048", "2,048 FLOP"], highlight: false },
+    { values: ["FP8 (E4M3/E5M2)", "16x8x32", "8,192", "8,192 FLOP"], highlight: true },
+    { values: ["INT8", "16x8x32", "8,192", "8,192 FLOP"], highlight: false },
+  ]}
+  notes="WGMMA (warp group) instructions operate on larger tiles (64x256x16 for FP16) by tiling across 4 warps. The hardware tile size is per tensor core; WGMMA coordinates multiple tensor core invocations."
+/>
+
+### WGMMA: Warp Group Matrix Multiply
+
+On Hopper, the preferred interface for tensor cores is WGMMA (Warp Group MMA), which operates on 128 threads (4 warps). WGMMA instructions can read one operand directly from shared memory, bypassing the register file:
+
+```cpp
+// CUTLASS 3.x uses WGMMA via the cute library
+// This is the abstraction layer over raw WGMMA PTX instructions
+
+// Raw PTX for reference (do not write this by hand):
+// wgmma.mma_async.sync.aligned.m64n256k16.f16.f16.f16
+//   {d0, d1, ..., d63},      // 64 accumulator registers
+//   {a0, a1, a2, a3},        // 4 registers holding A tile (from registers)
+//   desc_b,                   // Shared memory descriptor for B tile
+//   p, q, r, s;              // Scaling and negation modifiers
+```
+
+The ability to read B from shared memory instead of registers is significant: it means the 256 KB register file does not need to hold both operands. For large GEMMs, this roughly halves the register pressure for the tensor core portion of the kernel.
+
+## Occupancy: Analysis from First Principles
+
+### What Limits Occupancy
+
+Occupancy is the ratio of resident warps to the maximum possible warps (48 on Hopper). Three resources limit it:
+
+1. **Registers per thread:** $\lfloor 65{,}536 / (\text{threads\_per\_block} \times \text{regs\_per\_thread}) \rfloor$ blocks, times warps per block
+2. **Shared memory per block:** $\lfloor \text{smem\_per\_SM} / \text{smem\_per\_block} \rfloor$ blocks, times warps per block
+3. **Threads per SM:** $\lfloor 1536 / \text{threads\_per\_block} \rfloor$ blocks, times warps per block (Hopper max: 48 warps)
+
+The actual occupancy is the minimum of these three limits.
+
+### Occupancy Calculator from First Principles
+
+```cpp
+#include <cstdio>
+#include <algorithm>
+
+struct SmSpec {
+    int max_warps_per_sm;
+    int max_blocks_per_sm;
+    int max_threads_per_sm;
+    int registers_per_sm;
+    int max_shared_memory_per_sm;
+    int register_allocation_granularity;  // Registers allocated in multiples of this
+    int warp_allocation_granularity;      // Warps allocated in multiples of this
+    int shared_memory_allocation_granularity;  // Shared memory allocated in multiples of this
+};
+
+// Hopper (SM 9.0) specification
+SmSpec hopper = {
+    .max_warps_per_sm = 48,
+    .max_blocks_per_sm = 32,
+    .max_threads_per_sm = 1536,
+    .registers_per_sm = 65536,
+    .max_shared_memory_per_sm = 228 * 1024,  // 228 KB max shared
+    .register_allocation_granularity = 256,   // Registers allocated per warp in multiples of 256
+    .warp_allocation_granularity = 4,         // Warp group granularity on Hopper
+    .shared_memory_allocation_granularity = 128,  // 128-byte chunks
+};
+
+// Ampere (SM 8.0) specification
+SmSpec ampere = {
+    .max_warps_per_sm = 64,
+    .max_blocks_per_sm = 32,
+    .max_threads_per_sm = 2048,
+    .registers_per_sm = 65536,
+    .max_shared_memory_per_sm = 164 * 1024,
+    .register_allocation_granularity = 256,
+    .warp_allocation_granularity = 4,
+    .shared_memory_allocation_granularity = 128,
+};
+
+int round_up(int value, int granularity) {
+    return ((value + granularity - 1) / granularity) * granularity;
+}
+
+struct OccupancyResult {
+    int active_warps;
+    int active_blocks;
+    float occupancy_pct;
+    const char* limiting_factor;
+};
+
+OccupancyResult calculate_occupancy(
+    SmSpec spec,
+    int threads_per_block,
+    int regs_per_thread,
+    int shared_mem_per_block
+) {
+    int warps_per_block = (threads_per_block + 31) / 32;
+
+    // Limit 1: Max blocks per SM
+    int limit_blocks = spec.max_blocks_per_sm;
+
+    // Limit 2: Max threads (warps) per SM
+    int limit_threads = spec.max_warps_per_sm / warps_per_block;
+
+    // Limit 3: Registers
+    // Registers are allocated per warp in units of register_allocation_granularity
+    int regs_per_warp = round_up(regs_per_thread * 32, spec.register_allocation_granularity);
+    int max_warps_by_regs = spec.registers_per_sm / regs_per_warp;
+    int limit_regs = max_warps_by_regs / warps_per_block;
+
+    // Limit 4: Shared memory
+    int smem_alloc = round_up(shared_mem_per_block, spec.shared_memory_allocation_granularity);
+    int limit_smem;
+    if (smem_alloc == 0) {
+        limit_smem = spec.max_blocks_per_sm;
+    } else {
+        limit_smem = spec.max_shared_memory_per_sm / smem_alloc;
+    }
+
+    // Take minimum
+    int active_blocks = std::min({limit_blocks, limit_threads, limit_regs, limit_smem});
+    active_blocks = std::max(active_blocks, 0);
+    int active_warps = active_blocks * warps_per_block;
+    active_warps = std::min(active_warps, spec.max_warps_per_sm);
+    float occupancy = (float)active_warps / spec.max_warps_per_sm * 100.0f;
+
+    const char* limiter;
+    if (active_blocks == limit_regs) limiter = "REGISTERS";
+    else if (active_blocks == limit_smem) limiter = "SHARED MEMORY";
+    else if (active_blocks == limit_threads) limiter = "MAX WARPS";
+    else limiter = "MAX BLOCKS";
+
+    return {active_warps, active_blocks, occupancy, limiter};
+}
+
+int main() {
+    printf("=== Hopper SM Occupancy Calculator ===\n\n");
+    printf("%-8s %-8s %-10s %-8s %-8s %-10s %s\n",
+           "Threads", "Regs", "Smem(KB)", "Blocks", "Warps", "Occupancy", "Limiter");
+    printf("-------------------------------------------------------------------\n");
+
+    struct TestCase { int threads; int regs; int smem_kb; };
+    TestCase cases[] = {
+        {256, 32, 0},
+        {256, 48, 0},
+        {256, 64, 0},
+        {256, 96, 0},
+        {256, 128, 0},
+        {128, 32, 48},
+        {256, 32, 48},
+        {256, 64, 48},
+        {256, 32, 100},
+        {256, 32, 164},
+        {256, 32, 228},
+    };
+
+    for (auto& tc : cases) {
+        auto r = calculate_occupancy(hopper, tc.threads, tc.regs, tc.smem_kb * 1024);
+        printf("%-8d %-8d %-10d %-8d %-8d %-9.1f%% %s\n",
+               tc.threads, tc.regs, tc.smem_kb,
+               r.active_blocks, r.active_warps, r.occupancy_pct, r.limiting_factor);
+    }
+
+    return 0;
+}
+```
+
+Expected output:
+
+```
+Threads  Regs     Smem(KB)   Blocks   Warps    Occupancy  Limiter
+-------------------------------------------------------------------
+256      32       0          6        48       100.0%     MAX WARPS
+256      48       0          5        40       83.3%      REGISTERS
+256      64       0          4        32       66.7%      REGISTERS
+256      96       0          2        16       33.3%      REGISTERS
+256      128      0          2        16       33.3%      REGISTERS
+128      32       48         4        16       33.3%      SHARED MEMORY
+256      32       48         4        32       66.7%      SHARED MEMORY
+256      64       48         4        32       66.7%      SHARED MEMORY
+256      32       100        2        16       33.3%      SHARED MEMORY
+256      32       164        1        8        16.7%      SHARED MEMORY
+256      32       228        1        8        16.7%      SHARED MEMORY
+```
+
+<Callout type="perf" title="Occupancy Is Not Everything">
+Higher occupancy does not always mean better performance. A kernel at 33% occupancy with data in registers can outperform a 100% occupancy kernel that constantly accesses shared or global memory. The key insight: occupancy matters because it enables latency hiding. If your kernel has no high-latency operations to hide (everything is in registers or shared memory), low occupancy is acceptable. If your kernel reads from HBM, you need enough warps to hide the 400-600 cycle latency.
+</Callout>
+
+## The Execution Pipeline in Detail
+
+### Instruction Issue Timeline
+
+Consider a simplified example: a kernel that loads data from HBM, performs an FMA, and stores the result.
+
+```
+// Per-warp instruction sequence:
+// 1. LD.GLOBAL  -> Load from HBM (~400 cycles latency)
+// 2. FMA.FP32   -> Fused multiply-add (~4 cycles latency)
+// 3. ST.GLOBAL  -> Store to HBM (~400 cycles latency)
+```
+
+With a single warp on one scheduler, the timeline is:
+
+```
+Cycle 0:     Issue LD.GLOBAL (Warp 0)
+Cycle 1-399: Warp 0 stalled, scheduler idle (no other warps)
+Cycle 400:   LD completes, Warp 0 ready
+Cycle 401:   Issue FMA (Warp 0)
+Cycle 405:   FMA completes
+Cycle 406:   Issue ST.GLOBAL (Warp 0)
+Cycle 407-806: Warp 0 stalled
+Total: 807 cycles for 2 FLOPs -> 0.25% utilization
+```
+
+With 12 warps on one scheduler (each independent):
+
+```
+Cycle 0:     Issue LD.GLOBAL (Warp 0)
+Cycle 1:     Issue LD.GLOBAL (Warp 1)
+Cycle 2:     Issue LD.GLOBAL (Warp 2)
+...
+Cycle 11:    Issue LD.GLOBAL (Warp 11)
+Cycle 12-399: Issue instructions from other warps (if available), or stall
+Cycle 400:   Warp 0's LD completes
+Cycle 401:   Issue FMA (Warp 0)
+Cycle 402:   Warp 1's LD completes
+Cycle 403:   Issue FMA (Warp 1)
+...
+```
+
+With 12 warps, the scheduler can keep the load/store units busy for 12 of every ~400 cycles — 3% utilization of the memory pipeline. Still not great. You need approximately 400/1 = 400 warps to fully hide HBM latency — but each scheduler can hold at most 12 warps (48 warps / 4 schedulers). This is why memory-bound kernels hit a fundamental limit even at 100% occupancy: 12 warps per scheduler cannot fully hide 400+ cycle latency.
+
+The solution is instruction-level parallelism (ILP): each warp issues multiple independent loads before needing any result.
+
+```cpp
+// ILP=1: Sequential loads (bad)
+float a = global_ptr[idx];
+float b = global_ptr[idx + stride];  // Must wait for nothing, but compiler may serialize
+float c = a + b;
+
+// ILP=4: Four independent loads in flight per warp
+float a = global_ptr[idx];
+float b = global_ptr[idx + stride];
+float c = global_ptr[idx + 2*stride];
+float d = global_ptr[idx + 3*stride];
+// All four loads are in flight simultaneously
+// Effective warps = actual_warps * ILP = 12 * 4 = 48 "virtual warps" per scheduler
+float result = a + b + c + d;
+```
+
+### Tensor Core Pipeline
+
+Tensor core instructions take longer to complete than FP32 FMA (typically 8-16 cycles depending on tile size and precision), but they process hundreds of FLOPs per instruction. The pipelining is similar: while one warp's tensor core operation completes, the scheduler can issue tensor core instructions from other warps.
+
+On Hopper with WGMMA, each warp group (4 warps) occupies the tensor core for multiple cycles. Since each SM partition has one tensor core and up to 12 warps, that is at most 3 warp groups per partition. Pipelining 3 WGMMA operations is usually sufficient for compute-bound kernels — but the limited warp group count means register pressure management is critical.
+
+## Register Pressure Analysis: A Real Example
+
+Consider a simple FP16 GEMV kernel (used in LLM decode):
+
+```cpp
+__global__ void gemv_fp16(
+    const half *__restrict__ W,  // [N, K] weight matrix
+    const half *__restrict__ x,  // [K] input vector
+    half *__restrict__ y,        // [N] output vector
+    int N, int K
+) {
+    // Each thread computes one output element
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= N) return;
+
+    float acc = 0.0f;  // 1 register for accumulator
+
+    // Load x into shared memory
+    extern __shared__ half shared_x[];
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        shared_x[i] = x[i];  // 0 extra registers (address computed on the fly)
+    }
+    __syncthreads();
+
+    // Compute dot product
+    for (int k = 0; k < K; k += 8) {
+        // Load 8 weight elements (vectorized)
+        float4 w_vec = *reinterpret_cast<const float4*>(&W[row * K + k]);
+        // Unpack float4 -> 8 half values -> 4 float pairs
+        half2 w0 = *reinterpret_cast<half2*>(&w_vec.x);
+        half2 w1 = *reinterpret_cast<half2*>(&w_vec.y);
+        half2 w2 = *reinterpret_cast<half2*>(&w_vec.z);
+        half2 w3 = *reinterpret_cast<half2*>(&w_vec.w);
+
+        half2 x0 = *reinterpret_cast<half2*>(&shared_x[k]);
+        half2 x1 = *reinterpret_cast<half2*>(&shared_x[k+2]);
+        half2 x2 = *reinterpret_cast<half2*>(&shared_x[k+4]);
+        half2 x3 = *reinterpret_cast<half2*>(&shared_x[k+6]);
+
+        // FMA operations
+        acc += __half2float(w0.x) * __half2float(x0.x);
+        acc += __half2float(w0.y) * __half2float(x0.y);
+        // ... (8 multiplies total per iteration)
+    }
+
+    y[row] = __float2half(acc);
+}
+```
+
+Register pressure analysis:
+- `acc`: 1 FP32 register
+- `w_vec` (float4): 4 FP32 registers
+- `w0..w3` (half2): 4 FP32 registers (half2 fits in 32-bit register)
+- `x0..x3` (half2): 4 FP32 registers
+- Loop variable `k`: 1 register
+- `row`, `threadIdx.x`, address calculations: approximately 4-6 registers
+- Total: approximately 18-20 registers per thread
+
+At 20 registers per thread with 256 threads per block: 48 warps can be resident (100% occupancy). This kernel is not register-limited — it is memory-bandwidth-limited because the inner loop reads weights from HBM.
+
+Contrast with a tiled GEMM kernel that keeps tiles in registers:
+
+```cpp
+// Tiled GEMM fragment: each thread holds a 8x8 tile of C
+// That's 64 FP32 values = 64 registers just for the accumulator
+// Plus A and B tile fragments: ~16 registers each
+// Plus addressing, loop variables: ~10 registers
+// Total: ~106 registers per thread
+```
+
+At 106 registers, the compiler will either spill or limit occupancy to 2 blocks of 256 threads (16 warps, 33% occupancy). This is acceptable for a compute-bound GEMM because the tensor cores keep the SM busy even at low occupancy.
+
+<PerfChart
+  title="Occupancy vs Performance (Illustrative)"
+  data={[
+    { label: "Memory-bound kernel at 33% occ.", value: 40, color: "#ef4444", annotation: "Not enough warps to hide latency" },
+    { label: "Memory-bound kernel at 67% occ.", value: 72, color: "#f97316", annotation: "Better latency hiding" },
+    { label: "Memory-bound kernel at 100% occ.", value: 88, color: "#10b981", annotation: "Near-peak BW utilization" },
+    { label: "Compute-bound kernel at 33% occ.", value: 82, color: "#3b82f6", annotation: "Registers keep cores fed" },
+    { label: "Compute-bound kernel at 67% occ.", value: 87, color: "#3b82f6", annotation: "Diminishing returns" },
+    { label: "Compute-bound kernel at 100% occ.", value: 89, color: "#3b82f6", annotation: "Marginal improvement" }
+  ]}
+  unit="% of peak throughput"
+  baseline={0}
+/>
+
+## Profiling SM Utilization
+
+```bash
+# Nsight Compute: full SM analysis
+ncu --set full ./my_kernel
+
+# Key SM metrics:
+# smsp__warps_active.avg.per_cycle_active          -> Average active warps per scheduler
+# smsp__warps_eligible.avg.per_cycle_active         -> Average eligible (ready) warps
+# smsp__issue_active.avg.per_cycle_active           -> Fraction of cycles with an issue
+# sm__warps_active.avg.pct_of_peak_sustained_elapsed -> Overall occupancy achieved
+
+# Stall reasons:
+# smsp__pcsamp_warps_issue_stalled_wait_barrier     -> Stalled on __syncthreads
+# smsp__pcsamp_warps_issue_stalled_long_scoreboard  -> Stalled on memory load
+# smsp__pcsamp_warps_issue_stalled_short_scoreboard -> Stalled on shared memory / L1
+# smsp__pcsamp_warps_issue_stalled_not_selected     -> Ready but not selected (good)
+```
+
+The most informative metric is `smsp__warps_eligible.avg.per_cycle_active`. If this is below 1.0, the scheduler frequently has no ready warp to issue — the kernel is stall-limited and needs either more warps (higher occupancy) or more ILP.
+
+If `smsp__warps_eligible` is above 2.0 but `smsp__issue_active` is below 1.0, the functional units are the bottleneck — the kernel is compute-bound and adding more warps will not help.
+
+## SM Evolution Summary
+
+<Benchmark
+  title="SM Architecture Evolution: Volta, Ampere, Hopper"
+  columns={["Spec", "Volta (SM 7.0)", "Ampere (SM 8.0)", "Hopper (SM 9.0)"]}
+  rows={[
+    { values: ["Max warps per SM", "64", "64", "48"], highlight: true },
+    { values: ["Max threads per SM", "2,048", "2,048", "1,536"], highlight: true },
+    { values: ["FP32 cores per SM", "64", "64 (+ 64 INT32)", "128"], highlight: false },
+    { values: ["Tensor cores per SM", "8 (1st gen)", "4 (3rd gen)", "4 (4th gen)"], highlight: false },
+    { values: ["Register file per SM", "256 KB", "256 KB", "256 KB"], highlight: false },
+    { values: ["Max shared memory per SM", "96 KB", "164 KB", "228 KB"], highlight: true },
+    { values: ["L1 / smem pool", "128 KB", "192 KB", "256 KB"], highlight: false },
+    { values: ["Warp group support", "No", "No", "Yes (128 threads)"], highlight: true },
+    { values: ["TMA support", "No", "No", "Yes"], highlight: true },
+    { values: ["Async copy (cp.async)", "No", "Yes", "Yes (via TMA)"], highlight: false },
+  ]}
+/>
+
+The trend is clear: fewer, larger warps (warp groups), more shared memory, dedicated data movement hardware (TMA), and an execution model increasingly optimized for matrix operations rather than general-purpose SIMT. The SM is becoming a matrix engine with a SIMT wrapper, not the other way around.

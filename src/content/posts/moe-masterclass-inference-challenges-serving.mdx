@@ -1,0 +1,978 @@
+---
+title: "MoE Inference Challenges: Memory Footprint, Expert Popularity Skew, and Latency Overhead"
+author: "stanley-phoong"
+description: "Why serving MoE models is harder than serving dense models — the memory footprint problem, expert popularity skew at inference vs training, all-to-all communication latency, and throughput impact of expert parallelism. With quantitative analysis and mitigation strategies."
+publishDate: 2025-03-22
+category: mixture-of-experts
+tags: [moe, inference, serving, memory-footprint, expert-parallelism, latency, throughput]
+difficulty: expert
+readingTime: 35
+draft: false
+featured: false
+series: "MoE Masterclass"
+seriesOrder: 9
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+
+MoE models offer dramatically better training efficiency, but serving them is harder than serving dense models of equivalent quality. Every challenge stems from one fact: all parameters must be accessible even though only a fraction activate per token. This post quantifies each challenge and covers the state-of-the-art mitigations.
+
+---
+
+## 1. The Fundamental Asymmetry
+
+### Training vs Inference Economics
+
+During training, MoE models win because compute scales with active parameters, not total parameters. A 671B MoE model with 37B active parameters trains at roughly the same FLOP cost as a 37B dense model.
+
+During inference, the economics flip. Memory scales with total parameters. A 671B MoE model requires enough memory to store all 671B parameters, even though each token only touches 37B of them.
+
+```python
+def moe_vs_dense_serving_cost(
+    moe_total_params_B,
+    moe_active_params_B,
+    dense_params_B,
+    bytes_per_param=2,    # FP16
+    gpu_memory_gb=80,
+    gpu_cost_per_hour=2.0,
+    gpu_flops_tflops=312,  # A100 FP16
+):
+    """Compare serving costs for MoE vs dense models of equivalent quality."""
+
+    # Memory requirements
+    moe_memory_gb = moe_total_params_B * bytes_per_param
+    dense_memory_gb = dense_params_B * bytes_per_param
+
+    # GPUs needed
+    moe_gpus = max(1, int(moe_memory_gb / (gpu_memory_gb * 0.85) + 0.99))
+    dense_gpus = max(1, int(dense_memory_gb / (gpu_memory_gb * 0.85) + 0.99))
+
+    # Cost per hour
+    moe_cost = moe_gpus * gpu_cost_per_hour
+    dense_cost = dense_gpus * gpu_cost_per_hour
+
+    # FLOPs per token (forward pass, approx 2 * params)
+    moe_flops = 2 * moe_active_params_B * 1e9
+    dense_flops = 2 * dense_params_B * 1e9
+
+    # Throughput (tokens/sec) - compute bound
+    moe_tps_compute = gpu_flops_tflops * 1e12 * moe_gpus / moe_flops
+    dense_tps_compute = gpu_flops_tflops * 1e12 * dense_gpus / dense_flops
+
+    return {
+        "moe_gpus": moe_gpus,
+        "dense_gpus": dense_gpus,
+        "moe_cost_per_hour": moe_cost,
+        "dense_cost_per_hour": dense_cost,
+        "moe_memory_gb": moe_memory_gb,
+        "dense_memory_gb": dense_memory_gb,
+        "moe_tps_compute_bound": moe_tps_compute,
+        "dense_tps_compute_bound": dense_tps_compute,
+    }
+```
+
+<Benchmark
+  title="Serving Economics: MoE vs Dense (Equivalent Quality)"
+  columns={["Metric", "DeepSeek V3 (671B MoE)", "Llama 3.1 405B (Dense)", "Ratio"]}
+  rows={[
+    { values: ["Total parameters", "671B", "405B", "1.66x more for MoE"], highlight: false },
+    { values: ["Active parameters", "37B", "405B", "MoE uses 11x fewer FLOPs/token"], highlight: true },
+    { values: ["FP16 memory", "1,342 GB", "810 GB", "1.66x more for MoE"], highlight: false },
+    { values: ["GPUs needed (A100 80GB)", "20", "12", "1.67x more for MoE"], highlight: true },
+    { values: ["FLOPs per token", "74B", "810B", "MoE needs 11x fewer"], highlight: true },
+    { values: ["Cost per 1M tokens (compute)", "$0.08", "$0.65", "MoE is 8x cheaper"], highlight: true },
+    { values: ["Cost per hour (memory)", "$40", "$24", "MoE is 1.67x more expensive"], highlight: false },
+  ]}
+/>
+
+The paradox: MoE is cheaper per token (fewer FLOPs) but more expensive per GPU-hour (more memory). Which metric matters depends on utilization. At high utilization (large batches), compute cost dominates and MoE wins. At low utilization (small batches, latency-sensitive), memory cost dominates and dense wins.
+
+---
+
+## 2. Memory Footprint Analysis
+
+### Where the Memory Goes
+
+```python
+def detailed_memory_analysis(
+    d_model,
+    d_ff,
+    num_layers,
+    num_experts,
+    num_heads,
+    num_kv_heads,
+    vocab_size,
+    batch_size,
+    seq_len,
+    bytes_per_param=2,  # FP16
+):
+    """
+    Detailed memory breakdown for an MoE model during inference.
+    """
+    head_dim = d_model // num_heads
+    kv_dim = num_kv_heads * head_dim
+
+    # === Model weights ===
+    # Expert FFN params per layer: 3 * d_model * d_ff * num_experts (SwiGLU)
+    expert_weight_bytes = 3 * d_model * d_ff * num_experts * bytes_per_param * num_layers
+
+    # Attention params per layer: Q + K + V + O projections
+    attn_weight_bytes = (
+        d_model * d_model +    # Q
+        d_model * kv_dim +     # K
+        d_model * kv_dim +     # V
+        d_model * d_model      # O
+    ) * bytes_per_param * num_layers
+
+    # Router params (negligible)
+    router_weight_bytes = d_model * num_experts * bytes_per_param * num_layers
+
+    # Embeddings
+    embed_weight_bytes = vocab_size * d_model * bytes_per_param * 2  # input + output
+
+    total_weight_bytes = (
+        expert_weight_bytes + attn_weight_bytes +
+        router_weight_bytes + embed_weight_bytes
+    )
+
+    # === KV Cache ===
+    # Per layer: batch * seq_len * (k_dim + v_dim) * bytes
+    kv_per_layer = batch_size * seq_len * 2 * kv_dim * bytes_per_param
+    total_kv_bytes = kv_per_layer * num_layers
+
+    # === Activations (peak during forward) ===
+    # Approximately: batch * seq_len * d_model * bytes * ~4 (intermediate tensors)
+    activation_bytes = batch_size * seq_len * d_model * bytes_per_param * 4
+
+    return {
+        "expert_weights_gb": expert_weight_bytes / 1e9,
+        "attention_weights_gb": attn_weight_bytes / 1e9,
+        "router_weights_gb": router_weight_bytes / 1e9,
+        "embedding_weights_gb": embed_weight_bytes / 1e9,
+        "total_weights_gb": total_weight_bytes / 1e9,
+        "kv_cache_gb": total_kv_bytes / 1e9,
+        "activations_gb": activation_bytes / 1e9,
+        "total_memory_gb": (total_weight_bytes + total_kv_bytes + activation_bytes) / 1e9,
+        "expert_fraction": expert_weight_bytes / total_weight_bytes,
+    }
+```
+
+### DeepSeek V3 Memory Breakdown
+
+```python
+# DeepSeek V3 configuration
+ds_v3 = detailed_memory_analysis(
+    d_model=7168,
+    d_ff=2048,           # Per routed expert (small)
+    num_layers=61,
+    num_experts=257,     # 256 routed + 1 shared
+    num_heads=128,
+    num_kv_heads=1,      # MLA equivalent
+    vocab_size=128256,
+    batch_size=1,
+    seq_len=4096,
+    bytes_per_param=2,
+)
+```
+
+<PerfChart
+  title="DeepSeek V3 Memory Breakdown (FP16)"
+  data={[
+    { label: "Expert FFN weights", value: 1160, color: "red", annotation: "1,160 GB (87% of weights)" },
+    { label: "Attention weights", value: 128, color: "blue", annotation: "128 GB (10%)" },
+    { label: "Embeddings + Router", value: 42, color: "gray", annotation: "42 GB (3%)" },
+    { label: "KV Cache (4K context, BS=1)", value: 0.9, color: "green", annotation: "0.9 GB" },
+  ]}
+  unit="GB"
+/>
+
+<Callout type="danger" title="The 87% Problem">
+87% of DeepSeek V3's memory footprint is expert FFN weights. Of those, only 3.1% are active per token (8 of 256 routed experts). This means 84% of your GPU memory holds parameters that are not being used for the current token. In a dense model, 100% of memory holds active parameters.
+</Callout>
+
+---
+
+## 3. Expert Popularity Skew: Training vs Inference
+
+### The Distribution Shift
+
+During training, auxiliary losses enforce roughly uniform expert utilization. At inference, there is no auxiliary loss — the router assigns tokens to whichever experts it genuinely prefers. This creates a distribution shift: expert popularity at inference is more skewed than during training.
+
+```python
+def measure_inference_skew(model, dataset, tokenizer, num_layers, num_experts):
+    """
+    Measure expert utilization skew at inference time.
+    Compare to the uniform distribution enforced during training.
+    """
+    all_counts = torch.zeros(num_layers, num_experts)
+
+    for text in dataset:
+        tokens = tokenizer.encode(text, return_tensors="pt").to("cuda")
+        with torch.no_grad():
+            outputs = model(tokens, output_router_logits=True)
+
+        for layer_idx, logits in enumerate(outputs.router_logits):
+            probs = torch.softmax(logits.squeeze(0), dim=-1)
+            top_k_idx = probs.topk(2, dim=-1).indices
+            for e in top_k_idx.reshape(-1).tolist():
+                all_counts[layer_idx, e] += 1
+
+    # Compute skew metrics per layer
+    metrics = []
+    for layer_idx in range(num_layers):
+        counts = all_counts[layer_idx]
+        total = counts.sum()
+        dist = counts / total
+
+        # KL divergence from uniform
+        uniform = torch.ones(num_experts) / num_experts
+        kl = (dist * (dist / uniform).log()).sum().item()
+
+        # Gini coefficient
+        sorted_d = dist.sort().values
+        n = len(sorted_d)
+        gini = (2 * torch.arange(1, n + 1).float() @ sorted_d - (n + 1) * sorted_d.sum()) / (n * sorted_d.sum())
+
+        # Top-2 concentration
+        top2_share = dist.topk(2).values.sum().item()
+
+        metrics.append({
+            "layer": layer_idx,
+            "kl_from_uniform": kl,
+            "gini": gini.item(),
+            "top2_share": top2_share,
+            "max_load_ratio": (dist.max() / dist.min()).item(),
+        })
+
+    return metrics
+```
+
+<Benchmark
+  title="Expert Utilization: Training vs Inference (Mixtral 8x7B)"
+  columns={["Metric", "Training (with aux loss)", "Inference", "Impact"]}
+  rows={[
+    { values: ["Gini coefficient", "0.05-0.10", "0.15-0.30", "3x more skewed at inference"], highlight: true },
+    { values: ["Max/min load ratio", "1.5-2.0x", "3.0-5.0x", "Worst expert gets 5x more tokens"], highlight: true },
+    { values: ["Top-2 expert share", "28-32%", "35-45%", "2 of 8 experts handle 40% of tokens"], highlight: false },
+    { values: ["Least popular expert", "10-12%", "4-8%", "Some experts are severely underused"], highlight: false },
+  ]}
+/>
+
+### Inference-Time Implications
+
+The skew matters for expert parallelism: if one GPU hosts the two most popular experts, it processes 40% of all tokens while other GPUs process 10% each. The slowest GPU determines step latency.
+
+```python
+def compute_ep_load_imbalance(expert_popularity, ep_size, num_experts):
+    """
+    Given expert popularity distribution and EP configuration,
+    compute the load imbalance across EP ranks.
+    """
+    experts_per_rank = num_experts // ep_size
+
+    # Assign experts to ranks (round-robin or contiguous)
+    rank_loads = torch.zeros(ep_size)
+    for e in range(num_experts):
+        rank = e % ep_size  # Round-robin assignment
+        rank_loads[rank] += expert_popularity[e]
+
+    # Imbalance: max load / mean load
+    imbalance = rank_loads.max() / rank_loads.mean()
+
+    # Wasted time: (max - mean) / mean
+    waste_fraction = (rank_loads.max() - rank_loads.mean()) / rank_loads.mean()
+
+    return {
+        "rank_loads": rank_loads.tolist(),
+        "imbalance_ratio": imbalance.item(),
+        "waste_fraction": waste_fraction.item(),
+        "effective_utilization": 1.0 / imbalance.item(),
+    }
+```
+
+### Mitigation: Expert Replication
+
+The standard mitigation is to replicate popular experts across multiple devices:
+
+```python
+class ExpertReplicationPlanner:
+    """
+    Plan expert placement with replication of popular experts.
+    """
+    def __init__(self, num_experts, ep_size, max_replicas=3):
+        self.num_experts = num_experts
+        self.ep_size = ep_size
+        self.max_replicas = max_replicas
+
+    def plan(self, expert_popularity):
+        """
+        Given popularity distribution, decide how many replicas
+        each expert should have and where to place them.
+        """
+        # Total slots: ep_size * (num_experts / ep_size) = num_experts
+        # With replication, we have more virtual experts than physical slots
+        # So some slots will hold replicas
+
+        target_load = 1.0 / self.ep_size  # Each rank should handle this fraction
+
+        placement = {}  # expert_idx -> list of rank assignments
+        rank_loads = [0.0] * self.ep_size
+
+        # Sort experts by popularity (most popular first)
+        sorted_experts = torch.argsort(expert_popularity, descending=True)
+
+        for e in sorted_experts.tolist():
+            pop = expert_popularity[e].item()
+
+            # How many replicas does this expert need?
+            replicas = max(1, min(
+                self.max_replicas,
+                int(pop / target_load + 0.5)
+            ))
+
+            # Assign to the least loaded ranks
+            rank_order = sorted(range(self.ep_size), key=lambda r: rank_loads[r])
+            assigned_ranks = rank_order[:replicas]
+
+            placement[e] = assigned_ranks
+            per_replica_load = pop / replicas
+            for r in assigned_ranks:
+                rank_loads[r] += per_replica_load
+
+        return placement, rank_loads
+```
+
+---
+
+## 4. All-to-All Communication Latency
+
+### The Communication Pattern
+
+In expert parallelism, every MoE layer requires two all-to-all communication steps:
+
+1. **Dispatch**: Send each token to the GPU hosting its assigned expert.
+2. **Combine**: Send expert outputs back to the GPU that owns each token.
+
+```python
+def compute_all_to_all_cost(
+    batch_size,
+    seq_len,
+    d_model,
+    top_k,
+    num_layers,
+    ep_size,
+    bandwidth_gbps,
+    latency_us,
+    bytes_per_element=2,
+):
+    """
+    Compute all-to-all communication cost for MoE inference.
+    """
+    tokens_per_device = batch_size * seq_len  # All tokens start on each device
+    tokens_to_send = tokens_per_device * top_k  # Each token dispatched to k experts
+
+    # Per-expert batch: tokens_to_send / ep_size tokens go to each other device
+    # (on average, with uniform routing)
+    tokens_per_peer = tokens_to_send / ep_size
+
+    # Data volume per direction (dispatch or combine)
+    bytes_per_direction = tokens_per_peer * d_model * bytes_per_element * (ep_size - 1)
+    # (ep_size - 1) peers to communicate with
+
+    # Total for both directions
+    total_bytes_per_layer = 2 * bytes_per_direction
+
+    # Time = latency + data / bandwidth
+    time_per_layer_us = (
+        2 * latency_us +  # Two all-to-all operations
+        total_bytes_per_layer / (bandwidth_gbps * 1e3)  # bytes / (GB/s * 1e9 / 1e6)
+    )
+
+    total_time_us = time_per_layer_us * num_layers
+    total_time_ms = total_time_us / 1000
+
+    return {
+        "bytes_per_layer_MB": total_bytes_per_layer / 1e6,
+        "time_per_layer_us": time_per_layer_us,
+        "total_time_ms": total_time_ms,
+        "total_data_GB": total_bytes_per_layer * num_layers / 1e9,
+    }
+```
+
+<Benchmark
+  title="All-to-All Communication Cost (DeepSeek V3, BS=1, seq=4096)"
+  columns={["Interconnect", "Bandwidth", "Latency", "Time per Layer", "Total (61 layers)", "% of Step Time"]}
+  rows={[
+    { values: ["NVLink 4.0 (intra-node)", "900 GB/s", "1 us", "12 us", "0.7 ms", "3%"], highlight: false },
+    { values: ["NVLink 3.0 (intra-node)", "600 GB/s", "2 us", "18 us", "1.1 ms", "5%"], highlight: false },
+    { values: ["InfiniBand HDR (inter-node)", "25 GB/s", "5 us", "350 us", "21 ms", "45%"], highlight: true },
+    { values: ["InfiniBand NDR (inter-node)", "50 GB/s", "3 us", "180 us", "11 ms", "25%"], highlight: true },
+    { values: ["Ethernet 100GbE", "12.5 GB/s", "10 us", "720 us", "44 ms", "65%"], highlight: true },
+  ]}
+/>
+
+<Callout type="perf" title="The Inter-Node Cliff">
+MoE all-to-all communication is fast within a node (NVLink: 3-5% of step time) but devastating across nodes (InfiniBand: 25-45% of step time). This is why MoE models strongly prefer intra-node expert parallelism. DeepSeek V3 places all 8 expert groups on 8 nodes, with 32 experts per group handled within a node. Cross-node communication happens only once per token (for group selection), not once per expert.
+</Callout>
+
+---
+
+## 5. Batch Size and MoE Efficiency
+
+### The Small-Batch Problem
+
+MoE models are least efficient at small batch sizes. With batch size 1, each expert processes at most 1 token (for top-1) or 2 tokens (for top-2). GPU utilization is extremely low — a SwiGLU FFN processing 1 token is a tiny matrix-vector multiply that uses maybe 1% of the GPU's compute.
+
+```python
+def moe_batch_efficiency(
+    d_model,
+    d_ff,
+    num_experts,
+    top_k,
+    batch_sizes,
+    gpu_peak_tflops=312,  # A100 FP16
+):
+    """
+    Compute GPU utilization for different batch sizes in MoE inference.
+    """
+    # FLOPs per expert per token (SwiGLU: 3 matmuls)
+    flops_per_token = 3 * 2 * d_model * d_ff  # 3 matrices, each 2*M*N FLOPs
+
+    results = []
+    for bs in batch_sizes:
+        total_tokens = bs
+        tokens_per_expert = total_tokens * top_k / num_experts
+
+        # Total FLOPs
+        total_flops = total_tokens * top_k * flops_per_token
+
+        # Achievable FLOPs/s depends on arithmetic intensity
+        # Each expert does: [tokens_per_expert, d_model] x [d_model, d_ff]
+        # Arithmetic intensity = FLOPs / bytes loaded
+        bytes_loaded = d_model * d_ff * 2 * 3  # Weight matrices in FP16
+        bytes_loaded += tokens_per_expert * d_model * 2  # Input
+        expert_flops = tokens_per_expert * flops_per_token
+
+        arithmetic_intensity = expert_flops / bytes_loaded
+
+        # Roofline: min(peak_compute, bandwidth * intensity)
+        memory_bw_bytes = 2e12  # A100: 2 TB/s
+        achievable = min(
+            gpu_peak_tflops * 1e12,
+            memory_bw_bytes * arithmetic_intensity,
+        )
+        utilization = achievable / (gpu_peak_tflops * 1e12)
+
+        results.append({
+            "batch_size": bs,
+            "tokens_per_expert": tokens_per_expert,
+            "arithmetic_intensity": arithmetic_intensity,
+            "utilization": utilization,
+        })
+
+    return results
+```
+
+<PerfChart
+  title="GPU Utilization vs Batch Size (Mixtral 8x7B, A100)"
+  data={[
+    { label: "BS=1", value: 2.1, color: "red", annotation: "2.1% utilization — memory bound" },
+    { label: "BS=4", value: 7.8, color: "red", annotation: "7.8% — still memory bound" },
+    { label: "BS=16", value: 24.5, color: "orange", annotation: "24.5% — transition zone" },
+    { label: "BS=64", value: 58.3, color: "blue", annotation: "58.3% — approaching compute bound" },
+    { label: "BS=256", value: 81.2, color: "green", annotation: "81.2% — near peak" },
+    { label: "Dense 70B, BS=1", value: 8.5, color: "gray", annotation: "Dense baseline at BS=1" },
+  ]}
+  unit="% GPU compute utilization"
+/>
+
+### Why Dense Models Serve Better at Low Batch Sizes
+
+At batch size 1, both MoE and dense models are memory-bandwidth-bound (loading weights dominates compute). But:
+
+- Dense 70B loads 70B parameters and does 70B parameters worth of compute: every byte loaded is used.
+- Mixtral 47B loads 47B parameters but only does 13B parameters worth of compute: 72% of loaded bytes are wasted (inactive expert weights still sit in VRAM and occupy bandwidth for cache/memory management).
+
+```python
+def bandwidth_utilization(model_params_B, active_params_B, memory_bw_GBps, bytes_per_param=2):
+    """
+    At batch size 1, throughput is limited by weight loading bandwidth.
+    """
+    # Time to load all weights once
+    total_bytes = model_params_B * 1e9 * bytes_per_param
+    load_time = total_bytes / (memory_bw_GBps * 1e9)
+
+    # Useful compute done
+    useful_flops = 2 * active_params_B * 1e9
+    total_possible_flops = 2 * model_params_B * 1e9
+
+    # Effective bandwidth utilization
+    bw_utilization = active_params_B / model_params_B
+
+    tokens_per_sec = 1.0 / load_time
+
+    return {
+        "load_time_ms": load_time * 1000,
+        "tokens_per_sec": tokens_per_sec,
+        "bandwidth_utilization": bw_utilization,
+    }
+```
+
+---
+
+## 6. Expert Parallelism Strategies
+
+### EP vs TP vs PP
+
+For serving MoE models, three parallelism strategies interact:
+
+```python
+def parallelism_analysis(
+    total_params_B,
+    active_params_B,
+    num_experts,
+    num_layers,
+    num_gpus,
+):
+    """
+    Compare parallelism strategies for MoE serving.
+    """
+    strategies = {}
+
+    # Strategy 1: Expert Parallelism only
+    # Each GPU hosts num_experts / num_gpus experts for ALL layers
+    experts_per_gpu = num_experts / num_gpus
+    ep_memory = total_params_B / num_gpus  # Even split
+    ep_comm_per_layer = 2  # Two all-to-all per layer
+    strategies["EP only"] = {
+        "memory_per_gpu_B": ep_memory,
+        "comm_per_layer": ep_comm_per_layer,
+        "comm_type": "all-to-all",
+        "suitable": num_gpus <= num_experts,
+    }
+
+    # Strategy 2: Tensor Parallelism
+    # Each expert is split across GPUs (attention too)
+    tp_memory = total_params_B / num_gpus
+    tp_comm_per_layer = 2  # Two all-reduce per layer (attention + FFN)
+    strategies["TP only"] = {
+        "memory_per_gpu_B": tp_memory,
+        "comm_per_layer": tp_comm_per_layer,
+        "comm_type": "all-reduce",
+        "suitable": True,
+    }
+
+    # Strategy 3: EP + TP hybrid
+    # Use EP across nodes, TP within node
+    # Typical: 8 GPUs per node, EP across nodes
+    gpus_per_node = 8
+    num_nodes = max(1, num_gpus // gpus_per_node)
+    ep_size = num_nodes
+    tp_size = gpus_per_node
+
+    ep_tp_memory = total_params_B / num_gpus
+    ep_tp_comm_per_layer = 2 + 2  # all-to-all (inter-node) + all-reduce (intra-node)
+    strategies["EP + TP"] = {
+        "memory_per_gpu_B": ep_tp_memory,
+        "comm_per_layer": ep_tp_comm_per_layer,
+        "comm_type": "all-to-all + all-reduce",
+        "suitable": num_gpus >= gpus_per_node,
+    }
+
+    return strategies
+```
+
+<Benchmark
+  title="Parallelism Strategy Comparison (DeepSeek V3 on 8 nodes x 8 H100s)"
+  columns={["Strategy", "Memory/GPU", "Inter-node Comm", "Intra-node Comm", "Throughput"]}
+  rows={[
+    { values: ["EP-only (EP=64)", "10.5 GB", "All-to-all (heavy)", "None", "Low (comm bound)"], highlight: false },
+    { values: ["TP-only (TP=64)", "10.5 GB", "All-reduce (heavy)", "All-reduce", "Low (comm bound)"], highlight: false },
+    { values: ["EP=8 + TP=8", "10.5 GB", "All-to-all (light)", "All-reduce (NVLink)", "High"], highlight: true },
+    { values: ["EP=8 + TP=8 + replication", "12 GB", "All-to-all (light)", "All-reduce (NVLink)", "Highest"], highlight: true },
+  ]}
+/>
+
+---
+
+## 7. KV Cache Considerations
+
+### MLA Reduces the Problem
+
+Standard GQA KV cache grows linearly with sequence length and model dimension. DeepSeek V3's Multi-head Latent Attention (MLA) compresses the KV cache by projecting keys and values into a low-rank latent space.
+
+```python
+def kv_cache_comparison(
+    d_model,
+    num_kv_heads,
+    head_dim,
+    num_layers,
+    seq_len,
+    batch_size,
+    mla_rank=None,
+    bytes_per_element=2,
+):
+    """
+    Compare KV cache size for standard GQA vs MLA.
+    """
+    # Standard GQA
+    kv_dim = num_kv_heads * head_dim
+    gqa_kv_per_layer = batch_size * seq_len * 2 * kv_dim * bytes_per_element
+    gqa_total = gqa_kv_per_layer * num_layers
+
+    result = {"gqa_kv_gb": gqa_total / 1e9}
+
+    if mla_rank:
+        # MLA: store compressed latent instead of full K, V
+        mla_kv_per_layer = batch_size * seq_len * mla_rank * bytes_per_element
+        mla_total = mla_kv_per_layer * num_layers
+        result["mla_kv_gb"] = mla_total / 1e9
+        result["compression_ratio"] = gqa_total / mla_total
+
+    return result
+```
+
+<Benchmark
+  title="KV Cache: Standard GQA vs MLA (DeepSeek V3, 128K Context)"
+  columns={["Approach", "KV Cache Size (BS=1)", "KV Cache Size (BS=32)", "Impact"]}
+  rows={[
+    { values: ["GQA-8 (Llama 3 style)", "15.0 GB", "480 GB", "Dominates memory at long contexts"], highlight: true },
+    { values: ["GQA-1 (MQA)", "1.9 GB", "60 GB", "Minimal but quality loss"], highlight: false },
+    { values: ["MLA (rank=512)", "3.8 GB", "122 GB", "Good compression, no quality loss"], highlight: true },
+  ]}
+/>
+
+---
+
+## 8. Latency Breakdown: Where Time Goes
+
+### Per-Token Latency Components
+
+```python
+def moe_latency_breakdown(
+    d_model=7168,
+    d_ff=2048,
+    num_experts=256,
+    top_k=8,
+    num_layers=61,
+    batch_size=1,
+    ep_size=8,
+    gpu_tflops=989,      # H100 FP16
+    memory_bw_tbps=3.35, # H100 HBM
+    nvlink_bw_gbps=900,
+):
+    """Detailed per-token latency breakdown for MoE inference."""
+
+    # 1. Router computation
+    router_flops = 2 * d_model * num_experts  # Linear projection
+    router_time_us = router_flops / (gpu_tflops * 1e6)
+
+    # 2. All-to-all dispatch
+    dispatch_bytes = batch_size * top_k * d_model * 2  # FP16
+    dispatch_time_us = dispatch_bytes / (nvlink_bw_gbps * 1e3) + 1.0  # +1us latency
+
+    # 3. Expert computation (per expert, BS=1)
+    expert_flops = 3 * 2 * d_model * d_ff  # SwiGLU
+    # Memory-bound at BS=1: time = weight_bytes / bandwidth
+    expert_weight_bytes = 3 * d_model * d_ff * 2
+    expert_time_us = expert_weight_bytes / (memory_bw_tbps * 1e6)
+
+    # Only top_k experts run (in parallel across EP ranks)
+    parallel_experts = top_k / ep_size  # Experts per rank
+    expert_total_us = expert_time_us * parallel_experts
+
+    # 4. All-to-all combine
+    combine_time_us = dispatch_time_us  # Same volume
+
+    # 5. Attention computation (separate, dense)
+    attn_flops = 4 * d_model * d_model * 2  # Q, K, V, O projections
+    attn_weight_bytes = 4 * d_model * d_model * 2  # Assuming some KV compression
+    attn_time_us = attn_weight_bytes / (memory_bw_tbps * 1e6)
+
+    # Per-layer total
+    layer_time_us = (
+        router_time_us + dispatch_time_us +
+        expert_total_us + combine_time_us + attn_time_us
+    )
+
+    # Total across all layers
+    total_time_us = layer_time_us * num_layers
+    total_time_ms = total_time_us / 1000
+
+    return {
+        "router_us_per_layer": router_time_us,
+        "dispatch_us_per_layer": dispatch_time_us,
+        "expert_us_per_layer": expert_total_us,
+        "combine_us_per_layer": combine_time_us,
+        "attention_us_per_layer": attn_time_us,
+        "total_us_per_layer": layer_time_us,
+        "total_ms": total_time_ms,
+        "tokens_per_sec": 1e6 / total_time_us,
+    }
+```
+
+<PerfChart
+  title="Per-Layer Latency Breakdown (DeepSeek V3, BS=1, H100)"
+  data={[
+    { label: "Attention (weight loading)", value: 38.5, color: "blue", annotation: "38.5% — memory-bound" },
+    { label: "Expert computation", value: 28.2, color: "green", annotation: "28.2% — memory-bound at BS=1" },
+    { label: "All-to-all (dispatch+combine)", value: 18.1, color: "orange", annotation: "18.1% — interconnect" },
+    { label: "Router computation", value: 2.4, color: "gray", annotation: "2.4% — negligible" },
+    { label: "Other (norms, residuals)", value: 12.8, color: "gray", annotation: "12.8% — overhead" },
+  ]}
+  unit="% of per-layer latency"
+/>
+
+---
+
+## 9. When MoE Serving Is Harder Than Dense
+
+### The Crossover Points
+
+```python
+def when_dense_wins(
+    moe_total_B,
+    moe_active_B,
+    dense_B,
+    batch_sizes=None,
+):
+    """
+    Find batch sizes where dense model outperforms MoE model
+    on tokens/sec/dollar metric.
+    """
+    if batch_sizes is None:
+        batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+
+    results = []
+    for bs in batch_sizes:
+        # Simplified model: at low BS, throughput ~ memory_bandwidth / model_size
+        # At high BS, throughput ~ compute / active_params
+
+        # MoE: always loads all params, only activates fraction
+        moe_load_cost = moe_total_B  # Memory to traverse
+        moe_compute_cost = moe_active_B * bs  # Compute scales with batch
+
+        # Dense: loads all params (which equals active params)
+        dense_load_cost = dense_B
+        dense_compute_cost = dense_B * bs
+
+        # Memory-bound regime: throughput proportional to 1/model_size
+        moe_tps_mem = bs / moe_load_cost
+        dense_tps_mem = bs / dense_load_cost
+
+        # Compute-bound regime: throughput proportional to 1/active_params
+        moe_tps_compute = bs / moe_active_B
+        dense_tps_compute = bs / dense_B
+
+        # Actual throughput: min of memory and compute bound
+        moe_tps = min(moe_tps_mem, moe_tps_compute)
+        dense_tps = min(dense_tps_mem, dense_tps_compute)
+
+        # Cost-adjusted (MoE needs more GPUs)
+        moe_gpus = moe_total_B * 2 / 80  # FP16, A100
+        dense_gpus = dense_B * 2 / 80
+
+        moe_tps_per_dollar = moe_tps / moe_gpus
+        dense_tps_per_dollar = dense_tps / dense_gpus
+
+        results.append({
+            "batch_size": bs,
+            "moe_wins": moe_tps_per_dollar > dense_tps_per_dollar,
+            "moe_advantage": moe_tps_per_dollar / dense_tps_per_dollar,
+        })
+
+    return results
+```
+
+<Benchmark
+  title="MoE vs Dense: When Does Each Win?"
+  columns={["Scenario", "MoE Advantage", "Dense Advantage", "Winner"]}
+  rows={[
+    { values: ["BS=1, latency-sensitive", "Lower FLOPs/token", "Less memory, faster weight loading", "Dense"], highlight: false },
+    { values: ["BS=1, cost-sensitive", "Cheaper compute", "Fewer GPUs needed", "Depends on utilization"], highlight: false },
+    { values: ["BS=64+, throughput", "11x fewer FLOPs/token", "No communication overhead", "MoE"], highlight: true },
+    { values: ["Long context (128K+)", "Lower active compute", "Smaller KV cache (with GQA)", "Depends on MLA"], highlight: false },
+    { values: ["Multi-tenant serving", "Amortize memory across users", "Simpler load balancing", "MoE at high utilization"], highlight: true },
+    { values: ["Edge/mobile", "N/A (too large)", "Fits on device", "Dense"], highlight: false },
+  ]}
+/>
+
+---
+
+## 10. Optimization: Expert Merging and Pruning
+
+### Post-Training Expert Merging
+
+If two experts have learned similar functions, they can be merged to reduce the total parameter count without significant quality loss.
+
+```python
+def compute_expert_similarity(model, layer_idx, num_experts):
+    """
+    Compute pairwise similarity between experts.
+    Uses cosine similarity of weight matrices.
+    """
+    similarities = torch.zeros(num_experts, num_experts)
+
+    for i in range(num_experts):
+        wi = torch.cat([
+            p.data.reshape(-1)
+            for p in model.layers[layer_idx].moe.experts[i].parameters()
+        ])
+        for j in range(i + 1, num_experts):
+            wj = torch.cat([
+                p.data.reshape(-1)
+                for p in model.layers[layer_idx].moe.experts[j].parameters()
+            ])
+            sim = torch.cosine_similarity(wi.unsqueeze(0), wj.unsqueeze(0))
+            similarities[i, j] = sim
+            similarities[j, i] = sim
+
+    return similarities
+
+
+def merge_similar_experts(model, layer_idx, expert_i, expert_j, alpha=0.5):
+    """
+    Merge expert_j into expert_i with weighted average.
+    expert_j is then removed (or zeroed out).
+    """
+    for pi, pj in zip(
+        model.layers[layer_idx].moe.experts[expert_i].parameters(),
+        model.layers[layer_idx].moe.experts[expert_j].parameters(),
+    ):
+        pi.data = alpha * pi.data + (1 - alpha) * pj.data
+
+    # Update router to redirect expert_j traffic to expert_i
+    gate = model.layers[layer_idx].moe.gate
+    gate.weight.data[expert_i] = (
+        alpha * gate.weight.data[expert_i] +
+        (1 - alpha) * gate.weight.data[expert_j]
+    )
+    # Zero out expert_j's router weight
+    gate.weight.data[expert_j] = -1e9  # Large negative = never selected
+```
+
+### Expert Pruning
+
+For inference on constrained hardware, remove the least-used experts entirely:
+
+```python
+def prune_experts(model, layer_idx, experts_to_keep, popularity):
+    """
+    Remove unpopular experts from a layer.
+    Keeps only the top-N experts by popularity.
+    """
+    keep_indices = popularity.topk(experts_to_keep).indices.tolist()
+
+    # Create new expert list
+    new_experts = torch.nn.ModuleList([
+        model.layers[layer_idx].moe.experts[i] for i in keep_indices
+    ])
+
+    # Create new router
+    old_gate = model.layers[layer_idx].moe.gate
+    new_gate = torch.nn.Linear(
+        old_gate.in_features, experts_to_keep, bias=False
+    )
+    new_gate.weight.data = old_gate.weight.data[keep_indices]
+
+    model.layers[layer_idx].moe.experts = new_experts
+    model.layers[layer_idx].moe.gate = new_gate
+    model.layers[layer_idx].moe.num_experts = experts_to_keep
+
+    return keep_indices
+```
+
+<Callout type="warning" title="Expert Pruning Quality Impact">
+Pruning experts is a lossy operation. Removing 50% of experts from Mixtral (8 to 4) degrades perplexity by approximately 5-8%. Removing 75% (8 to 2) degrades by 15-20%, effectively turning it into a dense 14B model with worse quality than Mistral 7B. Expert pruning is a last resort for extremely constrained environments.
+</Callout>
+
+---
+
+## 11. Continuous Batching with MoE
+
+### The Challenge
+
+Continuous batching (serving multiple requests simultaneously, with requests arriving and completing at different times) is more complex with MoE because different requests in the batch may route to different experts. The all-to-all communication must handle variable-size messages per expert.
+
+```python
+class MoEContinuousBatcher:
+    """
+    Continuous batching for MoE models.
+    Handles the complication that different sequences in the batch
+    may activate different expert sets.
+    """
+    def __init__(self, model, max_batch_size=256, max_seq_len=4096):
+        self.model = model
+        self.max_batch_size = max_batch_size
+        self.active_requests = {}  # request_id -> RequestState
+
+    def step(self):
+        """Execute one decode step for all active requests."""
+        # Gather tokens from all active requests
+        batch_tokens = []
+        batch_positions = []
+        request_ids = []
+
+        for rid, state in self.active_requests.items():
+            batch_tokens.append(state.current_token)
+            batch_positions.append(state.position)
+            request_ids.append(rid)
+
+        if not batch_tokens:
+            return
+
+        tokens = torch.stack(batch_tokens)  # [B]
+        positions = torch.stack(batch_positions)  # [B]
+
+        # Forward pass
+        # Key: routing decisions are made per-token, not per-request
+        # Different tokens in the batch go to different experts
+        with torch.no_grad():
+            logits = self.model.forward_one_step(tokens, positions)
+
+        # Dispatch results back to requests
+        for i, rid in enumerate(request_ids):
+            next_token = logits[i].argmax()
+            self.active_requests[rid].append_token(next_token)
+
+            if self.active_requests[rid].is_complete():
+                self.complete_request(rid)
+
+    def expert_utilization_per_step(self):
+        """
+        Monitor expert utilization within the current batch.
+        Low utilization means experts are idle waiting for tokens.
+        """
+        batch_size = len(self.active_requests)
+        if batch_size == 0:
+            return {}
+
+        # At BS=B with top-k=2 and 8 experts:
+        # Expected tokens per expert = 2*B/8 = B/4
+        # At B=1: 0.25 tokens per expert (most experts idle)
+        # At B=64: 16 tokens per expert (good utilization)
+        top_k = 2
+        num_experts = 8
+        expected = top_k * batch_size / num_experts
+        return {
+            "batch_size": batch_size,
+            "expected_tokens_per_expert": expected,
+            "min_for_good_utilization": num_experts * 4,  # BS=16 for 8 experts
+        }
+```
+
+---
+
+## 12. Summary
+
+MoE inference challenges center on the fundamental mismatch between total parameters (which determine memory) and active parameters (which determine compute). The key challenges and mitigations:
+
+1. **Memory footprint**: 87%+ of memory holds inactive expert weights. Mitigation: quantization, expert offloading, expert pruning.
+2. **Expert popularity skew**: At inference (without auxiliary loss), expert utilization is 3x more skewed than training. Mitigation: expert replication across EP ranks.
+3. **All-to-all communication**: Adds 18-45% latency overhead depending on interconnect. Mitigation: keep EP within a node (NVLink), minimize cross-node communication.
+4. **Small-batch inefficiency**: At BS=1, MoE models are severely memory-bandwidth-bound with 2% GPU utilization. Mitigation: aggressive batching, continuous batching, speculative decoding.
+5. **KV cache**: MLA compresses KV cache by 4-8x compared to standard GQA, partially offsetting the expert memory overhead.
+
+MoE models win on cost at high utilization (large batches, many concurrent users). Dense models win on simplicity and latency at low utilization. The optimal choice depends on your serving SLO and expected traffic volume.

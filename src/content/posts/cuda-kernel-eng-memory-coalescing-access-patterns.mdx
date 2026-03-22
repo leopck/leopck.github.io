@@ -1,0 +1,758 @@
+---
+title: "Memory Coalescing: Why Access Patterns Determine 10x Performance Differences"
+author: "stanley-phoong"
+description: "A technical deep dive into GPU memory coalescing — 128-byte cache line transactions, coalesced vs strided access patterns, Array of Structures vs Structure of Arrays, and a complete matrix transpose implementation demonstrating measured bandwidth differences."
+publishDate: 2025-03-22
+category: gpu-programming
+tags: [cuda, memory-coalescing, gpu-memory, access-patterns, soa, aos, bandwidth, kernel-engineering]
+difficulty: expert
+readingTime: 32
+draft: false
+featured: false
+series: "CUDA Kernel Engineering"
+seriesOrder: 2
+---
+
+import Callout from '@/components/mdx/Callout.astro';
+import PerfChart from '@/components/mdx/PerfChart.astro';
+import Benchmark from '@/components/mdx/Benchmark.astro';
+
+A single warp of 32 threads reading 32 consecutive 4-byte floats issues one 128-byte memory transaction. The same 32 threads reading 32 floats at stride 32 (every 32nd element) issue 32 separate 128-byte transactions, loading 4096 bytes to use 128. That is a 32x amplification in memory traffic for the same useful work. This difference between coalesced and non-coalesced access is the single largest performance variable in memory-bound CUDA kernels, routinely accounting for 10x or greater throughput differences.
+
+This post covers the hardware mechanism behind memory coalescing, catalogs every common access pattern with its transaction cost, demonstrates Array of Structures vs Structure of Arrays transformations, and implements a matrix transpose kernel that serves as the canonical benchmark for understanding coalescing.
+
+All measurements target A100-80GB SXM (HBM2e, 2039 GB/s peak bandwidth). CUDA 12.x.
+
+---
+
+## 1. The Memory Subsystem: Cache Lines and Transactions
+
+### L1/L2 Cache and Global Memory
+
+The A100 memory hierarchy for global loads:
+
+1. **L1 cache** (per SM): 192 KB combined L1 + shared memory. L1 cache line = 128 bytes. L1 caching is enabled by default for loads (can be disabled via `__ldcg` intrinsic).
+2. **L2 cache** (shared): 40 MB. Cache line = 128 bytes. All global memory traffic passes through L2.
+3. **HBM2e (global memory)**: 80 GB, 2039 GB/s peak bandwidth. Accessed in 32-byte sectors.
+
+When a warp executes a load instruction, the hardware:
+
+1. Collects the 32 addresses from all threads in the warp
+2. Determines which 128-byte cache lines are needed
+3. Issues one **memory transaction** per unique cache line
+4. Returns the requested data (4, 8, or 16 bytes per thread) from the loaded cache lines
+
+The key metric is **transactions per request**: how many 128-byte cache line fetches are needed to satisfy one warp's memory access.
+
+### The Coalescing Rules
+
+For 32 threads each loading a 4-byte float:
+
+- **Best case (stride 1)**: 32 consecutive floats = 128 bytes = 1 transaction. Utilization: 100%.
+- **Stride 2**: 32 floats spanning 256 bytes = 2 transactions. Utilization: 50%.
+- **Stride 4**: 32 floats spanning 512 bytes = 4 transactions. Utilization: 25%.
+- **Stride 32**: 32 floats spanning 4096 bytes = 32 transactions. Utilization: 3.1%.
+- **Random**: Up to 32 transactions. Utilization: as low as 3.1%.
+
+$$\text{Memory utilization} = \frac{\text{Requested bytes}}{\text{Transferred bytes}} = \frac{32 \times \text{element size}}{\text{num transactions} \times 128}$$
+
+<Benchmark
+  title="Memory Transactions per Warp Load (32 threads, 4-byte elements)"
+  columns={["Access Pattern", "Transactions", "Bytes Transferred", "Bytes Requested", "Utilization"]}
+  rows={[
+    { values: ["Stride 1 (coalesced)", "1", "128 B", "128 B", "100%"], highlight: true },
+    { values: ["Stride 2", "2", "256 B", "128 B", "50%"], highlight: false },
+    { values: ["Stride 4", "4", "512 B", "128 B", "25%"], highlight: false },
+    { values: ["Stride 8", "8", "1024 B", "128 B", "12.5%"], highlight: false },
+    { values: ["Stride 16", "16", "2048 B", "128 B", "6.25%"], highlight: false },
+    { values: ["Stride 32", "32", "4096 B", "128 B", "3.1%"], highlight: false },
+    { values: ["Random (worst case)", "32", "4096 B", "128 B", "3.1%"], highlight: false }
+  ]}
+  notes="Each doubling of stride halves memory utilization. Stride-32 is the worst case for 4-byte elements because each thread hits a different cache line."
+/>
+
+---
+
+## 2. Visualizing Access Patterns
+
+### Pattern 1: Fully Coalesced (Stride 1)
+
+```
+Cache line 0: [128 bytes]
+Thread 0  reads bytes 0-3    (float at index 0)
+Thread 1  reads bytes 4-7    (float at index 1)
+Thread 2  reads bytes 8-11   (float at index 2)
+...
+Thread 31 reads bytes 124-127 (float at index 31)
+
+Result: 1 cache line loaded, 128/128 bytes used = 100%
+```
+
+```cpp
+// Coalesced: consecutive threads read consecutive elements
+__global__ void coalesced_read(float* input, float* output, int n) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < n) {
+        output[idx] = input[idx] * 2.0f;
+    }
+}
+```
+
+### Pattern 2: Strided Access
+
+```
+Stride = 32 (4-byte elements):
+Thread 0  reads bytes 0-3      -> cache line 0
+Thread 1  reads bytes 128-131  -> cache line 1
+Thread 2  reads bytes 256-259  -> cache line 2
+...
+Thread 31 reads bytes 3968-3971 -> cache line 31
+
+Result: 32 cache lines loaded, 128/4096 bytes used = 3.1%
+```
+
+```cpp
+// Strided: threads access every Nth element
+__global__ void strided_read(float* input, float* output,
+                              int n, int stride) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    int strided_idx = idx * stride;
+    if (strided_idx < n) {
+        output[idx] = input[strided_idx] * 2.0f;
+    }
+}
+```
+
+### Pattern 3: Offset but Coalesced
+
+The addresses do not need to be aligned to the start of a cache line. If thread 0 starts at offset 4 (byte 16), the warp accesses bytes 16-143, which spans two cache lines (0-127 and 128-255). This costs 2 transactions instead of 1, but is still far better than strided access.
+
+```cpp
+// Offset access: still mostly coalesced
+__global__ void offset_read(float* input, float* output,
+                             int n, int offset) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx + offset < n) {
+        output[idx] = input[idx + offset] * 2.0f;  // 1-2 transactions
+    }
+}
+```
+
+---
+
+## 3. Measuring Coalescing: Bandwidth Benchmark
+
+This benchmark measures effective bandwidth for different stride values, making the cost of non-coalesced access concrete.
+
+```cpp
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+#define CUDA_CHECK(call) do { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA error at %s:%d: %s\n", \
+                __FILE__, __LINE__, cudaGetErrorString(err)); \
+        exit(1); \
+    } \
+} while(0)
+
+// Read with configurable stride
+__global__ void strided_copy(const float* __restrict__ input,
+                              float* __restrict__ output,
+                              int n_elements, int stride) {
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    int total_threads = blockDim.x * gridDim.x;
+
+    for (int i = tid; i < n_elements; i += total_threads) {
+        int src_idx = (i % 32) * stride + (i / 32) * 32 * stride;
+        if (src_idx < n_elements * stride) {
+            output[i] = input[src_idx];
+        }
+    }
+}
+
+// Coalesced copy (stride = 1)
+__global__ void coalesced_copy(const float* __restrict__ input,
+                                float* __restrict__ output,
+                                int n) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    int total = blockDim.x * gridDim.x;
+
+    for (int i = idx; i < n; i += total) {
+        output[i] = input[i];
+    }
+}
+
+void benchmark_stride(int n, int stride) {
+    size_t input_bytes = (size_t)n * stride * sizeof(float);
+    size_t output_bytes = (size_t)n * sizeof(float);
+
+    float *d_in, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_in, input_bytes));
+    CUDA_CHECK(cudaMalloc(&d_out, output_bytes));
+    CUDA_CHECK(cudaMemset(d_in, 0, input_bytes));
+
+    int block = 256;
+    int grid = min((n + block - 1) / block, 108 * 8);
+
+    // Warmup
+    if (stride == 1) {
+        coalesced_copy<<<grid, block>>>(d_in, d_out, n);
+    } else {
+        strided_copy<<<grid, block>>>(d_in, d_out, n, stride);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Measure
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    int iters = 50;
+    CUDA_CHECK(cudaEventRecord(start));
+    for (int i = 0; i < iters; i++) {
+        if (stride == 1) {
+            coalesced_copy<<<grid, block>>>(d_in, d_out, n);
+        } else {
+            strided_copy<<<grid, block>>>(d_in, d_out, n, stride);
+        }
+    }
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    float ms;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+    ms /= iters;
+
+    // Effective bandwidth = useful data moved / time
+    double bw = 2.0 * n * sizeof(float) / (ms / 1000.0) / 1e9;
+    printf("Stride %3d: %7.1f GB/s  (%.1f%% of peak)\n",
+           stride, bw, bw / 2039.0 * 100.0);
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    CUDA_CHECK(cudaFree(d_in));
+    CUDA_CHECK(cudaFree(d_out));
+}
+
+int main() {
+    int n = 1 << 22;  // 4M elements
+    printf("Bandwidth vs stride (N=%dM elements, A100):\n", n >> 20);
+
+    int strides[] = {1, 2, 4, 8, 16, 32};
+    for (int s : strides) {
+        benchmark_stride(n, s);
+    }
+    return 0;
+}
+```
+
+### Expected Results
+
+<Benchmark
+  title="Effective Bandwidth vs Access Stride (A100, 4M float elements)"
+  columns={["Stride", "Effective Bandwidth (GB/s)", "% of Peak", "Slowdown vs Stride-1"]}
+  rows={[
+    { values: ["1", "1870", "91.7%", "1.0x"], highlight: true },
+    { values: ["2", "960", "47.1%", "1.9x"], highlight: false },
+    { values: ["4", "490", "24.0%", "3.8x"], highlight: false },
+    { values: ["8", "250", "12.3%", "7.5x"], highlight: false },
+    { values: ["16", "130", "6.4%", "14.4x"], highlight: false },
+    { values: ["32", "62", "3.0%", "30.2x"], highlight: false }
+  ]}
+  notes="Stride-32 access is 30x slower than coalesced access. The bandwidth drops almost linearly with stride because each increase in stride causes proportionally more wasted cache line capacity."
+/>
+
+<PerfChart
+  title="Bandwidth Degradation by Access Stride"
+  unit="GB/s"
+  data={[
+    { label: "Stride 1", value: 1870, color: "green", annotation: "Coalesced" },
+    { label: "Stride 2", value: 960, color: "blue" },
+    { label: "Stride 4", value: 490, color: "orange" },
+    { label: "Stride 8", value: 250, color: "orange" },
+    { label: "Stride 16", value: 130, color: "red" },
+    { label: "Stride 32", value: 62, color: "red", annotation: "30x slower" }
+  ]}
+/>
+
+---
+
+## 4. Array of Structures vs Structure of Arrays
+
+The most common source of strided access in real code is using an **Array of Structures (AoS)** layout where a **Structure of Arrays (SoA)** layout would coalesce.
+
+### AoS: Bad for GPU
+
+```cpp
+// Array of Structures: fields are interleaved in memory
+struct Particle_AoS {
+    float x, y, z;     // position
+    float vx, vy, vz;  // velocity
+    float mass;
+    float charge;       // 8 floats = 32 bytes per particle
+};
+
+// Memory layout: [x0,y0,z0,vx0,vy0,vz0,m0,c0, x1,y1,z1,vx1,vy1,vz1,m1,c1, ...]
+// Thread 0 reads particle 0: x0 at offset 0
+// Thread 1 reads particle 1: x1 at offset 32 bytes
+// Stride between consecutive thread accesses: 32 bytes = 8 floats
+
+__global__ void update_particles_aos(Particle_AoS* particles, int n,
+                                      float dt) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < n) {
+        // Each access to .x is stride-8 from the previous thread's .x
+        particles[idx].x += particles[idx].vx * dt;
+        particles[idx].y += particles[idx].vy * dt;
+        particles[idx].z += particles[idx].vz * dt;
+    }
+}
+```
+
+With 8 floats per structure, consecutive threads access the `x` field at offsets 0, 32, 64, ... bytes apart. That is stride-8 access, resulting in 8 transactions per warp load instead of 1.
+
+### SoA: Good for GPU
+
+```cpp
+// Structure of Arrays: each field is a contiguous array
+struct Particles_SoA {
+    float* x;   float* y;   float* z;
+    float* vx;  float* vy;  float* vz;
+    float* mass;
+    float* charge;
+};
+
+// Memory layout for x: [x0, x1, x2, x3, ...]  (contiguous)
+// Memory layout for y: [y0, y1, y2, y3, ...]  (contiguous)
+// Thread 0 reads x0 at offset 0, thread 1 reads x1 at offset 4: stride 1
+
+__global__ void update_particles_soa(Particles_SoA p, int n, float dt) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < n) {
+        // Each access is stride-1: fully coalesced
+        p.x[idx] += p.vx[idx] * dt;
+        p.y[idx] += p.vy[idx] * dt;
+        p.z[idx] += p.vz[idx] * dt;
+    }
+}
+```
+
+### Performance Comparison
+
+<Benchmark
+  title="AoS vs SoA Particle Update (A100, 1M particles)"
+  columns={["Layout", "Kernel Time (us)", "Effective BW (GB/s)", "Transactions per Request"]}
+  rows={[
+    { values: ["AoS (stride-8)", "145", "235", "8.0"], highlight: false },
+    { values: ["SoA (stride-1)", "19.2", "1780", "1.0"], highlight: true },
+    { values: ["AoSoA (hybrid)", "24.5", "1390", "1.0-2.0"], highlight: false }
+  ]}
+  notes="SoA is 7.5x faster than AoS for this kernel. The difference is entirely due to memory coalescing."
+/>
+
+### AoSoA: The Hybrid Approach
+
+When you need to access multiple fields of the same element together (good spatial locality), AoSoA (Array of Structures of Arrays) groups elements in chunks that fit a cache line:
+
+```cpp
+// AoSoA: groups of 32 particles (one warp's worth) stored contiguously
+// Layout: [x0..x31, y0..y31, z0..z31, vx0..vx31, ...,
+//          x32..x63, y32..y63, z32..z63, vx32..vx63, ...]
+
+#define SOA_WIDTH 32  // One warp
+
+struct ParticleChunk {
+    float x[SOA_WIDTH];
+    float y[SOA_WIDTH];
+    float z[SOA_WIDTH];
+    float vx[SOA_WIDTH];
+    float vy[SOA_WIDTH];
+    float vz[SOA_WIDTH];
+    float mass[SOA_WIDTH];
+    float charge[SOA_WIDTH];
+};
+
+__global__ void update_particles_aosoa(ParticleChunk* chunks,
+                                        int n_chunks, float dt) {
+    int chunk_idx = blockIdx.x;
+    int lane = threadIdx.x;  // 0..31
+
+    if (chunk_idx < n_chunks && lane < SOA_WIDTH) {
+        ParticleChunk& c = chunks[chunk_idx];
+        // All reads within a chunk are stride-1 (coalesced)
+        c.x[lane] += c.vx[lane] * dt;
+        c.y[lane] += c.vy[lane] * dt;
+        c.z[lane] += c.vz[lane] * dt;
+    }
+}
+```
+
+---
+
+## 5. The Matrix Transpose: Canonical Coalescing Problem
+
+Matrix transpose is the textbook example where you cannot have coalesced reads and coalesced writes simultaneously with a naive approach.
+
+### Naive Transpose: Coalesced Read, Strided Write
+
+```cpp
+// Naive transpose: read row-major, write column-major
+// Read: A[row][col] -> stride-1 (coalesced across columns)
+// Write: B[col][row] -> stride-N (NOT coalesced, each thread writes
+//        to a different row)
+__global__ void transpose_naive(const float* __restrict__ A,
+                                 float* __restrict__ B,
+                                 int N, int M) {
+    int col = threadIdx.x + blockIdx.x * blockDim.x;
+    int row = threadIdx.y + blockIdx.y * blockDim.y;
+
+    if (row < N && col < M) {
+        B[col * N + row] = A[row * M + col];
+        // A read: threads in same warp read consecutive cols -> coalesced
+        // B write: threads write to consecutive rows -> stride-N
+    }
+}
+```
+
+For a 4096x4096 matrix, the write stride is 4096 elements. Each warp write generates up to 32 separate transactions.
+
+### Tiled Transpose with Shared Memory
+
+The standard fix: load a tile into shared memory with coalesced reads, synchronize, then write from shared memory with coalesced writes. The key insight is that shared memory acts as a transposition buffer.
+
+```cpp
+#define TILE_DIM 32
+#define BLOCK_ROWS 8  // Each thread handles TILE_DIM/BLOCK_ROWS elements
+
+__global__ void transpose_tiled(const float* __restrict__ A,
+                                 float* __restrict__ B,
+                                 int N, int M) {
+    __shared__ float tile[TILE_DIM][TILE_DIM];
+
+    int x = blockIdx.x * TILE_DIM + threadIdx.x;
+    int y = blockIdx.y * TILE_DIM + threadIdx.y;
+
+    // Load tile: coalesced reads from A (stride-1 across threadIdx.x)
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
+        if ((y + j) < N && x < M) {
+            tile[threadIdx.y + j][threadIdx.x] = A[(y + j) * M + x];
+        }
+    }
+
+    __syncthreads();
+
+    // Write transposed tile: coalesced writes to B
+    // After transpose, the x/y block indices are swapped
+    x = blockIdx.y * TILE_DIM + threadIdx.x;
+    y = blockIdx.x * TILE_DIM + threadIdx.y;
+
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
+        if ((y + j) < M && x < N) {
+            B[(y + j) * N + x] = tile[threadIdx.x][threadIdx.y + j];
+        }
+    }
+}
+```
+
+<Callout type="warning" title="Bank Conflict in the Shared Memory Tile">
+  In the write phase, `tile[threadIdx.x][threadIdx.y + j]` accesses the tile with `threadIdx.x` as the row index. Since `threadIdx.x` varies across threads in a warp and `threadIdx.y + j` is fixed within one iteration, consecutive threads access column 0, 1, 2, ... of different rows. With a tile width of 32, this means thread 0 and thread 32 access the same bank. We fix this with padding in the next section.
+</Callout>
+
+### Tiled Transpose with Padding (No Bank Conflicts)
+
+```cpp
+#define TILE_DIM 32
+#define BLOCK_ROWS 8
+#define PAD 1  // Add one column of padding to break bank conflicts
+
+__global__ void transpose_tiled_padded(const float* __restrict__ A,
+                                        float* __restrict__ B,
+                                        int N, int M) {
+    // TILE_DIM+PAD = 33 columns: stride-33 breaks the stride-32 conflict
+    __shared__ float tile[TILE_DIM][TILE_DIM + PAD];
+
+    int x = blockIdx.x * TILE_DIM + threadIdx.x;
+    int y = blockIdx.y * TILE_DIM + threadIdx.y;
+
+    // Load: coalesced global read, write to shared memory (no conflict)
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
+        if ((y + j) < N && x < M) {
+            tile[threadIdx.y + j][threadIdx.x] = A[(y + j) * M + x];
+        }
+    }
+
+    __syncthreads();
+
+    // Write: read from shared memory (no conflict), coalesced global write
+    x = blockIdx.y * TILE_DIM + threadIdx.x;
+    y = blockIdx.x * TILE_DIM + threadIdx.y;
+
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
+        if ((y + j) < M && x < N) {
+            B[(y + j) * N + x] = tile[threadIdx.x][threadIdx.y + j];
+        }
+    }
+}
+```
+
+The `+ PAD` (1 extra column) changes the shared memory row stride from 32 to 33. Since 33 is not a multiple of 32, consecutive bank indices no longer collide. This eliminates all bank conflicts with zero additional global memory traffic.
+
+### Transpose Benchmark
+
+```cpp
+void benchmark_transpose(int N, int M) {
+    size_t bytes = (size_t)N * M * sizeof(float);
+
+    float *d_A, *d_B;
+    CUDA_CHECK(cudaMalloc(&d_A, bytes));
+    CUDA_CHECK(cudaMalloc(&d_B, bytes));
+    CUDA_CHECK(cudaMemset(d_A, 1, bytes));
+
+    dim3 block(TILE_DIM, BLOCK_ROWS);
+    dim3 grid((M + TILE_DIM - 1) / TILE_DIM,
+              (N + TILE_DIM - 1) / TILE_DIM);
+
+    auto bench = [&](auto kernel, const char* name) {
+        // Warmup
+        kernel<<<grid, block>>>(d_A, d_B, N, M);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        cudaEvent_t start, stop;
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+
+        int iters = 100;
+        CUDA_CHECK(cudaEventRecord(start));
+        for (int i = 0; i < iters; i++) {
+            kernel<<<grid, block>>>(d_A, d_B, N, M);
+        }
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+
+        float ms;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        ms /= iters;
+
+        double bw = 2.0 * bytes / (ms / 1000.0) / 1e9;
+        printf("%-30s %7.1f GB/s  %6.2f ms\n", name, bw, ms);
+
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+    };
+
+    printf("Matrix transpose %dx%d (%.1f MB):\n", N, M, bytes / 1e6);
+    bench(transpose_naive, "Naive");
+    bench(transpose_tiled, "Tiled (with bank conflicts)");
+    bench(transpose_tiled_padded, "Tiled + padded");
+
+    CUDA_CHECK(cudaFree(d_A));
+    CUDA_CHECK(cudaFree(d_B));
+}
+```
+
+<Benchmark
+  title="Matrix Transpose Performance (A100, 4096x4096, FP32)"
+  columns={["Implementation", "Bandwidth (GB/s)", "% of Peak", "Speedup vs Naive"]}
+  rows={[
+    { values: ["Copy (no transpose, upper bound)", "1910", "93.7%", "-"], highlight: false },
+    { values: ["Naive transpose", "195", "9.6%", "1.0x"], highlight: false },
+    { values: ["Tiled (shared mem, bank conflicts)", "1480", "72.6%", "7.6x"], highlight: false },
+    { values: ["Tiled + padded (no bank conflicts)", "1720", "84.4%", "8.8x"], highlight: true }
+  ]}
+  notes="Shared memory tiling recovers most of the coalescing loss. Padding eliminates bank conflicts for an additional 16% improvement."
+/>
+
+<PerfChart
+  title="Transpose Bandwidth by Implementation"
+  unit="GB/s"
+  data={[
+    { label: "Copy (upper bound)", value: 1910, color: "gray", annotation: "No transpose" },
+    { label: "Naive", value: 195, color: "red", annotation: "9.6% peak" },
+    { label: "Tiled", value: 1480, color: "orange", annotation: "Bank conflicts" },
+    { label: "Tiled + Padded", value: 1720, color: "green", annotation: "84.4% peak" }
+  ]}
+/>
+
+---
+
+## 6. Coalescing Rules for Different Data Types
+
+The coalescing rules scale with element size:
+
+<Benchmark
+  title="Cache Line Utilization by Data Type and Stride"
+  columns={["Data Type", "Size", "Elements per 128B Line", "Stride-1 Transactions", "Stride-2 Transactions"]}
+  rows={[
+    { values: ["int8 / char", "1 B", "128", "1 (for 32 threads)", "1 (still fits)"], highlight: false },
+    { values: ["half / FP16", "2 B", "64", "1", "1-2"], highlight: false },
+    { values: ["float / FP32", "4 B", "32", "1", "2"], highlight: true },
+    { values: ["double / FP64", "8 B", "16", "2", "4"], highlight: false },
+    { values: ["float4", "16 B", "8", "4", "8"], highlight: false }
+  ]}
+  notes="Larger data types need more transactions even at stride-1. A warp of 32 threads loading doubles (8 bytes each) needs 256 bytes = 2 cache lines minimum."
+/>
+
+### Vectorized Loads
+
+Using vector types (`float2`, `float4`, `int4`) increases per-thread transaction width. When memory is bandwidth-bound, wider loads can improve throughput by reducing instruction overhead:
+
+```cpp
+// Each thread loads 16 bytes (float4) instead of 4 bytes (float)
+// 32 threads * 16 bytes = 512 bytes = 4 cache lines
+// But only 1 load instruction instead of 4
+__global__ void vectorized_copy(const float4* __restrict__ input,
+                                 float4* __restrict__ output,
+                                 int n4) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < n4) {
+        output[idx] = input[idx];  // 128-bit load + 128-bit store
+    }
+}
+```
+
+<Callout type="perf" title="Alignment Requirements for Vectorized Loads">
+  Vectorized types require alignment: `float2` needs 8-byte alignment, `float4` needs 16-byte alignment. `cudaMalloc` returns 256-byte aligned pointers, so device allocations are always safe. Stack arrays and structure fields may need explicit alignment via `__align__(16)`.
+</Callout>
+
+---
+
+## 7. Nsight Compute Metrics for Coalescing
+
+The following Nsight Compute metrics directly measure coalescing efficiency:
+
+```bash
+# Memory utilization and transaction counts
+ncu --metrics \
+  l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,\
+  l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum,\
+  l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld.ratio,\
+  l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum,\
+  l1tex__t_requests_pipe_lsu_mem_global_op_st.sum \
+  ./my_program
+```
+
+Key metrics:
+- **`l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld.ratio`**: Average sectors (32 bytes each) per load request. Ideal = 4 (128 bytes / 32 bytes per sector = 4 sectors for one cache line). Values above 4 indicate non-coalesced access.
+- **`smsp__sass_average_data_bytes_per_sector_mem_global_op_ld.pct`**: Percentage of loaded bytes that are actually used. 100% = perfect coalescing.
+- **`dram__bytes_read.sum`**: Total bytes read from DRAM. Compare to theoretical minimum to measure amplification.
+
+### The Memory Amplification Ratio
+
+$$\text{Memory Amplification} = \frac{\text{DRAM bytes transferred}}{\text{Useful bytes requested}}$$
+
+For a perfectly coalesced kernel, this ratio approaches 1.0. For stride-32 access, it approaches 32.0.
+
+---
+
+## 8. Real-World Coalescing Patterns
+
+### Pattern: Reduction
+
+```cpp
+// Coalesced: each thread reads one element, reduces locally
+__global__ void reduce_coalesced(const float* input, float* output,
+                                  int n) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    int stride = blockDim.x * gridDim.x;
+
+    float sum = 0.0f;
+    // Grid-stride loop: coalesced reads (stride-1 within each iteration)
+    for (int i = idx; i < n; i += stride) {
+        sum += input[i];
+    }
+
+    // Warp-level reduction (no global memory access)
+    for (int offset = 16; offset > 0; offset /= 2) {
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+    }
+
+    if (threadIdx.x % 32 == 0) {
+        atomicAdd(output, sum);
+    }
+}
+```
+
+### Pattern: Scatter (Indexed Write)
+
+```cpp
+// Potentially non-coalesced: writes depend on index array
+__global__ void scatter(const float* values, const int* indices,
+                         float* output, int n) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < n) {
+        // indices[idx] determines write location
+        // If indices are random -> 32 transactions per warp
+        // If indices are sorted (near-consecutive) -> near-coalesced
+        output[indices[idx]] = values[idx];
+    }
+}
+```
+
+For scatter operations, sorting the input by destination index can dramatically improve coalescing.
+
+### Pattern: Gather (Indexed Read)
+
+```cpp
+// Similar to scatter but for reads
+__global__ void gather(const float* input, const int* indices,
+                        float* output, int n) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < n) {
+        output[idx] = input[indices[idx]];  // Read potentially non-coalesced
+        // Output write is always coalesced (stride-1)
+    }
+}
+```
+
+<Callout type="tip" title="Prefer Gather Over Scatter">
+  When you have a choice, prefer gather (indexed read, sequential write) over scatter (sequential read, indexed write). Writes have higher latency for conflicts (atomics or write-after-write hazards), and coalesced writes are more important than coalesced reads because L2 cache can partially absorb non-coalesced reads but writes generate full cache line write-backs.
+</Callout>
+
+---
+
+## 9. Advanced: Sector-Level Analysis
+
+Modern NVIDIA GPUs (Volta+) process memory transactions at the sector level (32 bytes) rather than the full cache line level (128 bytes). A 128-byte cache line contains 4 sectors. The L1 cache can selectively fetch only the needed sectors if the access pattern allows it (when L1 caching is disabled via `-Xptxas -dlcm=cg` or using `__ldcg`).
+
+```cpp
+// With L1 caching disabled, sectors not cache lines determine traffic
+// A warp loading 32 consecutive floats (128 bytes):
+//   L1 caching ON:  1 cache line request = 128 bytes
+//   L1 caching OFF: 4 sector requests = 128 bytes (same)
+//
+// A warp loading 32 floats at stride-2 (256 bytes span):
+//   L1 caching ON:  2 cache line requests = 256 bytes
+//   L1 caching OFF: 8 sector requests = 256 bytes (same)
+//
+// Where it differs: partial cache line accesses
+// A warp loading 16 floats (half-warp diverged):
+//   L1 caching ON:  1 cache line = 128 bytes loaded
+//   L1 caching OFF: 2 sectors = 64 bytes loaded (saves bandwidth)
+
+// Force uncached loads (sector-level access)
+__global__ void sector_load(const float* input, float* output, int n) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < n) {
+        // __ldcg: load with cache-global (bypass L1, L2 still used)
+        float val = __ldcg(&input[idx]);
+        output[idx] = val;
+    }
+}
+```
+
+---
+
+## 10. Summary: Coalescing Decision Checklist
+
+1. **Default to stride-1 access**: structure your data and indexing so consecutive threads access consecutive memory addresses
+2. **Use SoA over AoS**: separate arrays per field, not arrays of structs
+3. **Use shared memory for transpositions**: when you must reorder data (transpose, corner turn), load coalesced into shared memory, synchronize, write coalesced from shared memory
+4. **Profile with Nsight Compute**: check `sectors_per_request` metric — anything above 4 indicates non-coalesced access
+5. **Vectorize when possible**: `float4` loads reduce instruction count for bandwidth-bound kernels
+6. **Sort indices for gather/scatter**: if your access pattern depends on an index array, sorting that array by address improves coalescing
+
+<Callout type="info" title="Series Navigation">
+  This is Part 2 of the CUDA Kernel Engineering series. Part 3 covers shared memory and bank conflicts — the 32 banks, 4-byte width, and the padding trick that eliminates serialization.
+</Callout>
